@@ -164,11 +164,12 @@ deepmd-lr/
 │   ├── argcheck.py           # model_args_plugin / fitting_args_plugin registrations
 │   ├── model/lr_model.py     # LongRangeEnergyModel(EnergyModel), registered "dp_lr"
 │   ├── fitting/charge.py     # ChargeFittingNet + project_to_total_charge
-│   └── pme/term.py           # Phase 3: particle_mesh_ewald wrapper + unit conversion
+│   └── pme/term.py           # PMEEnergy: particle_mesh_ewald + eV conversion
 ├── tests/
 │   ├── test_pme_physics.py
 │   ├── test_plugin_registration.py
-│   └── test_charge_head.py
+│   ├── test_charge_head.py
+│   └── test_pme_term.py
 └── examples/water_lr/input.json
 ```
 
@@ -284,13 +285,49 @@ pathology the long-range term exists to avoid. It is uniform (so charge
 *differences* survive), permutation-equivariant, `gradcheck`-clean, and
 guarded against NaN on a fully-padded frame.
 
-### Phase 3 — PME term
-`deepmd_lr/pme/term.py` wraps `particle_mesh_ewald`. Responsibilities:
-- Unit conversion into deepmd's eV / Å convention (nvalchemi takes charges in elementary charge
-  units; verify the Coulomb prefactor explicitly against a two-charge analytic case).
-- Parameter selection: `accuracy`, `mesh_spacing`, `spline_order`; expose in the input JSON.
-- Non-periodic frames: `box is None` must raise a clear error, matching how
-  `deepmd/pt_expt/modifier/dipole_charge.py` handles it.
+### Phase 3 — PME term — **DONE**
+`deepmd_lr/pme/term.py` exposes `PMEEnergy`, a `torch.nn.Module` returning
+per-atom long-range energy in eV for `(nf, nloc, 3)` coordinates,
+`(nf, nloc)` charges and `(nf, 3, 3)` cells.
+
+**Units.** The conversion constant is imported from DeePMD-kit
+(`deepmd.dpmodel.modifier.dipole_charge.ELECTROSTATIC_CONVERSION`) rather
+than redefined, so our long-range energy lands on exactly the same scale as
+DeePMD-kit's existing DPLR path; a second definition would be a silent source
+of drift between them. Validated two independent ways: a dipole in a growing
+cell converges to the analytic `-k_e/r`, and the residual falls as 1/L³ —
+the dipole–image scaling, which confirms the leftover is periodicity and not
+a mis-scaled prefactor. The NaCl lattice energy in eV is checked separately.
+
+**Guards.** `box=None` and zero-volume cells are rejected with messages
+naming the physical reason; `spline_order >= 7` is refused at construction
+(Phase 0's silent-failure mode); padding atoms are given zero charge, which
+removes them from every Ewald contribution exactly, including the
+charge-quadratic self term.
+
+> **nvalchemi's batched `naive` neighbour list is wrong, and silently so.**
+> The auto-selector picks `naive` at our sizes. For two identical 216-atom
+> frames it returned 17280 pairs for frame 0 but only **10024** for frame 1 —
+> no error, no sensitivity to `max_neighbors`, no cross-frame pairs, just
+> missing neighbours. Three identical frames gave frame 0 correct and frames
+> 1 and 2 wrong by the same constant. Since a training batch *is* the batched
+> case, this would have quietly corrupted the long-range energy of every
+> frame but the first, in every batch, while leaving the numbers finite and
+> plausible.
+>
+> `method="cell_list"` returns the correct count for every frame and every
+> geometry tested (rcut/L from 0.12 to 0.49). The term pins it
+> (`NEIGHBOR_LIST_METHOD`) instead of letting the dispatcher choose, and
+> `TestBatching::test_identical_frames_give_identical_energies` fails
+> immediately if the pin is dropped. **Worth reporting upstream**, alongside
+> the `spline_order` finding.
+
+Two smaller API notes: the neighbour list needs an explicit `max_neighbors`
+and raises rather than truncating on overflow, so the term doubles capacity
+on `NeighborOverflowError` (up to a ceiling, to fail loudly rather than
+exhaust memory); and a real-space cutoff larger than half the shortest cell
+vector explodes the pair count — 2102 neighbours per atom in one accidental
+test configuration — so cutoffs should stay under `L/2`.
 
 ### Phase 4 — joint model
 `LongRangeEnergyModel(EnergyModel)`, registered `dp_lr`. Override `forward` to:

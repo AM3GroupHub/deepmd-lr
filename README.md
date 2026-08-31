@@ -18,7 +18,7 @@ environment setup.
 | 0 | Environment + PME validation | **done** |
 | 1 | Plugin skeleton (`dp_lr` model type, no long-range term yet) | **done** |
 | 2 | Charge head (`charge` fitting type + total-charge projection) | **done** |
-| 3 | PME term | not started |
+| 3 | PME term (`PMEEnergy`, eV units, guards) | **done** |
 | 4 | Joint model | not started |
 | 5 | Training + validation | not started |
 | 6 | MD via nvalchemi/ASE | not started |
@@ -74,6 +74,9 @@ pytest tests/ -q
 - `tests/test_charge_head.py` — the total-charge projection (exactness,
   masking, differentiability) and the charge head's physical symmetries
   through a real DPA4C descriptor.
+- `tests/test_pme_term.py` — the eV unit conversion (against analytic
+  Coulomb and Madelung), boundary-condition guards, batching, masking, and
+  gradients including the double backward that force training needs.
 
 The tests import only `deepmd`, never `deepmd_lr`, so they fail if the entry
 point stops working rather than silently passing.
