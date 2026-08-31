@@ -1,0 +1,202 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
+"""Environment-dependent partial charges for the long-range term.
+
+DPA4C takes the *total* charge of a frame as an input condition (see
+``deepmd.utils.charge_state``); it emits no per-atom charges. PME needs
+per-atom charges, so this module adds a second head on the shared descriptor
+that predicts them.
+
+Where the total-charge constraint is applied, and why not here
+--------------------------------------------------------------
+Physically the charges must satisfy :math:`\\sum_i q_i = Q_\\text{total}`.
+That constraint is a per-frame reduction, and a fitting net cannot express it:
+on the graph route ``call_graph`` receives the flat node axis ``(N,)`` with no
+frame structure at all -- it reuses the dense forward by treating each node as
+its own single-atom frame -- so it cannot tell which atoms share a frame, and
+``charge_spin`` is never passed to a fitting in the first place.
+
+So the head here predicts *raw* charges, and :func:`project_to_total_charge`
+is applied one level up, at the model, where both the frame structure and
+``charge_spin`` are available. Keeping the projection a separate pure function
+also makes it testable on its own, independently of any network.
+"""
+
+from typing import (
+    Any,
+)
+
+import array_api_compat
+from deepmd.dpmodel.array_api import (
+    Array,
+)
+from deepmd.dpmodel.common import (
+    DEFAULT_PRECISION,
+)
+from deepmd.dpmodel.fitting.invar_fitting import (
+    InvarFitting,
+)
+from deepmd.pt_expt.common import (
+    torch_module,
+)
+from deepmd.pt_expt.fitting.base_fitting import (
+    BaseFitting,
+)
+
+#: Name of the per-atom variable this head produces, and the key it is
+#: registered and serialized under.
+CHARGE_VAR_NAME = "charge"
+
+
+def project_to_total_charge(
+    raw_charge: Array,
+    total_charge: Array | float = 0.0,
+    mask: Array | None = None,
+) -> Array:
+    r"""Shift raw per-atom charges so each frame carries its total charge.
+
+    .. math::
+        q_i = \tilde q_i + \frac{Q_\text{total} - \sum_j \tilde q_j}{N}
+
+    The deficit is spread uniformly over the real atoms of the frame. This is
+    the cheapest constraint that is exact, differentiable everywhere, and
+    permutation-equivariant -- an important combination, because the charges
+    are trained through the PME energy and any non-differentiable projection
+    (clamping, rounding, a hard renormalization by division) would either
+    block gradients or bias them.
+
+    Note the constraint is enforced *exactly*, not as a penalty term: a
+    penalty would let a frame drift off-neutral during training, and a
+    non-neutral cell makes the Ewald reciprocal sum conditionally convergent,
+    which is exactly the pathology the term is meant to avoid.
+
+    Parameters
+    ----------
+    raw_charge
+        Unconstrained per-atom charges, shape ``(nf, nloc)``.
+    total_charge
+        Target total charge per frame: a scalar applied to every frame, or an
+        array of shape ``(nf,)``. Defaults to 0.0 (neutral).
+    mask
+        Optional ``(nf, nloc)`` mask of real atoms; falsy entries are treated
+        as padding, take no share of the deficit, and are returned as zero.
+        ``None`` means every atom is real.
+
+    Returns
+    -------
+    Array
+        Constrained charges, shape ``(nf, nloc)``. Summing over ``nloc``
+        reproduces ``total_charge`` for every frame.
+    """
+    xp = array_api_compat.array_namespace(raw_charge)
+    dtype = raw_charge.dtype
+
+    if mask is None:
+        weight = xp.ones_like(raw_charge)
+    else:
+        weight = xp.astype(mask, dtype)
+
+    # Padding atoms must not contribute to the sum they are being corrected by.
+    masked = raw_charge * weight
+    current = xp.sum(masked, axis=-1)  # (nf,)
+    n_real = xp.sum(weight, axis=-1)  # (nf,)
+
+    target = total_charge
+    if not hasattr(target, "shape"):
+        target = xp.full_like(current, target)
+    else:
+        target = xp.astype(xp.reshape(target, (-1,)), dtype)
+
+    # A frame with no real atoms has nothing to correct; guard the divide so it
+    # yields 0 rather than a NaN that would poison the whole batch's gradients.
+    safe_n = xp.where(n_real > 0, n_real, xp.ones_like(n_real))
+    shift = xp.where(n_real > 0, (target - current) / safe_n, xp.zeros_like(n_real))
+
+    return (raw_charge + shift[..., None]) * weight
+
+
+class ChargeFittingNetDP(InvarFitting):
+    # Compose rather than replace the base documentation, matching how
+    # EnergyFittingNet extends InvarFitting.
+    __doc__ = r"""Fit raw per-atom partial charges.
+
+        :math:`\tilde q_i = F_\theta(\mathcal D_i)`.
+
+        The output is deliberately unconstrained; the total-charge constraint is
+        applied by :func:`project_to_total_charge` at the model level, for the
+        reasons given in this module's docstring.
+
+        """ + (InvarFitting.__doc__ or "")
+
+    def __init__(
+        self,
+        ntypes: int,
+        dim_descrpt: int,
+        # Mutable defaults mirror deepmd's own fitting signatures verbatim
+        # (InvarFitting, EnergyFittingNet); matching them keeps this head
+        # drop-in wherever a built-in fitting is accepted.
+        neuron: list[int] = [128, 128, 128],  # noqa: B006
+        resnet_dt: bool = True,
+        numb_fparam: int = 0,
+        numb_aparam: int = 0,
+        dim_case_embd: int = 0,
+        rcond: float | None = None,
+        trainable: list[bool] | None = None,
+        activation_function: str = "tanh",
+        precision: str = DEFAULT_PRECISION,
+        mixed_types: bool = True,
+        exclude_types: list[int] = [],  # noqa: B006
+        type_map: list[str] | None = None,
+        seed: int | list[int] | None = None,
+        default_fparam: list | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(
+            var_name=CHARGE_VAR_NAME,
+            ntypes=ntypes,
+            dim_descrpt=dim_descrpt,
+            dim_out=1,
+            neuron=neuron,
+            resnet_dt=resnet_dt,
+            numb_fparam=numb_fparam,
+            numb_aparam=numb_aparam,
+            dim_case_embd=dim_case_embd,
+            rcond=rcond,
+            trainable=trainable,
+            activation_function=activation_function,
+            precision=precision,
+            mixed_types=mixed_types,
+            exclude_types=exclude_types,
+            type_map=type_map,
+            seed=seed,
+            default_fparam=default_fparam,
+            **kwargs,
+        )
+
+    def serialize(self) -> dict:
+        """Serialize, tagging the wire format with this fitting's own type."""
+        return {**super().serialize(), "type": CHARGE_VAR_NAME}
+
+    @classmethod
+    def deserialize(cls, data: dict) -> "ChargeFittingNetDP":
+        """Drop the fields this subclass fixes, then defer to the base.
+
+        ``var_name`` and ``dim_out`` are constants of this class, not
+        constructor arguments, so they must be removed before the base
+        deserializer forwards the dict as keyword arguments -- otherwise they
+        collide with the values ``__init__`` passes up.
+
+        Everything else is left alone deliberately: ``@class``, ``type``,
+        ``@variables`` and ``nets`` are popped by ``GeneralFitting``, and
+        ``@version`` is checked by ``InvarFitting``. Popping ``type`` here
+        would starve that base pop, which has no default and raises KeyError.
+        """
+        data = data.copy()
+        data.pop("var_name", None)
+        data.pop("dim_out", None)
+        return super().deserialize(data)
+
+
+@BaseFitting.register(CHARGE_VAR_NAME)
+@torch_module
+class ChargeFittingNet(ChargeFittingNetDP):
+    """PyTorch (pt_expt) binding of :class:`ChargeFittingNetDP`."""

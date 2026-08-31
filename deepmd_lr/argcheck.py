@@ -14,10 +14,14 @@ from dargs import (
 )
 from deepmd.utils.argcheck import (
     descrpt_variant_type_args,
+    fitting_args_plugin,
     fitting_variant_type_args,
     model_args_plugin,
 )
 
+from deepmd_lr.fitting.charge import (
+    CHARGE_VAR_NAME,
+)
 from deepmd_lr.model.lr_model import (
     MODEL_TYPE,
 )
@@ -60,3 +64,79 @@ def dp_lr_model_args() -> Argument:
             "standard model; the long-range term is added in a later phase."
         ),
     )
+
+
+@fitting_args_plugin.register(CHARGE_VAR_NAME)
+def charge_fitting_args() -> list[Argument]:
+    """Schema for ``fitting_net.type: "charge"``.
+
+    The same knobs as the energy fitting net, minus the ones that are
+    energy-specific (``atom_ener``, ``tot_ener_zero``) or fixed by this head
+    (``var_name``, ``dim_out``). Returning a list rather than an ``Argument``
+    lets ``ArgsPlugin`` name the block from the registration key, which is how
+    the built-in fitting nets are declared.
+    """
+    return [
+        Argument(
+            "neuron",
+            list[int],
+            optional=True,
+            default=[128, 128, 128],
+            doc="The number of neurons in each hidden layer of the charge head.",
+        ),
+        Argument(
+            "activation_function",
+            str,
+            optional=True,
+            default="tanh",
+            doc="The activation function in the charge head.",
+        ),
+        Argument(
+            "resnet_dt",
+            bool,
+            optional=True,
+            default=True,
+            doc='Whether to use a "Timestep" in the skip connection.',
+        ),
+        Argument(
+            "precision",
+            str,
+            optional=True,
+            default="default",
+            doc="The precision of the charge head parameters.",
+        ),
+        Argument(
+            "numb_fparam",
+            int,
+            optional=True,
+            default=0,
+            doc="The dimension of the frame parameter.",
+        ),
+        Argument(
+            "numb_aparam",
+            int,
+            optional=True,
+            default=0,
+            doc="The dimension of the atomic parameter.",
+        ),
+        Argument(
+            "trainable",
+            [bool, list[bool]],
+            optional=True,
+            default=True,
+            doc="Whether the parameters in the charge head are trainable.",
+        ),
+        Argument(
+            "seed",
+            [int, list[int], None],
+            optional=True,
+            doc="Random seed for parameter initialization of the charge head.",
+        ),
+        Argument(
+            "exclude_types",
+            list[int],
+            optional=True,
+            default=[],
+            doc="Atoms of the listed types are given zero charge.",
+        ),
+    ]

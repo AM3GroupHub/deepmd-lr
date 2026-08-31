@@ -163,11 +163,12 @@ deepmd-lr/
 │   ├── register.py           # entry-point target; import-only (see Phase 1)
 │   ├── argcheck.py           # model_args_plugin / fitting_args_plugin registrations
 │   ├── model/lr_model.py     # LongRangeEnergyModel(EnergyModel), registered "dp_lr"
-│   ├── fitting/charge.py     # Phase 2: ChargeFitting(InvarFitting)
+│   ├── fitting/charge.py     # ChargeFittingNet + project_to_total_charge
 │   └── pme/term.py           # Phase 3: particle_mesh_ewald wrapper + unit conversion
 ├── tests/
 │   ├── test_pme_physics.py
-│   └── test_plugin_registration.py
+│   ├── test_plugin_registration.py
+│   └── test_charge_head.py
 └── examples/water_lr/input.json
 ```
 
@@ -250,17 +251,38 @@ loss curves (batch sampling and initialization are not fully seed-locked
 across processes), so the end-to-end run is a sanity check; the equivalence
 claim rests on the unit test, which fixes weights and inputs.
 
-### Phase 2 — charge head
-`ChargeFitting(InvarFitting)` with `dim_out=1`, registered as fitting type `charge`, plus its
-`fitting_args_plugin` entry. Apply the total-charge constraint by projection:
+### Phase 2 — charge head — **DONE**
+`ChargeFittingNet` (a `dim_out=1` `InvarFitting`, `var_name="charge"`) is
+registered as fitting type `charge` in both the pt_expt fitting registry and
+the `dargs` schema. Charges from a real DPA4C descriptor are verified
+invariant under translation, rotation and periodic wrapping, and equivariant
+under permutation — with explicit guards that those tests cannot pass
+vacuously (the output must have real spread across atoms and must respond to
+moving an atom, so neither a constant head nor fixed per-element charges
+would satisfy them).
 
-```
-q_i = q~_i - (Σ_j q~_j - Q_total) / N
-```
+> **The projection cannot live inside the fitting.** The plan assumed the
+> head would apply the total-charge constraint itself. It cannot: on the
+> graph route `call_graph` receives the flat node axis `(N,)` and reuses the
+> dense forward by treating *each node as its own single-atom frame*, so it
+> has no way to tell which atoms share a frame — and `charge_spin` is never
+> passed to a fitting at all. A per-frame reduction is therefore
+> inexpressible there.
+>
+> This is the same shape of constraint as the cell: frame-level information
+> lives at the model, not below it. So the head emits **raw** charges, and
+> `project_to_total_charge` is a separate pure function applied at the model
+> level in Phase 4, where both frame structure and `charge_spin` are
+> available. Splitting it this way also made the projection testable on its
+> own, independently of any network.
 
-so `Σq_i = Q_total` exactly and the projection stays differentiable. `Q_total` comes from the
-existing `charge_spin` tensor. Test: charges sum to the target, are permutation-equivariant, and
-are invariant to rotation and translation of the frame.
+The projection is
+`q_i = q̃_i + (Q_total - Σ_j q̃_j) / N`, enforced *exactly* rather than as a
+penalty: a penalty would let a frame drift off-neutral, and a non-neutral
+cell makes the Ewald reciprocal sum conditionally convergent — precisely the
+pathology the long-range term exists to avoid. It is uniform (so charge
+*differences* survive), permutation-equivariant, `gradcheck`-clean, and
+guarded against NaN on a fully-padded frame.
 
 ### Phase 3 — PME term
 `deepmd_lr/pme/term.py` wraps `particle_mesh_ewald`. Responsibilities:

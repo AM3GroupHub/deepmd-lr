@@ -17,7 +17,7 @@ environment setup.
 |---|---|---|
 | 0 | Environment + PME validation | **done** |
 | 1 | Plugin skeleton (`dp_lr` model type, no long-range term yet) | **done** |
-| 2 | Charge head | not started |
+| 2 | Charge head (`charge` fitting type + total-charge projection) | **done** |
 | 3 | PME term | not started |
 | 4 | Joint model | not started |
 | 5 | Training + validation | not started |
@@ -71,6 +71,9 @@ pytest tests/ -q
   silent-failure mode (see PLAN.md, Phase 0).
 - `tests/test_plugin_registration.py` — entry-point registration, input-schema
   acceptance, equivalence to the standard model, and serialization round-trip.
+- `tests/test_charge_head.py` — the total-charge projection (exactness,
+  masking, differentiability) and the charge head's physical symmetries
+  through a real DPA4C descriptor.
 
 The tests import only `deepmd`, never `deepmd_lr`, so they fail if the entry
 point stops working rather than silently passing.

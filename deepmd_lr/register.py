@@ -18,11 +18,14 @@ input-normalization time -- both strictly after the backend import that
 brings us here.
 """
 
-from deepmd_lr import (  # noqa: F401  registers `dp_lr` input-schema args
+from deepmd_lr import (  # noqa: F401  registers `dp_lr` / `charge` schema args
     argcheck,
+)
+from deepmd_lr.fitting import (  # noqa: F401  registers the `charge` fitting head
+    charge,
 )
 from deepmd_lr.model import (  # noqa: F401  registers the `dp_lr` model type
     lr_model,
 )
 
-__all__ = ["argcheck", "lr_model"]
+__all__ = ["argcheck", "charge", "lr_model"]
