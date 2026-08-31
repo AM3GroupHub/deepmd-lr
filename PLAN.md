@@ -66,8 +66,12 @@ conda run -n dpmd pip install --index-url https://download.pytorch.org/whl/cu130
 # 2. deepmd-kit (prebuilt aarch64 wheel; core deps only, avoids pulling mpich)
 conda run -n dpmd pip install "deepmd-kit==3.2.0"
 
-# 3. deepmd's torch-path extras, explicitly
-conda run -n dpmd pip install "e3nn>=0.5.9" "vesin[torch]"
+# 3. deepmd's torch-path extras, explicitly.
+#    mpich is REQUIRED, not optional: the PyPI wheel is cibuildwheel-built, so
+#    deepmd/pt/cxx_op.py calls load_mpi_library() unconditionally at import and
+#    resolves libmpi.so through mpich's package metadata. Without it,
+#    `import deepmd.pt_expt.descriptor` raises PackageNotFoundError.
+conda run -n dpmd pip install "e3nn>=0.5.9" "vesin[torch]" mpich
 
 # 4. nvalchemi PME engine (pure-python wheel + aarch64 warp)
 conda run -n dpmd pip install "nvalchemi-toolkit-ops>=0.4.1" "warp-lang>=1.13.0"
@@ -75,6 +79,9 @@ conda run -n dpmd pip install "nvalchemi-toolkit-ops>=0.4.1" "warp-lang>=1.13.0"
 # 5. data / MD / dev tooling
 conda run -n dpmd pip install "dpdata>=0.2.7" "ase>=3.23.0" \
     pytest pytest-cov ruff pre-commit
+
+# 5b. reference PME implementation, used only to validate our own PME usage
+conda run -n dpmd pip install "torch-pme==0.3.2"
 
 # 6. optional: nvalchemi MD driver (for the ASE/nvalchemi MD path later)
 conda run -n dpmd pip install nvalchemi-toolkit
@@ -171,14 +178,39 @@ deepmd_lr = "deepmd_lr.register:register"
 
 ## Implementation phases
 
-### Phase 0 — environment + baseline (do this first, it de-risks everything)
-1. Install per the block above; run the smoke test.
-2. Train stock DPA4C on `examples/water/dpa4c/input.json` from the deepmd-kit source tree for a
-   few hundred steps. This proves the toolchain before any of our code exists, and becomes the
-   accuracy baseline the long-range model must beat.
-3. Independently exercise `particle_mesh_ewald` on a known system (e.g. NaCl lattice) and check
-   the energy against the Madelung constant. Confirm forces and the charge gradient agree with
-   `torch.autograd.gradcheck` in float64.
+### Phase 0 — environment + baseline — **DONE, verified on this machine**
+1. Install per the block above. Verified working:
+   `torch 2.11.0+cu130`, `deepmd-kit 3.2.0`, `warp-lang 1.17.0`,
+   `nvalchemi-toolkit-ops 0.4.1`. `torch.cuda` sees the GB10 at capability
+   `(12, 1)`; warp initialises against `sm_121` and runs kernels correctly.
+   DPA4C imports and the pt_expt registries populate.
+2. `nvalchemi`'s own PME test-suite passes here: 78 CUDA tests, plus 146
+   reference tests against `torch-pme` once that package is installed (they
+   silently skip without it -- install it, or the tests that check *absolute*
+   energies never run).
+3. PME validated against the NaCl Madelung constant: **6.7e-7** relative error
+   (216 atoms, alpha=2.5, spline order 6, 96^3 mesh; residual is real-space
+   cutoff truncation). `gradcheck` passes for positions and for charges, and
+   `gradgradcheck` passes with `nondet_tol=1e-8` -- so the double backward
+   needed to train against force labels is sound.
+
+> **API hazard found during this validation -- `spline_order` must be 3-6.**
+> At `spline_order >= 7` `pme_reciprocal_space` **silently drops the entire
+> reciprocal-space sum** and returns only the self-energy term
+> (-alpha/sqrt(pi) * sum q_i^2), with no error raised. The result looks
+> plausible and varies with alpha, so it is easy to mistake for a convergence
+> problem: it produced a 7% Madelung error that was invariant to mesh size.
+> Pin `spline_order=6` and treat it as a validated constant, not a tunable.
+
+Other usage notes established here:
+- PyTorch bindings are `nvalchemiops.torch.interactions.electrostatics.*`.
+- `particle_mesh_ewald` **requires** a neighbour list for its real-space part
+  (`neighbor_list` + `neighbor_ptr` + `neighbor_shifts`, or the matrix form);
+  build it with `nvalchemiops.torch.neighbors.neighbor_list`, which needs an
+  explicit `max_neighbors` or it raises `NeighborOverflowError`.
+- Both `mesh_spacing` and `mesh_dimensions` work and agree.
+- `estimate_pme_mesh_dimensions` expects a batched (array) `alpha`; passing a
+  Python float raises `TypeError`.
 
 ### Phase 1 — plugin skeleton
 Create the package, the entry point, and a `register()` that registers a `dp_lr` model type
@@ -259,8 +291,9 @@ keeping.
 
 | Risk | Mitigation |
 |---|---|
-| warp-lang cannot JIT for sm_121 | Caught in the Phase 0 smoke test; fix is a newer `warp-lang`. Blocks everything, so test first. |
-| Coulomb prefactor / unit mismatch | Phase 0 Madelung check against an analytic value before any integration. |
+| ~~warp-lang cannot JIT for sm_121~~ | **Resolved.** warp 1.17.0 initialises on `sm_121` and its kernels give correct results. |
+| Coulomb prefactor / unit mismatch | Madelung check passed at 6.7e-7 in nvalchemi's native units (prefactor 1). The eV/Angstrom conversion for deepmd is still to be applied and tested in Phase 3. |
 | Joint training unstable from random charge init | Fall back to the staged scheme: fit charges first, then unfreeze. Design already supports it. |
 | Double-counting: DPA4C absorbs short-range Coulomb | Expected and acceptable — PME real-space is screened within `rcut`. Watch for charge drift toward unphysical magnitudes; regularize charges if so. |
-| deepmd-kit 3.2.0 lags master | The plugin hooks are all present in 3.2.0 (verified). Pin 3.2.0; revisit only if a needed DPA4C fix is master-only. |
+| deepmd-kit 3.2.0 lags master | The plugin hooks are all present in 3.2.0 (verified by import). Pin 3.2.0; revisit only if a needed DPA4C fix is master-only. |
+| Silent-wrong-answer APIs in nvalchemi | `spline_order>=7` proved that wrong values can come back with no error raised. Every PME parameter change must be re-validated against the Madelung test, which is why that test belongs in the committed suite. |
