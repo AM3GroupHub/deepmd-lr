@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+
+# Training artifacts
+*.pt
+*.pth
+*.pb
+*.ckpt
+*.ckpt.*
+lcurve.out
+checkpoint
+model.ckpt*
+out.json
+input_v2_compat.json
+
+# Data
+*.npy
+*.hdf5
+*.h5
+!examples/**/type_map.raw
+
+# Warp / torch caches
+.cache/
+warp_cache/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
