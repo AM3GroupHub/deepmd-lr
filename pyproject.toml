@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deepmd-lr"
+version = "0.1.0"
+description = "Long-range electrostatics for DPA4C via nvalchemi PME, as a DeePMD-kit plugin"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = "LGPL-3.0-or-later"
+dependencies = [
+    "deepmd-kit==3.2.0",
+    "nvalchemi-toolkit-ops>=0.4.1",
+    "torch>=2.11.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest", "pytest-cov", "torch-pme==0.3.2"]
+
+# The hook that makes a fork unnecessary: deepmd/pt_expt/__init__.py calls
+# load_entry_point("deepmd.pt_expt"), so this runs at backend import and our
+# model type lands in the same registry the built-in ones use.
+[project.entry-points."deepmd.pt_expt"]
+deepmd_lr = "deepmd_lr.register"
+
+[tool.setuptools.packages.find]
+include = ["deepmd_lr*"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

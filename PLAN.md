@@ -160,12 +160,14 @@ deepmd-lr/
 ├── PLAN.md                   # this document
 ├── deepmd_lr/
 │   ├── __init__.py
-│   ├── register.py           # entry-point target; imports the modules below
-│   ├── fitting/charge.py     # ChargeFitting(InvarFitting), registered "charge"
+│   ├── register.py           # entry-point target; import-only (see Phase 1)
+│   ├── argcheck.py           # model_args_plugin / fitting_args_plugin registrations
 │   ├── model/lr_model.py     # LongRangeEnergyModel(EnergyModel), registered "dp_lr"
-│   ├── pme/term.py           # thin wrapper over particle_mesh_ewald + unit conversion
-│   └── argcheck.py           # model_args_plugin / fitting_args_plugin registrations
+│   ├── fitting/charge.py     # Phase 2: ChargeFitting(InvarFitting)
+│   └── pme/term.py           # Phase 3: particle_mesh_ewald wrapper + unit conversion
 ├── tests/
+│   ├── test_pme_physics.py
+│   └── test_plugin_registration.py
 └── examples/water_lr/input.json
 ```
 
@@ -173,7 +175,7 @@ deepmd-lr/
 
 ```toml
 [project.entry-points."deepmd.pt_expt"]
-deepmd_lr = "deepmd_lr.register:register"
+deepmd_lr = "deepmd_lr.register"   # a module, NOT a callable
 ```
 
 ## Implementation phases
@@ -212,11 +214,41 @@ Other usage notes established here:
 - `estimate_pme_mesh_dimensions` expects a batched (array) `alpha`; passing a
   Python float raises `TypeError`.
 
-### Phase 1 — plugin skeleton
-Create the package, the entry point, and a `register()` that registers a `dp_lr` model type
-which simply *delegates to plain DPA4C* with no long-range term. Verify
-`dp --pt-expt train` accepts `"type": "dp_lr"` and reproduces Phase 0 numbers exactly. This
-isolates "does the plugin mechanism work" from "is the physics right".
+### Phase 1 — plugin skeleton — **DONE**
+The package registers a `dp_lr` model type that delegates to plain DPA4C with
+no long-range term, so plugin wiring is proven independently of the physics.
+`dp --pt-expt train examples/water_lr/input.json` runs end to end on the water
+dataset, the loss descends, and the checkpoint records `type: "dp_lr"` and
+rebuilds as `LongRangeEnergyModel` with 0 missing/unexpected weights.
+
+Two things worth knowing before Phase 2 touches this machinery:
+
+> **The entry point is loaded, never called.** `load_entry_point` is
+> `[ep.load() for ep in eps]` — it imports the target and discards the result.
+> Registration therefore has to be a *module import side effect*; an entry
+> point naming a `register()` function silently does nothing, because the
+> function object is loaded and dropped. `pyproject.toml` names the module
+> `deepmd_lr.register`, whose body is import-only.
+
+> **Registering the model class is only half of it.** An input file is
+> validated against the `dargs` schema before any model is built, so a type
+> missing from `model_args_plugin` is rejected at `dp train` time no matter
+> what the model registry says. Both registrations live in
+> `deepmd_lr/register.py`'s two imports.
+
+**Correction to the phase gate.** This plan originally required Phase 1 to
+reproduce the baseline *bit-for-bit*. That is not achievable and the gate was
+wrong: the descriptor's segment/scatter reductions sum in a nondeterministic
+order on GPU, so evaluating one model twice on identical inputs already
+differs by ~3.5e-15. The tests instead measure that floor in-process and
+require the `dp_lr`-vs-standard difference to sit at or below it — a stronger
+statement anyway, since it says the two models differ by no more than one
+model differs from itself. State dicts are separately asserted bitwise equal.
+
+Note also that two *training runs* of the same config do not produce identical
+loss curves (batch sampling and initialization are not fully seed-locked
+across processes), so the end-to-end run is a sanity check; the equivalence
+claim rests on the unit test, which fixes weights and inputs.
 
 ### Phase 2 — charge head
 `ChargeFitting(InvarFitting)` with `dim_out=1`, registered as fitting type `charge`, plus its
@@ -283,9 +315,9 @@ conda run -n dpmd dp --pt-expt test -m model.ckpt.pt -s /path/to/validation
 conda run -n dpmd python examples/water_lr/nve_drift.py   # NVE energy drift over 10 ps
 ```
 
-Gate for each phase: Phase 1 must reproduce the Phase 0 baseline *bit-for-bit*; Phase 4 must
-reduce to Phase 1 when charges are forced to zero. Both are cheap regression tests worth
-keeping.
+Gate for each phase: Phase 1 must match the standard model to within the GPU nondeterminism
+floor (see Phase 1 — the original "bit-for-bit" wording was wrong); Phase 4 must reduce to
+Phase 1 when charges are forced to zero. Both are cheap regression tests worth keeping.
 
 ## Risks
 

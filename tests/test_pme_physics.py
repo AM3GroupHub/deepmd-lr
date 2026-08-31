@@ -14,7 +14,6 @@ import math
 
 import pytest
 import torch
-
 from nvalchemiops.torch.interactions.electrostatics.pme import (
     particle_mesh_ewald,
     pme_reciprocal_space,

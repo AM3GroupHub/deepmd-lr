@@ -32,3 +32,6 @@ warp_cache/
 .vscode/
 .idea/
 .DS_Store
+
+# Example run directories
+examples/**/run_*/
