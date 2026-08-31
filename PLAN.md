@@ -170,7 +170,7 @@ deepmd-lr/
 │   ├── test_plugin_registration.py
 │   ├── test_charge_head.py
 │   └── test_pme_term.py
-└── examples/water_lr/input.json
+└── examples/water_lr/            # joint, baseline twin, warm-up
 ```
 
 `pyproject.toml` entry point:
@@ -219,7 +219,7 @@ Other usage notes established here:
 ### Phase 1 — plugin skeleton — **DONE**
 The package registers a `dp_lr` model type that delegates to plain DPA4C with
 no long-range term, so plugin wiring is proven independently of the physics.
-`dp --pt-expt train examples/water_lr/input.json` runs end to end on the water
+`dp --pt-expt train examples/water_lr/input_joint.json` runs end to end on the water
 dataset, the loss descends, and the checkpoint records `type: "dp_lr"` and
 rebuilds as `LongRangeEnergyModel` with 0 missing/unexpected weights.
 
@@ -441,6 +441,15 @@ data.
 > `deepmd_lr/pme/term.py` would need a sibling. Worth settling before Phase 6,
 > because it changes what "MD deployment" should target.
 
+> **Training guide.** The practical recipe that came out of Phases 3-5 lives
+> in `TRAINING.md`: how to choose `alpha` and the mesh, the joint and staged
+> schedules, and `scripts/graft_short_range.py`, which exists because
+> `dp train --init-model` loads state dicts strictly and so refuses a
+> checkpoint that predates the charge head. That script also zeroes the
+> charge head's output layer, which turned out to matter: grafting with a
+> randomly initialized head threw the water force error from 0.173 back up
+> to 0.789 eV/A, while a zeroed head continued smoothly at 0.160.
+
 ### Phase 6 — MD via nvalchemi/ASE
 Wire the trained model into the nvalchemi driver, following
 `examples/water/dpa4/nvalchemi/relax.py` and `doc/third-party/nvalchemi.md` in the deepmd-kit
@@ -462,7 +471,7 @@ from deepmd.pt_expt.model.model import BaseModel
 print('dp_lr' in BaseModel.get_plugins())"
 
 # end-to-end
-conda run -n dpmd dp --pt-expt train examples/water_lr/input.json
+conda run -n dpmd dp --pt-expt train examples/water_lr/input_joint.json
 conda run -n dpmd dp --pt-expt test -m model.ckpt.pt -s /path/to/validation
 
 # conservation

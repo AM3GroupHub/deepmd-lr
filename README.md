@@ -23,6 +23,12 @@ environment setup.
 | 5 | Training + validation (benchmark + control) | **done** |
 | 6 | MD via nvalchemi/ASE | not started |
 
+## Training
+
+**[TRAINING.md](TRAINING.md)** is the practical guide: choosing `alpha` and
+the mesh (with measured tables), an annotated input file, the joint and
+staged training schedules, what to monitor, and troubleshooting.
+
 ## Install
 
 Follow the environment section of [PLAN.md](PLAN.md) first, then:
@@ -120,6 +126,7 @@ global-sign degeneracy).
 
 ## Example
 
-`examples/water_lr/input.json` is a runnable energy-training config. It expects
-the DeePMD-kit water dataset in `examples/water_lr/data` — copy it from a
-DeePMD-kit checkout (`examples/water/data`); it is not vendored here.
+`examples/water_lr/` has a runnable trio: the joint model, its baseline twin,
+and a short-range warm-up for the staged schedule. See that directory's
+README. The dataset is not vendored; copy it from a DeePMD-kit checkout
+(`examples/water/data`).
