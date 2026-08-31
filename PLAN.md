@@ -329,16 +329,56 @@ exhaust memory); and a real-space cutoff larger than half the shortest cell
 vector explodes the pair count — 2102 neighbours per atom in one accidental
 test configuration — so cutoffs should stay under `L/2`.
 
-### Phase 4 — joint model
-`LongRangeEnergyModel(EnergyModel)`, registered `dp_lr`. Override `forward` to:
-1. call the parent for `E_sr` per atom,
-2. run the charge head on the same descriptor output,
-3. call the PME term with `coord`, `q`, `box`,
-4. sum per-atom energies before the reduction/derivative machinery, so force and virial come out
-   of the existing autograd path with no bespoke code.
+### Phase 4 — joint model — **DONE**
+`model.type: "dp_lr"` with an optional `long_range` block containing
+`charge_net` and `pme`. Omit the block and the model is exactly the Phase 1
+model, which is what keeps "the long-range term is the only thing that
+changed" a testable property. The forward returns the usual keys plus
+`charge`, `energy_short_range` and `energy_long_range` as diagnostics.
 
-Getting the summation *upstream* of the derivative machinery is the key detail — it means
-`_to_public_keys` (`ener_model.py:57`) produces correct `force`/`virial` for free.
+> **The long-range energy cannot reuse DeePMD-kit's force machinery.** The
+> obvious implementation — add the PME per-atom energy to the atomic
+> output — is silently wrong. On the graph route force and virial come from
+> `edge_force_virial`, which differentiates with respect to `edge_vec`. The
+> PME energy is not a function of `edge_vec` (it depends on absolute
+> coordinates and the cell), so it would contribute exactly **zero** force
+> and virial while still shifting the energy: energies move, forces do not,
+> and the model quietly stops being conservative.
+>
+> The long-range branch therefore carries its own derivatives — `-dE/dr` for
+> the force, and `-dE/dε` under a symmetric strain applied to coordinates and
+> cell together for the virial, matching the convention read off
+> `edge_force_virial`. Both are verified against finite differences of the
+> *total* energy. The same finite-difference check on the pure short-range
+> model reproduces DeePMD-kit's own virial to 2e-10, which is what makes it a
+> trustworthy oracle for the joint one.
+
+> **A spacing-derived PME mesh makes the energy discontinuous in the cell.**
+> The mesh is `ceil(L / mesh_spacing)`, so a cell length sitting on a
+> multiple of the spacing gains a whole grid point under an infinitesimal
+> strain. This first appeared as a 2% virial error that looked like a bug in
+> the strain derivative; the derivative was right and the energy was
+> genuinely discontinuous where the finite difference sampled it. `PMEEnergy`
+> now accepts explicit `mesh_dimensions`, which is the right setting whenever
+> the cell can change (NPT, or any strain derivative). Harmless at fixed cell.
+
+**Cost.** A frame runs the descriptor twice: the short-range path consumes
+and discards its own descriptor output, and the charge head needs it again.
+Measured at ~3x per training step on small systems (24 atoms: 15 ms → 45 ms;
+96 atoms: 14 ms → 46 ms), though these sizes are launch-overhead dominated so
+the ratio should improve with system size. Sharing one pass means giving the
+atomic model a second, non-reducible `charge` output; the carry-through works
+(`fit_output_to_model_output_graph` does `model_ret = dict(fit_ret.items())`
+and skips reduction for non-reducible keys), but `init_out_stat` sizes bias
+and std buffers from *every* output key, which would entangle charges with
+the out-stat machinery that has no charge labels. Deferred as a profiling-led
+optimization rather than done speculatively.
+
+**A gap the unit tests missed.** The trainer passes coordinates flattened to
+`(nf, nloc * 3)` and the cell to `(nf, 9)`, while eager callers pass
+`(nf, nloc, 3)` and `(nf, 3, 3)`. The tests only exercised the eager shapes,
+so the first real training step failed with `batch1 must be a 3D tensor`.
+Both conventions are now pinned by `TestCallingConventions`.
 
 ### Phase 5 — training + validation
 Train jointly on a system where long-range matters and the baseline is known to struggle —

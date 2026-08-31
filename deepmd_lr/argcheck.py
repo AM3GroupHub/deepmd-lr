@@ -23,6 +23,7 @@ from deepmd_lr.fitting.charge import (
     CHARGE_VAR_NAME,
 )
 from deepmd_lr.model.lr_model import (
+    LONG_RANGE_KEY,
     MODEL_TYPE,
 )
 
@@ -57,11 +58,12 @@ def dp_lr_model_args() -> Argument:
                 [fitting_variant_type_args()],
                 doc="The fitting of physical properties. Must be an energy fitting.",
             ),
+            _long_range_args(),
         ],
         doc=(
             "Energy model with an explicit long-range electrostatic term "
-            "(PME, via nvalchemi-toolkit-ops). Currently equivalent to the "
-            "standard model; the long-range term is added in a later phase."
+            "(PME, via nvalchemi-toolkit-ops). Without a `long_range` block "
+            "it is exactly the standard energy model."
         ),
     )
 
@@ -140,3 +142,89 @@ def charge_fitting_args() -> list[Argument]:
             doc="Atoms of the listed types are given zero charge.",
         ),
     ]
+
+
+def _long_range_args() -> Argument:
+    """Schema for the optional ``long_range`` block.
+
+    Optional by design: omitting it leaves ``dp_lr`` behaviourally identical
+    to the standard energy model, which is what makes the "adding the
+    long-range term is the only thing that changed" comparison meaningful.
+    """
+    charge_net = Argument(
+        "charge_net",
+        dict,
+        charge_fitting_args(),
+        doc="The head predicting per-atom charges from the shared descriptor.",
+    )
+    pme = Argument(
+        "pme",
+        dict,
+        [
+            Argument(
+                "rcut",
+                [float, None],
+                optional=True,
+                default=None,
+                doc="Real-space cutoff in angstrom. Should stay below half "
+                "the shortest cell vector; null derives one from `accuracy`.",
+            ),
+            Argument(
+                "alpha",
+                [float, None],
+                optional=True,
+                default=None,
+                doc="Ewald splitting parameter in inverse angstrom. "
+                "null derives it from `rcut` and `accuracy`.",
+            ),
+            Argument(
+                "mesh_spacing",
+                [float, None],
+                optional=True,
+                default=None,
+                doc="Reciprocal-mesh spacing in angstrom; null derives the "
+                "mesh from `accuracy`. The mesh is ceil(L / spacing), a step "
+                "function of the cell, so prefer `mesh_dimensions` if the "
+                "cell can change.",
+            ),
+            Argument(
+                "mesh_dimensions",
+                [list[int], None],
+                optional=True,
+                default=None,
+                doc="Fixed reciprocal-mesh dimensions [nx, ny, nz], "
+                "overriding `mesh_spacing`. Prefer this under NPT: a "
+                "spacing-derived mesh jumps a whole grid point when a cell "
+                "length crosses a multiple of the spacing, making the energy "
+                "discontinuous there.",
+            ),
+            Argument(
+                "spline_order",
+                int,
+                optional=True,
+                default=6,
+                doc="B-spline interpolation order. Must be between 3 and 6: "
+                "at 7 and above the underlying library silently drops the "
+                "reciprocal-space sum.",
+            ),
+            Argument(
+                "accuracy",
+                float,
+                optional=True,
+                default=1e-6,
+                doc="Target relative accuracy for any PME parameter left null.",
+            ),
+        ],
+        optional=True,
+        default={},
+        doc="Particle-mesh-Ewald parameters.",
+    )
+    return Argument(
+        LONG_RANGE_KEY,
+        dict,
+        [charge_net, pme],
+        optional=True,
+        default=None,
+        doc="The long-range electrostatic term. Omit for a pure short-range "
+        "model identical to the standard energy model.",
+    )

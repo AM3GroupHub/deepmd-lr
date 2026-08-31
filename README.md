@@ -19,7 +19,7 @@ environment setup.
 | 1 | Plugin skeleton (`dp_lr` model type, no long-range term yet) | **done** |
 | 2 | Charge head (`charge` fitting type + total-charge projection) | **done** |
 | 3 | PME term (`PMEEnergy`, eV units, guards) | **done** |
-| 4 | Joint model | not started |
+| 4 | Joint model (`long_range` block, conservative forces) | **done** |
 | 5 | Training + validation | not started |
 | 6 | MD via nvalchemi/ASE | not started |
 
@@ -51,14 +51,30 @@ Select the model type in the input file:
 }
 ```
 
+Add a `long_range` block to switch the electrostatics on:
+
+```json
+{
+  "model": {
+    "type": "dp_lr",
+    "type_map": ["O", "H"],
+    "descriptor": { "type": "dpa4c", "rcut": 6.0 },
+    "fitting_net": { "neuron": [192, 192, 192] },
+    "long_range": {
+      "charge_net": { "neuron": [64, 64] },
+      "pme": { "rcut": 5.0, "alpha": 0.35, "mesh_dimensions": [16, 16, 16] }
+    }
+  }
+}
+```
+
 ```bash
 dp --pt-expt train input.json
 ```
 
-As of Phase 1 this is numerically identical to the built-in standard model —
-the long-range term is added in Phase 4. That is deliberate: it separates
-"the plugin is wired in correctly" from "the physics is right", so any
-numerical change later can only come from the physics.
+Without the `long_range` block the model is exactly the built-in standard
+model. Prefer `mesh_dimensions` over `mesh_spacing` whenever the cell can
+change — see PLAN.md, Phase 4.
 
 ## Tests
 
@@ -77,6 +93,9 @@ pytest tests/ -q
 - `tests/test_pme_term.py` — the eV unit conversion (against analytic
   Coulomb and Madelung), boundary-condition guards, batching, masking, and
   gradients including the double backward that force training needs.
+- `tests/test_joint_model.py` — the combined model: force and virial against
+  finite differences of the total energy, energy decomposition, both calling
+  conventions, and serialization of the long-range term.
 
 The tests import only `deepmd`, never `deepmd_lr`, so they fail if the entry
 point stops working rather than silently passing.

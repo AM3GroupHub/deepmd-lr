@@ -256,6 +256,80 @@ class TestGradients:
         assert torch.allclose(energy, torch.zeros_like(energy), atol=1e-12)
 
 
+class TestMeshChoice:
+    """A spacing-derived mesh is a step function of the cell.
+
+    Smoothness is measured as the stability of a central difference under
+    uniform scaling across two step sizes. Comparing energies directly would
+    prove nothing: scaling a Coulomb system genuinely changes its energy
+    (E scales as 1/lambda). A smooth energy gives the same derivative at both
+    step sizes; a discontinuous one gives a derivative that explodes as the
+    step shrinks onto the jump.
+    """
+
+    @staticmethod
+    def _scaling_derivative(term, coord, charge, cell, eps):
+        hi = float(term(coord * (1 + eps), charge, cell * (1 + eps)).sum())
+        lo = float(term(coord * (1 - eps), charge, cell * (1 - eps)).sum())
+        return (hi - lo) / (2 * eps)
+
+    def test_spacing_derived_mesh_jumps_at_a_boundary(self):
+        """Document the hazard rather than leave it to be rediscovered.
+
+        The mesh is ceil(L / spacing), so a cell length sitting exactly on a
+        multiple of the spacing gains a whole grid point under an
+        infinitesimal strain. It cost a 2% virial error before being
+        identified. Harmless at fixed cell (NVE/NVT); a real problem under
+        NPT or any strain derivative.
+        """
+        coord, charge, cell = nacl(reps=3, a=2.0)  # L = 6.0
+        # 6.0 / 1.0 is exactly 6, so any expansion adds a grid point.
+        term = PMEEnergy(rcut=2.5, alpha=2.0, mesh_spacing=1.0)
+        coarse = self._scaling_derivative(term, coord, charge, cell, 1e-4)
+        fine = self._scaling_derivative(term, coord, charge, cell, 1e-6)
+        assert abs(fine - coarse) > 0.1 * abs(coarse), (
+            "expected the derivative to be unstable across a mesh jump; "
+            f"got coarse={coarse:.6f} fine={fine:.6f}"
+        )
+
+    def test_fixed_mesh_is_smooth_across_that_boundary(self):
+        """Pinning the mesh removes the jump, which is why it is the
+        recommended setting whenever the cell can change."""
+        coord, charge, cell = nacl(reps=3, a=2.0)
+        term = PMEEnergy(rcut=2.5, alpha=2.0, mesh_dimensions=(12, 12, 12))
+        coarse = self._scaling_derivative(term, coord, charge, cell, 1e-4)
+        fine = self._scaling_derivative(term, coord, charge, cell, 1e-6)
+        assert abs(fine - coarse) < 1e-3 * abs(coarse), (
+            f"expected a stable derivative; got coarse={coarse:.6f} "
+            f"fine={fine:.6f}"
+        )
+
+    def test_uniform_scaling_follows_inverse_length(self):
+        """Scaling a Coulomb system by lambda scales every distance, so
+        E -> E / lambda and dE/dlambda = -E at lambda = 1.
+
+        This doubles as a convergence check on the PME parameters, because
+        the identity only holds when they are converged. A fixed mesh has a
+        fixed number of grid points, so as the cell grows the grid spacing
+        grows with it while alpha -- an inverse length in absolute units --
+        does not. If the mesh only barely resolves the screening Gaussian,
+        it resolves it worse after scaling and the exact law breaks: at
+        alpha=2.0 on a 12^3 mesh the ratio came out at 0.985, while a wider
+        Gaussian on a finer mesh gives 1.0003.
+        """
+        coord, charge, cell = nacl(reps=3, a=2.0)
+        term = PMEEnergy(rcut=2.9, alpha=1.5, mesh_dimensions=(16, 16, 16))
+        energy = float(term(coord, charge, cell).sum())
+        derivative = self._scaling_derivative(term, coord, charge, cell, 1e-5)
+        assert abs(derivative + energy) < 1e-3 * abs(energy)
+
+    def test_rejects_bad_mesh_dimensions(self):
+        with pytest.raises(ValueError, match="three integers"):
+            PMEEnergy(mesh_dimensions=(8, 8))
+        with pytest.raises(ValueError, match="three integers"):
+            PMEEnergy(mesh_dimensions=(8, 8, 1))
+
+
 class TestSerialization:
     def test_round_trip(self):
         term = PMEEnergy(rcut=7.0, alpha=0.35, mesh_spacing=0.9, spline_order=5,

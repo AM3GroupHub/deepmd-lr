@@ -97,8 +97,18 @@ class PMEEnergy(torch.nn.Module):
         Ewald splitting parameter in inverse angstrom. ``None`` derives it
         from ``rcut`` and ``accuracy`` as :math:`\sqrt{-\ln\varepsilon}/r_c`.
     mesh_spacing
-        Reciprocal-mesh spacing in angstrom. ``None`` derives the mesh from
-        ``accuracy``.
+        Reciprocal-mesh spacing in angstrom; the mesh is
+        ``ceil(cell_length / mesh_spacing)``. ``None`` derives the mesh from
+        ``accuracy``. Note this makes the mesh a *step function* of the cell,
+        so the energy is only piecewise smooth in the cell -- see
+        ``mesh_dimensions``.
+    mesh_dimensions
+        Fixed reciprocal-mesh dimensions ``(nx, ny, nz)``, overriding
+        ``mesh_spacing``. Prefer this whenever the cell can change (NPT, or
+        any strain derivative): a spacing-derived mesh jumps by a whole grid
+        point as a cell length crosses a multiple of the spacing, which makes
+        the energy discontinuous there. The jump is small but real -- it moved
+        a virial by 2% in testing -- and it is invisible unless looked for.
     spline_order
         B-spline interpolation order; must not exceed :data:`MAX_SPLINE_ORDER`.
     accuracy
@@ -110,6 +120,7 @@ class PMEEnergy(torch.nn.Module):
         rcut: float | None = None,
         alpha: float | None = None,
         mesh_spacing: float | None = None,
+        mesh_dimensions: tuple[int, int, int] | list[int] | None = None,
         spline_order: int = DEFAULT_SPLINE_ORDER,
         accuracy: float = 1e-6,
         **kwargs: Any,
@@ -131,9 +142,17 @@ class PMEEnergy(torch.nn.Module):
         if not 0 < accuracy < 1:
             raise ValueError(f"accuracy must be in (0, 1), got {accuracy}")
 
+        if mesh_dimensions is not None:
+            mesh_dimensions = tuple(int(m) for m in mesh_dimensions)
+            if len(mesh_dimensions) != 3 or any(m < 2 for m in mesh_dimensions):
+                raise ValueError(
+                    "mesh_dimensions must be three integers >= 2, got "
+                    f"{mesh_dimensions}"
+                )
         self.rcut = rcut
         self.alpha = alpha
         self.mesh_spacing = mesh_spacing
+        self.mesh_dimensions = mesh_dimensions
         self.spline_order = int(spline_order)
         self.accuracy = float(accuracy)
 
@@ -141,6 +160,7 @@ class PMEEnergy(torch.nn.Module):
         return (
             f"rcut={self.rcut}, alpha={self.alpha}, "
             f"mesh_spacing={self.mesh_spacing}, "
+            f"mesh_dimensions={self.mesh_dimensions}, "
             f"spline_order={self.spline_order}, accuracy={self.accuracy}"
         )
 
@@ -149,6 +169,7 @@ class PMEEnergy(torch.nn.Module):
             "rcut": self.rcut,
             "alpha": self.alpha,
             "mesh_spacing": self.mesh_spacing,
+            "mesh_dimensions": self.mesh_dimensions,
             "spline_order": self.spline_order,
             "accuracy": self.accuracy,
         }
@@ -186,7 +207,9 @@ class PMEEnergy(torch.nn.Module):
         alpha = (
             self.alpha if self.alpha is not None else float(estimated.alpha.min())
         )
-        if self.mesh_spacing is not None:
+        if self.mesh_dimensions is not None:
+            mesh = self.mesh_dimensions
+        elif self.mesh_spacing is not None:
             lengths = torch.linalg.norm(cell.detach(), dim=-1).max(dim=0).values
             mesh = tuple(
                 max(int(math.ceil(float(length) / self.mesh_spacing)), 2)
