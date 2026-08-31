@@ -47,8 +47,9 @@ LONG_RANGE = {
     # so with L=10 and spacing=1.0 a strain of 1e-5 flips it from 10 to 11 and
     # the energy is discontinuous exactly where the virial finite difference
     # samples it. Pinning the mesh keeps the energy smooth in the cell.
-    "pme": {"rcut": 4.0, "alpha": 0.4, "mesh_dimensions": [15, 15, 15],
-            "spline_order": 6},
+    # No rcut: only the reciprocal half is computed, so there is no
+    # real-space cutoff to set.
+    "pme": {"alpha": 0.4, "mesh_dimensions": [15, 15, 15], "spline_order": 6},
 }
 
 
@@ -258,6 +259,19 @@ class TestTraining:
 
 
 class TestGuards:
+    def test_rejects_unknown_long_range_parameters(self):
+        """A stale key must fail loudly rather than run different physics."""
+        cfg = {
+            "type": "dp_lr",
+            "type_map": ["O", "H"],
+            "descriptor": copy.deepcopy(DESCRIPTOR),
+            "fitting_net": copy.deepcopy(FITTING),
+            "long_range": copy.deepcopy(LONG_RANGE),
+        }
+        cfg["long_range"]["pme"]["rcut"] = 4.0
+        with pytest.raises(TypeError, match="rcut"):
+            get_model(cfg)
+
     def test_rejects_missing_box(self):
         model = build()
         coord, atype, _ = frame()

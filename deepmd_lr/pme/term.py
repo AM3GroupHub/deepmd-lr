@@ -1,30 +1,45 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""The long-range electrostatic energy term, backed by nvalchemi's PME.
+r"""The long-range (reciprocal-space) electrostatic energy, evaluated by PME.
 
-This is a thin, well-guarded wrapper. It owns three things that are easy to
-get wrong and expensive to notice later: the unit convention, the PME
-parameter choice, and the boundary conditions PME is and is not valid under.
+What this computes, and what it deliberately does not
+-----------------------------------------------------
+Ewald splits the Coulomb energy into a screened real-space part, a smooth
+reciprocal-space part, and a self term:
 
-Units
------
-nvalchemi computes the electrostatic energy with a prefactor of 1 --
-:math:`\\sum_{i<j} q_i q_j / r_{ij}` -- so with charges in elementary-charge
-units and coordinates in angstrom, its output is in units of
-:math:`e^2/\\text{\\AA}`. DeePMD-kit works in eV and angstrom, so the result is
-scaled by :math:`e^2/(4\\pi\\varepsilon_0)` in eV*angstrom.
+.. math::
+    E = \underbrace{\sum_{i<j}
+            \frac{q_i q_j \operatorname{erfc}(\alpha r_{ij})}{r_{ij}}
+        }_{\text{short-ranged}}
+      + \underbrace{\frac{2\pi}{V}\sum_{k \neq 0}
+            \frac{e^{-k^2/4\alpha^2}}{k^2}|S(k)|^2
+        }_{\text{long-ranged}}
+      - \frac{\alpha}{\sqrt{\pi}}\sum_i q_i^2
 
-That constant is imported from DeePMD-kit rather than redefined here. It is
-the same one its existing DPLR path uses, so a long-range energy from this
-term lands on exactly the same scale as one from ``dipole_charge`` -- and a
-second definition would be a silent source of drift between them. (The value
-differs from a current-CODATA evaluation in the eighth significant figure;
-matching DeePMD-kit is worth more than matching CODATA.)
+This module supplies **only the reciprocal sum**. The real-space part decays
+like ``erfc(alpha r)/r`` and is already inside the descriptor's cutoff, so the
+short-range model represents it directly -- adding it here would ask the
+network to learn to subtract something it can already describe.
 
-Boundary conditions
--------------------
-PME assumes 3D periodicity. A non-periodic frame is rejected rather than
-silently treated as periodic, which would fabricate interactions with images
-that do not exist.
+That is the same decomposition DeePMD-kit's own DPLR uses, and this term is
+checked against its ``ewald_reciprocal_energy`` (no real-space term, no self
+subtraction) as the reference. nvalchemi's ``pme_reciprocal_space`` returns
+the k-space sum *minus* the self term, so the self term is added back here to
+land on DeePMD-kit's convention.
+
+Because there is no real-space part, this module needs **no neighbour list**:
+no cutoff, no capacity to size, no ``rcut < L/2`` constraint.
+
+Choosing alpha
+--------------
+In a full Ewald sum ``alpha`` is arbitrary -- the total does not depend on it.
+Here it is a real modelling choice, because it sets where the division of
+labour falls: the network handles ``erfc(alpha r)/r`` and this term handles
+the rest. ``alpha`` must be large enough that what is left to the network has
+died inside the descriptor cutoff. At ``rcut = 6`` angstrom, ``alpha = 0.4``
+leaves ``erfc(2.4) = 7e-4``, which is comfortable. Too small an ``alpha``
+hands the network a tail it structurally cannot represent; too large makes
+the reciprocal sum need a fine mesh. It must also match between training and
+any later MD.
 """
 
 import math
@@ -36,13 +51,9 @@ import torch
 from deepmd.dpmodel.modifier.dipole_charge import (
     ELECTROSTATIC_CONVERSION,
 )
-from nvalchemiops.torch.interactions.electrostatics.parameters import (
-    estimate_pme_parameters,
-)
 from nvalchemiops.torch.interactions.electrostatics.pme import (
-    particle_mesh_ewald,
+    pme_reciprocal_space,
 )
-from nvalchemiops.torch.neighbors import neighbor_list
 
 #: Highest B-spline interpolation order nvalchemi computes correctly.
 #:
@@ -51,81 +62,62 @@ from nvalchemiops.torch.neighbors import neighbor_list
 #: nothing. The result stays plausible and still varies with alpha, so it
 #: reads as a convergence problem rather than a bug -- in testing it produced
 #: a 7% error in the NaCl Madelung constant that was invariant to mesh size.
-#: This is validated by ``tests/test_pme_physics.py``; treat it as a hard
-#: ceiling, not a tunable.
+#: Validated by ``tests/test_pme_physics.py``; a hard ceiling, not a tunable.
 MAX_SPLINE_ORDER = 6
 
-#: Default B-spline order: the highest that is correct, and accurate enough
-#: that the mesh is never the limiting error term in practice.
+#: Default B-spline order: the highest that is correct.
 DEFAULT_SPLINE_ORDER = 6
 
-#: Starting neighbour-list capacity per atom. The list is rebuilt with a
-#: larger capacity if this overflows, so it is a performance hint and not a
-#: correctness limit.
-INITIAL_MAX_NEIGHBORS = 128
-
-#: Ceiling on capacity growth, to fail loudly instead of exhausting memory on
-#: a pathological (e.g. collapsed-cell) frame.
-MAX_NEIGHBOR_CAPACITY = 8192
-
-#: Neighbour-list algorithm, pinned rather than auto-selected.
-#:
-#: nvalchemi's ``naive`` batched builder silently under-reports neighbours for
-#: every frame after the first: for two identical 216-atom frames it returned
-#: 17280 pairs for frame 0 but only 10024 for frame 1, with no error and no
-#: sensitivity to ``max_neighbors``. Since a training batch is exactly the
-#: batched case, letting the dispatcher pick (it chooses ``naive`` at these
-#: sizes) would corrupt the long-range energy of all but the first frame of
-#: every batch -- and quietly, since the result stays finite and plausible.
-#: ``cell_list`` returns the correct count for every frame. Regression-tested
-#: by ``TestBatching`` in ``tests/test_pme_term.py``.
-NEIGHBOR_LIST_METHOD = "cell_list"
+#: Default Ewald splitting parameter, in inverse angstrom. Matches the DPLR
+#: default (``ewald_beta``) and leaves erfc(alpha * 6 A) = 7e-4 for a 6 A
+#: descriptor cutoff.
+DEFAULT_ALPHA = 0.4
 
 
-class PMEEnergy(torch.nn.Module):
-    r"""Per-atom long-range electrostatic energy for periodic frames.
+class LongRangeEnergy(torch.nn.Module):
+    r"""Per-atom reciprocal-space electrostatic energy, in eV.
 
     Parameters
     ----------
-    rcut
-        Real-space cutoff in angstrom. ``None`` lets nvalchemi choose one
-        from the cell volume and atom count. Pinning it is usually better:
-        it keeps the neighbour-list cost predictable and stops the split
-        between real and reciprocal space from moving as a training batch
-        changes shape.
     alpha
-        Ewald splitting parameter in inverse angstrom. ``None`` derives it
-        from ``rcut`` and ``accuracy`` as :math:`\sqrt{-\ln\varepsilon}/r_c`.
+        Ewald splitting parameter in inverse angstrom. Not arbitrary here --
+        see the module docstring.
     mesh_spacing
         Reciprocal-mesh spacing in angstrom; the mesh is
-        ``ceil(cell_length / mesh_spacing)``. ``None`` derives the mesh from
-        ``accuracy``. Note this makes the mesh a *step function* of the cell,
-        so the energy is only piecewise smooth in the cell -- see
-        ``mesh_dimensions``.
+        ``ceil(cell_length / mesh_spacing)``. This makes the mesh a *step
+        function* of the cell, so the energy is only piecewise smooth in the
+        cell -- see ``mesh_dimensions``.
     mesh_dimensions
-        Fixed reciprocal-mesh dimensions ``(nx, ny, nz)``, overriding
-        ``mesh_spacing``. Prefer this whenever the cell can change (NPT, or
-        any strain derivative): a spacing-derived mesh jumps by a whole grid
-        point as a cell length crosses a multiple of the spacing, which makes
-        the energy discontinuous there. The jump is small but real -- it moved
-        a virial by 2% in testing -- and it is invisible unless looked for.
+        Fixed mesh ``(nx, ny, nz)``, overriding ``mesh_spacing``. Prefer this
+        whenever the cell can change (NPT, or any strain derivative): a
+        spacing-derived mesh jumps a whole grid point as a cell length crosses
+        a multiple of the spacing, which makes the energy discontinuous there.
+        The jump is small but real -- it moved a virial by 2% in testing.
     spline_order
         B-spline interpolation order; must not exceed :data:`MAX_SPLINE_ORDER`.
-    accuracy
-        Target relative accuracy used for any parameter left as ``None``.
     """
 
     def __init__(
         self,
-        rcut: float | None = None,
-        alpha: float | None = None,
+        alpha: float = DEFAULT_ALPHA,
         mesh_spacing: float | None = None,
         mesh_dimensions: tuple[int, int, int] | list[int] | None = None,
         spline_order: int = DEFAULT_SPLINE_ORDER,
-        accuracy: float = 1e-6,
         **kwargs: Any,
     ) -> None:
         super().__init__()
+        # Reject unknown keys rather than absorb them. This term used to take
+        # a real-space `rcut`; dropping the real-space half made it
+        # meaningless, and a permissive **kwargs silently accepted stale
+        # configs that then ran with different physics than they asked for.
+        if kwargs:
+            raise TypeError(
+                f"unexpected long-range parameters: {sorted(kwargs)}. "
+                "Supported: alpha, mesh_spacing, mesh_dimensions, "
+                "spline_order. Note `rcut` was removed: this term computes "
+                "only the reciprocal-space half of the Ewald sum, which "
+                "needs no real-space cutoff."
+            )
         if spline_order > MAX_SPLINE_ORDER:
             raise ValueError(
                 f"spline_order={spline_order} exceeds the maximum order "
@@ -135,13 +127,8 @@ class PMEEnergy(torch.nn.Module):
             )
         if spline_order < 3:
             raise ValueError(f"spline_order must be at least 3, got {spline_order}")
-        if rcut is not None and rcut <= 0:
-            raise ValueError(f"rcut must be positive, got {rcut}")
-        if alpha is not None and alpha <= 0:
+        if alpha is None or alpha <= 0:
             raise ValueError(f"alpha must be positive, got {alpha}")
-        if not 0 < accuracy < 1:
-            raise ValueError(f"accuracy must be in (0, 1), got {accuracy}")
-
         if mesh_dimensions is not None:
             mesh_dimensions = tuple(int(m) for m in mesh_dimensions)
             if len(mesh_dimensions) != 3 or any(m < 2 for m in mesh_dimensions):
@@ -149,120 +136,43 @@ class PMEEnergy(torch.nn.Module):
                     "mesh_dimensions must be three integers >= 2, got "
                     f"{mesh_dimensions}"
                 )
-        self.rcut = rcut
-        self.alpha = alpha
+        if mesh_dimensions is None and mesh_spacing is None:
+            mesh_spacing = 1.0
+        if mesh_spacing is not None and mesh_spacing <= 0:
+            raise ValueError(f"mesh_spacing must be positive, got {mesh_spacing}")
+
+        self.alpha = float(alpha)
         self.mesh_spacing = mesh_spacing
         self.mesh_dimensions = mesh_dimensions
         self.spline_order = int(spline_order)
-        self.accuracy = float(accuracy)
 
     def extra_repr(self) -> str:
         return (
-            f"rcut={self.rcut}, alpha={self.alpha}, "
-            f"mesh_spacing={self.mesh_spacing}, "
+            f"alpha={self.alpha}, mesh_spacing={self.mesh_spacing}, "
             f"mesh_dimensions={self.mesh_dimensions}, "
-            f"spline_order={self.spline_order}, accuracy={self.accuracy}"
+            f"spline_order={self.spline_order}"
         )
 
     def serialize(self) -> dict[str, Any]:
         return {
-            "rcut": self.rcut,
             "alpha": self.alpha,
             "mesh_spacing": self.mesh_spacing,
             "mesh_dimensions": self.mesh_dimensions,
             "spline_order": self.spline_order,
-            "accuracy": self.accuracy,
         }
 
     @classmethod
-    def deserialize(cls, data: dict[str, Any]) -> "PMEEnergy":
+    def deserialize(cls, data: dict[str, Any]) -> "LongRangeEnergy":
         return cls(**data)
 
-    def _resolved_parameters(
-        self,
-        positions: torch.Tensor,
-        cell: torch.Tensor,
-        batch_idx: torch.Tensor,
-    ) -> tuple[float, float, tuple[int, int, int]]:
-        """Settle rcut, alpha and the mesh, filling gaps from ``accuracy``.
-
-        nvalchemi's estimator is consulted with detached geometry: these are
-        discretization choices, not differentiable quantities, and letting a
-        gradient run back into the mesh size is meaningless.
-        """
-        estimated = estimate_pme_parameters(
-            positions.detach(),
-            cell.detach(),
-            batch_idx=batch_idx,
-            accuracy=self.accuracy,
-            real_space_cutoff=self.rcut,
-        )
-        rcut = (
-            self.rcut
-            if self.rcut is not None
-            else float(estimated.real_space_cutoff.min())
-        )
-        # A single alpha is shared across the batch: it is tied to the one
-        # real-space cutoff the shared neighbour list was built with.
-        alpha = (
-            self.alpha if self.alpha is not None else float(estimated.alpha.min())
-        )
+    def _mesh(self, cell: torch.Tensor) -> tuple[int, int, int]:
         if self.mesh_dimensions is not None:
-            mesh = self.mesh_dimensions
-        elif self.mesh_spacing is not None:
-            lengths = torch.linalg.norm(cell.detach(), dim=-1).max(dim=0).values
-            mesh = tuple(
-                max(int(math.ceil(float(length) / self.mesh_spacing)), 2)
-                for length in lengths
-            )
-        else:
-            mesh = tuple(int(m) for m in estimated.mesh_dimensions)
-        return rcut, alpha, mesh
-
-    def _neighbor_list(
-        self,
-        positions: torch.Tensor,
-        cell: torch.Tensor,
-        pbc: torch.Tensor,
-        batch_idx: torch.Tensor,
-        rcut: float,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Build the real-space neighbour list, growing capacity on overflow.
-
-        The algorithm is pinned to :data:`NEIGHBOR_LIST_METHOD`; see that
-        constant for why the auto-selected one cannot be used.
-
-        nvalchemi allocates a fixed ``max_neighbors`` per atom and raises
-        rather than truncating when it is exceeded -- truncation would
-        silently drop real-space pairs and bias the energy. Doubling on
-        overflow keeps that guarantee without asking the caller to guess a
-        capacity that depends on density and cutoff.
-
-        Built from detached geometry: edge indices and lattice shifts are
-        discrete, so they carry no gradient. The energy is still
-        differentiable in the positions through ``particle_mesh_ewald``.
-        """
-        from nvalchemiops.neighbors.neighbor_utils import (
-            NeighborOverflowError,
+            return self.mesh_dimensions
+        lengths = torch.linalg.norm(cell.detach(), dim=-1).max(dim=0).values
+        return tuple(
+            max(int(math.ceil(float(length) / self.mesh_spacing)), 2)
+            for length in lengths
         )
-
-        capacity = INITIAL_MAX_NEIGHBORS
-        while True:
-            try:
-                return neighbor_list(
-                    positions.detach(),
-                    rcut,
-                    cell=cell.detach(),
-                    pbc=pbc,
-                    batch_idx=batch_idx,
-                    return_neighbor_list=True,
-                    max_neighbors=capacity,
-                    method=NEIGHBOR_LIST_METHOD,
-                )
-            except NeighborOverflowError:
-                capacity *= 2
-                if capacity > MAX_NEIGHBOR_CAPACITY:
-                    raise
 
     def forward(
         self,
@@ -278,28 +188,26 @@ class PMEEnergy(torch.nn.Module):
         coord
             Coordinates in angstrom, shape ``(nf, nloc, 3)``.
         charge
-            Per-atom charges in elementary-charge units, shape ``(nf, nloc)``.
-            Expected to already satisfy the total-charge constraint.
+            Per-atom charges in elementary-charge units, shape ``(nf, nloc)``,
+            already satisfying the total-charge constraint.
         box
             Cell vectors as rows, shape ``(nf, 3, 3)``. Required.
         mask
             Optional ``(nf, nloc)`` mask of real atoms. Padding atoms are
-            given zero charge, which removes them from every Ewald
-            contribution exactly -- including the self term, which is
-            quadratic in charge.
+            given zero charge, which removes them from the reciprocal sum and
+            from the self term exactly -- both are quadratic in charge.
 
         Returns
         -------
         torch.Tensor
-            Per-atom energy in eV, shape ``(nf, nloc, 1)``. Summing over
-            atoms gives the frame's long-range energy.
+            Per-atom energy in eV, shape ``(nf, nloc, 1)``.
         """
         if box is None:
             raise ValueError(
-                "The long-range PME term requires a periodic cell, but box "
-                "is None. Ewald summation is only defined under periodic "
-                "boundary conditions; for an isolated system use a "
-                "real-space Coulomb or DSF term instead."
+                "The long-range term requires a periodic cell, but box is "
+                "None. Ewald summation is only defined under periodic "
+                "boundary conditions; for an isolated system use a real-space "
+                "Coulomb or DSF term instead."
             )
         if coord.ndim != 3 or coord.shape[-1] != 3:
             raise ValueError(f"coord must have shape (nf, nloc, 3), got {coord.shape}")
@@ -315,8 +223,8 @@ class PMEEnergy(torch.nn.Module):
         volume = torch.abs(torch.linalg.det(cell.detach()))
         if bool((volume <= 0).any()):
             raise ValueError(
-                "The long-range PME term requires a non-degenerate cell, but "
-                "at least one frame has zero volume. A collapsed or unset box "
+                "The long-range term requires a non-degenerate cell, but at "
+                "least one frame has zero volume. A collapsed or unset box "
                 "cannot define periodic images."
             )
 
@@ -328,26 +236,27 @@ class PMEEnergy(torch.nn.Module):
         batch_idx = torch.repeat_interleave(
             torch.arange(nf, dtype=torch.int32, device=coord.device), nloc
         )
-        pbc = torch.ones(3, dtype=torch.bool, device=coord.device)
 
-        rcut, alpha, mesh = self._resolved_parameters(positions, cell, batch_idx)
-        nlist, nptr, nshifts = self._neighbor_list(
-            positions, cell, pbc, batch_idx, rcut
-        )
-
-        energy = particle_mesh_ewald(
+        # nvalchemi returns the k-space sum MINUS the self term; DeePMD-kit's
+        # DPLR convention is the k-space sum alone, so add the self term back.
+        # It is per-atom and charge-quadratic, so it lands naturally on the
+        # per-atom axis.
+        energy = pme_reciprocal_space(
             positions,
             charges,
             cell,
-            alpha=alpha,
-            mesh_dimensions=mesh,
+            alpha=self.alpha,
+            mesh_dimensions=self._mesh(cell),
             spline_order=self.spline_order,
             batch_idx=batch_idx,
-            neighbor_list=nlist,
-            neighbor_ptr=nptr,
-            neighbor_shifts=nshifts,
-            pbc=pbc,
             energy_reduction="atom",
         )
-        energy = energy * ELECTROSTATIC_CONVERSION
+        self_energy = (self.alpha / math.sqrt(math.pi)) * charges * charges
+        energy = (energy + self_energy) * ELECTROSTATIC_CONVERSION
         return energy.reshape(nf, nloc, 1)
+
+
+#: Backwards-compatible alias. The previous class computed the *full* Ewald
+#: sum; this one computes only its long-range half, so the name changed with
+#: the behaviour.
+PMEEnergy = LongRangeEnergy

@@ -13,11 +13,11 @@ top-level model, which is what this class is.
 
 Why the long-range energy is added at the model level, not to the atomic energy
 ------------------------------------------------------------------------------
-It is tempting to add the PME per-atom energy into the atomic model's output
+It is tempting to add the long-range per-atom energy into the atomic output
 and let the existing machinery produce force and virial. That would be
 silently wrong. On the graph route, force and virial come from
 ``edge_force_virial``, which differentiates the energy with respect to
-``edge_vec`` and scatters the result along edges. The PME energy does not
+``edge_vec`` and scatters the result along edges. The reciprocal-space energy does not
 depend on ``edge_vec`` at all -- it depends on absolute coordinates and the
 cell -- so it would contribute exactly **zero** force and virial while still
 shifting the energy. Energies would move, forces would not, and the model
@@ -74,7 +74,7 @@ from deepmd_lr.fitting.charge import (
     project_to_total_charge,
 )
 from deepmd_lr.pme.term import (
-    PMEEnergy,
+    LongRangeEnergy,
 )
 
 #: The ``model.type`` that selects this class, and the tag written into
@@ -105,7 +105,7 @@ class LongRangeEnergyModel(EnergyModel):
         self,
         *args: Any,
         charge_fitting: Any = None,
-        pme: PMEEnergy | None = None,
+        pme: LongRangeEnergy | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -169,7 +169,7 @@ class LongRangeEnergyModel(EnergyModel):
     @classmethod
     def _build_long_range(
         cls, data: dict, descriptor: Any
-    ) -> tuple[Any, PMEEnergy | None]:
+    ) -> tuple[Any, LongRangeEnergy | None]:
         """Build the charge head and PME term from the ``long_range`` block.
 
         Returns ``(None, None)`` when the block is absent, which leaves this
@@ -187,7 +187,7 @@ class LongRangeEnergyModel(EnergyModel):
         charge_net["type_map"] = copy.deepcopy(data["type_map"])
         charge_fitting = BaseFitting.get_class_by_type("charge")(**charge_net)
 
-        pme = PMEEnergy(**copy.deepcopy(block.get("pme", {})))
+        pme = LongRangeEnergy(**copy.deepcopy(block.get("pme", {})))
         return charge_fitting, pme
 
 
@@ -298,9 +298,9 @@ class LongRangeEnergyModel(EnergyModel):
             # well defined -- the k-space energy is inherently collective --
             # so refuse rather than invent an attribution.
             raise NotImplementedError(
-                "do_atomic_virial is not supported with a long-range PME "
-                "term: the reciprocal-space energy is collective and admits "
-                "no meaningful per-atom virial decomposition."
+                "do_atomic_virial is not supported with a long-range term: "
+                "the reciprocal-space energy is collective and admits no "
+                "meaningful per-atom virial decomposition."
             )
         return out
 
@@ -330,8 +330,8 @@ class LongRangeEnergyModel(EnergyModel):
             return short_range
         if box is None:
             raise ValueError(
-                "The 'dp_lr' model has a long-range PME term configured, "
-                "which requires a periodic cell, but box is None."
+                "The 'dp_lr' model has a long-range term configured, which "
+                "requires a periodic cell, but box is None."
             )
 
         long_range = self._long_range(
@@ -377,5 +377,5 @@ class LongRangeEnergyModel(EnergyModel):
         model = super().deserialize(data)
         if block is not None:
             model.charge_fitting = BaseFitting.deserialize(block["charge_net"])
-            model.pme = PMEEnergy.deserialize(block["pme"])
+            model.pme = LongRangeEnergy.deserialize(block["pme"])
         return model

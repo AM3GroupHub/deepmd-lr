@@ -162,30 +162,28 @@ def _long_range_args() -> Argument:
         dict,
         [
             Argument(
-                "rcut",
-                [float, None],
-                optional=True,
-                default=None,
-                doc="Real-space cutoff in angstrom. Should stay below half "
-                "the shortest cell vector; null derives one from `accuracy`.",
-            ),
-            Argument(
                 "alpha",
-                [float, None],
+                float,
                 optional=True,
-                default=None,
-                doc="Ewald splitting parameter in inverse angstrom. "
-                "null derives it from `rcut` and `accuracy`.",
+                default=0.4,
+                doc="Ewald splitting parameter in inverse angstrom. Unlike a "
+                "full Ewald sum this is a real modelling choice: it sets how "
+                "much of the Coulomb interaction is left to the short-range "
+                "network (erfc(alpha r) / r) and how much this term supplies. "
+                "It must be large enough that the network's share has decayed "
+                "inside the descriptor cutoff -- alpha 0.4 leaves erfc(2.4) = "
+                "7e-4 at a 6 angstrom cutoff -- and must match between "
+                "training and any later MD.",
             ),
             Argument(
                 "mesh_spacing",
                 [float, None],
                 optional=True,
                 default=None,
-                doc="Reciprocal-mesh spacing in angstrom; null derives the "
-                "mesh from `accuracy`. The mesh is ceil(L / spacing), a step "
-                "function of the cell, so prefer `mesh_dimensions` if the "
-                "cell can change.",
+                doc="Reciprocal-mesh spacing in angstrom; the mesh is "
+                "ceil(L / spacing), a step function of the cell, so prefer "
+                "`mesh_dimensions` if the cell can change. Defaults to 1.0 "
+                "when no mesh is given.",
             ),
             Argument(
                 "mesh_dimensions",
@@ -207,17 +205,13 @@ def _long_range_args() -> Argument:
                 "at 7 and above the underlying library silently drops the "
                 "reciprocal-space sum.",
             ),
-            Argument(
-                "accuracy",
-                float,
-                optional=True,
-                default=1e-6,
-                doc="Target relative accuracy for any PME parameter left null.",
-            ),
         ],
         optional=True,
         default={},
-        doc="Particle-mesh-Ewald parameters.",
+        doc="Reciprocal-space (long-range) electrostatics, evaluated by "
+        "particle-mesh Ewald. Only the long-range half of the Ewald "
+        "decomposition is computed here; the screened real-space half is "
+        "already inside the descriptor cutoff and is left to the network.",
     )
     return Argument(
         LONG_RANGE_KEY,

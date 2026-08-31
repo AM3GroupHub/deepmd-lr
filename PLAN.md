@@ -285,49 +285,52 @@ pathology the long-range term exists to avoid. It is uniform (so charge
 *differences* survive), permutation-equivariant, `gradcheck`-clean, and
 guarded against NaN on a fully-padded frame.
 
-### Phase 3 — PME term — **DONE**
-`deepmd_lr/pme/term.py` exposes `PMEEnergy`, a `torch.nn.Module` returning
-per-atom long-range energy in eV for `(nf, nloc, 3)` coordinates,
+### Phase 3 — long-range term — **DONE** (revised)
+`deepmd_lr/pme/term.py` exposes `LongRangeEnergy`, returning per-atom
+long-range electrostatic energy in eV for `(nf, nloc, 3)` coordinates,
 `(nf, nloc)` charges and `(nf, 3, 3)` cells.
 
-**Units.** The conversion constant is imported from DeePMD-kit
-(`deepmd.dpmodel.modifier.dipole_charge.ELECTROSTATIC_CONVERSION`) rather
-than redefined, so our long-range energy lands on exactly the same scale as
-DeePMD-kit's existing DPLR path; a second definition would be a silent source
-of drift between them. Validated two independent ways: a dipole in a growing
-cell converges to the analytic `-k_e/r`, and the residual falls as 1/L³ —
-the dipole–image scaling, which confirms the leftover is periodicity and not
-a mis-scaled prefactor. The NaCl lattice energy in eV is checked separately.
-
-**Guards.** `box=None` and zero-volume cells are rejected with messages
-naming the physical reason; `spline_order >= 7` is refused at construction
-(Phase 0's silent-failure mode); padding atoms are given zero charge, which
-removes them from every Ewald contribution exactly, including the
-charge-quadratic self term.
-
-> **nvalchemi's batched `naive` neighbour list is wrong, and silently so.**
-> The auto-selector picks `naive` at our sizes. For two identical 216-atom
-> frames it returned 17280 pairs for frame 0 but only **10024** for frame 1 —
-> no error, no sensitivity to `max_neighbors`, no cross-frame pairs, just
-> missing neighbours. Three identical frames gave frame 0 correct and frames
-> 1 and 2 wrong by the same constant. Since a training batch *is* the batched
-> case, this would have quietly corrupted the long-range energy of every
-> frame but the first, in every batch, while leaving the numbers finite and
-> plausible.
+> **It supplies only the reciprocal half of the Ewald split.** The first
+> implementation computed the *full* sum (real + reciprocal + self). That was
+> wrong for this design: the screened real-space part decays as
+> `erfc(alpha r)/r` and lives entirely inside the descriptor cutoff, so the
+> short-range network already represents it. Including it asked the network
+> to learn to *subtract* something it could describe directly. This is the
+> same decomposition DeePMD-kit's own DPLR uses.
 >
-> `method="cell_list"` returns the correct count for every frame and every
-> geometry tested (rcut/L from 0.12 to 0.49). The term pins it
-> (`NEIGHBOR_LIST_METHOD`) instead of letting the dispatcher choose, and
-> `TestBatching::test_identical_frames_give_identical_energies` fails
-> immediately if the pin is dropped. **Worth reporting upstream**, alongside
-> the `spline_order` finding.
+> The correction paid off measurably: the benchmark force gain went from
+> 2.6x to **4.9x**, and an energy regression on real water (0.79x) turned
+> into a 1.29x improvement.
+>
+> It also simplified the term considerably. With no real-space part there is
+> **no neighbour list**: no cutoff, no capacity to size, no `rcut < L/2`
+> constraint — and the batched-`naive` neighbour-list bug found in the first
+> pass is now unreachable by construction. The test suite got 3x faster.
 
-Two smaller API notes: the neighbour list needs an explicit `max_neighbors`
-and raises rather than truncating on overflow, so the term doubles capacity
-on `NeighborOverflowError` (up to a ceiling, to fail loudly rather than
-exhaust memory); and a real-space cutoff larger than half the shortest cell
-vector explodes the pair count — 2102 neighbours per atom in one accidental
-test configuration — so cutoffs should stay under `L/2`.
+**Validation.** The oracle is DeePMD-kit's own `ewald_reciprocal_energy` —
+the function its DPLR path uses — matched to 1e-7. That single comparison
+pins the split, the units, and the self-term convention at once (nvalchemi's
+`pme_reciprocal_space` returns k-space *minus* self; DeePMD-kit keeps it in,
+so the term adds it back).
+
+**`alpha` is a modelling choice here, not a free parameter.** In a full Ewald
+sum the total is alpha-independent. For the reciprocal half alone, alpha
+decides how the work is divided: the network handles `erfc(alpha r)/r` and
+this term handles the rest. It must be large enough that the network's share
+has died inside the descriptor cutoff — `alpha = 0.4` leaves `erfc(2.4) =
+7e-4` at 6 Å — and must match between training and any later MD.
+
+A physical corollary worth knowing: the reciprocal term only carries weight
+where the charge density has *long-wavelength* structure. A tight rocksalt
+lattice at `alpha = 0.5` has a reciprocal energy of ~1e-9 eV, because its
+charge ordering is short-wavelength and `exp(-k^2/4 alpha^2)` suppresses it.
+
+**Other guards.** `box=None` and zero-volume cells are rejected with messages
+naming the physical reason; `spline_order >= 7` is refused at construction
+(Phase 0's silent-failure mode); unknown parameters raise rather than being
+absorbed (a stale `rcut` in a config silently ran different physics until
+this was tightened); padding atoms get zero charge, which removes them from
+both the reciprocal sum and the self term exactly.
 
 ### Phase 4 — joint model — **DONE**
 `model.type: "dp_lr"` with an optional `long_range` block containing
@@ -398,22 +401,23 @@ any strictly local model.
 | model    | E RMSE (meV/atom) | F RMSE (eV/Å) |
 |----------|------------------:|--------------:|
 | baseline |            187.31 |        0.4075 |
-| joint    |             43.61 |        0.1570 |
+| joint    |             34.04 |        0.0826 |
 
 The baseline lands at 0.41 eV/Å — essentially exactly the predicted floor.
-The joint model reaches 0.157, *below* it, which requires representing
-interaction beyond the cutoff.
+The joint model reaches 0.083, *five times below* it, which requires
+representing interaction beyond the cutoff.
 
 **The capacity control matters more than the headline.** The joint model has
 an extra network, so the honest objection is that it wins on parameters. Re-run
-on an identical dataset with Coulomb removed: baseline 0.0243 vs joint 0.0255
-eV/Å — **no benefit at all** (0.95×). The gain is specifically long-range
+on an identical dataset with Coulomb removed: baseline 0.0243 vs joint 0.0257
+eV/Å — **no benefit at all** (0.94×). The gain is specifically long-range
 physics, not capacity.
 
 **Learned charges recover the truth up to an exact symmetry.** The head, never
-shown a charge, returns ∓0.9364 against a true ±1: magnitude within 6.4%,
-relative assignment correct, global sign inverted. That inversion is a genuine
-gauge freedom — the Coulomb energy is bilinear in charge, so `q → −q` leaves
+shown a charge, returns ±0.9604 against a true ±1: magnitude within 4%,
+relative assignment correct. The global sign is a genuine gauge freedom — this
+run happened to land on the physical branch, an earlier one on the inverted
+branch (∓0.9364), and both are equally optimal. The freedom is exact — the Coulomb energy is bilinear in charge, so `q → −q` leaves
 every `q_i q_j` unchanged and, for a neutral cell, the branches are exactly
 degenerate (verified to 1.4e-14, pinned by `TestChargeSignDegeneracy`).
 Anyone comparing learned charges to a Bader/Mulliken analysis must break the
@@ -421,11 +425,11 @@ symmetry themselves. The residual 6.4% is a second, softer degeneracy: the
 short-range/long-range split is not unique, since DPA4C can absorb Coulomb
 inside its cutoff.
 
-**Real water is inconclusive, and reported as such.** 240 frames of the
-DeePMD-kit water example gives a ~10% force improvement and a slight energy
-regression — far too small a dataset to resolve a 10% effect on neutral
-water. The useful conclusion is negative: the long-range term does not break
-or destabilize training on real DFT data.
+**Real water is suggestive, not demonstrated.** 240 frames of the DeePMD-kit
+water example gives 1.29× on energy and 1.07× on force — too small a dataset
+to resolve an effect that size on neutral water. What it establishes is that
+the long-range term neither breaks nor destabilizes training on real DFT
+data.
 
 > **Open question for the target science.** If the systems of interest are
 > the electrolyte clusters in `/home/admin/storage/dataset/electrolyte`, they

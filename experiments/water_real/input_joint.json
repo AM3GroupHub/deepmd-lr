@@ -39,8 +39,7 @@
         "seed": 1
       },
       "pme": {
-        "rcut": 5.0,
-        "alpha": 0.6,
+        "alpha": 0.4,
         "mesh_dimensions": [
           20,
           20,

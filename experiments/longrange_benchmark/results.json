@@ -4,7 +4,7 @@
     "force_rmse": 0.4075014961922196
   },
   "joint": {
-    "energy_rmse_per_atom": 0.043613437482771175,
-    "force_rmse": 0.15695165714135484
+    "energy_rmse_per_atom": 0.03403851537075395,
+    "force_rmse": 0.08260701786452582
   }
 }

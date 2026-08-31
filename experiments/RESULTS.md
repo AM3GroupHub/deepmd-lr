@@ -12,6 +12,16 @@ example (240 training frames, 192 atoms).
 So the primary experiment is a controlled synthetic benchmark, with the water
 set as a secondary real-data check.
 
+> **Corrected after the first run.** The long-range term originally computed
+> the *full* Ewald sum (real + reciprocal + self). It should only supply the
+> reciprocal half: the screened real-space part decays as `erfc(alpha r)/r`
+> and is already inside the descriptor cutoff, so the short-range network
+> represents it directly — including it here asks the network to learn to
+> subtract something it can already describe. Every number below is from the
+> corrected, reciprocal-only term. The correction improved the result
+> substantially (force gain 2.6x → 4.9x) and removed an energy regression on
+> real water.
+
 ## Benchmark design
 
 A periodic molten-salt-like system, 32 ions (±1) in a 14 Å cubic cell, with a
@@ -40,13 +50,14 @@ Held-out validation, 200 frames:
 | model    | E RMSE (meV/atom) | F RMSE (eV/Å) |
 |----------|------------------:|--------------:|
 | baseline |            187.31 |        0.4075 |
-| joint    |             43.61 |        0.1570 |
-|          |       **4.3×**    |    **2.6×**   |
+| joint    |             34.04 |        0.0826 |
+|          |       **5.5×**    |    **4.9×**   |
 
 The baseline lands at 0.41 eV/Å, essentially exactly the 0.37 eV/Å floor
 predicted from the beyond-cutoff signal — it has hit the wall the analysis
-said it would. The joint model reaches 0.157 eV/Å, **below that floor**,
-which is only possible by representing interaction beyond the cutoff.
+said it would. The joint model reaches 0.083 eV/Å, **five times below that
+floor**, which is only possible by representing interaction beyond the
+cutoff.
 
 ## The control: is it just extra parameters?
 
@@ -56,8 +67,8 @@ identical dataset with the Coulomb term **removed**:
 
 | dataset             | baseline F RMSE | joint F RMSE | ratio |
 |---------------------|----------------:|-------------:|------:|
-| with Coulomb        |          0.4075 |       0.1570 | 2.6×  |
-| repulsion only      |          0.0243 |       0.0255 | 0.95× |
+| with Coulomb        |          0.4094 |       0.0832 | 4.9×  |
+| repulsion only      |          0.0243 |       0.0257 | 0.94× |
 
 With no long-range physics present, the long-range machinery gives **no
 benefit at all** (a hair worse, within noise). The gain is specifically from
@@ -71,17 +82,19 @@ The charge head is never shown a charge. It recovers:
 
 | type | true | learned mean |    std |
 |------|-----:|-------------:|-------:|
-| Na   | +1.00 |      −0.9364 | 0.0024 |
-| Cl   | −1.00 |      +0.9364 | 0.0020 |
+| Na   | +1.00 |      +0.9604 | 0.0137 |
+| Cl   | −1.00 |      −0.9604 | 0.0139 |
 
-Magnitude recovered to within 6.4%, relative assignment correct, tiny spread
-across configurations — but **the global sign is inverted**.
+Magnitude recovered to within 4%, relative assignment correct, small spread
+across configurations.
 
-That is not an error. The Coulomb energy is bilinear in charge, so every
-product `q_i q_j` is unchanged under `q → −q`; for a neutral cell the two
-branches are *exactly* degenerate. Verified numerically to 1.4e-14, and now
-pinned by `TestChargeSignDegeneracy`. No amount of energy or force data can
-break it.
+**The global sign is a genuine degeneracy, and this run merely happened to
+land on the physical branch.** The Coulomb energy is bilinear in charge, so
+every product `q_i q_j` is unchanged under `q → −q`; for a neutral cell the
+two branches are *exactly* degenerate. Verified numerically to 1.4e-14 and
+pinned by `TestChargeSignDegeneracy`. An earlier run of this same benchmark
+converged to the inverted branch (−0.9364 / +0.9364), which is equally
+optimal. No amount of energy or force data can break the tie.
 
 Practical consequence: a charge head trained on energies and forces alone
 gives magnitudes and relative signs, with the overall sign arbitrary. Anyone
@@ -101,13 +114,15 @@ last quarter of the learning curve:
 | model    | E RMSE (meV/atom) | F RMSE (eV/Å) |
 |----------|------------------:|--------------:|
 | baseline |             1.341 |        0.0962 |
-| joint    |             1.688 |        0.0868 |
+| joint    |             1.038 |        0.0895 |
 
-A ~10% force improvement and a slight energy regression. **This does not
-demonstrate a benefit.** 240 frames of neutral water is far too small to
-resolve a 10% effect, and neutral water at a 6 Å cutoff has modest long-range
-force content to begin with. The useful conclusion is the negative one: the
-long-range term does not break or destabilize training on real DFT data.
+A 1.29× energy and 1.07× force improvement. **This is suggestive, not
+demonstrated.** 240 frames of neutral water is too small to resolve an effect
+this size, and neutral water at a 6 Å cutoff has modest long-range force
+content to begin with. What it does establish is that the long-range term
+neither breaks nor destabilizes training on real DFT data. (With the earlier
+full-Ewald term this comparison showed an energy *regression*, 0.79×, which
+the reciprocal-only correction removed.)
 
 ## Reproducing
 

@@ -18,7 +18,7 @@ environment setup.
 | 0 | Environment + PME validation | **done** |
 | 1 | Plugin skeleton (`dp_lr` model type, no long-range term yet) | **done** |
 | 2 | Charge head (`charge` fitting type + total-charge projection) | **done** |
-| 3 | PME term (`PMEEnergy`, eV units, guards) | **done** |
+| 3 | Long-range term (`LongRangeEnergy`, reciprocal-only, eV) | **done** |
 | 4 | Joint model (`long_range` block, conservative forces) | **done** |
 | 5 | Training + validation (benchmark + control) | **done** |
 | 6 | MD via nvalchemi/ASE | not started |
@@ -62,7 +62,7 @@ Add a `long_range` block to switch the electrostatics on:
     "fitting_net": { "neuron": [192, 192, 192] },
     "long_range": {
       "charge_net": { "neuron": [64, 64] },
-      "pme": { "rcut": 5.0, "alpha": 0.35, "mesh_dimensions": [16, 16, 16] }
+      "pme": { "alpha": 0.4, "mesh_dimensions": [16, 16, 16] }
     }
   }
 }
@@ -73,8 +73,17 @@ dp --pt-expt train input.json
 ```
 
 Without the `long_range` block the model is exactly the built-in standard
-model. Prefer `mesh_dimensions` over `mesh_spacing` whenever the cell can
-change — see PLAN.md, Phase 4.
+model.
+
+Two settings matter. `alpha` divides the labour: the network handles the
+screened part `erfc(alpha r) / r` and this term supplies the rest, so `alpha`
+must be large enough that the network's share dies inside the descriptor
+cutoff (`alpha = 0.4` leaves `erfc(2.4) = 7e-4` at 6 A), and it must match
+between training and MD. Prefer `mesh_dimensions` over `mesh_spacing`
+whenever the cell can change — see PLAN.md, Phases 3 and 4.
+
+Only the long-range (reciprocal-space) half of the Ewald sum is computed
+here; the short-range half is already covered by the descriptor.
 
 ## Tests
 
@@ -103,7 +112,7 @@ point stops working rather than silently passing.
 ## Results
 
 `experiments/RESULTS.md` has the Phase 5 write-up: a controlled periodic
-benchmark where the joint model beats the strictly local baseline by 2.6x on
+benchmark where the joint model beats the strictly local baseline by 4.9x on
 force RMSE and breaks through the floor a 6 A cutoff imposes, a control
 showing the gain disappears when there is no long-range physics to capture,
 and the charge head recovering the true charge magnitudes (up to an exact
