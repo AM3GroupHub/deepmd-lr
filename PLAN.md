@@ -380,11 +380,62 @@ optimization rather than done speculatively.
 so the first real training step failed with `batch1 must be a 3D tensor`.
 Both conventions are now pinned by `TestCallingConventions`.
 
-### Phase 5 — training + validation
-Train jointly on a system where long-range matters and the baseline is known to struggle —
-bulk water with an applied field, or an ionic solution. Compare against the Phase 0 DPA4C
-baseline on energy/force RMSE, and specifically on properties the cutoff should ruin: dielectric
-response, ion–ion PMF beyond `rcut`.
+### Phase 5 — training + validation — **DONE**
+Full write-up in `experiments/RESULTS.md`. Headlines:
+
+**The data situation is a finding in itself.** No periodic dataset exists on
+this machine: `omol25`, `opoly26` and all three `electrolyte` sets are
+non-periodic molecular clusters (`pbc = [F F F]`). PME needs 3D periodicity,
+so none of it can drive this work as built. See the note at the end of this
+section.
+
+**Controlled benchmark.** A periodic molten-salt-like system (32 ions, 14 Å
+cell) whose ground truth is exactly `E_repulsion(<5 Å) + E_Coulomb(±1)`, with
+labels from the *exact* Ewald path rather than the PME one the model uses.
+17.7% of the force signal lies beyond the 6 Å cutoff — a 0.37 eV/Å floor for
+any strictly local model.
+
+| model    | E RMSE (meV/atom) | F RMSE (eV/Å) |
+|----------|------------------:|--------------:|
+| baseline |            187.31 |        0.4075 |
+| joint    |             43.61 |        0.1570 |
+
+The baseline lands at 0.41 eV/Å — essentially exactly the predicted floor.
+The joint model reaches 0.157, *below* it, which requires representing
+interaction beyond the cutoff.
+
+**The capacity control matters more than the headline.** The joint model has
+an extra network, so the honest objection is that it wins on parameters. Re-run
+on an identical dataset with Coulomb removed: baseline 0.0243 vs joint 0.0255
+eV/Å — **no benefit at all** (0.95×). The gain is specifically long-range
+physics, not capacity.
+
+**Learned charges recover the truth up to an exact symmetry.** The head, never
+shown a charge, returns ∓0.9364 against a true ±1: magnitude within 6.4%,
+relative assignment correct, global sign inverted. That inversion is a genuine
+gauge freedom — the Coulomb energy is bilinear in charge, so `q → −q` leaves
+every `q_i q_j` unchanged and, for a neutral cell, the branches are exactly
+degenerate (verified to 1.4e-14, pinned by `TestChargeSignDegeneracy`).
+Anyone comparing learned charges to a Bader/Mulliken analysis must break the
+symmetry themselves. The residual 6.4% is a second, softer degeneracy: the
+short-range/long-range split is not unique, since DPA4C can absorb Coulomb
+inside its cutoff.
+
+**Real water is inconclusive, and reported as such.** 240 frames of the
+DeePMD-kit water example gives a ~10% force improvement and a slight energy
+regression — far too small a dataset to resolve a 10% effect on neutral
+water. The useful conclusion is negative: the long-range term does not break
+or destabilize training on real DFT data.
+
+> **Open question for the target science.** If the systems of interest are
+> the electrolyte clusters in `/home/admin/storage/dataset/electrolyte`, they
+> are non-periodic and charged, and **PME is the wrong engine for them** —
+> Ewald is only defined under PBC. nvalchemi ships `coulomb` and `dsf`
+> (damped shifted force) for exactly that case, and both are already
+> differentiable with charge gradients. The charge head, the projection, the
+> model wiring and the derivative handling are all engine-agnostic; only
+> `deepmd_lr/pme/term.py` would need a sibling. Worth settling before Phase 6,
+> because it changes what "MD deployment" should target.
 
 ### Phase 6 — MD via nvalchemi/ASE
 Wire the trained model into the nvalchemi driver, following

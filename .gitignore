@@ -35,3 +35,9 @@ warp_cache/
 
 # Example run directories
 examples/**/run_*/
+
+# Experiment data and run directories (regenerate with generate_data.py)
+experiments/**/data/
+experiments/**/data_norc/
+experiments/**/run_*/
+experiments/**/__pycache__/

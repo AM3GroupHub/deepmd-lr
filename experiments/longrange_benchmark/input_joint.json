@@ -1,0 +1,85 @@
+{
+  "_comment": "Joint: identical, plus a learned charge head and a PME long-range term.",
+  "model": {
+    "type_map": [
+      "Na",
+      "Cl"
+    ],
+    "descriptor": {
+      "type": "dpa4c",
+      "rcut": 6.0,
+      "channels": 32,
+      "lmax": 2,
+      "basis_type": "bessel",
+      "n_radial": 16,
+      "radial_modes": 4,
+      "precision": "float64",
+      "seed": 1
+    },
+    "fitting_net": {
+      "neuron": [
+        128,
+        128,
+        128
+      ],
+      "resnet_dt": false,
+      "activation_function": "silu",
+      "precision": "float64",
+      "seed": 1
+    },
+    "type": "dp_lr",
+    "long_range": {
+      "charge_net": {
+        "neuron": [
+          64,
+          64
+        ],
+        "activation_function": "silu",
+        "precision": "float64",
+        "seed": 1
+      },
+      "pme": {
+        "rcut": 6.0,
+        "alpha": 0.5,
+        "mesh_dimensions": [
+          24,
+          24,
+          24
+        ],
+        "spline_order": 6
+      }
+    }
+  },
+  "learning_rate": {
+    "type": "exp",
+    "start_lr": 0.001,
+    "stop_lr": 1e-05
+  },
+  "loss": {
+    "type": "ener",
+    "start_pref_e": 1,
+    "limit_pref_e": 1,
+    "start_pref_f": 100,
+    "limit_pref_f": 100
+  },
+  "training": {
+    "training_data": {
+      "systems": [
+        "./data/train"
+      ],
+      "batch_size": 4
+    },
+    "validation_data": {
+      "systems": [
+        "./data/valid"
+      ],
+      "batch_size": 4,
+      "numb_btch": 10
+    },
+    "numb_steps": 5000,
+    "save_freq": 5000,
+    "disp_file": "lcurve.out",
+    "disp_freq": 250,
+    "seed": 1
+  }
+}

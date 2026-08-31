@@ -330,6 +330,38 @@ class TestMeshChoice:
             PMEEnergy(mesh_dimensions=(8, 8, 1))
 
 
+class TestChargeSignDegeneracy:
+    """The global sign of the charges is unobservable, by construction.
+
+    The Coulomb energy is bilinear in charge, so every product q_i q_j is
+    unchanged by q -> -q. For a neutral cell the two assignments are exactly
+    degenerate, and no amount of energy or force data can distinguish them.
+    This is not a defect but it has a practical consequence: a charge head
+    trained only on energies and forces recovers charge magnitudes and
+    relative signs, and picks the overall sign arbitrarily. In the Phase 5
+    benchmark it settled on the inverted branch. Anyone comparing learned
+    charges against a population analysis has to break the symmetry
+    themselves -- with a charge label or a sign constraint.
+    """
+
+    def test_energy_is_invariant_under_global_charge_inversion(self):
+        term = PMEEnergy(rcut=2.5, alpha=2.0, mesh_dimensions=(12, 12, 12))
+        coord, charge, cell = nacl(reps=3, a=2.0)
+        assert torch.allclose(
+            term(coord, charge, cell), term(coord, -charge, cell), atol=1e-12
+        )
+
+    def test_forces_are_invariant_under_global_charge_inversion(self):
+        term = PMEEnergy(rcut=2.5, alpha=2.0, mesh_dimensions=(12, 12, 12))
+        coord, charge, cell = nacl(reps=3, a=2.0)
+
+        def force(q):
+            c = coord.clone().requires_grad_(True)
+            return -torch.autograd.grad(term(c, q, cell).sum(), c)[0]
+
+        assert torch.allclose(force(charge), force(-charge), atol=1e-10)
+
+
 class TestSerialization:
     def test_round_trip(self):
         term = PMEEnergy(rcut=7.0, alpha=0.35, mesh_spacing=0.9, spline_order=5,

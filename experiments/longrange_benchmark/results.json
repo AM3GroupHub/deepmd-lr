@@ -1,0 +1,10 @@
+{
+  "baseline": {
+    "energy_rmse_per_atom": 0.1873071568553952,
+    "force_rmse": 0.4075014961922196
+  },
+  "joint": {
+    "energy_rmse_per_atom": 0.043613437482771175,
+    "force_rmse": 0.15695165714135484
+  }
+}

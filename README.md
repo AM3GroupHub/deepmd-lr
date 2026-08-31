@@ -20,7 +20,7 @@ environment setup.
 | 2 | Charge head (`charge` fitting type + total-charge projection) | **done** |
 | 3 | PME term (`PMEEnergy`, eV units, guards) | **done** |
 | 4 | Joint model (`long_range` block, conservative forces) | **done** |
-| 5 | Training + validation | not started |
+| 5 | Training + validation (benchmark + control) | **done** |
 | 6 | MD via nvalchemi/ASE | not started |
 
 ## Install
@@ -99,6 +99,15 @@ pytest tests/ -q
 
 The tests import only `deepmd`, never `deepmd_lr`, so they fail if the entry
 point stops working rather than silently passing.
+
+## Results
+
+`experiments/RESULTS.md` has the Phase 5 write-up: a controlled periodic
+benchmark where the joint model beats the strictly local baseline by 2.6x on
+force RMSE and breaks through the floor a 6 A cutoff imposes, a control
+showing the gain disappears when there is no long-range physics to capture,
+and the charge head recovering the true charge magnitudes (up to an exact
+global-sign degeneracy).
 
 ## Example
 
