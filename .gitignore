@@ -18,11 +18,15 @@ model.ckpt*
 out.json
 input_v2_compat.json
 
-# Data
+# Data. Datasets are never vendored -- examples/water_lr/README.md and
+# experiments/RESULTS.md say where each one comes from and how to regenerate
+# or copy it in. Tracking a bare type.raw without its set.000/*.npy just
+# leaves a confusing fragment in a fresh clone.
 *.npy
 *.hdf5
 *.h5
-!examples/**/type_map.raw
+examples/water_lr/data/
+experiments/water_real/data
 
 # Warp / torch caches
 .cache/
