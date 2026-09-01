@@ -27,7 +27,7 @@ from deepmd.dpmodel.modifier.dipole_charge import (
 )
 from deepmd.pt_expt.utils.env import DEVICE
 
-from deepmd_lr.pme import MAX_SPLINE_ORDER, LongRangeEnergy
+from deepmd_lr.lr import MAX_SPLINE_ORDER, LongRangeEnergy
 
 MADELUNG_NACL = 1.7475645946331821
 DT = torch.float64

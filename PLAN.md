@@ -164,12 +164,12 @@ deepmd-lr/
 │   ├── argcheck.py           # model_args_plugin / fitting_args_plugin registrations
 │   ├── model/lr_model.py     # LongRangeEnergyModel(EnergyModel), registered "dp_lr"
 │   ├── fitting/charge.py     # ChargeFittingNet + project_to_total_charge
-│   └── pme/term.py           # PMEEnergy: particle_mesh_ewald + eV conversion
+│   └── lr/term.py            # LongRangeEnergy: PME or explicit Ewald, in eV
 ├── tests/
 │   ├── test_pme_physics.py
 │   ├── test_plugin_registration.py
 │   ├── test_charge_head.py
-│   └── test_pme_term.py
+│   └── test_lr_term.py
 └── examples/water_lr/            # joint, baseline twin, warm-up
 ```
 
@@ -286,7 +286,7 @@ pathology the long-range term exists to avoid. It is uniform (so charge
 guarded against NaN on a fully-padded frame.
 
 ### Phase 3 — long-range term — **DONE** (revised)
-`deepmd_lr/pme/term.py` exposes `LongRangeEnergy`, returning per-atom
+`deepmd_lr/lr/term.py` exposes `LongRangeEnergy`, returning per-atom
 long-range electrostatic energy in eV for `(nf, nloc, 3)` coordinates,
 `(nf, nloc)` charges and `(nf, 3, 3)` cells.
 
@@ -447,7 +447,7 @@ data.
 > (damped shifted force) for exactly that case, and both are already
 > differentiable with charge gradients. The charge head, the projection, the
 > model wiring and the derivative handling are all engine-agnostic; only
-> `deepmd_lr/pme/term.py` would need a sibling. Worth settling before Phase 6,
+> `deepmd_lr/lr/term.py` would need a sibling. Worth settling before Phase 6,
 > because it changes what "MD deployment" should target.
 
 > **Training guide.** The practical recipe that came out of Phases 3-5 lives

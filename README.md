@@ -122,7 +122,7 @@ pytest tests/ -q
 - `tests/test_charge_head.py` — the total-charge projection (exactness,
   masking, differentiability) and the charge head's physical symmetries
   through a real DPA4C descriptor.
-- `tests/test_pme_term.py` — the eV unit conversion (against analytic
+- `tests/test_lr_term.py` — the eV unit conversion (against analytic
   Coulomb and Madelung), boundary-condition guards, batching, masking, and
   gradients including the double backward that force training needs.
 - `tests/test_joint_model.py` — the combined model: force and virial against

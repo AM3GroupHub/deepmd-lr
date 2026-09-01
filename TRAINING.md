@@ -63,7 +63,7 @@ error, disagreement between the two is a statement about your mesh, not about
 the physics. A cheap sanity check before a long run:
 
 ```python
-from deepmd_lr.pme import LongRangeEnergy
+from deepmd_lr.lr import LongRangeEnergy
 pme   = LongRangeEnergy(alpha=0.4, mesh_dimensions=[16, 16, 16])
 ewald = LongRangeEnergy(alpha=0.4, method="ewald")
 a, b = pme(coord, q, box).sum(), ewald(coord, q, box).sum()

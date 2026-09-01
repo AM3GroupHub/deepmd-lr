@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
-r"""The long-range (reciprocal-space) electrostatic energy, evaluated by PME.
+r"""The long-range (reciprocal-space) electrostatic energy.
+
+Evaluated either by particle-mesh Ewald or by an explicit k-vector sum --
+see *Two ways to evaluate the same sum* below. The module is named for what
+it computes rather than for one of the two ways of computing it.
 
 What this computes, and what it deliberately does not
 -----------------------------------------------------

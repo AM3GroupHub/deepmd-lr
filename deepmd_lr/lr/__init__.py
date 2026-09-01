@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""The long-range (reciprocal-space) electrostatic term."""
+"""The long-range (reciprocal-space) electrostatic term.
 
-from deepmd_lr.pme.term import (
+Holds both ways of evaluating it -- particle-mesh Ewald and the explicit
+k-vector sum -- which is why the package is ``lr`` rather than ``pme``.
+"""
+
+from deepmd_lr.lr.term import (
     DEFAULT_ALPHA,
     DEFAULT_SPLINE_ORDER,
     MAX_SPLINE_ORDER,

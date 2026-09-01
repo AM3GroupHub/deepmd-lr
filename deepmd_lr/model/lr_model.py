@@ -73,7 +73,7 @@ from deepmd.pt_expt.model.model import (
 from deepmd_lr.fitting.charge import (
     project_to_total_charge,
 )
-from deepmd_lr.pme.term import (
+from deepmd_lr.lr.term import (
     LongRangeEnergy,
 )
 
