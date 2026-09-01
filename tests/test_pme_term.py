@@ -55,9 +55,7 @@ def nacl(reps: int = 3, a: float = 2.0):
 def random_neutral(n: int = 16, box: float = 12.0, seed: int = 0):
     """A neutral cell of random charges -- the general case, not a lattice."""
     rng = np.random.default_rng(seed)
-    coord = torch.tensor(
-        rng.uniform(0.0, box, size=(1, n, 3)), dtype=DT, device=DEVICE
-    )
+    coord = torch.tensor(rng.uniform(0.0, box, size=(1, n, 3)), dtype=DT, device=DEVICE)
     charge = torch.tensor(rng.normal(size=(1, n)), dtype=DT, device=DEVICE)
     charge = charge - charge.mean()
     cell = (torch.eye(3, dtype=DT, device=DEVICE) * box).unsqueeze(0)
@@ -148,10 +146,16 @@ class TestMatchesDeepmdConvention:
         decides how much work is handed to the short-range network.
         """
         coord, charge, cell = random_neutral()
-        a = float(LongRangeEnergy(alpha=0.3, mesh_dimensions=FINE_MESH)(
-            coord, charge, cell).sum())
-        b = float(LongRangeEnergy(alpha=0.6, mesh_dimensions=FINE_MESH)(
-            coord, charge, cell).sum())
+        a = float(
+            LongRangeEnergy(alpha=0.3, mesh_dimensions=FINE_MESH)(
+                coord, charge, cell
+            ).sum()
+        )
+        b = float(
+            LongRangeEnergy(alpha=0.6, mesh_dimensions=FINE_MESH)(
+                coord, charge, cell
+            ).sum()
+        )
         assert abs(a - b) > 0.1 * abs(a)
 
     def test_needs_no_neighbor_list(self):
@@ -174,10 +178,14 @@ class TestMethodChoice:
         statement about the PME mesh, not about the physics.
         """
         coord, charge, cell = random_neutral()
-        pme = float(LongRangeEnergy(alpha=alpha, mesh_dimensions=FINE_MESH)(
-            coord, charge, cell).sum())
-        ewald = float(LongRangeEnergy(alpha=alpha, method="ewald")(
-            coord, charge, cell).sum())
+        pme = float(
+            LongRangeEnergy(alpha=alpha, mesh_dimensions=FINE_MESH)(
+                coord, charge, cell
+            ).sum()
+        )
+        ewald = float(
+            LongRangeEnergy(alpha=alpha, method="ewald")(coord, charge, cell).sum()
+        )
         assert abs(pme - ewald) < 1e-5 * abs(ewald)
 
     def test_ewald_is_the_more_accurate_of_the_two(self):
@@ -188,10 +196,14 @@ class TestMethodChoice:
         """
         coord, charge, cell = random_neutral()
         reference = deepmd_reference(coord, charge, cell, 0.4)
-        coarse = float(LongRangeEnergy(alpha=0.4, mesh_dimensions=(8, 8, 8))(
-            coord, charge, cell).sum())
-        ewald = float(LongRangeEnergy(alpha=0.4, method="ewald")(
-            coord, charge, cell).sum())
+        coarse = float(
+            LongRangeEnergy(alpha=0.4, mesh_dimensions=(8, 8, 8))(
+                coord, charge, cell
+            ).sum()
+        )
+        ewald = float(
+            LongRangeEnergy(alpha=0.4, method="ewald")(coord, charge, cell).sum()
+        )
         assert abs(ewald - reference) < abs(coarse - reference)
 
     def test_k_cutoff_is_derived_from_alpha(self):
@@ -205,8 +217,8 @@ class TestMethodChoice:
             LongRangeEnergy(method="fmm")
 
     @pytest.mark.parametrize(
-        "kwargs", [{"mesh_dimensions": (8, 8, 8)}, {"mesh_spacing": 1.0},
-                   {"spline_order": 4}]
+        "kwargs",
+        [{"mesh_dimensions": (8, 8, 8)}, {"mesh_spacing": 1.0}, {"spline_order": 4}],
     )
     def test_rejects_pme_parameters_under_ewald(self, kwargs):
         """A mesh setting silently ignored under `ewald` would be
@@ -230,6 +242,38 @@ class TestMethodChoice:
         grad_q = torch.autograd.grad((force**2).sum(), q)[0]
         assert torch.isfinite(force).all() and torch.isfinite(grad_q).all()
         assert float(grad_q.abs().sum()) > 0.0
+
+    def test_ewald_cell_gradient_matches_finite_difference(self):
+        """Reciprocal vectors must deform with the cell for a physical virial."""
+        coord, charge, cell = random_neutral(n=8, box=12.0)
+        term = LongRangeEnergy(alpha=0.4, method="ewald")
+
+        eps = torch.zeros((1, 3, 3), dtype=DT, device=DEVICE, requires_grad=True)
+        strain = torch.eye(3, dtype=DT, device=DEVICE).unsqueeze(0) + eps
+        energy = term(
+            coord @ strain.transpose(-1, -2),
+            charge,
+            cell @ strain.transpose(-1, -2),
+        ).sum()
+        analytic = torch.autograd.grad(energy, eps)[0][0, 0, 0]
+
+        h = 1.0e-5
+        delta = torch.zeros((1, 3, 3), dtype=DT, device=DEVICE)
+        delta[0, 0, 0] = h
+        numeric = []
+        eye = torch.eye(3, dtype=DT, device=DEVICE).unsqueeze(0)
+        for sign in (1.0, -1.0):
+            deform = eye + sign * delta
+            numeric.append(
+                term(
+                    coord @ deform.transpose(-1, -2),
+                    charge,
+                    cell @ deform.transpose(-1, -2),
+                ).sum()
+            )
+        finite_difference = (numeric[0] - numeric[1]) / (2.0 * h)
+
+        assert torch.allclose(analytic, finite_difference, atol=2.0e-5, rtol=2.0e-4)
 
     def test_ewald_batches_correctly(self):
         term = LongRangeEnergy(alpha=0.5, method="ewald")
@@ -283,8 +327,9 @@ class TestParameterValidation:
     def test_default_order_is_within_supported_range(self):
         assert LongRangeEnergy().spline_order <= MAX_SPLINE_ORDER
 
-    @pytest.mark.parametrize("kwargs", [{"alpha": 0.0}, {"alpha": -1.0},
-                                        {"mesh_spacing": 0.0}])
+    @pytest.mark.parametrize(
+        "kwargs", [{"alpha": 0.0}, {"alpha": -1.0}, {"mesh_spacing": 0.0}]
+    )
     def test_rejects_nonsense_parameters(self, kwargs):
         with pytest.raises(ValueError):
             LongRangeEnergy(**kwargs)
@@ -351,9 +396,7 @@ class TestBatching:
         term = LongRangeEnergy(alpha=0.5, mesh_dimensions=(32, 32, 32))
         coord, charge, cell = nacl(reps=2, a=2.0)
         n = 3
-        energy = term(
-            coord.repeat(n, 1, 1), charge.repeat(n, 1), cell.repeat(n, 1, 1)
-        )
+        energy = term(coord.repeat(n, 1, 1), charge.repeat(n, 1), cell.repeat(n, 1, 1))
         totals = energy.sum(dim=(1, 2))
         assert torch.allclose(totals, totals[0].expand(n), atol=1e-9)
 
@@ -478,8 +521,6 @@ class TestMeshChoice:
 
 class TestSerialization:
     def test_round_trip(self):
-        term = LongRangeEnergy(
-            alpha=0.35, mesh_dimensions=(20, 20, 20), spline_order=5
-        )
+        term = LongRangeEnergy(alpha=0.35, mesh_dimensions=(20, 20, 20), spline_order=5)
         restored = LongRangeEnergy.deserialize(term.serialize())
         assert restored.serialize() == term.serialize()

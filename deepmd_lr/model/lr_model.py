@@ -209,10 +209,21 @@ class LongRangeEnergyModel(EnergyModel):
         descriptor = self.atomic_model.descriptor
         graph = build_neighbor_graph(coord, atype, box, descriptor.get_rcut())
         atype_flat = atype.reshape(-1)
+        # The charge head must see the SAME frame conditioning as the energy
+        # head, or the two descriptor passes disagree about what system they
+        # are describing. Gated on the descriptor's own capability, exactly as
+        # `DPAtomicModel.forward_atomic_graph` gates it -- only the DPA4
+        # family accepts the keyword, and `dp_lr` allows any descriptor.
+        charge_spin_kwargs = (
+            {"charge_spin": charge_spin}
+            if self.atomic_model.supports_charge_spin
+            else {}
+        )
         gg, rot_mat = descriptor.call_graph(
             graph,
             atype_flat,
             type_embedding=descriptor.graph_type_embedding_table(),
+            **charge_spin_kwargs,
         )
         raw = self.charge_fitting.call_graph(gg, atype_flat, gr=rot_mat)["charge"]
         raw = raw.reshape(coord.shape[0], coord.shape[1])

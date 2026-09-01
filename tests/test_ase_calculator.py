@@ -31,8 +31,10 @@ def water_atoms(seed: int = 0, n_mol: int = 4, box: float = 10.0) -> Atoms:
         positions += [o, o + [0.96, 0.0, 0.0], o + [-0.24, 0.93, 0.0]]
         symbols += ["O", "H", "H"]
     return Atoms(
-        symbols=symbols, positions=np.array(positions),
-        cell=np.eye(3) * box, pbc=True,
+        symbols=symbols,
+        positions=np.array(positions),
+        cell=np.eye(3) * box,
+        pbc=True,
     )
 
 
@@ -50,9 +52,9 @@ class TestCalculatorMatchesTheModel:
         cell = torch.tensor(
             np.asarray(atoms.get_cell()), dtype=torch.float64, device=DEVICE
         ).unsqueeze(0)
-        atype = torch.tensor(
-            [0, 1, 1] * 4, dtype=torch.int64, device=DEVICE
-        ).unsqueeze(0)
+        atype = torch.tensor([0, 1, 1] * 4, dtype=torch.int64, device=DEVICE).unsqueeze(
+            0
+        )
         direct = model(coord, atype, box=cell)
 
         assert atoms.get_potential_energy() == pytest.approx(
@@ -82,6 +84,12 @@ class TestCalculatorMatchesTheModel:
         charges = atoms.calc.results["charges"]
         assert charges.shape == (len(atoms),)
         assert abs(charges.sum()) < 1e-9
+
+    def test_passes_a_fixed_charge_state(self):
+        atoms = water_atoms()
+        atoms.calc = LongRangeCalculator(build(), charge_spin=(1.0, 1.0))
+        atoms.get_potential_energy()
+        assert atoms.calc.results["charges"].sum() == pytest.approx(1.0, abs=1e-9)
 
     def test_stress_shape_and_symmetry(self):
         atoms = water_atoms()

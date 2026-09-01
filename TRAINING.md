@@ -232,7 +232,7 @@ Warm up the short-range model first, then switch the long-range term on.
 | stage | steps | LR | what trains |
 |-------|------:|----|-------------|
 | 1. warm-up | 10–20% of budget | 1e-3 → 1e-4 | descriptor + energy head (no `long_range` block) |
-| 2. graft   | — | — | copy weights across, zero the charge head |
+| 2. graft   | — | — | copy weights across, scale down the charge head |
 | 3. joint   | remainder | 5e-4 → 1e-5 | everything |
 
 Stage 2 needs a helper, because `dp train --init-model` loads the state dict
@@ -252,13 +252,33 @@ python scripts/graft_short_range.py \
 dp --pt-expt train input_joint.json --init-model init_joint.ckpt
 ```
 
-The script zeroes the charge head's output layer by default, which matters
-more than it sounds: **a freshly initialized charge head predicts random
-charges and injects a large spurious long-range energy**, undoing the warm
-start. Measured on the water set — warm-up ended at 0.173 eV/Å; grafting
-without zeroing restarted at **0.789**, grafting with zeroing continued at
-0.160. Zeroed, the grafted model is identical to the warm-up model at step 0
-and the long-range term grows from nothing.
+The script scales the charge head's output layer by 0.01 by default, and the
+scale has to be *small but not zero*. Both failure modes are real:
+
+- **Too large** (a freshly initialized head) predicts random charges and
+  injects a large spurious long-range energy, undoing the warm start. Measured
+  on the water set: the warm-up ended at 0.176 eV/Å and grafting an unscaled
+  head restarted training at **0.789**.
+- **Exactly zero** looks safe and is worse, because it fails silently. The
+  electrostatic energy is quadratic in charge, so at `q = 0` the gradient
+  `dE/dq` is exactly zero — and with it every gradient reaching the charge
+  head. Measured: a zeroed head gives `sum|grad| = 0.000e+00`. The head is
+  frozen at zero permanently, the long-range term never turns on, and training
+  looks perfectly healthy because the short-range model simply carries on
+  alone.
+
+At the default 0.01 the graft is continuous and the head is alive. Measured on
+the water set:
+
+| | long-range energy | max abs charge | training force RMSE |
+|---|---:|---:|---:|
+| warm-up ended | — | — | 0.176 eV/Å |
+| grafted init  | 0.0002 eV | 4.1e-03 | 0.168 eV/Å |
+| after stage 3 | 0.0492 eV | 8.7e-02 | 0.175 eV/Å |
+
+The long-range term starts negligible, preserving the warm start, then grows
+by ~20× as the head learns. Use `--charge-init-scale` to tune it; the script
+rejects zero.
 
 ---
 

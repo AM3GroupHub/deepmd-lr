@@ -352,9 +352,12 @@ class LongRangeEnergy(torch.nn.Module):
             alpha = torch.full(
                 (nf,), self.alpha, dtype=coord.dtype, device=coord.device
             )
-            k_vectors = generate_k_vectors_ewald_summation(
-                cell.detach(), self.k_cutoff
-            )
+            # Keep the reciprocal vectors connected to the strained cell.
+            # Treating them as fixed Cartesian metadata gives correct energies
+            # and position forces but an unphysical cell derivative/virial.
+            # The integer Miller bounds are still discrete setup metadata; the
+            # returned Cartesian vectors themselves must deform with the cell.
+            k_vectors = generate_k_vectors_ewald_summation(cell, self.k_cutoff)
             energy = ewald_reciprocal_space(
                 positions,
                 charges,

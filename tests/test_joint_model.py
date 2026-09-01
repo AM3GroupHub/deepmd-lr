@@ -77,8 +77,9 @@ def frame(n_mol: int = 4, box: float = 10.0, seed: int = 0):
         coords.append(o + np.array([0.96, 0.0, 0.0]))
         coords.append(o + np.array([-0.24, 0.93, 0.0]))
     coord = torch.tensor(np.array(coords), dtype=DT, device=DEVICE).unsqueeze(0)
-    atype = torch.tensor([0, 1, 1] * n_mol, dtype=torch.int64,
-                         device=DEVICE).unsqueeze(0)
+    atype = torch.tensor([0, 1, 1] * n_mol, dtype=torch.int64, device=DEVICE).unsqueeze(
+        0
+    )
     cell = (torch.eye(3, dtype=DT, device=DEVICE) * box).unsqueeze(0)
     return coord, atype, cell
 
@@ -105,8 +106,11 @@ class TestComposition:
         joint = build(long_range=True)
         pure = build(long_range=False)
         pure.load_state_dict(
-            {k: v for k, v in joint.state_dict().items()
-             if not k.startswith(("charge_fitting.", "pme."))},
+            {
+                k: v
+                for k, v in joint.state_dict().items()
+                if not k.startswith(("charge_fitting.", "pme."))
+            },
             strict=False,
         )
         coord, atype, cell = frame()
@@ -128,6 +132,25 @@ class TestComposition:
         charge = model(coord, atype, box=cell)["charge"]
         assert abs(float(charge.sum())) < 1e-10
 
+    def test_charge_state_conditions_the_charge_head_descriptor(self):
+        """A required charge/spin condition must reach both descriptor passes."""
+        cfg = {
+            "type": "dp_lr",
+            "type_map": ["O", "H"],
+            "descriptor": copy.deepcopy(DESCRIPTOR),
+            "fitting_net": copy.deepcopy(FITTING),
+            "long_range": copy.deepcopy(LONG_RANGE),
+        }
+        cfg["descriptor"]["add_chg_spin_ebd"] = True
+        model = get_model(cfg).eval()
+        coord, atype, cell = frame()
+        neutral = torch.tensor([[0.0, 1.0]], dtype=DT, device=DEVICE)
+        different_spin = torch.tensor([[0.0, 3.0]], dtype=DT, device=DEVICE)
+        q_neutral = model(coord, atype, box=cell, charge_spin=neutral)["charge"]
+        q_spin = model(coord, atype, box=cell, charge_spin=different_spin)["charge"]
+        assert torch.allclose(q_neutral.sum(-1), neutral[:, 0], atol=1e-10)
+        assert torch.allclose(q_spin.sum(-1), different_spin[:, 0], atol=1e-10)
+
 
 class TestCallingConventions:
     """The trainer and eager callers pass different shapes for the same data.
@@ -145,9 +168,7 @@ class TestCallingConventions:
         nf, nloc = atype.shape
 
         rect = model(coord, atype, box=cell)
-        flat = model(
-            coord.reshape(nf, nloc * 3), atype, box=cell.reshape(nf, 9)
-        )
+        flat = model(coord.reshape(nf, nloc * 3), atype, box=cell.reshape(nf, 9))
         for key in ("energy", "energy_long_range", "charge"):
             assert torch.allclose(rect[key], flat[key], atol=1e-10), key
 
@@ -156,9 +177,9 @@ class TestCallingConventions:
         coord, atype, cell = frame()
         nf, nloc = atype.shape
         rect = model(coord, atype, box=cell)["force"]
-        flat = model(
-            coord.reshape(nf, nloc * 3), atype, box=cell.reshape(nf, 9)
-        )["force"]
+        flat = model(coord.reshape(nf, nloc * 3), atype, box=cell.reshape(nf, 9))[
+            "force"
+        ]
         assert rect.shape == flat.shape == (nf, nloc, 3)
         assert torch.allclose(rect, flat, atol=1e-10)
 
@@ -208,9 +229,7 @@ class TestConservation:
                 energies = []
                 for sign in (1.0, -1.0):
                     strain = eye + sign * delta
-                    e = model(
-                        coord @ strain.T, atype, box=cell @ strain.T
-                    )["energy"]
+                    e = model(coord @ strain.T, atype, box=cell @ strain.T)["energy"]
                     energies.append(float(e))
                 numeric[i, j] = -(energies[0] - energies[1]) / (2 * h)
 
@@ -233,9 +252,7 @@ class TestTraining:
         model.train()
         coord, atype, cell = frame()
         model(coord, atype, box=cell)["energy"].sum().backward()
-        grads = [
-            p.grad for p in model.charge_fitting.parameters() if p.requires_grad
-        ]
+        grads = [p.grad for p in model.charge_fitting.parameters() if p.requires_grad]
         assert grads and any(
             g is not None and torch.isfinite(g).all() and g.abs().sum() > 0
             for g in grads
@@ -249,9 +266,7 @@ class TestTraining:
         coord, atype, cell = frame()
         out = model(coord, atype, box=cell)
         (out["force"] ** 2).sum().backward()
-        grads = [
-            p.grad for p in model.charge_fitting.parameters() if p.requires_grad
-        ]
+        grads = [p.grad for p in model.charge_fitting.parameters() if p.requires_grad]
         assert grads and any(
             g is not None and torch.isfinite(g).all() and g.abs().sum() > 0
             for g in grads

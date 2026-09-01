@@ -454,10 +454,12 @@ data.
 > in `TRAINING.md`: how to choose `alpha` and the mesh, the joint and staged
 > schedules, and `scripts/graft_short_range.py`, which exists because
 > `dp train --init-model` loads state dicts strictly and so refuses a
-> checkpoint that predates the charge head. That script also zeroes the
+> checkpoint that predates the charge head. That script also scales down the
 > charge head's output layer, which turned out to matter: grafting with a
 > randomly initialized head threw the water force error from 0.173 back up
-> to 0.789 eV/A, while a zeroed head continued smoothly at 0.160.
+> to 0.789 eV/A. The helper now uses a small nonzero scale rather than exact
+> zero, because the quadratic electrostatic energy has zero gradient at
+> zero charge and an exactly zeroed head cannot begin learning.
 
 ### Phase 6 — MD deployment — **DONE**
 `deepmd_lr/ase.py` provides `LongRangeCalculator`, an ASE calculator that

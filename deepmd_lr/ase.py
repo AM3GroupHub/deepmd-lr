@@ -47,15 +47,16 @@ def load_model(checkpoint: str, device: str | torch.device = DEVICE) -> Any:
     params = state["model"]["_extra_state"]["model_params"]
     model = get_model(params)
     weights = {
-        key[len(_STATE_PREFIX):]: value
+        key[len(_STATE_PREFIX) :]: value
         for key, value in state["model"].items()
         if key.startswith(_STATE_PREFIX)
     }
     missing, unexpected = model.load_state_dict(weights, strict=False)
-    if unexpected:
+    if missing or unexpected:
         raise ValueError(
-            f"checkpoint has {len(unexpected)} tensors the model does not "
-            f"expect, e.g. {unexpected[:3]} -- is it from a different config?"
+            "checkpoint weights do not match the recorded model config: "
+            f"{len(missing)} missing (e.g. {missing[:3]}) and "
+            f"{len(unexpected)} unexpected (e.g. {unexpected[:3]})"
         )
     return model.to(device).eval()
 
@@ -70,6 +71,9 @@ class LongRangeCalculator(Calculator):
         constructed model.
     device
         Torch device; defaults to DeePMD-kit's own choice.
+    charge_spin
+        Optional fixed (total_charge, spin_multiplicity) condition for the
+        trajectory. Defaults to the model's neutral/default state.
 
     Examples
     --------
@@ -90,24 +94,36 @@ class LongRangeCalculator(Calculator):
         self,
         model: str | Any,
         device: str | torch.device = DEVICE,
+        charge_spin: tuple[float, float] | list[float] | torch.Tensor | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self.device = device
-        self.model = load_model(model, device) if isinstance(model, str) else model
+        self.model = (
+            load_model(model, device)
+            if isinstance(model, str)
+            else model.to(device).eval()
+        )
         self.type_map = list(self.model.get_type_map())
+        self.charge_spin = None
+        if charge_spin is not None:
+            condition = torch.as_tensor(
+                charge_spin, dtype=torch.float64, device=self.device
+            )
+            if condition.numel() != 2:
+                raise ValueError(
+                    "charge_spin must contain (total_charge, spin_multiplicity)"
+                )
+            self.charge_spin = condition.reshape(1, 2)
 
     def _atom_types(self, atoms: Any) -> torch.Tensor:
         """Map ASE chemical symbols onto the model's type indices."""
         try:
             indices = [self.type_map.index(s) for s in atoms.get_chemical_symbols()]
         except ValueError as exc:
-            unknown = sorted(
-                set(atoms.get_chemical_symbols()) - set(self.type_map)
-            )
+            unknown = sorted(set(atoms.get_chemical_symbols()) - set(self.type_map))
             raise ValueError(
-                f"element(s) {unknown} are not in the model's type_map "
-                f"{self.type_map}"
+                f"element(s) {unknown} are not in the model's type_map {self.type_map}"
             ) from exc
         return torch.tensor(indices, dtype=torch.int64, device=self.device)
 
@@ -128,7 +144,8 @@ class LongRangeCalculator(Calculator):
             )
 
         coord = torch.tensor(
-            np.asarray(atoms.get_positions()), dtype=torch.float64,
+            np.asarray(atoms.get_positions()),
+            dtype=torch.float64,
             device=self.device,
         ).unsqueeze(0)
         cell = torch.tensor(
@@ -136,14 +153,17 @@ class LongRangeCalculator(Calculator):
         ).unsqueeze(0)
         atype = self._atom_types(atoms).unsqueeze(0)
 
-        out = self.model(coord, atype, box=cell)
+        out = self.model(coord, atype, box=cell, charge_spin=self.charge_spin)
 
-        energy = float(out["energy"].reshape(-1)[0])
+        energy = float(out["energy"].reshape(-1)[0].detach())
         self.results["energy"] = energy
         self.results["free_energy"] = energy
         self.results["forces"] = (
-            out["forces"] if "forces" in out else out["force"]
-        )[0].detach().cpu().numpy()
+            (out["forces"] if "forces" in out else out["force"])[0]
+            .detach()
+            .cpu()
+            .numpy()
+        )
 
         if "virial" in out:
             virial = out["virial"].reshape(3, 3).detach().cpu().numpy()
@@ -151,7 +171,9 @@ class LongRangeCalculator(Calculator):
             stress = -virial / atoms.get_volume()
             self.results["stress"] = np.array(
                 [
-                    stress[0, 0], stress[1, 1], stress[2, 2],
+                    stress[0, 0],
+                    stress[1, 1],
+                    stress[2, 2],
                     0.5 * (stress[1, 2] + stress[2, 1]),
                     0.5 * (stress[0, 2] + stress[2, 0]),
                     0.5 * (stress[0, 1] + stress[1, 0]),
@@ -164,8 +186,6 @@ class LongRangeCalculator(Calculator):
             ("energy_long_range", "energy_long_range"),
         ):
             if key in out:
-                self.results[name] = float(out[key].reshape(-1)[0])
+                self.results[name] = float(out[key].reshape(-1)[0].detach())
         if "charge" in out:
-            self.results["charges"] = (
-                out["charge"].reshape(-1).detach().cpu().numpy()
-            )
+            self.results["charges"] = out["charge"].reshape(-1).detach().cpu().numpy()
