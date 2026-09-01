@@ -93,7 +93,6 @@ def sample_configuration(rng, n_ion_pairs, box, device):
 
 def build(n_frames, n_ion_pairs, box, seed, device, include_coulomb=True):
     rng = np.random.default_rng(seed)
-    n = 2 * n_ion_pairs
     # Type 0 = cation (+1), type 1 = anion (-1). The model is never told this.
     atype = np.array([0] * n_ion_pairs + [1] * n_ion_pairs, dtype=int)
     charge = torch.tensor(

@@ -21,7 +21,7 @@ environment setup.
 | 3 | Long-range term (`LongRangeEnergy`, reciprocal-only, eV) | **done** |
 | 4 | Joint model (`long_range` block, conservative forces) | **done** |
 | 5 | Training + validation (benchmark + control) | **done** |
-| 6 | MD via nvalchemi/ASE | not started |
+| 6 | MD deployment (ASE calculator, export guard) | **done** |
 
 ## Training
 
@@ -96,6 +96,17 @@ The sum is evaluated by particle-mesh Ewald by default. Set
 interpolation error, which makes it the way to check a PME mesh setting. It
 is much slower (114 ms vs 3 ms at 2048 atoms), so it is a validation tool
 rather than a production one.
+
+## Running MD
+
+```python
+from deepmd_lr.ase import LongRangeCalculator
+atoms.calc = LongRangeCalculator("run_joint/model.ckpt.pt")
+```
+
+`dp freeze` is **refused** for a model with a `long_range` block: the exported
+graph lower receives edge vectors and no cell, so the artifact would silently
+contain only the short-range energy. See TRAINING.md §9.
 
 ## Tests
 

@@ -459,45 +459,51 @@ data.
 > randomly initialized head threw the water force error from 0.173 back up
 > to 0.789 eV/A, while a zeroed head continued smoothly at 0.160.
 
-### Phase 6 — MD via nvalchemi/ASE
-Wire the trained model into the nvalchemi driver, following
-`examples/water/dpa4/nvalchemi/relax.py` and `doc/third-party/nvalchemi.md` in the deepmd-kit
-tree. Confirm energy conservation in NVE — this is the sharpest test that forces are the exact
-gradient of the energy, PME term included.
+### Phase 6 — MD deployment — **DONE**
+`deepmd_lr/ase.py` provides `LongRangeCalculator`, an ASE calculator that
+drives the model's full `forward` (energy, forces, stress, plus
+`energy_short_range` / `energy_long_range` / `charges` as diagnostics).
 
-## Verification
+> **`dp freeze` silently dropped the long-range term, and now refuses.** The
+> exported artifact is traced from `forward_lower_graph_exportable`, which
+> receives edge vectors and no cell — the same constraint that shaped the
+> Phase 4 design, reappearing at deployment. Freezing *succeeded* with no
+> warning and produced a model returning **−93.74 eV** where the eager model
+> gives **−55.12**, having dropped the entire 38.6 eV long-range
+> contribution. Anyone training a joint model and freezing it for MD would
+> have got a model that quietly lost the physics they added.
+>
+> `forward_lower_graph_exportable`, its `_with_comm` twin, and the dense
+> `forward_lower` now raise when a `long_range` block is configured, with an
+> error naming the supported route. A short-range-only model still exports
+> normally.
+>
+> The same reasoning rules out DeePMD-kit's own `deepmd.calculator.DP`: it
+> goes through `DeepPot`, which evaluates the lower interface.
 
-```bash
-# unit
-conda run -n dpmd pytest tests/ -v
+**Energy conservation.** NVE on the water model (192 atoms, 340 K) over the
+same 0.5 ps: drift is +10.7 meV/atom/ps at dt = 1.0 fs, −0.40 at 0.5 fs, and
+−0.005 at 0.25 fs. Drift vanishing with the timestep is the signature of a
+force that is the exact gradient of the reported energy; an inconsistent
+long-range force would leave a floor no timestep reduction removes.
 
-# physics: PME against analytic Madelung; gradcheck in float64
-conda run -n dpmd pytest tests/test_pme_physics.py -v
+**Not done: the nvalchemi MD driver.** `nvalchemi-toolkit` (the driver, as
+distinct from `-ops`) is not installed here, and its DeePMD-kit adapter
+(`deepmd.pt.nvalchemi.DPA4Wrapper`) targets the `pt` backend and the frozen
+graph path — the same path that cannot carry this term. Wiring it up means
+giving that wrapper a cell-aware route, which is a larger change than ASE
+needed. ASE covers the stated Phase 0 requirement.
 
-# plugin wiring: is the type registered from a stock deepmd?
-conda run -n dpmd python -c "
-from deepmd.pt_expt.model.model import BaseModel
-print('dp_lr' in BaseModel.get_plugins())"
+## Status
 
-# end-to-end
-conda run -n dpmd dp --pt-expt train examples/water_lr/input_joint.json
-conda run -n dpmd dp --pt-expt test -m model.ckpt.pt -s /path/to/validation
+Phases 0-6 complete. `TRAINING.md` is the practical guide; `experiments/RESULTS.md`
+has the benchmark. Remaining work, in rough priority order:
 
-# conservation
-conda run -n dpmd python examples/water_lr/nve_drift.py   # NVE energy drift over 10 ps
-```
-
-Gate for each phase: Phase 1 must match the standard model to within the GPU nondeterminism
-floor (see Phase 1 — the original "bit-for-bit" wording was wrong); Phase 4 must reduce to
-Phase 1 when charges are forced to zero. Both are cheap regression tests worth keeping.
-
-## Risks
-
-| Risk | Mitigation |
-|---|---|
-| ~~warp-lang cannot JIT for sm_121~~ | **Resolved.** warp 1.17.0 initialises on `sm_121` and its kernels give correct results. |
-| Coulomb prefactor / unit mismatch | Madelung check passed at 6.7e-7 in nvalchemi's native units (prefactor 1). The eV/Angstrom conversion for deepmd is still to be applied and tested in Phase 3. |
-| Joint training unstable from random charge init | Fall back to the staged scheme: fit charges first, then unfreeze. Design already supports it. |
-| Double-counting: DPA4C absorbs short-range Coulomb | Expected and acceptable — PME real-space is screened within `rcut`. Watch for charge drift toward unphysical magnitudes; regularize charges if so. |
-| deepmd-kit 3.2.0 lags master | The plugin hooks are all present in 3.2.0 (verified by import). Pin 3.2.0; revisit only if a needed DPA4C fix is master-only. |
-| Silent-wrong-answer APIs in nvalchemi | `spline_order>=7` proved that wrong values can come back with no error raised. Every PME parameter change must be re-validated against the Madelung test, which is why that test belongs in the committed suite. |
+1. **Non-periodic systems.** Every dataset on this machine is a molecular
+   cluster, and Ewald needs periodicity. A `coulomb` or `dsf` sibling to
+   `LongRangeEnergy` would cover them; everything above the energy term is
+   engine-agnostic.
+2. **Single descriptor pass.** The joint model currently runs the descriptor
+   twice (~3x per training step). See Phase 4 for the route and the obstacle.
+3. **LAMMPS.** Out of scope by the Phase 0 decision, and blocked by the same
+   missing-cell constraint as `dp freeze`.

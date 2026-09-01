@@ -352,6 +352,51 @@ class LongRangeEnergyModel(EnergyModel):
         out["energy_short_range"] = short_range["energy"]
         return out
 
+    def _refuse_export(self, what: str) -> None:
+        """Block the graph-lower export path when a long-range term is set.
+
+        The exported artifact is traced from ``forward_lower_graph*``, which
+        takes ``edge_vec`` and no cell -- so it cannot see the long-range
+        term at all. Left alone, ``dp freeze`` succeeds and produces a model
+        that silently returns only the short-range energy: measured on the
+        Phase 5 benchmark, the frozen artifact came back at -93.74 eV against
+        the eager model's -55.12, having dropped the entire 38.6 eV
+        long-range contribution without a word.
+
+        A loud failure is the only safe behaviour. Use the ASE calculator in
+        ``deepmd_lr.ase`` for MD, which drives the eager model through
+        ``forward`` and therefore has the cell.
+        """
+        raise NotImplementedError(
+            f"{what} is not supported for a 'dp_lr' model with a long_range "
+            "block. The exported graph lower receives edge vectors and no "
+            "cell, so it cannot evaluate the reciprocal-space term, and the "
+            "artifact would silently contain only the short-range energy. "
+            "For MD use deepmd_lr.ase.LongRangeCalculator, which drives the "
+            "model through its full forward. Freezing the short-range model "
+            "alone (omit `long_range`) still works."
+        )
+
+    def forward_lower_graph_exportable(self, *args: Any, **kwargs: Any) -> Any:
+        """Refuse to export a model whose long-range term cannot be traced."""
+        if self.has_long_range:
+            self._refuse_export("Graph-lower export (`dp freeze`)")
+        return super().forward_lower_graph_exportable(*args, **kwargs)
+
+    def forward_lower_graph_exportable_with_comm(
+        self, *args: Any, **kwargs: Any
+    ) -> Any:
+        """Refuse the multi-rank export twin for the same reason."""
+        if self.has_long_range:
+            self._refuse_export("Graph-lower export (`dp freeze`)")
+        return super().forward_lower_graph_exportable_with_comm(*args, **kwargs)
+
+    def forward_lower(self, *args: Any, **kwargs: Any) -> Any:
+        """Refuse the dense lower path, which also carries no cell."""
+        if self.has_long_range:
+            self._refuse_export("The lower (neighbour-list) interface")
+        return super().forward_lower(*args, **kwargs)
+
     def serialize(self) -> dict[str, Any]:
         """Serialize, stamping our own type so the round-trip returns this class.
 
