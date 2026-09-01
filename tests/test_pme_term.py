@@ -13,6 +13,7 @@ nvalchemi subtracts it, so the wrapper adds it back).
 """
 
 import itertools
+import math
 
 import numpy as np
 import pytest
@@ -63,6 +64,13 @@ def random_neutral(n: int = 16, box: float = 12.0, seed: int = 0):
     return coord, charge, cell
 
 
+def _method_kwargs(method: str) -> dict:
+    """Backend-specific settings that make the two methods comparable."""
+    if method == "pme":
+        return {"method": "pme", "mesh_dimensions": FINE_MESH}
+    return {"method": "ewald"}
+
+
 def deepmd_reference(coord, charge, cell, alpha):
     """DeePMD-kit's own DPLR reciprocal energy, in eV, for one frame."""
     grids = compute_ewald_grids(cell.detach().cpu().numpy(), 0.4)
@@ -78,9 +86,10 @@ class TestMatchesDeepmdConvention:
     """
 
     @pytest.mark.parametrize("alpha", [0.3, 0.4, 0.6])
-    def test_matches_dplr_reciprocal_energy(self, alpha):
+    @pytest.mark.parametrize("method", ["pme", "ewald"])
+    def test_matches_dplr_reciprocal_energy(self, alpha, method):
         coord, charge, cell = random_neutral()
-        term = LongRangeEnergy(alpha=alpha, mesh_dimensions=FINE_MESH)
+        term = LongRangeEnergy(alpha=alpha, **_method_kwargs(method))
         ours = float(term(coord, charge, cell).sum())
         reference = deepmd_reference(coord, charge, cell, alpha)
         assert abs(ours - reference) < 1e-5 * abs(reference)
@@ -152,6 +161,90 @@ class TestMatchesDeepmdConvention:
         coord, charge, cell = nacl(reps=2, a=2.0)  # L = 4 A
         term = LongRangeEnergy(alpha=0.5, mesh_dimensions=(32, 32, 32))
         assert torch.isfinite(term(coord, charge, cell)).all()
+
+
+class TestMethodChoice:
+    """`pme` and `ewald` evaluate the same sum by different routes."""
+
+    @pytest.mark.parametrize("alpha", [0.3, 0.5])
+    def test_the_two_methods_agree(self, alpha):
+        """The explicit sum is what makes a mesh setting checkable.
+
+        Ewald has no interpolation error at all, so a disagreement here is a
+        statement about the PME mesh, not about the physics.
+        """
+        coord, charge, cell = random_neutral()
+        pme = float(LongRangeEnergy(alpha=alpha, mesh_dimensions=FINE_MESH)(
+            coord, charge, cell).sum())
+        ewald = float(LongRangeEnergy(alpha=alpha, method="ewald")(
+            coord, charge, cell).sum())
+        assert abs(pme - ewald) < 1e-5 * abs(ewald)
+
+    def test_ewald_is_the_more_accurate_of_the_two(self):
+        """On a coarse mesh, PME drifts and Ewald does not.
+
+        Confirms the explicit sum really is mesh-independent, which is the
+        only reason to reach for it.
+        """
+        coord, charge, cell = random_neutral()
+        reference = deepmd_reference(coord, charge, cell, 0.4)
+        coarse = float(LongRangeEnergy(alpha=0.4, mesh_dimensions=(8, 8, 8))(
+            coord, charge, cell).sum())
+        ewald = float(LongRangeEnergy(alpha=0.4, method="ewald")(
+            coord, charge, cell).sum())
+        assert abs(ewald - reference) < abs(coarse - reference)
+
+    def test_k_cutoff_is_derived_from_alpha(self):
+        """2 alpha sqrt(-ln(accuracy)), the standard reciprocal cutoff."""
+        term = LongRangeEnergy(alpha=0.4, method="ewald")
+        expected = 2.0 * 0.4 * math.sqrt(-math.log(1e-6))
+        assert term.k_cutoff == pytest.approx(expected)
+
+    def test_rejects_unknown_method(self):
+        with pytest.raises(ValueError, match="method must be one of"):
+            LongRangeEnergy(method="fmm")
+
+    @pytest.mark.parametrize(
+        "kwargs", [{"mesh_dimensions": (8, 8, 8)}, {"mesh_spacing": 1.0},
+                   {"spline_order": 4}]
+    )
+    def test_rejects_pme_parameters_under_ewald(self, kwargs):
+        """A mesh setting silently ignored under `ewald` would be
+        indistinguishable from one that was applied."""
+        with pytest.raises(ValueError, match="only apply to method='pme'"):
+            LongRangeEnergy(method="ewald", **kwargs)
+
+    @pytest.mark.parametrize("kwargs", [{"k_cutoff": 3.0}, {"accuracy": 1e-8}])
+    def test_rejects_ewald_parameters_under_pme(self, kwargs):
+        with pytest.raises(ValueError, match="only apply to method='ewald'"):
+            LongRangeEnergy(method="pme", **kwargs)
+
+    def test_ewald_carries_gradients(self):
+        """The alternative backend has to be trainable too, not just correct."""
+        coord, charge, cell = nacl(reps=2, a=2.0)
+        term = LongRangeEnergy(alpha=0.5, method="ewald")
+        c = coord.clone().requires_grad_(True)
+        q = charge.clone().requires_grad_(True)
+        energy = term(c, q, cell).sum()
+        force = -torch.autograd.grad(energy, c, create_graph=True)[0]
+        grad_q = torch.autograd.grad((force**2).sum(), q)[0]
+        assert torch.isfinite(force).all() and torch.isfinite(grad_q).all()
+        assert float(grad_q.abs().sum()) > 0.0
+
+    def test_ewald_batches_correctly(self):
+        term = LongRangeEnergy(alpha=0.5, method="ewald")
+        coord, charge, cell = nacl(reps=2, a=2.0)
+        n = 3
+        totals = term(
+            coord.repeat(n, 1, 1), charge.repeat(n, 1), cell.repeat(n, 1, 1)
+        ).sum(dim=(1, 2))
+        assert torch.allclose(totals, totals[0].expand(n), atol=1e-9)
+
+    def test_ewald_round_trips(self):
+        term = LongRangeEnergy(alpha=0.35, method="ewald", k_cutoff=3.0)
+        restored = LongRangeEnergy.deserialize(term.serialize())
+        assert restored.serialize() == term.serialize()
+        assert restored.method == "ewald"
 
 
 class TestBoundaryConditions:

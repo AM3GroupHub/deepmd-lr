@@ -34,7 +34,47 @@ correspondingly small return.
 
 ---
 
-## 1. Choosing `alpha` and the mesh
+## 1. Choosing the method: `pme` or `ewald`
+
+Both compute the *same* reciprocal sum, by different routes.
+
+| | `pme` (default) | `ewald` |
+|---|---|---|
+| how | charges onto a mesh, then an FFT | explicit sum over k-vectors |
+| scaling | `O(N log N)` | `O(N · K)`, and `K` grows with cell volume |
+| error | mesh interpolation, ~1e-6 at a sane mesh | none — exact for its `k_cutoff` |
+| knobs | `mesh_dimensions` / `mesh_spacing`, `spline_order` | `k_cutoff` (or `accuracy`) |
+
+Measured on this machine (energy + backward, alpha 0.4, 1.25 Å mesh):
+
+| atoms | cell | `pme` | `ewald` | k-vectors |
+|------:|-----:|------:|--------:|----------:|
+|    32 | 14 Å | 2.9 ms |  3.3 ms |     1,687 |
+|   128 | 22 Å | 2.8 ms |  5.0 ms |     6,083 |
+|   512 | 35 Å | 2.7 ms | 25.5 ms |    21,437 |
+|  2048 | 56 Å | 2.9 ms | 113.6 ms |   83,187 |
+
+**Use `pme` for training.** It is faster at every size tested — including the
+smallest, so there is no small-system crossover to exploit — and the gap grows
+to 40× by 2048 atoms.
+
+**Use `ewald` to check a `pme` setting.** Because it has no interpolation
+error, disagreement between the two is a statement about your mesh, not about
+the physics. A cheap sanity check before a long run:
+
+```python
+from deepmd_lr.pme import LongRangeEnergy
+pme   = LongRangeEnergy(alpha=0.4, mesh_dimensions=[16, 16, 16])
+ewald = LongRangeEnergy(alpha=0.4, method="ewald")
+a, b = pme(coord, q, box).sum(), ewald(coord, q, box).sum()
+print(abs(a - b) / abs(b))       # want <= 1e-4; if not, refine the mesh
+```
+
+Set it in the input file with `"method": "ewald"`. Parameters belonging to
+the other method are **rejected**, not ignored — a mesh setting silently
+dropped under `ewald` would be indistinguishable from one that was applied.
+
+## 2. Choosing `alpha` and the mesh
 
 `alpha` is **not** a free parameter here. This term supplies only the
 reciprocal half of the Ewald split, so `alpha` decides the division of labour:
@@ -94,7 +134,7 @@ the strain derivative.
 
 ---
 
-## 2. The input file
+## 3. The input file
 
 Annotated; the `_comment` keys are ignored by DeePMD-kit.
 
@@ -130,7 +170,8 @@ Annotated; the `_comment` keys are ignored by DeePMD-kit.
       },
 
       "pme": {
-        "_comment": "alpha 0.4 pairs with rcut 6.0 (erfc(2.4) = 7e-4).",
+        "_comment": "method defaults to 'pme'; set 'ewald' for the exact k-sum (see section 1).",
+        "_comment_alpha": "alpha 0.4 pairs with rcut 6.0 (erfc(2.4) = 7e-4).",
         "alpha": 0.4,
         "_comment_mesh": "Fixed mesh, ~1.25 A spacing for a 20 A cell.",
         "mesh_dimensions": [16, 16, 16],
@@ -170,7 +211,7 @@ dp --pt-expt train input_baseline.json     # same settings, no long_range
 
 ---
 
-## 3. The training schedule
+## 4. The training schedule
 
 ### Plan A — joint from scratch (default)
 
@@ -182,7 +223,7 @@ settling near ±1 within a few thousand steps.
 |-------|------:|----|-------------|
 | joint | full budget | 1e-3 → 1e-5 (exp decay) | descriptor, energy head, charge head |
 
-Use it unless you hit one of the symptoms in §6.
+Use it unless you hit one of the symptoms in §7.
 
 ### Plan B — staged (fallback when Plan A is unstable)
 
@@ -221,7 +262,7 @@ and the long-range term grows from nothing.
 
 ---
 
-## 4. What to watch
+## 5. What to watch
 
 The model returns three diagnostics beyond the usual outputs:
 
@@ -241,7 +282,7 @@ out["charge"]               # per-atom, after the total-charge projection
 
 ---
 
-## 5. Validating a trained model
+## 6. Validating a trained model
 
 **Against the baseline.** The only claim that matters. Compare held-out
 energy and force RMSE against the identically configured run without
@@ -262,21 +303,23 @@ drift.
 
 ---
 
-## 6. Troubleshooting
+## 7. Troubleshooting
 
 | symptom | likely cause | fix |
 |---------|--------------|-----|
 | No improvement over baseline | little signal beyond the cutoff | run the headroom check; if it is ~1%, the term cannot help |
-| No improvement, but headroom is large | `alpha` too small, so the network is still being handed a long tail | raise `alpha` per §1 |
+| No improvement, but headroom is large | `alpha` too small, so the network is still being handed a long tail | raise `alpha` per §2 |
 | Loss spikes when long-range switches on | charge head initialized random | use `graft_short_range.py` without `--keep-charge-init` |
 | Charges grow without bound | short-range and long-range trading off against each other | raise the force weight, or add a charge regularizer |
 | Virial wrong by a few % | mesh jumping with the cell | use `mesh_dimensions`, not `mesh_spacing` |
 | `TypeError: unexpected long-range parameters: ['rcut']` | stale config | `rcut` was removed; only the reciprocal half is computed, so there is no real-space cutoff |
+| `ValueError: ... only apply to method='pme'` | mesh knob set with `method: ewald` | use `k_cutoff`, or drop `method` to stay on PME |
+| `pme` and `ewald` disagree by more than ~1e-4 | mesh too coarse for this `alpha` | refine the mesh per §2, or lower `alpha` |
 | Energies fine, forces bad | `alpha`/mesh mismatch | check the mesh resolves `1/(2·alpha)` |
 
 ---
 
-## 7. Cost
+## 8. Cost
 
 The joint model runs the descriptor twice — the short-range path consumes and
 discards its own descriptor output, and the charge head needs it again.

@@ -162,6 +162,17 @@ def _long_range_args() -> Argument:
         dict,
         [
             Argument(
+                "method",
+                str,
+                optional=True,
+                default="pme",
+                doc="How to evaluate the reciprocal sum: 'pme' (mesh + FFT, "
+                "O(N log N)) or 'ewald' (explicit k-vector sum, exact but "
+                "much slower -- 114 ms vs 3 ms at 2048 atoms). Both compute "
+                "the same quantity; use 'ewald' to check a 'pme' setting, "
+                "not for production.",
+            ),
+            Argument(
                 "alpha",
                 float,
                 optional=True,
@@ -180,38 +191,56 @@ def _long_range_args() -> Argument:
                 [float, None],
                 optional=True,
                 default=None,
-                doc="Reciprocal-mesh spacing in angstrom; the mesh is "
-                "ceil(L / spacing), a step function of the cell, so prefer "
-                "`mesh_dimensions` if the cell can change. Defaults to 1.0 "
-                "when no mesh is given.",
+                doc="method='pme' only. Reciprocal-mesh spacing in angstrom; "
+                "the mesh is ceil(L / spacing), a step function of the cell, "
+                "so prefer `mesh_dimensions` if the cell can change. Defaults "
+                "to 1.0 when no mesh is given.",
             ),
             Argument(
                 "mesh_dimensions",
                 [list[int], None],
                 optional=True,
                 default=None,
-                doc="Fixed reciprocal-mesh dimensions [nx, ny, nz], "
-                "overriding `mesh_spacing`. Prefer this under NPT: a "
-                "spacing-derived mesh jumps a whole grid point when a cell "
-                "length crosses a multiple of the spacing, making the energy "
-                "discontinuous there.",
+                doc="method='pme' only. Fixed reciprocal-mesh dimensions "
+                "[nx, ny, nz], overriding `mesh_spacing`. Prefer this under "
+                "NPT: a spacing-derived mesh jumps a whole grid point when a "
+                "cell length crosses a multiple of the spacing, making the "
+                "energy discontinuous there.",
             ),
             Argument(
                 "spline_order",
                 int,
                 optional=True,
                 default=6,
-                doc="B-spline interpolation order. Must be between 3 and 6: "
-                "at 7 and above the underlying library silently drops the "
-                "reciprocal-space sum.",
+                doc="method='pme' only. B-spline interpolation order, between "
+                "3 and 6: at 7 and above the underlying library silently "
+                "drops the reciprocal-space sum.",
+            ),
+            Argument(
+                "k_cutoff",
+                [float, None],
+                optional=True,
+                default=None,
+                doc="method='ewald' only. Largest |k| included, in inverse "
+                "angstrom. null derives it from `alpha` and `accuracy` as "
+                "2 alpha sqrt(-ln(accuracy)).",
+            ),
+            Argument(
+                "accuracy",
+                float,
+                optional=True,
+                default=1e-6,
+                doc="method='ewald' only. Target accuracy used to derive "
+                "`k_cutoff` when it is not given.",
             ),
         ],
         optional=True,
         default={},
-        doc="Reciprocal-space (long-range) electrostatics, evaluated by "
-        "particle-mesh Ewald. Only the long-range half of the Ewald "
-        "decomposition is computed here; the screened real-space half is "
-        "already inside the descriptor cutoff and is left to the network.",
+        doc="Reciprocal-space (long-range) electrostatics. Only the "
+        "long-range half of the Ewald decomposition is computed here; the "
+        "screened real-space half is already inside the descriptor cutoff "
+        "and is left to the network. Parameters belonging to the other "
+        "`method` are rejected rather than ignored.",
     )
     return Argument(
         LONG_RANGE_KEY,

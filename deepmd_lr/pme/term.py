@@ -29,6 +29,16 @@ land on DeePMD-kit's convention.
 Because there is no real-space part, this module needs **no neighbour list**:
 no cutoff, no capacity to size, no ``rcut < L/2`` constraint.
 
+Two ways to evaluate the same sum
+---------------------------------
+``method="pme"`` interpolates the charges onto a mesh and uses an FFT --
+``O(N log N)``, the right choice once systems get large. ``method="ewald"``
+sums the k-vectors explicitly -- ``O(N * K)``, with no interpolation error at
+all. They compute the *same quantity* and agree to the accuracy of whichever
+is coarser, so the explicit sum makes a good reference for checking a PME
+setting, and is often the faster of the two for small cells where the FFT
+overhead dominates.
+
 Choosing alpha
 --------------
 In a full Ewald sum ``alpha`` is arbitrary -- the total does not depend on it.
@@ -51,6 +61,12 @@ import torch
 from deepmd.dpmodel.modifier.dipole_charge import (
     ELECTROSTATIC_CONVERSION,
 )
+from nvalchemiops.torch.interactions.electrostatics.ewald import (
+    ewald_reciprocal_space,
+)
+from nvalchemiops.torch.interactions.electrostatics.k_vectors import (
+    generate_k_vectors_ewald_summation,
+)
 from nvalchemiops.torch.interactions.electrostatics.pme import (
     pme_reciprocal_space,
 )
@@ -72,6 +88,15 @@ DEFAULT_SPLINE_ORDER = 6
 #: default (``ewald_beta``) and leaves erfc(alpha * 6 A) = 7e-4 for a 6 A
 #: descriptor cutoff.
 DEFAULT_ALPHA = 0.4
+
+#: Supported ways of evaluating the reciprocal sum.
+METHODS = ("pme", "ewald")
+
+#: Parameters that only mean something for one method. Passing one to the
+#: other method raises, rather than being silently ignored -- a setting that
+#: looks applied but is not is the worst kind of configuration bug.
+_PME_ONLY = ("mesh_spacing", "mesh_dimensions", "spline_order")
+_EWALD_ONLY = ("k_cutoff", "accuracy")
 
 
 class LongRangeEnergy(torch.nn.Module):
@@ -100,9 +125,12 @@ class LongRangeEnergy(torch.nn.Module):
     def __init__(
         self,
         alpha: float = DEFAULT_ALPHA,
+        method: str = "pme",
         mesh_spacing: float | None = None,
         mesh_dimensions: tuple[int, int, int] | list[int] | None = None,
         spline_order: int = DEFAULT_SPLINE_ORDER,
+        k_cutoff: float | None = None,
+        accuracy: float = 1e-6,
         **kwargs: Any,
     ) -> None:
         super().__init__()
@@ -113,59 +141,125 @@ class LongRangeEnergy(torch.nn.Module):
         if kwargs:
             raise TypeError(
                 f"unexpected long-range parameters: {sorted(kwargs)}. "
-                "Supported: alpha, mesh_spacing, mesh_dimensions, "
-                "spline_order. Note `rcut` was removed: this term computes "
-                "only the reciprocal-space half of the Ewald sum, which "
-                "needs no real-space cutoff."
+                f"Supported: alpha, method, {', '.join(_PME_ONLY)}, "
+                f"{', '.join(_EWALD_ONLY)}. Note `rcut` was removed: this "
+                "term computes only the reciprocal-space half of the Ewald "
+                "sum, which needs no real-space cutoff."
             )
-        if spline_order > MAX_SPLINE_ORDER:
+        if method not in METHODS:
             raise ValueError(
-                f"spline_order={spline_order} exceeds the maximum order "
-                f"nvalchemi computes correctly ({MAX_SPLINE_ORDER}). At order "
-                ">= 7 the reciprocal-space sum is silently dropped and only "
-                "the self-energy is returned, with no error raised."
+                f"method must be one of {METHODS}, got {method!r}"
             )
-        if spline_order < 3:
-            raise ValueError(f"spline_order must be at least 3, got {spline_order}")
         if alpha is None or alpha <= 0:
             raise ValueError(f"alpha must be positive, got {alpha}")
-        if mesh_dimensions is not None:
-            mesh_dimensions = tuple(int(m) for m in mesh_dimensions)
-            if len(mesh_dimensions) != 3 or any(m < 2 for m in mesh_dimensions):
+
+        # Reject cross-method parameters. Both evaluate the same sum, but
+        # their knobs are not interchangeable, and a mesh setting silently
+        # ignored under `ewald` would be indistinguishable from one applied.
+        supplied_pme = [
+            name
+            for name, value in (
+                ("mesh_spacing", mesh_spacing),
+                ("mesh_dimensions", mesh_dimensions),
+            )
+            if value is not None
+        ]
+        if spline_order != DEFAULT_SPLINE_ORDER:
+            supplied_pme.append("spline_order")
+        supplied_ewald = [
+            name
+            for name, value in (("k_cutoff", k_cutoff),)
+            if value is not None
+        ]
+        if accuracy != 1e-6:
+            supplied_ewald.append("accuracy")
+
+        if method == "ewald" and supplied_pme:
+            raise ValueError(
+                f"{supplied_pme} only apply to method='pme'; with "
+                "method='ewald' the k-vectors are summed explicitly and "
+                "there is no mesh. Use k_cutoff (or accuracy) instead."
+            )
+        if method == "pme" and supplied_ewald:
+            raise ValueError(
+                f"{supplied_ewald} only apply to method='ewald'; with "
+                "method='pme' the reciprocal sum is evaluated on a mesh. "
+                "Use mesh_dimensions (or mesh_spacing) instead."
+            )
+
+        if method == "pme":
+            if spline_order > MAX_SPLINE_ORDER:
                 raise ValueError(
-                    "mesh_dimensions must be three integers >= 2, got "
-                    f"{mesh_dimensions}"
+                    f"spline_order={spline_order} exceeds the maximum order "
+                    f"nvalchemi computes correctly ({MAX_SPLINE_ORDER}). At "
+                    "order >= 7 the reciprocal-space sum is silently dropped "
+                    "and only the self-energy is returned, with no error."
                 )
-        if mesh_dimensions is None and mesh_spacing is None:
-            mesh_spacing = 1.0
-        if mesh_spacing is not None and mesh_spacing <= 0:
-            raise ValueError(f"mesh_spacing must be positive, got {mesh_spacing}")
+            if spline_order < 3:
+                raise ValueError(
+                    f"spline_order must be at least 3, got {spline_order}"
+                )
+            if mesh_dimensions is not None:
+                mesh_dimensions = tuple(int(m) for m in mesh_dimensions)
+                if len(mesh_dimensions) != 3 or any(m < 2 for m in mesh_dimensions):
+                    raise ValueError(
+                        "mesh_dimensions must be three integers >= 2, got "
+                        f"{mesh_dimensions}"
+                    )
+            if mesh_dimensions is None and mesh_spacing is None:
+                mesh_spacing = 1.0
+            if mesh_spacing is not None and mesh_spacing <= 0:
+                raise ValueError(f"mesh_spacing must be positive, got {mesh_spacing}")
+        else:
+            if not 0 < accuracy < 1:
+                raise ValueError(f"accuracy must be in (0, 1), got {accuracy}")
+            if k_cutoff is None:
+                # Standard Ewald reciprocal cutoff: the Gaussian
+                # exp(-k^2 / 4 alpha^2) has fallen to `accuracy` by here.
+                # Measured: alpha=0.4 with accuracy=1e-6 gives k_cutoff=3.0,
+                # which reaches 1e-10 against the reference.
+                k_cutoff = 2.0 * alpha * math.sqrt(-math.log(accuracy))
+            if k_cutoff <= 0:
+                raise ValueError(f"k_cutoff must be positive, got {k_cutoff}")
 
         self.alpha = float(alpha)
+        self.method = method
         self.mesh_spacing = mesh_spacing
         self.mesh_dimensions = mesh_dimensions
         self.spline_order = int(spline_order)
+        self.k_cutoff = None if k_cutoff is None else float(k_cutoff)
+        self.accuracy = float(accuracy)
 
     def extra_repr(self) -> str:
+        if self.method == "pme":
+            return (
+                f"method='pme', alpha={self.alpha}, "
+                f"mesh_spacing={self.mesh_spacing}, "
+                f"mesh_dimensions={self.mesh_dimensions}, "
+                f"spline_order={self.spline_order}"
+            )
         return (
-            f"alpha={self.alpha}, mesh_spacing={self.mesh_spacing}, "
-            f"mesh_dimensions={self.mesh_dimensions}, "
-            f"spline_order={self.spline_order}"
+            f"method='ewald', alpha={self.alpha}, k_cutoff={self.k_cutoff}"
         )
 
     def serialize(self) -> dict[str, Any]:
-        return {
-            "alpha": self.alpha,
-            "mesh_spacing": self.mesh_spacing,
-            "mesh_dimensions": self.mesh_dimensions,
-            "spline_order": self.spline_order,
-        }
+        data: dict[str, Any] = {"alpha": self.alpha, "method": self.method}
+        if self.method == "pme":
+            data.update(
+                mesh_spacing=self.mesh_spacing,
+                mesh_dimensions=self.mesh_dimensions,
+                spline_order=self.spline_order,
+            )
+        else:
+            data.update(k_cutoff=self.k_cutoff)
+        return data
 
     @classmethod
     def deserialize(cls, data: dict[str, Any]) -> "LongRangeEnergy":
         return cls(**data)
 
     def _mesh(self, cell: torch.Tensor) -> tuple[int, int, int]:
+        """PME mesh dimensions for this cell."""
         if self.mesh_dimensions is not None:
             return self.mesh_dimensions
         lengths = torch.linalg.norm(cell.detach(), dim=-1).max(dim=0).values
@@ -237,20 +331,39 @@ class LongRangeEnergy(torch.nn.Module):
             torch.arange(nf, dtype=torch.int32, device=coord.device), nloc
         )
 
-        # nvalchemi returns the k-space sum MINUS the self term; DeePMD-kit's
-        # DPLR convention is the k-space sum alone, so add the self term back.
-        # It is per-atom and charge-quadratic, so it lands naturally on the
-        # per-atom axis.
-        energy = pme_reciprocal_space(
-            positions,
-            charges,
-            cell,
-            alpha=self.alpha,
-            mesh_dimensions=self._mesh(cell),
-            spline_order=self.spline_order,
-            batch_idx=batch_idx,
-            energy_reduction="atom",
-        )
+        # Both backends return the k-space sum MINUS the self term;
+        # DeePMD-kit's DPLR convention is the k-space sum alone, so the self
+        # term is added back below. It is per-atom and charge-quadratic, so
+        # it lands naturally on the per-atom axis.
+        if self.method == "pme":
+            energy = pme_reciprocal_space(
+                positions,
+                charges,
+                cell,
+                alpha=self.alpha,
+                mesh_dimensions=self._mesh(cell),
+                spline_order=self.spline_order,
+                batch_idx=batch_idx,
+                energy_reduction="atom",
+            )
+        else:
+            # The explicit sum wants alpha per system as a tensor, not a
+            # float, and its own k-vector set for this cell.
+            alpha = torch.full(
+                (nf,), self.alpha, dtype=coord.dtype, device=coord.device
+            )
+            k_vectors = generate_k_vectors_ewald_summation(
+                cell.detach(), self.k_cutoff
+            )
+            energy = ewald_reciprocal_space(
+                positions,
+                charges,
+                cell,
+                k_vectors,
+                alpha,
+                batch_idx=batch_idx,
+                energy_reduction="atom",
+            )
         self_energy = (self.alpha / math.sqrt(math.pi)) * charges * charges
         energy = (energy + self_energy) * ELECTROSTATIC_CONVERSION
         return energy.reshape(nf, nloc, 1)

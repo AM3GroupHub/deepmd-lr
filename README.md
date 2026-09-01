@@ -91,6 +91,12 @@ whenever the cell can change — see PLAN.md, Phases 3 and 4.
 Only the long-range (reciprocal-space) half of the Ewald sum is computed
 here; the short-range half is already covered by the descriptor.
 
+The sum is evaluated by particle-mesh Ewald by default. Set
+`"method": "ewald"` for an explicit k-vector sum — exact, with no mesh
+interpolation error, which makes it the way to check a PME mesh setting. It
+is much slower (114 ms vs 3 ms at 2048 atoms), so it is a validation tool
+rather than a production one.
+
 ## Tests
 
 ```bash

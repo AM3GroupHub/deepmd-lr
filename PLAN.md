@@ -307,6 +307,15 @@ long-range electrostatic energy in eV for `(nf, nloc, 3)` coordinates,
 > constraint — and the batched-`naive` neighbour-list bug found in the first
 > pass is now unreachable by construction. The test suite got 3x faster.
 
+**Two backends for the same sum.** `method="pme"` (default) interpolates onto
+a mesh and FFTs; `method="ewald"` sums k-vectors explicitly. They agree to
+~1e-6 and both match the DeePMD-kit oracle. PME is faster at every size
+measured — 2.9 ms vs 3.3 ms at 32 atoms, 2.9 vs 113.6 ms at 2048 — so there
+is no small-system crossover, and Ewald's value is that it has *no*
+interpolation error: a disagreement between them is a statement about the
+mesh, not the physics. Parameters belonging to the other method are rejected
+rather than ignored.
+
 **Validation.** The oracle is DeePMD-kit's own `ewald_reciprocal_energy` —
 the function its DPLR path uses — matched to 1e-7. That single comparison
 pins the split, the units, and the self-term convention at once (nvalchemi's
