@@ -1,0 +1,98 @@
+{
+  "_comment": "Stage 2: joint. Start from the stage-1 weights via scripts/graft_short_range.py so the long-range term grows from small rather than shocking the warm start.",
+  "model": {
+    "type": "dp_lr",
+    "type_map": [
+      "C",
+      "F",
+      "H",
+      "Li",
+      "N",
+      "O",
+      "S"
+    ],
+    "descriptor": {
+      "type": "dpa4c",
+      "rcut": 6.0,
+      "channels": 32,
+      "lmax": 2,
+      "basis_type": "bessel",
+      "n_radial": 16,
+      "radial_modes": 4,
+      "precision": "float32",
+      "seed": 1
+    },
+    "fitting_net": {
+      "neuron": [
+        128,
+        128,
+        128
+      ],
+      "resnet_dt": false,
+      "activation_function": "silu",
+      "precision": "float32",
+      "seed": 1
+    },
+    "long_range": {
+      "_comment": "The cell is padded to 3D-periodic but the physics is a 2D slab, so the Yeh-Berkowitz correction is required -- see TRAINING.md.",
+      "charge_net": {
+        "neuron": [
+          64,
+          64
+        ],
+        "activation_function": "silu",
+        "precision": "float32",
+        "seed": 1
+      },
+      "pme": {
+        "_comment_alpha": "alpha 0.4 pairs with rcut 6.0: erfc(2.4)=7e-4 is left to the network.",
+        "alpha": 0.4,
+        "_comment_mesh": "cell 28.08 x 28.08 x 124.38; spacing 1.17/1.17/1.24 A, all finer than 1/(2*alpha)=1.25 A. Fixed, not spacing-derived.",
+        "mesh_dimensions": [
+          24,
+          24,
+          100
+        ],
+        "spline_order": 6,
+        "slab_correction": true,
+        "pbc": [
+          true,
+          true,
+          false
+        ]
+      }
+    }
+  },
+  "learning_rate": {
+    "type": "exp",
+    "start_lr": 0.0005,
+    "stop_lr": 1e-05
+  },
+  "loss": {
+    "type": "ener",
+    "start_pref_e": 1,
+    "limit_pref_e": 1,
+    "start_pref_f": 100,
+    "limit_pref_f": 100
+  },
+  "training": {
+    "training_data": {
+      "systems": [
+        "./data/train"
+      ],
+      "batch_size": 1
+    },
+    "validation_data": {
+      "systems": [
+        "./data/valid"
+      ],
+      "batch_size": 1,
+      "numb_btch": 5
+    },
+    "numb_steps": 400,
+    "save_freq": 100,
+    "disp_file": "lcurve.out",
+    "disp_freq": 25,
+    "seed": 1
+  }
+}

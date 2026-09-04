@@ -40,8 +40,17 @@ warp_cache/
 # Example run directories
 examples/**/run_*/
 
-# Experiment data and run directories (regenerate with generate_data.py)
+# Experiment data and run directories. Scoped deliberately: a bare
+# `experiments/` here once swallowed the whole tree, so new analysis scripts
+# were silently unaddable while already-tracked ones kept working.
 experiments/**/data/
 experiments/**/data_norc/
 experiments/**/run_*/
 experiments/**/__pycache__/
+
+# Uploaded trajectories and anything derived from them. The LiFSI xyz alone is
+# 3.3 GB; experiments/lifsi/TRAINING_LiFSI.md says how to regenerate the
+# dataset from it with prepare_dataset.py.
+*.xyz
+*.traj
+experiments/lifsi/data/
