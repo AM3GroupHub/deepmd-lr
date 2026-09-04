@@ -233,6 +233,28 @@ def _long_range_args() -> Argument:
                 doc="method='ewald' only. Target accuracy used to derive "
                 "`k_cutoff` when it is not given.",
             ),
+            Argument(
+                "slab_correction",
+                bool,
+                optional=True,
+                default=False,
+                doc="Add the Yeh-Berkowitz correction for a 2D-periodic slab. "
+                "Ewald assumes 3D periodicity, so a slab in a padded box "
+                "still interacts with its images through the vacuum; for a "
+                "slab with a net dipole that error is large and adding more "
+                "vacuum barely helps. Requires `pbc` with one axis false. "
+                "Leave off for a genuinely 3D-periodic system.",
+            ),
+            Argument(
+                "pbc",
+                [list[bool], None],
+                optional=True,
+                default=None,
+                doc="Periodicity per axis, e.g. [true, true, false] for a slab "
+                "stacked along z. Defaults to fully periodic. Must have "
+                "exactly one false entry when `slab_correction` is on, and "
+                "none when it is off.",
+            ),
         ],
         optional=True,
         default={},

@@ -291,6 +291,92 @@ class TestMethodChoice:
         assert restored.method == "ewald"
 
 
+class TestSlabCorrection:
+    """Ewald assumes 3D periodicity; a slab in a padded box does not have it.
+
+    Without the Yeh-Berkowitz term a dipolar slab keeps interacting with its
+    images through the vacuum, and the error shrinks only slowly with vacuum
+    thickness -- so "add more vacuum" is not a fix. The correction is what
+    makes a 2D-periodic system tractable at all.
+    """
+
+    @staticmethod
+    def _dipolar_slab(box_z: float, n: int = 64, box_xy: float = 12.0):
+        """Two oppositely charged sheets: a strong dipole across z."""
+        rng = np.random.default_rng(0)
+        xy = rng.uniform(0.0, box_xy, size=(n, 2))
+        z = np.where(np.arange(n) < n // 2, 3.0, 7.0)
+        q = np.where(np.arange(n) < n // 2, 1.0, -1.0).astype(float)
+        coord = torch.tensor(
+            np.column_stack([xy, z]), dtype=DT, device=DEVICE
+        ).unsqueeze(0)
+        charge = torch.tensor(q, dtype=DT, device=DEVICE).unsqueeze(0)
+        cell = torch.tensor(
+            np.diag([box_xy, box_xy, box_z]), dtype=DT, device=DEVICE
+        ).unsqueeze(0)
+        return coord, charge, cell
+
+    def _energy(self, box_z, **kwargs):
+        coord, charge, cell = self._dipolar_slab(box_z)
+        term = LongRangeEnergy(alpha=0.4, mesh_spacing=0.8, **kwargs)
+        return float(term(coord, charge, cell).sum())
+
+    def test_uncorrected_slab_energy_drifts_with_vacuum(self):
+        """The artefact being corrected. Not converged even at 160 A."""
+        near = self._energy(40.0)
+        far = self._energy(160.0)
+        assert abs(far - near) > 0.05 * abs(near)
+
+    def test_corrected_slab_energy_is_vacuum_independent(self):
+        """The 2D-periodic answer, recovered without a huge box."""
+        kwargs = {"slab_correction": True, "pbc": [True, True, False]}
+        near = self._energy(40.0, **kwargs)
+        far = self._energy(160.0, **kwargs)
+        assert abs(far - near) < 1e-4 * abs(near)
+
+    def test_correction_changes_the_answer(self):
+        """Guard against a silently inactive correction."""
+        plain = self._energy(40.0)
+        corrected = self._energy(
+            40.0, slab_correction=True, pbc=[True, True, False]
+        )
+        assert abs(corrected - plain) > 0.01 * abs(plain)
+
+    def test_requires_exactly_one_open_axis(self):
+        with pytest.raises(ValueError, match="exactly one non-periodic axis"):
+            LongRangeEnergy(slab_correction=True, pbc=[True, True, True])
+        with pytest.raises(ValueError, match="exactly one non-periodic axis"):
+            LongRangeEnergy(slab_correction=True, pbc=[True, False, False])
+
+    def test_open_axis_without_the_correction_is_refused(self):
+        """Silently running a plain 3D sum on a slab is the trap."""
+        with pytest.raises(ValueError, match="slab_correction: true"):
+            LongRangeEnergy(pbc=[True, True, False])
+
+    def test_round_trips(self):
+        term = LongRangeEnergy(
+            alpha=0.4, mesh_spacing=0.8,
+            slab_correction=True, pbc=[True, True, False],
+        )
+        restored = LongRangeEnergy.deserialize(term.serialize())
+        assert restored.serialize() == term.serialize()
+        assert restored.slab_correction and restored.pbc == (True, True, False)
+
+    def test_gradients_flow_through_the_correction(self):
+        coord, charge, cell = self._dipolar_slab(40.0)
+        term = LongRangeEnergy(
+            alpha=0.4, mesh_spacing=0.8,
+            slab_correction=True, pbc=[True, True, False],
+        )
+        c = coord.clone().requires_grad_(True)
+        q = charge.clone().requires_grad_(True)
+        energy = term(c, q, cell).sum()
+        force = -torch.autograd.grad(energy, c, create_graph=True)[0]
+        grad_q = torch.autograd.grad((force**2).sum(), q)[0]
+        assert torch.isfinite(force).all() and torch.isfinite(grad_q).all()
+        assert float(grad_q.abs().sum()) > 0.0
+
+
 class TestBoundaryConditions:
     """Ewald is only valid for a periodic, non-degenerate cell."""
 

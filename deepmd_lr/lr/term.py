@@ -43,6 +43,20 @@ is coarser, so the explicit sum makes a good reference for checking a PME
 setting, and is often the faster of the two for small cells where the FFT
 overhead dominates.
 
+Slabs
+-----
+Ewald assumes 3D periodicity. A 2D-periodic system -- an interface, a film, a
+liquid slab with vacuum above it -- is normally handled by adding vacuum and
+running the 3D sum anyway, but that leaves each slab interacting with its
+images through the vacuum. For a slab with a net dipole across the
+non-periodic axis the error is large and converges only slowly with vacuum
+thickness, so more vacuum is not a fix.
+
+``slab_correction=True`` adds the Yeh-Berkowitz term, which removes that
+image-dipole interaction and recovers the 2D-periodic answer. Pass ``pbc``
+with ``False`` on the non-periodic axis. It is off by default because it is
+wrong for a genuinely 3D-periodic system.
+
 Choosing alpha
 --------------
 In a full Ewald sum ``alpha`` is arbitrary -- the total does not depend on it.
@@ -73,6 +87,9 @@ from nvalchemiops.torch.interactions.electrostatics.k_vectors import (
 )
 from nvalchemiops.torch.interactions.electrostatics.pme import (
     pme_reciprocal_space,
+)
+from nvalchemiops.torch.interactions.electrostatics.slab import (
+    compute_slab_correction,
 )
 
 #: Highest B-spline interpolation order nvalchemi computes correctly.
@@ -135,6 +152,8 @@ class LongRangeEnergy(torch.nn.Module):
         spline_order: int = DEFAULT_SPLINE_ORDER,
         k_cutoff: float | None = None,
         accuracy: float = 1e-6,
+        slab_correction: bool = False,
+        pbc: tuple[bool, bool, bool] | list[bool] | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__()
@@ -226,8 +245,28 @@ class LongRangeEnergy(torch.nn.Module):
             if k_cutoff <= 0:
                 raise ValueError(f"k_cutoff must be positive, got {k_cutoff}")
 
+        if pbc is None:
+            pbc = (True, True, True)
+        pbc = tuple(bool(p) for p in pbc)
+        if len(pbc) != 3:
+            raise ValueError(f"pbc must have three entries, got {pbc}")
+        if slab_correction and sum(pbc) != 2:
+            raise ValueError(
+                "slab_correction expects exactly one non-periodic axis, but "
+                f"pbc={pbc}. Set pbc with False on the slab normal, e.g. "
+                "[true, true, false] for a slab stacked along z."
+            )
+        if not slab_correction and sum(pbc) != 3:
+            raise ValueError(
+                f"pbc={pbc} marks a non-periodic axis but slab_correction is "
+                "off. Running a plain 3D sum on a slab leaves each image "
+                "interacting through the vacuum; set slab_correction: true."
+            )
+
         self.alpha = float(alpha)
         self.method = method
+        self.slab_correction = slab_correction
+        self.pbc = pbc
         self.mesh_spacing = mesh_spacing
         self.mesh_dimensions = mesh_dimensions
         self.spline_order = int(spline_order)
@@ -247,7 +286,12 @@ class LongRangeEnergy(torch.nn.Module):
         )
 
     def serialize(self) -> dict[str, Any]:
-        data: dict[str, Any] = {"alpha": self.alpha, "method": self.method}
+        data: dict[str, Any] = {
+            "alpha": self.alpha,
+            "method": self.method,
+            "slab_correction": self.slab_correction,
+            "pbc": list(self.pbc),
+        }
         if self.method == "pme":
             data.update(
                 mesh_spacing=self.mesh_spacing,
@@ -334,6 +378,7 @@ class LongRangeEnergy(torch.nn.Module):
         batch_idx = torch.repeat_interleave(
             torch.arange(nf, dtype=torch.int32, device=coord.device), nloc
         )
+        pbc = torch.tensor(self.pbc, dtype=torch.bool, device=coord.device)
 
         # Both backends return the k-space sum MINUS the self term;
         # DeePMD-kit's DPLR convention is the k-space sum alone, so the self
@@ -372,7 +417,22 @@ class LongRangeEnergy(torch.nn.Module):
                 energy_reduction="atom",
             )
         self_energy = (self.alpha / math.sqrt(math.pi)) * charges * charges
-        energy = (energy + self_energy) * ELECTROSTATIC_CONVERSION
+        energy = energy + self_energy
+
+        if self.slab_correction:
+            # Yeh-Berkowitz: cancels the interaction between a slab and its
+            # periodic images across the vacuum. Added to the 3D result, as
+            # nvalchemi's own docstring prescribes.
+            energy = energy + compute_slab_correction(
+                positions,
+                charges,
+                cell,
+                pbc.expand(nf, 3),
+                batch_idx=batch_idx,
+                energy_reduction="atom",
+            )
+
+        energy = energy * ELECTROSTATIC_CONVERSION
         return energy.reshape(nf, nloc, 1)
 
 
