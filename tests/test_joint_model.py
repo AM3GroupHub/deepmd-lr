@@ -274,6 +274,29 @@ class TestTraining:
 
 
 class TestGuards:
+    def test_accepts_comment_keys_in_a_raw_config(self):
+        """`_comment` is DeePMD-kit's annotation convention.
+
+        `dp train` strips these during normalization, so they never reach a
+        constructor through the CLI. A raw config read from JSON -- what the
+        graft script and any direct `get_model` call use -- still carries
+        them, and this model rejects unknown parameters rather than absorbing
+        them. Without explicit stripping an annotated config fails exactly
+        where the same config works through the CLI.
+        """
+        cfg = {
+            "type": "dp_lr",
+            "type_map": ["O", "H"],
+            "descriptor": copy.deepcopy(DESCRIPTOR),
+            "fitting_net": copy.deepcopy(FITTING),
+            "long_range": copy.deepcopy(LONG_RANGE),
+        }
+        cfg["long_range"]["_comment"] = "explaining the block"
+        cfg["long_range"]["pme"]["_comment_alpha"] = "why this alpha"
+        cfg["long_range"]["charge_net"]["_comment"] = "why this width"
+        model = get_model(cfg)
+        assert model.has_long_range
+
     def test_rejects_unknown_long_range_parameters(self):
         """A stale key must fail loudly rather than run different physics."""
         cfg = {

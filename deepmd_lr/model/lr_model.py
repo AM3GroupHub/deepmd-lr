@@ -91,6 +91,19 @@ _ATOMIC_MODEL_TYPE = "standard"
 LONG_RANGE_KEY = "long_range"
 
 
+def _strip_comments(block: dict) -> dict:
+    """Drop DeePMD-kit's ``_comment`` annotation keys from a config block.
+
+    ``dp train`` normalizes the input first and those keys never reach a
+    constructor, but a raw config read straight from JSON -- which is what
+    ``scripts/graft_short_range.py`` and any hand-built call to ``get_model``
+    do -- still carries them. Since this model rejects unknown parameters
+    rather than absorbing them, they have to be removed explicitly or an
+    annotated config fails where the same config works through the CLI.
+    """
+    return {k: v for k, v in block.items() if not k.startswith("_comment")}
+
+
 @BaseModel.register(MODEL_TYPE)
 class LongRangeEnergyModel(EnergyModel):
     """Energy model that will carry an explicit long-range electrostatic term.
@@ -178,8 +191,9 @@ class LongRangeEnergyModel(EnergyModel):
         block = data.get(LONG_RANGE_KEY)
         if not block:
             return None, None
+        block = _strip_comments(block)
 
-        charge_net = copy.deepcopy(block.get("charge_net", {}))
+        charge_net = _strip_comments(copy.deepcopy(block.get("charge_net", {})))
         charge_net.pop("type", None)
         charge_net["ntypes"] = descriptor.get_ntypes()
         charge_net["dim_descrpt"] = descriptor.get_dim_out()
@@ -187,7 +201,7 @@ class LongRangeEnergyModel(EnergyModel):
         charge_net["type_map"] = copy.deepcopy(data["type_map"])
         charge_fitting = BaseFitting.get_class_by_type("charge")(**charge_net)
 
-        pme = LongRangeEnergy(**copy.deepcopy(block.get("pme", {})))
+        pme = LongRangeEnergy(**_strip_comments(copy.deepcopy(block.get("pme", {}))))
         return charge_fitting, pme
 
 
