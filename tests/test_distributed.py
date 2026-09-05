@@ -265,25 +265,67 @@ class TestGatheredLongRange:
         assert np.isfinite(out["dE_dq"]).all()
         assert np.abs(out["dE_dq"]).max() > 1e-6
 
-    def test_charge_response_is_the_only_remaining_gap(self, system, joint):
-        """Documents precisely what Phase C still owes.
+    @pytest.mark.parametrize("n", PARTITION_COUNTS)
+    def test_full_force_matches_serial(self, system, joint, n):
+        """Phase C closes the loop: force, charge response included.
 
-        The assembled force is short-range + direct long-range. The serial
-        model additionally carries -sum_j (dE/dq_j) dq_j/dr_i. That term is
-        not small here: it is ~3e-2 eV/A against a direct long-range force of
-        ~2.5e-3, so skipping it would be a far bigger error than dropping the
-        direct piece. When Phase C lands this test is replaced by an equality
-        against the serial force.
+        Before the charge-response term the gap to serial was 3.1e-2 eV/A --
+        about 12x the direct long-range force it accompanies, so this is a
+        correctness requirement rather than a refinement.
         """
         coord, atype, cell, *_ = system
         model, serial = joint
         reference = serial["force"][0].detach().cpu().numpy()
         out = evaluate_partitioned(
+            model, coord, atype, cell, n_partitions=n, devices=[DEVICE] * n
+        )
+        assert np.abs(out["force"] - reference).max() < 1e-12
+
+    def test_charge_response_dominates_the_direct_term(self, system, joint):
+        """Guard against it being quietly dropped or scaled to nothing.
+
+        It is not a small correction here: ~7e-3 eV/A rms against ~2.5e-3 for
+        the direct long-range force. A regression that zeroed it would still
+        leave energies right and forces plausible.
+        """
+        coord, atype, cell, *_ = system
+        model, _ = joint
+        out = evaluate_partitioned(
             model, coord, atype, cell, n_partitions=4, devices=[DEVICE] * 4
         )
-        gap = np.abs(out["force"] - reference).max()
-        direct = np.abs(out["force_long_range"]).max()
-        assert gap > direct, (
-            "the charge-response term is expected to dominate the direct "
-            f"long-range force; gap {gap:.2e} vs direct {direct:.2e}"
-        )
+        response = np.sqrt((out["force_charge_response"] ** 2).mean())
+        direct = np.sqrt((out["force_long_range"] ** 2).mean())
+        assert response > direct
+
+    @pytest.mark.parametrize("n", [1, 4])
+    def test_assembled_force_is_the_gradient_of_the_assembled_energy(
+        self, system, joint, n
+    ):
+        """Finite-difference the partitioned pipeline against itself.
+
+        Stronger than agreeing with the serial model: it checks the assembled
+        force really is -dE/dr of the assembled energy, so a charge-response
+        term with the wrong sign or a missing ghost contribution shows up even
+        if the serial reference were also wrong.
+        """
+        coord, atype, cell, *_ = system
+        model, _ = joint
+
+        def energy(positions):
+            return evaluate_partitioned(
+                model, positions, atype, cell,
+                n_partitions=n, devices=[DEVICE] * n,
+            )["energy"]
+
+        force = evaluate_partitioned(
+            model, coord, atype, cell, n_partitions=n, devices=[DEVICE] * n
+        )["force"]
+
+        step = 1e-5
+        for atom in range(0, len(coord), 11):
+            for axis in range(3):
+                plus, minus = coord.copy(), coord.copy()
+                plus[atom, axis] += step
+                minus[atom, axis] -= step
+                numeric = -(energy(plus) - energy(minus)) / (2 * step)
+                assert abs(numeric - force[atom, axis]) < 1e-6

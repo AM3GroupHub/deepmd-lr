@@ -192,7 +192,67 @@ def evaluate_partitioned(
     )
     result["energy"] = result["energy_short_range"] + result["energy_long_range"]
     result["force"] = result["force"] + result["force_long_range"]
+
+    result["force_charge_response"] = _charge_response_force(
+        model, parts, devices, coord, atype, result["dE_dq"], rcut, dtype
+    )
+    result["force"] = result["force"] + result["force_charge_response"]
     return result
+
+
+def _charge_response_force(
+    model, parts, devices, coord, atype, dE_dq, rcut, dtype
+) -> np.ndarray:
+    r"""The force from charges shifting as atoms move.
+
+    Because the charges are predicted rather than fixed, the long-range force
+    has a second term beyond the electrostatic one:
+
+    .. math::
+        F_i \supset -\sum_j \frac{\partial E}{\partial q_j}
+                              \frac{\partial q_j}{\partial r_i}
+
+    It is not a correction: measured here it is ~3e-2 eV/A against a direct
+    long-range force of ~2.5e-3, an order of magnitude larger.
+
+    **This is the term that keeps the scheme parallel.** ``dq_j/dr_i`` is
+    nonzero only for atoms within ``rcut`` of j, so although the energy is
+    long-ranged its charge derivative is *short*-ranged. Each partition
+    backpropagates only its own owned atoms' cotangents through its own charge
+    head, on its own device -- no autograd graph spans devices and no
+    communication is needed beyond the halo already present.
+
+    The cotangent passes through the global projection first. With
+    ``q_i = q~_i + (Q - sum_k q~_k) / N``, the chain rule gives
+    ``dE/dq~_j = dE/dq_j - mean(dE/dq)``: a single mean subtraction.
+    """
+    cotangent = dE_dq - dE_dq.mean()
+    force = np.zeros((len(coord), 3))
+
+    for part, device in zip(parts, devices, strict=True):
+        node_coord = torch.tensor(
+            part.coordinates(coord)[None, ...],
+            dtype=dtype,
+            device=device,
+            requires_grad=True,
+        )
+        node_type = torch.tensor(
+            part.types(atype)[None, ...], dtype=torch.int64, device=device
+        )
+        graph = build_neighbor_graph(node_coord, node_type, None, rcut)
+        graph.edge_mask = graph.edge_mask & (graph.edge_index[1] < part.n_owned)
+
+        raw = partition_charges(model, graph, node_type.reshape(-1), part.n_owned)
+        weights = torch.tensor(
+            cotangent[part.owned], dtype=raw.dtype, device=device
+        )
+        (gradient,) = torch.autograd.grad((raw * weights).sum(), node_coord)
+        np.add.at(
+            force,
+            part.global_ids(),
+            -gradient.reshape(part.n_node, 3).detach().cpu().numpy(),
+        )
+    return force
 
 
 def _long_range_global(model, coord, cell, raw_charge, device, dtype) -> dict:
