@@ -22,6 +22,7 @@ no ``torch.distributed``. Passing the same device several times
 logic is tested on a single-GPU machine.
 """
 
+import copy
 from typing import (
     Any,
 )
@@ -40,7 +41,34 @@ from deepmd_lr.fitting.charge import (
     project_to_total_charge,
 )
 
-__all__ = ["evaluate_partitioned", "partition_charges", "partition_graph"]
+__all__ = [
+    "device_replicas",
+    "evaluate_partitioned",
+    "partition_charges",
+    "partition_graph",
+]
+
+
+def device_replicas(model, devices) -> dict:
+    """One model per distinct device.
+
+    Moving only the *tensors* to each device is not enough: the weights have to
+    be there too, or a partition on ``cuda:1`` meets parameters still on
+    ``cuda:0``. Single-GPU testing hides this, because every "device" is the
+    same one.
+
+    The model that is already on the target device is used as-is rather than
+    copied, so the common single-device case allocates nothing extra. Replicas
+    are read-only here -- this is inference -- so there is no gradient to
+    reduce across them.
+    """
+    home = next(model.parameters()).device
+    replicas = {}
+    for device in {torch.device(d) for d in devices}:
+        replicas[device] = (
+            model if device == home else copy.deepcopy(model).to(device).eval()
+        )
+    return replicas
 
 
 def partition_charges(model, graph, node_type, n_owned: int):
@@ -139,6 +167,7 @@ def evaluate_partitioned(
             "device per partition (repeats are allowed)"
         )
 
+    replicas = device_replicas(model, devices)
     long_range = getattr(model, "has_long_range", False)
     n_atoms = len(coord)
     force = np.zeros((n_atoms, 3))
@@ -147,11 +176,12 @@ def evaluate_partitioned(
     energy = 0.0
 
     for part, device in zip(parts, devices, strict=True):
+        local = replicas[torch.device(device)]
         graph, node_type = partition_graph(part, coord, atype, rcut, device, dtype)
         n_node = torch.tensor([part.n_node], dtype=torch.int64, device=device)
         n_local = torch.tensor([part.n_owned], dtype=torch.int64, device=device)
 
-        out = model.forward_common_lower_graph(
+        out = local.forward_common_lower_graph(
             node_type,
             n_node,
             n_local,
@@ -178,7 +208,7 @@ def evaluate_partitioned(
 
         if long_range:
             raw_charge[part.owned] = (
-                partition_charges(model, graph, node_type, part.n_owned)
+                partition_charges(local, graph, node_type, part.n_owned)
                 .detach()
                 .cpu()
                 .numpy()
@@ -188,14 +218,15 @@ def evaluate_partitioned(
     if not long_range:
         return result
 
+    gather = gather_device if gather_device is not None else devices[0]
     result["energy_short_range"] = energy
     result.update(
         _long_range_global(
-            model,
+            replicas[torch.device(gather)],
             coord,
             cell,
             raw_charge,
-            gather_device if gather_device is not None else devices[0],
+            gather,
             dtype,
         )
     )
@@ -203,14 +234,14 @@ def evaluate_partitioned(
     result["force"] = result["force"] + result["force_long_range"]
 
     result["force_charge_response"] = _charge_response_force(
-        model, parts, devices, coord, atype, result["dE_dq"], rcut, dtype
+        replicas, parts, devices, coord, atype, result["dE_dq"], rcut, dtype
     )
     result["force"] = result["force"] + result["force_charge_response"]
     return result
 
 
 def _charge_response_force(
-    model, parts, devices, coord, atype, dE_dq, rcut, dtype
+    replicas, parts, devices, coord, atype, dE_dq, rcut, dtype
 ) -> np.ndarray:
     r"""The force from charges shifting as atoms move.
 
@@ -251,7 +282,9 @@ def _charge_response_force(
         graph = build_neighbor_graph(node_coord, node_type, None, rcut)
         graph.edge_mask = graph.edge_mask & (graph.edge_index[1] < part.n_owned)
 
-        raw = partition_charges(model, graph, node_type.reshape(-1), part.n_owned)
+        raw = partition_charges(
+            replicas[torch.device(device)], graph, node_type.reshape(-1), part.n_owned
+        )
         weights = torch.tensor(
             cotangent[part.owned], dtype=raw.dtype, device=device
         )
