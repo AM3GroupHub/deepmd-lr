@@ -104,6 +104,8 @@ from deepmd_lr.ase import LongRangeCalculator
 atoms.calc = LongRangeCalculator("run_joint/model.ckpt.pt")
 ```
 
+`examples/lifsi/md_minimal.py` is a ten-line distributed MD run.
+
 For larger systems, `DistLongRangeCalculator` evaluates the same model over
 spatial partitions — the descriptor is split, the reciprocal sum is gathered
 onto one device. Identical results, verified partition-count invariant. See

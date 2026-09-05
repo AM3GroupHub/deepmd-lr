@@ -38,9 +38,11 @@ warp_cache/
 .DS_Store
 
 # Example run and data directories. Datasets are never vendored --
-# examples/lifsi/README.md says how to build them.
-examples/**/run_*/
-examples/**/data/
+# examples/lifsi/README.md says how to build them. No trailing slash: these
+# are often symlinks to a scratch location, and a `dir/` pattern matches only
+# real directories, so the symlinks would show up as untracked.
+examples/**/run_*
+examples/**/data
 
 # Experiment data and run directories. Scoped deliberately: a bare
 # `experiments/` here once swallowed the whole tree, so new analysis scripts

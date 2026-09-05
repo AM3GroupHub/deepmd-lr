@@ -3,6 +3,50 @@
 The worked example: training a long-range model on a real interface, and
 running MD with it — serially or over spatial partitions.
 
+## Quick start: distributed MD
+
+If you already have a trained model, [`md_minimal.py`](md_minimal.py) is the
+whole thing — the API is three lines:
+
+```python
+from deepmd_lr.distributed import DistLongRangeCalculator
+
+atoms.calc = DistLongRangeCalculator("run_joint/model.ckpt.pt")
+atoms.calc.enable_distributed_mode(4)          # or ["cuda:0", "cuda:1", ...]
+VelocityVerlet(atoms, timestep=0.5 * units.fs).run(1000)
+```
+
+```
+$ python md_minimal.py
+6520 atoms, 4 partitions
+  step      E_pot [eV]      E_tot [eV]    T [K]
+     0     -34073.2102     -33818.1876    302.6
+    40     -34040.5033     -33818.0056    264.0
+   100     -34057.5840     -33818.0551    284.2
+```
+
+An integer means "that many partitions on the current device" — identical
+arithmetic to that many GPUs, which is how the partitioning is exercised
+without multi-GPU hardware.
+
+The same thing with nvalchemi's ensembles instead of ASE:
+
+```python
+from nvalchemi.dynamics.integrators import NVTLangevin
+from deepmd_lr.nvalchemi import LongRangeNVAlchemiModel
+from deepmd_lr.ase import load_model
+
+model = LongRangeNVAlchemiModel(load_model("run_joint/model.ckpt.pt"),
+                                devices=["cuda:0"] * 4)
+NVTLangevin(model, dt=0.5, temperature=300.0, friction=0.01).run(batch)
+```
+
+`md_nvalchemi.py` is that with a CLI and a choice of `nve`, `nvt-langevin` or
+`nvt-nose-hoover`. Temperatures are in **Kelvin** throughout.
+
+The rest of this README is how to get to a trained model from the raw
+trajectory.
+
 ## The system
 
 A UMA trajectory of LiFSI salt in EC/DMC solvent against a lithium anode.
