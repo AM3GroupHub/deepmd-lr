@@ -170,7 +170,7 @@ deepmd-lr/
 │   ├── test_plugin_registration.py
 │   ├── test_charge_head.py
 │   └── test_lr_term.py
-└── examples/water_lr/            # joint, baseline twin, warm-up
+└── examples/lifsi/               # joint, baseline twin, warm-up, MD
 ```
 
 `pyproject.toml` entry point:
@@ -219,7 +219,7 @@ Other usage notes established here:
 ### Phase 1 — plugin skeleton — **DONE**
 The package registers a `dp_lr` model type that delegates to plain DPA4C with
 no long-range term, so plugin wiring is proven independently of the physics.
-`dp --pt-expt train examples/water_lr/input_joint.json` runs end to end on the water
+`dp --pt-expt train examples/lifsi/input_joint.json` runs end to end on the water
 dataset, the loss descends, and the checkpoint records `type: "dp_lr"` and
 rebuilds as `LongRangeEnergyModel` with 0 missing/unexpected weights.
 

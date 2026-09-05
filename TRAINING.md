@@ -386,8 +386,8 @@ The sharpest end-to-end test that the forces really are the gradient of the
 energy, long-range term included:
 
 ```bash
-python experiments/water_real/nve_drift.py \
-    --model run_joint/model.ckpt.pt --data data/data_3 \
+python examples/lifsi/md_nvalchemi.py \
+    --model run_joint/model.ckpt.pt --ensemble nve \
     --steps 1000 --timestep 0.5
 ```
 
@@ -473,6 +473,15 @@ DistLongRangeCalculator(model, skin=1.0, repartition_every=None)
 
 `repartition_every=1` forces a rebuild each step; it changes timing, never
 results — there is a test asserting exactly that.
+
+### With nvalchemi's ensembles instead of ASE
+
+`deepmd_lr.nvalchemi.LongRangeNVAlchemiModel` adapts the model to nvalchemi's
+dynamics engine (`NVE`, `NVTLangevin`, `NVTNoseHoover`, `NPT`, `NPH`), with the
+same optional partitioning. DeePMD-kit's own `DPA4Wrapper` cannot be used
+unchanged: it evaluates `forward_lower`, the neighbour-list interface, which
+carries no cell — so only `forward` is overridden. Temperatures are in Kelvin
+throughout. See `examples/lifsi/md_nvalchemi.py`.
 
 ### Limits
 
