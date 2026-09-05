@@ -103,6 +103,7 @@ def evaluate_partitioned(
     pbc=(True, True, True),
     dtype=torch.float64,
     gather_device: Any | None = None,
+    partitions: list[Partition] | None = None,
 ) -> dict[str, Any]:
     """Run ``model`` over spatial partitions and assemble the global result.
 
@@ -110,6 +111,10 @@ def evaluate_partitioned(
     ----------
     gather_device
         Where the long-range term is evaluated. Defaults to the first device.
+    partitions
+        Reuse a previously built partitioning instead of rebuilding. Valid as
+        long as its halo still covers every neighbour -- see the skin logic in
+        :class:`~deepmd_lr.distributed.calculator.DistLongRangeCalculator`.
 
     Returns
     -------
@@ -121,7 +126,11 @@ def evaluate_partitioned(
         charge head.
     """
     rcut = float(model.get_rcut())
-    parts = partition_system(coord, cell, rcut, n_partitions, pbc)
+    parts = (
+        partition_system(coord, cell, rcut, n_partitions, pbc)
+        if partitions is None
+        else partitions
+    )
     if devices is None:
         devices = [next(model.parameters()).device] * len(parts)
     if len(devices) != len(parts):

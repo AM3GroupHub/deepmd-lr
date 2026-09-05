@@ -110,6 +110,7 @@ def partition_system(
     rcut: float,
     n_partitions: int,
     pbc=(True, True, True),
+    skin: float = 0.0,
 ) -> list[Partition]:
     """Split atoms into ``n_partitions`` slabs, each with an ``rcut`` halo.
 
@@ -126,6 +127,11 @@ def partition_system(
         ``(3, 3)`` cell vectors as rows.
     rcut
         Descriptor cutoff; sets the halo width.
+    skin
+        Extra halo width. Ghosts are collected within ``rcut + skin`` so the
+        partition stays valid while atoms move, which is what lets an MD run
+        reuse it across steps. Edges are still built at ``rcut``, so a skin
+        changes cost but never the answer.
     n_partitions
         Number of partitions. ``1`` yields a single partition with no ghosts.
     pbc
@@ -167,7 +173,8 @@ def partition_system(
     # interaction across the boundary.
 
     # Every periodic image that could reach into some partition.
-    shifts = _image_shifts(cell, pbc, rcut)
+    halo = rcut + skin
+    shifts = _image_shifts(cell, pbc, halo)
     offsets = shifts @ cell
     images = (coord[None, :, :] + offsets[:, None, :]).reshape(-1, 3)
     image_atom = np.tile(np.arange(n_atoms), len(shifts))
@@ -179,7 +186,7 @@ def partition_system(
         owned = np.flatnonzero(owner == p)
         # Anything within rcut of an owned atom is needed to complete that
         # atom's neighbour shell.
-        near = tree.query_ball_point(coord[owned], r=rcut)
+        near = tree.query_ball_point(coord[owned], r=halo)
         candidates = np.unique(np.concatenate([np.asarray(x, dtype=int)
                                                for x in near])) if len(near) else \
             np.empty(0, dtype=int)

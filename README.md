@@ -104,6 +104,11 @@ from deepmd_lr.ase import LongRangeCalculator
 atoms.calc = LongRangeCalculator("run_joint/model.ckpt.pt")
 ```
 
+For larger systems, `DistLongRangeCalculator` evaluates the same model over
+spatial partitions — the descriptor is split, the reciprocal sum is gathered
+onto one device. Identical results, verified partition-count invariant. See
+TRAINING.md §10.
+
 `dp freeze` is **refused** for a model with a `long_range` block: the exported
 graph lower receives edge vectors and no cell, so the artifact would silently
 contain only the short-range energy. See TRAINING.md §9.

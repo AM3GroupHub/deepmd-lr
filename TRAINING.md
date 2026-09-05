@@ -416,3 +416,69 @@ wiring and the force/virial handling are all engine-agnostic — only the
 energy term itself would need a sibling built on `nvalchemiops`'s `coulomb`
 or `dsf` (damped shifted force), both of which are already differentiable
 with charge gradients. See PLAN.md, Phase 5.
+
+---
+
+## 10. Running MD over partitions
+
+`deepmd_lr.ase.LongRangeCalculator` is single-process. For larger systems,
+`DistLongRangeCalculator` evaluates the same model over spatial partitions:
+
+```python
+from deepmd_lr.distributed import DistLongRangeCalculator
+
+atoms.calc = DistLongRangeCalculator("run_joint/model.ckpt.pt")
+atoms.calc.enable_distributed_mode(["cuda:0", "cuda:1", "cuda:2", "cuda:3"])
+```
+
+or wrap a calculator you already have:
+
+```python
+atoms.calc = DistLongRangeCalculator.from_existing(calc).enable_distributed_mode(4)
+```
+
+Passing an integer means "that many partitions on the current device" — which
+is how the partitioning is exercised where only one GPU exists. Results are
+identical either way; only placement differs.
+
+### What is split and what is not
+
+| piece | cost at 6520 atoms | treatment |
+|---|---:|---|
+| descriptor + short-range | 883 ms | partitioned |
+| charge prediction | (same pass) | partitioned |
+| reciprocal sum + charge projection | 73 ms | gathered onto one device |
+| charge-response force | — | partitioned |
+
+The reciprocal sum is gathered rather than decomposed because it does not
+survive spatial decomposition — splitting it gave 2.0% error on 2 ranks and
+36.5% on 8 (`LAMMPS.md`). That is affordable because it is under 10% of the
+step and the round trip is ~230 KB. Only the descriptor is worth splitting.
+
+The charge-response force, `-Σⱼ (dE/dqⱼ) ∂qⱼ/∂rᵢ`, stays partitioned: `∂qⱼ/∂rᵢ`
+is nonzero only within `rcut`, so although the *energy* is long-ranged its
+*charge derivative* is short-ranged. Each partition backpropagates its own
+atoms' cotangents on its own device.
+
+### Reusing a partitioning across steps
+
+Ghosts are gathered within `rcut + skin`, and the partitioning is rebuilt only
+once atoms have moved far enough to threaten it (the Verlet criterion,
+`2·max displacement > skin`). In a 40-step test that meant 3 rebuilds instead
+of 40, with results identical to rebuilding every step.
+
+```python
+DistLongRangeCalculator(model, skin=1.0, repartition_every=None)
+```
+
+`repartition_every=1` forces a rebuild each step; it changes timing, never
+results — there is a test asserting exactly that.
+
+### Limits
+
+- **`stress` is not provided.** The partitioned path assembles energy and
+  forces only. Use `LongRangeCalculator` when the virial is needed.
+- **Multi-GPU is untested.** This was developed on a single-GPU machine.
+  Correctness is established by partition-count invariance — 1, 2, 4 and 8
+  partitions agree with the serial calculator to ~1e-15 (float64) or the
+  float32 noise floor — but scaling and concurrency are not benchmarked.

@@ -15,7 +15,9 @@ import pytest
 import torch
 from deepmd.pt_expt.utils.env import DEVICE
 
+from deepmd_lr.ase import LongRangeCalculator
 from deepmd_lr.distributed import (
+    DistLongRangeCalculator,
     evaluate_partitioned,
     partition_graph,
     partition_system,
@@ -329,3 +331,133 @@ class TestGatheredLongRange:
                 minus[atom, axis] -= step
                 numeric = -(energy(plus) - energy(minus)) / (2 * step)
                 assert abs(numeric - force[atom, axis]) < 1e-6
+
+
+class TestDistributedCalculator:
+    """Phase D: the ASE surface, and reuse of a partitioning across MD steps."""
+
+    @staticmethod
+    def _atoms(n_mol=16, box=14.0):
+        from .test_ase_calculator import water_atoms
+
+        return water_atoms(n_mol=n_mol, box=box)
+
+    @pytest.fixture(scope="class")
+    def serial(self):
+        return LongRangeCalculator(build(long_range=True))
+
+    @pytest.mark.parametrize("n", PARTITION_COUNTS)
+    def test_matches_the_serial_calculator(self, serial, n):
+        reference = self._atoms()
+        reference.calc = serial
+        energy, forces = reference.get_potential_energy(), reference.get_forces()
+
+        atoms = self._atoms()
+        atoms.calc = DistLongRangeCalculator.from_existing(
+            serial
+        ).enable_distributed_mode(n)
+        assert abs(atoms.get_potential_energy() - energy) < 1e-10
+        assert np.abs(atoms.get_forces() - forces).max() < 1e-12
+
+    def test_enable_distributed_mode_accepts_a_count(self, serial):
+        """An integer means 'this many partitions on the current device' --
+        the configuration that exercises partitioning on a single-GPU box."""
+        calc = DistLongRangeCalculator.from_existing(serial)
+        calc.enable_distributed_mode(4)
+        assert len(calc.devices) == 4
+
+    def test_rejects_empty_device_list(self, serial):
+        with pytest.raises(ValueError, match="at least one device"):
+            DistLongRangeCalculator.from_existing(serial).enable_distributed_mode([])
+
+    def test_reused_partitioning_stays_correct_under_motion(self, serial):
+        """The point of the skin: atoms move, the partitioning is reused, and
+        the answer must not drift. A halo too tight would lose neighbours
+        silently -- energies stay plausible, forces quietly go wrong.
+        """
+        from ase import units
+        from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
+        from ase.md.verlet import VelocityVerlet
+
+        atoms = self._atoms()
+        calc = DistLongRangeCalculator.from_existing(serial, skin=1.0)
+        calc.enable_distributed_mode(4)
+        atoms.calc = calc
+        np.random.seed(0)
+        MaxwellBoltzmannDistribution(atoms, temperature_K=300.0)
+        VelocityVerlet(atoms, timestep=0.5 * units.fs).run(40)
+
+        reference = self._atoms()
+        reference.positions = atoms.positions.copy()
+        reference.calc = serial
+        assert abs(
+            atoms.get_potential_energy() - reference.get_potential_energy()
+        ) < 1e-10
+        assert np.abs(atoms.get_forces() - reference.get_forces()).max() < 1e-11
+
+    def test_caching_actually_avoids_rebuilds(self, serial):
+        """If it rebuilt every step the skin would be pointless overhead."""
+        from ase import units
+        from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
+        from ase.md.verlet import VelocityVerlet
+
+        atoms = self._atoms()
+        calc = DistLongRangeCalculator.from_existing(serial, skin=1.0)
+        calc.enable_distributed_mode(4)
+        atoms.calc = calc
+        np.random.seed(0)
+        MaxwellBoltzmannDistribution(atoms, temperature_K=300.0)
+        VelocityVerlet(atoms, timestep=0.5 * units.fs).run(40)
+        assert calc.rebuild_count < 20
+
+    def test_forcing_a_rebuild_every_step_changes_nothing(self, serial):
+        """The plan's gate: caching must be an optimisation, not a physics knob."""
+        atoms = self._atoms()
+        eager = DistLongRangeCalculator.from_existing(
+            serial, skin=1.0, repartition_every=1
+        )
+        eager.enable_distributed_mode(4)
+        atoms.calc = eager
+        energy, forces = atoms.get_potential_energy(), atoms.get_forces()
+
+        cached_atoms = self._atoms()
+        cached = DistLongRangeCalculator.from_existing(serial, skin=1.0)
+        cached.enable_distributed_mode(4)
+        cached_atoms.calc = cached
+        assert abs(cached_atoms.get_potential_energy() - energy) < 1e-12
+        assert np.abs(cached_atoms.get_forces() - forces).max() < 1e-12
+
+    def test_refuses_stress_rather_than_returning_it_wrong(self, serial):
+        """The partitioned path assembles no virial, so `stress` is kept out
+        of `implemented_properties` and ASE refuses it before reaching us --
+        better than duplicating the check or returning a wrong virial."""
+        atoms = self._atoms()
+        atoms.calc = DistLongRangeCalculator.from_existing(
+            serial
+        ).enable_distributed_mode(2)
+        assert "stress" not in atoms.calc.implemented_properties
+        with pytest.raises(NotImplementedError, match="stress"):
+            atoms.get_stress()
+
+    def test_rejects_non_periodic_atoms(self, serial):
+        atoms = self._atoms()
+        atoms.pbc = False
+        atoms.calc = DistLongRangeCalculator.from_existing(
+            serial
+        ).enable_distributed_mode(2)
+        with pytest.raises(ValueError, match="fully periodic"):
+            atoms.get_potential_energy()
+
+    def test_exposes_the_energy_split_and_charges(self, serial):
+        atoms = self._atoms()
+        atoms.calc = DistLongRangeCalculator.from_existing(
+            serial
+        ).enable_distributed_mode(4)
+        atoms.get_potential_energy()
+        results = atoms.calc.results
+        assert results["charges"].shape == (len(atoms),)
+        assert abs(results["charges"].sum()) < 1e-10
+        assert abs(
+            results["energy"]
+            - (results["energy_short_range"] + results["energy_long_range"])
+        ) < 1e-9
