@@ -61,15 +61,16 @@ def main() -> None:
 
     n_frames = len(np.load(pathlib.Path(args.data) / "set.000/energy.npy"))
     print(f"Held-out evaluation on {n_frames} frames\n")
-    print(f"{'model':<10}{'E RMSE (meV/atom)':>20}{'F RMSE (eV/A)':>16}{'F MAE':>10}")
+    header = f"{'model':<10}{'E RMSE (meV/atom)':>20}"
+    print(header + f"{'F RMSE (eV/A)':>16}{'F MAE':>10}")
     for tag, r in rows.items():
         print(f"{tag:<10}{r['energy_rmse_meV_per_atom']:>20.3f}"
               f"{r['force_rmse']:>16.4f}{r['force_mae']:>10.4f}")
     if "baseline" in rows and "joint" in rows:
         b, j = rows["baseline"], rows["joint"]
-        print(f"\nimprovement: "
-              f"{b['energy_rmse_meV_per_atom'] / j['energy_rmse_meV_per_atom']:.2f}x energy, "
-              f"{b['force_rmse'] / j['force_rmse']:.2f}x force")
+        gain_e = b["energy_rmse_meV_per_atom"] / j["energy_rmse_meV_per_atom"]
+        gain_f = b["force_rmse"] / j["force_rmse"]
+        print(f"\nimprovement: {gain_e:.2f}x energy, {gain_f:.2f}x force")
     if "long_range_energy_mean" in rows.get("joint", {}):
         j = rows["joint"]
         print(f"\nlong-range energy: {j['long_range_energy_mean']:+.2f} "

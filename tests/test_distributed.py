@@ -66,9 +66,7 @@ class TestPartitioner:
                 delta = coord[atom] - coord
                 frac = delta @ inverse
                 delta = (frac - np.round(frac)) @ cell
-                within = np.flatnonzero(
-                    (np.linalg.norm(delta, axis=1) < RCUT)
-                )
+                within = np.flatnonzero(np.linalg.norm(delta, axis=1) < RCUT)
                 for neighbour in within:
                     separation = np.linalg.norm(
                         nodes - coord[atom], axis=1
