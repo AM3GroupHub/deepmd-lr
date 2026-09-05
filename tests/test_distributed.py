@@ -6,7 +6,8 @@ is precisely the test the LAMMPS domain decomposition failed -- splitting a
 reciprocal sum across ranks gave 2.0% error at 2 ranks and 36.5% at 8
 (see LAMMPS.md) -- so here it has to pass exactly, not approximately.
 
-Phase A covers the short-range model. The long-range term arrives in Phase B.
+Phase A covers the short-range model; Phase B adds the long-range term,
+gathered onto one device.
 """
 
 import numpy as np
@@ -187,3 +188,102 @@ class TestPartitionCountInvariance:
             evaluate_partitioned(
                 model, coord, atype, cell, n_partitions=4, devices=[DEVICE]
             )
+
+
+class TestGatheredLongRange:
+    """Phase B: the reciprocal term is gathered, not decomposed.
+
+    Splitting a reciprocal sum spatially does not work -- measured at 2.0%
+    error on 2 ranks and 36.5% on 8 (LAMMPS.md). So it is evaluated once on
+    one device over every atom. The charges feeding it still come from the
+    partitioned descriptor, and the total-charge projection is applied after
+    the gather because it constrains a sum over all atoms.
+    """
+
+    @pytest.fixture(scope="class")
+    def joint(self, system):
+        model = build(long_range=True)
+        model.eval()
+        coord, atype, cell, coord_t, atype_t, cell_t = system
+        return model, model(coord_t, atype_t, box=cell_t)
+
+    @pytest.mark.parametrize("n", PARTITION_COUNTS)
+    def test_charges_match_serial(self, system, joint, n):
+        """Charges are local, so partitioning must not move them at all."""
+        coord, atype, cell, *_ = system
+        model, serial = joint
+        reference = serial["charge"].reshape(-1).detach().cpu().numpy()
+        out = evaluate_partitioned(
+            model, coord, atype, cell, n_partitions=n, devices=[DEVICE] * n
+        )
+        assert np.abs(out["charge"] - reference).max() < 1e-12
+
+    @pytest.mark.parametrize("n", PARTITION_COUNTS)
+    def test_total_charge_constraint_survives_partitioning(self, system, joint, n):
+        """The constraint is global; a per-partition projection would break it."""
+        coord, atype, cell, *_ = system
+        model, _ = joint
+        out = evaluate_partitioned(
+            model, coord, atype, cell, n_partitions=n, devices=[DEVICE] * n
+        )
+        assert abs(out["charge"].sum()) < 1e-10
+
+    @pytest.mark.parametrize("n", PARTITION_COUNTS)
+    def test_long_range_energy_matches_serial(self, system, joint, n):
+        coord, atype, cell, *_ = system
+        model, serial = joint
+        reference = float(serial["energy_long_range"].reshape(-1)[0])
+        out = evaluate_partitioned(
+            model, coord, atype, cell, n_partitions=n, devices=[DEVICE] * n
+        )
+        assert abs(out["energy_long_range"] - reference) < 1e-10
+
+    def test_direct_long_range_force_matches_serial(self, system, joint):
+        """The piece Phase B is responsible for: -dE/dr at frozen charge."""
+        coord, atype, cell, coord_t, _, cell_t = system
+        model, serial = joint
+        frozen = serial["charge"].detach()
+        positions = coord_t.clone().requires_grad_(True)
+        energy = model.pme(positions, frozen, cell_t).sum()
+        reference = (
+            -torch.autograd.grad(energy, positions)[0][0].cpu().numpy()
+        )
+        out = evaluate_partitioned(
+            model, coord, atype, cell, n_partitions=4, devices=[DEVICE] * 4
+        )
+        assert np.abs(out["force_long_range"] - reference).max() < 1e-12
+
+    def test_charge_gradient_is_available_and_nonzero(self, system, joint):
+        """dE/dq is what Phase C backpropagates; taking it out as a value is
+        what keeps the autograd graph on a single device."""
+        coord, atype, cell, *_ = system
+        model, _ = joint
+        out = evaluate_partitioned(
+            model, coord, atype, cell, n_partitions=4, devices=[DEVICE] * 4
+        )
+        assert out["dE_dq"].shape == (len(coord),)
+        assert np.isfinite(out["dE_dq"]).all()
+        assert np.abs(out["dE_dq"]).max() > 1e-6
+
+    def test_charge_response_is_the_only_remaining_gap(self, system, joint):
+        """Documents precisely what Phase C still owes.
+
+        The assembled force is short-range + direct long-range. The serial
+        model additionally carries -sum_j (dE/dq_j) dq_j/dr_i. That term is
+        not small here: it is ~3e-2 eV/A against a direct long-range force of
+        ~2.5e-3, so skipping it would be a far bigger error than dropping the
+        direct piece. When Phase C lands this test is replaced by an equality
+        against the serial force.
+        """
+        coord, atype, cell, *_ = system
+        model, serial = joint
+        reference = serial["force"][0].detach().cpu().numpy()
+        out = evaluate_partitioned(
+            model, coord, atype, cell, n_partitions=4, devices=[DEVICE] * 4
+        )
+        gap = np.abs(out["force"] - reference).max()
+        direct = np.abs(out["force_long_range"]).max()
+        assert gap > direct, (
+            "the charge-response term is expected to dominate the direct "
+            f"long-range force; gap {gap:.2e} vs direct {direct:.2e}"
+        )

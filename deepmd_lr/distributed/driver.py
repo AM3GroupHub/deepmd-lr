@@ -1,10 +1,20 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 """Evaluate a model partition by partition and assemble the global result.
 
-Phase A scope: the short-range model only. The long-range term is added in
-Phase B, where it is gathered onto one device rather than distributed --
-profiling put it at 73 ms against 883 ms for the descriptor, so the descriptor
-is the part worth splitting.
+The short-range half is split across partitions; the long-range half is
+gathered onto one device rather than distributed. That is a measurement, not
+a shortcut: at 6520 atoms the descriptor costs 883 ms and the reciprocal term
+73 ms, so the descriptor is what is worth splitting. Gathering costs about
+104 KB in and 130 KB out.
+
+Two things are necessarily global and so happen after the gather:
+
+- **The total-charge projection.** ``sum_i q_i = Q_total`` is a constraint
+  over every atom, so it cannot be applied per partition. Partitions produce
+  *raw* charges; the projection runs once on the assembled vector.
+- **The reciprocal sum itself**, which is a structure factor over every atom.
+  This is exactly what does not survive spatial decomposition -- splitting it
+  across ranks gave 2.0% error at 2 ranks and 36.5% at 8 (see LAMMPS.md).
 
 Devices are handled DistMLIP-style: one process, tensors moved with ``.to()``,
 no ``torch.distributed``. Passing the same device several times
@@ -26,8 +36,36 @@ from deepmd_lr.distributed.partition import (
     Partition,
     partition_system,
 )
+from deepmd_lr.fitting.charge import (
+    project_to_total_charge,
+)
 
-__all__ = ["evaluate_partitioned", "partition_graph"]
+__all__ = ["evaluate_partitioned", "partition_charges", "partition_graph"]
+
+
+def partition_charges(model, graph, node_type, n_owned: int):
+    """Raw (unprojected) charges for one partition's owned atoms.
+
+    Runs the shared descriptor and the charge head on the subgraph, mirroring
+    ``LongRangeEnergyModel._predict_charges``. Only owned entries are kept:
+    a ghost's neighbour shell is incomplete here, and its charge is produced
+    correctly by whichever partition owns it.
+
+    The projection is deliberately NOT applied -- it is a global constraint,
+    handled once the partitions are assembled.
+    """
+    descriptor = model.atomic_model.descriptor
+    charge_spin_kwargs = (
+        {"charge_spin": None} if model.atomic_model.supports_charge_spin else {}
+    )
+    features, rot_mat = descriptor.call_graph(
+        graph,
+        node_type,
+        type_embedding=descriptor.graph_type_embedding_table(),
+        **charge_spin_kwargs,
+    )
+    raw = model.charge_fitting.call_graph(features, node_type, gr=rot_mat)["charge"]
+    return raw.reshape(-1)[:n_owned]
 
 
 def partition_graph(part: Partition, coord: np.ndarray, atype: np.ndarray,
@@ -64,13 +102,23 @@ def evaluate_partitioned(
     devices: list[Any] | None = None,
     pbc=(True, True, True),
     dtype=torch.float64,
+    gather_device: Any | None = None,
 ) -> dict[str, Any]:
-    """Run ``model`` over spatial partitions and assemble energy and forces.
+    """Run ``model`` over spatial partitions and assemble the global result.
+
+    Parameters
+    ----------
+    gather_device
+        Where the long-range term is evaluated. Defaults to the first device.
 
     Returns
     -------
     dict
-        ``energy`` (float), ``force`` ``(N, 3)``, ``atom_energy`` ``(N,)``.
+        ``energy``, ``force`` ``(N, 3)``, ``atom_energy`` ``(N,)``, and when the
+        model carries a long-range term also ``charge`` ``(N,)``,
+        ``energy_short_range``, ``energy_long_range``, and ``dE_dq`` ``(N,)``
+        -- the last is what Phase C backpropagates through each partition's
+        charge head.
     """
     rcut = float(model.get_rcut())
     parts = partition_system(coord, cell, rcut, n_partitions, pbc)
@@ -82,9 +130,11 @@ def evaluate_partitioned(
             "device per partition (repeats are allowed)"
         )
 
+    long_range = getattr(model, "has_long_range", False)
     n_atoms = len(coord)
     force = np.zeros((n_atoms, 3))
     atom_energy = np.zeros(n_atoms)
+    raw_charge = np.zeros(n_atoms)
     energy = 0.0
 
     for part, device in zip(parts, devices, strict=True):
@@ -117,4 +167,60 @@ def evaluate_partitioned(
         node_force = out["energy_derv_r"].reshape(part.n_node, 3)
         np.add.at(force, ids, node_force.detach().cpu().numpy())
 
-    return {"energy": energy, "force": force, "atom_energy": atom_energy}
+        if long_range:
+            raw_charge[part.owned] = (
+                partition_charges(model, graph, node_type, part.n_owned)
+                .detach()
+                .cpu()
+                .numpy()
+            )
+
+    result = {"energy": energy, "force": force, "atom_energy": atom_energy}
+    if not long_range:
+        return result
+
+    result["energy_short_range"] = energy
+    result.update(
+        _long_range_global(
+            model,
+            coord,
+            cell,
+            raw_charge,
+            gather_device if gather_device is not None else devices[0],
+            dtype,
+        )
+    )
+    result["energy"] = result["energy_short_range"] + result["energy_long_range"]
+    result["force"] = result["force"] + result["force_long_range"]
+    return result
+
+
+def _long_range_global(model, coord, cell, raw_charge, device, dtype) -> dict:
+    """The global half: project the charges, then evaluate the reciprocal sum.
+
+    Returns the direct force ``-dE/dr`` at fixed charge, and ``dE/dq``. The
+    remaining *charge-response* force, ``-sum_j (dE/dq_j) dq_j/dr_i``, is
+    short-ranged and is added per partition in Phase C -- taking ``dE/dq`` out
+    as a plain value here is what keeps the autograd graph on one device.
+    """
+    n_atoms = len(coord)
+    coord_t = torch.tensor(
+        coord[None, ...], dtype=dtype, device=device, requires_grad=True
+    )
+    cell_t = torch.tensor(cell.reshape(1, 3, 3), dtype=dtype, device=device)
+    charge_t = torch.tensor(
+        raw_charge[None, ...], dtype=dtype, device=device, requires_grad=True
+    )
+
+    charge = project_to_total_charge(charge_t, 0.0)
+    atom_energy = model.pme(coord_t, charge, cell_t)
+    total = atom_energy.sum()
+    grad_coord, grad_charge = torch.autograd.grad(total, [coord_t, charge_t])
+
+    return {
+        "charge": charge.reshape(-1).detach().cpu().numpy(),
+        "energy_long_range": float(total),
+        "atom_energy_long_range": atom_energy.reshape(-1).detach().cpu().numpy(),
+        "force_long_range": -grad_coord.reshape(n_atoms, 3).detach().cpu().numpy(),
+        "dE_dq": grad_charge.reshape(-1).detach().cpu().numpy(),
+    }
