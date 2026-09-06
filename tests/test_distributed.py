@@ -107,7 +107,7 @@ class TestPartitioner:
         for n in PARTITION_COUNTS:
             total = 0
             for part in partition_system(coord, cell, RCUT, n):
-                graph, _ = partition_graph(part, coord, atype, RCUT, DEVICE)
+                graph, _, _ = partition_graph(part, coord, atype, RCUT, DEVICE)
                 total += int(graph.edge_mask.sum())
             seen[n] = total
         assert len(set(seen.values())) == 1, (

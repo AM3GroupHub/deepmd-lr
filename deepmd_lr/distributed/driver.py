@@ -97,7 +97,8 @@ def partition_charges(model, graph, node_type, n_owned: int):
 
 
 def partition_graph(part: Partition, coord: np.ndarray, atype: np.ndarray,
-                    rcut: float, device: Any, dtype=torch.float64):
+                    rcut: float, device: Any, dtype=torch.float64,
+                    requires_grad: bool = False):
     """Build one partition's neighbour graph, keeping only owned destinations.
 
     Built with ``box=None`` -- non-periodic. The halo already carries explicit
@@ -107,9 +108,19 @@ def partition_graph(part: Partition, coord: np.ndarray, atype: np.ndarray,
     Edges whose destination is a ghost are masked out. That is what makes the
     assembled sum exact: each edge survives in exactly one partition, the one
     owning its destination.
+
+    With ``requires_grad``, the node coordinates are tracked and returned so a
+    later backward can reach them. That lets the charge-response term reuse
+    this graph instead of rebuilding it -- the search is the expensive part,
+    and it is identical either way.
+
+    Returns ``(graph, node_type_flat, node_coord)``.
     """
     node_coord = torch.tensor(
-        part.coordinates(coord)[None, ...], dtype=dtype, device=device
+        part.coordinates(coord)[None, ...],
+        dtype=dtype,
+        device=device,
+        requires_grad=requires_grad,
     )
     node_type = torch.tensor(
         part.types(atype)[None, ...], dtype=torch.int64, device=device
@@ -118,7 +129,7 @@ def partition_graph(part: Partition, coord: np.ndarray, atype: np.ndarray,
 
     owned_dst = graph.edge_index[1] < part.n_owned
     graph.edge_mask = graph.edge_mask & owned_dst
-    return graph, node_type.reshape(-1)
+    return graph, node_type.reshape(-1), node_coord
 
 
 def evaluate_partitioned(
@@ -132,6 +143,7 @@ def evaluate_partitioned(
     dtype=torch.float64,
     gather_device: Any | None = None,
     partitions: list[Partition] | None = None,
+    replicas: dict | None = None,
 ) -> dict[str, Any]:
     """Run ``model`` over spatial partitions and assemble the global result.
 
@@ -167,7 +179,8 @@ def evaluate_partitioned(
             "device per partition (repeats are allowed)"
         )
 
-    replicas = device_replicas(model, devices)
+    if replicas is None:
+        replicas = device_replicas(model, devices)
     long_range = getattr(model, "has_long_range", False)
     n_atoms = len(coord)
     force = np.zeros((n_atoms, 3))
@@ -175,9 +188,19 @@ def evaluate_partitioned(
     raw_charge = np.zeros(n_atoms)
     energy = 0.0
 
+    # ---- launch phase -------------------------------------------------------
+    # Queue every partition's work WITHOUT touching the host. A `.cpu()` here
+    # would synchronise, and the partition on the next device could not start
+    # until this one finished -- which is how two GPUs end up running strictly
+    # one after the other. Kernel launches are asynchronous and each device has
+    # its own stream, so deferring the transfers is what buys the overlap.
+    launched = []
     for part, device in zip(parts, devices, strict=True):
         local = replicas[torch.device(device)]
-        graph, node_type = partition_graph(part, coord, atype, rcut, device, dtype)
+        # `requires_grad` only when the charge-response backward will need it.
+        graph, node_type, node_coord = partition_graph(
+            part, coord, atype, rcut, device, dtype, requires_grad=long_range
+        )
         n_node = torch.tensor([part.n_node], dtype=torch.int64, device=device)
         n_local = torch.tensor([part.n_owned], dtype=torch.int64, device=device)
 
@@ -189,7 +212,20 @@ def evaluate_partitioned(
             graph.edge_vec,
             graph.edge_mask,
         )
+        # Charges come from the SAME graph, and the tensor is kept live so the
+        # charge-response force can backpropagate through it later instead of
+        # rebuilding the neighbour search and re-running the descriptor.
+        raw = (
+            partition_charges(local, graph, node_type, part.n_owned)
+            if long_range
+            else None
+        )
+        launched.append((part, device, out, raw, node_coord))
 
+    # ---- gather phase -------------------------------------------------------
+    # Now synchronise. Every device has been given its work, so the transfers
+    # below wait on kernels that have been running concurrently.
+    for part, _device, out, raw, _node_coord in launched:
         ids = part.global_ids()
         # Energy: owned atoms only. Each atom is scored by exactly one owner.
         per_atom = out["energy"].reshape(-1).detach().cpu().numpy()
@@ -207,12 +243,7 @@ def evaluate_partitioned(
         np.add.at(force, ids, node_force.detach().cpu().numpy())
 
         if long_range:
-            raw_charge[part.owned] = (
-                partition_charges(local, graph, node_type, part.n_owned)
-                .detach()
-                .cpu()
-                .numpy()
-            )
+            raw_charge[part.owned] = raw.detach().cpu().numpy()
 
     result = {"energy": energy, "force": force, "atom_energy": atom_energy}
     if not long_range:
@@ -234,15 +265,13 @@ def evaluate_partitioned(
     result["force"] = result["force"] + result["force_long_range"]
 
     result["force_charge_response"] = _charge_response_force(
-        replicas, parts, devices, coord, atype, result["dE_dq"], rcut, dtype
+        launched, len(coord), result["dE_dq"]
     )
     result["force"] = result["force"] + result["force_charge_response"]
     return result
 
 
-def _charge_response_force(
-    replicas, parts, devices, coord, atype, dE_dq, rcut, dtype
-) -> np.ndarray:
+def _charge_response_force(launched, n_atoms: int, dE_dq) -> np.ndarray:
     r"""The force from charges shifting as atoms move.
 
     Because the charges are predicted rather than fixed, the long-range force
@@ -265,30 +294,27 @@ def _charge_response_force(
     The cotangent passes through the global projection first. With
     ``q_i = q~_i + (Q - sum_k q~_k) / N``, the chain rule gives
     ``dE/dq~_j = dE/dq_j - mean(dE/dq)``: a single mean subtraction.
+
+    The charges arrive already computed, still attached to the graph that
+    produced them, so this is only the backward pass. Rebuilding the neighbour
+    search and re-running the descriptor here -- as an earlier version did --
+    was a third descriptor evaluation per partition for no additional
+    information.
     """
     cotangent = dE_dq - dE_dq.mean()
-    force = np.zeros((len(coord), 3))
+    force = np.zeros((n_atoms, 3))
 
-    for part, device in zip(parts, devices, strict=True):
-        node_coord = torch.tensor(
-            part.coordinates(coord)[None, ...],
-            dtype=dtype,
-            device=device,
-            requires_grad=True,
-        )
-        node_type = torch.tensor(
-            part.types(atype)[None, ...], dtype=torch.int64, device=device
-        )
-        graph = build_neighbor_graph(node_coord, node_type, None, rcut)
-        graph.edge_mask = graph.edge_mask & (graph.edge_index[1] < part.n_owned)
-
-        raw = partition_charges(
-            replicas[torch.device(device)], graph, node_type.reshape(-1), part.n_owned
-        )
+    # Launch every backward first, then transfer, for the same reason the
+    # forward pass is staged: a `.cpu()` between them serialises the devices.
+    gradients = []
+    for part, _device, _out, raw, node_coord in launched:
         weights = torch.tensor(
-            cotangent[part.owned], dtype=raw.dtype, device=device
+            cotangent[part.owned], dtype=raw.dtype, device=raw.device
         )
         (gradient,) = torch.autograd.grad((raw * weights).sum(), node_coord)
+        gradients.append((part, gradient))
+
+    for part, gradient in gradients:
         np.add.at(
             force,
             part.global_ids(),

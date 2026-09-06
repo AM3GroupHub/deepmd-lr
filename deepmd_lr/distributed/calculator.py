@@ -25,6 +25,7 @@ from deepmd_lr.ase import (
     LongRangeCalculator,
 )
 from deepmd_lr.distributed.driver import (
+    device_replicas,
     evaluate_partitioned,
 )
 from deepmd_lr.distributed.partition import (
@@ -83,6 +84,7 @@ class DistLongRangeCalculator(LongRangeCalculator):
         self.skin = float(skin)
         self.repartition_every = repartition_every
         self.devices = None
+        self._replicas = None
         self._partitions = None
         self._reference_positions = None
         self._calls_since_rebuild = 0
@@ -107,6 +109,7 @@ class DistLongRangeCalculator(LongRangeCalculator):
         if not devices:
             raise ValueError("enable_distributed_mode needs at least one device")
         self.devices = list(devices)
+        self._replicas = None
         self._invalidate()
         return self
 
@@ -158,6 +161,14 @@ class DistLongRangeCalculator(LongRangeCalculator):
         atype = self._atom_types(atoms).cpu().numpy()
         devices = self.devices if self.devices is not None else [self.device]
 
+        # One deepcopy per non-home device, held for the life of the device
+        # list. Rebuilding it every step -- as this did -- re-copied the whole
+        # model onto every other GPU on every MD step, which costs nothing on
+        # a single device (`model if device == home`) and so never showed up
+        # in single-GPU testing.
+        if self._replicas is None:
+            self._replicas = device_replicas(self.model, devices)
+
         if self._needs_rebuild(coord):
             self._partitions = partition_system(
                 coord,
@@ -180,6 +191,7 @@ class DistLongRangeCalculator(LongRangeCalculator):
             n_partitions=len(devices),
             devices=devices,
             partitions=self._partitions,
+            replicas=self._replicas,
         )
 
         self.results["energy"] = out["energy"]
