@@ -54,9 +54,6 @@ import torch
 from deepmd.dpmodel.model.model_factory import (
     get_model_components,
 )
-from deepmd.dpmodel.utils.neighbor_graph import (
-    build_neighbor_graph,
-)
 from deepmd.pt_expt.descriptor import (
     BaseDescriptor,
 )
@@ -75,6 +72,9 @@ from deepmd_lr.fitting.charge import (
 )
 from deepmd_lr.lr.term import (
     LongRangeEnergy,
+)
+from deepmd_lr.neighbors import (
+    build_neighbor_graph_fast,
 )
 
 #: The ``model.type`` that selects this class, and the tag written into
@@ -221,7 +221,7 @@ class LongRangeEnergyModel(EnergyModel):
         express a per-frame reduction (see ``deepmd_lr.fitting.charge``).
         """
         descriptor = self.atomic_model.descriptor
-        graph = build_neighbor_graph(coord, atype, box, descriptor.get_rcut())
+        graph = build_neighbor_graph_fast(coord, atype, box, descriptor.get_rcut())
         atype_flat = atype.reshape(-1)
         # The charge head must see the SAME frame conditioning as the energy
         # head, or the two descriptor passes disagree about what system they

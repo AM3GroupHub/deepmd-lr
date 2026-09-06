@@ -496,8 +496,18 @@ results — there is a test asserting exactly that.
   Partitioning also *multiplies* that fixed cost, so fewer, larger partitions
   are cheaper than many small ones until then.
 
-- **The neighbour search is deepmd's O(N²) reference builder.**
-  `build_neighbor_graph` documents itself as a "correctness oracle"; the O(N)
-  backends are not yet wired up. Measured 473 ms at 6144 atoms against 146 ms
-  for `build_neighbor_graph_ase` (ASE cell list). Below ~2000 atoms the dense
-  search is actually faster; above it the gap widens with N.
+- **The neighbour search uses nvalchemiops' GPU cell list above a size
+  threshold.** DeePMD-kit's `build_neighbor_graph` calls itself a "correctness
+  oracle" and is O(N²); `deepmd_lr/neighbors.py` swaps in
+  `nvalchemiops.torch.neighbors.cell_list` once a frame is big enough to pay
+  for it (512 atoms periodic, 3072 non-periodic — partitions are the latter,
+  since the halo already carries the images).
+
+  Only the *search* is taken from nvalchemiops. Its edge vectors come out of a
+  Warp kernel with no gradient, so they are discarded and DeePMD-kit's
+  `neighbor_graph_from_ijs` recomputes `edge_vec` from `coord`/`box`. Using the
+  kernel's vectors directly would produce a model with no forces.
+
+  Edge sets are identical to the oracle — same count, same vectors to 9
+  decimals, periodic and not (`tests/test_neighbors.py`). End-to-end this is
+  1.00–1.77× over 768–12288 atoms, growing with system size.

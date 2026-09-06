@@ -29,9 +29,6 @@ from typing import (
 
 import numpy as np
 import torch
-from deepmd.dpmodel.utils.neighbor_graph import (
-    build_neighbor_graph,
-)
 
 from deepmd_lr.distributed.partition import (
     Partition,
@@ -39,6 +36,9 @@ from deepmd_lr.distributed.partition import (
 )
 from deepmd_lr.fitting.charge import (
     project_to_total_charge,
+)
+from deepmd_lr.neighbors import (
+    build_neighbor_graph_fast,
 )
 
 __all__ = [
@@ -125,7 +125,7 @@ def partition_graph(part: Partition, coord: np.ndarray, atype: np.ndarray,
     node_type = torch.tensor(
         part.types(atype)[None, ...], dtype=torch.int64, device=device
     )
-    graph = build_neighbor_graph(node_coord, node_type, None, rcut)
+    graph = build_neighbor_graph_fast(node_coord, node_type, None, rcut)
 
     owned_dst = graph.edge_index[1] < part.n_owned
     graph.edge_mask = graph.edge_mask & owned_dst
