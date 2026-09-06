@@ -3,8 +3,8 @@
 
     python md_minimal.py
 
-Everything below the loader is the actual API. `md_nvalchemi.py` is the same
-thing with a CLI, a choice of ensembles, and energy reporting.
+Everything below the loader is the actual API. `md.py` is the same thing with
+a CLI, a choice of ensembles, and energy reporting.
 """
 
 import numpy as np

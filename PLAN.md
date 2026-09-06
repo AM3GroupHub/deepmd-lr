@@ -1,4 +1,4 @@
-# Long-Range Electrostatics for DPA4C via nvalchemi PME
+# Long-Range Electrostatics for DPA4C via nvalchemiops PME
 
 ## Context
 
@@ -31,7 +31,7 @@ new *model type* rather than a new *atomic model*.
 - Charges: environment-dependent charge head on the DPA4C descriptor, projected to satisfy the
   total-charge constraint.
 - Training: joint end-to-end, one loss over `E_sr + E_lr`.
-- MD target: nvalchemi / ASE (both drive the top-level forward, which has the box). LAMMPS is
+- MD target: ASE (it drives the top-level forward, which has the box). LAMMPS is
   explicitly out of scope — its pair-style path cannot see the cell.
 
 ## Environment
@@ -73,7 +73,7 @@ conda run -n dpmd pip install "deepmd-kit==3.2.0"
 #    `import deepmd.pt_expt.descriptor` raises PackageNotFoundError.
 conda run -n dpmd pip install "e3nn>=0.5.9" "vesin[torch]" mpich
 
-# 4. nvalchemi PME engine (pure-python wheel + aarch64 warp)
+# 4. nvalchemiops PME engine (pure-python wheel + aarch64 warp)
 conda run -n dpmd pip install "nvalchemi-toolkit-ops>=0.4.1" "warp-lang>=1.13.0"
 
 # 5. data / MD / dev tooling
@@ -82,9 +82,6 @@ conda run -n dpmd pip install "dpdata>=0.2.7" "ase>=3.23.0" \
 
 # 5b. reference PME implementation, used only to validate our own PME usage
 conda run -n dpmd pip install "torch-pme==0.3.2"
-
-# 6. optional: nvalchemi MD driver (for the ASE/nvalchemi MD path later)
-conda run -n dpmd pip install nvalchemi-toolkit
 ```
 
 Wheel availability confirmed for all of the above on `cp311` / `linux_aarch64`:
@@ -188,7 +185,7 @@ deepmd_lr = "deepmd_lr.register"   # a module, NOT a callable
    `nvalchemi-toolkit-ops 0.4.1`. `torch.cuda` sees the GB10 at capability
    `(12, 1)`; warp initialises against `sm_121` and runs kernels correctly.
    DPA4C imports and the pt_expt registries populate.
-2. `nvalchemi`'s own PME test-suite passes here: 78 CUDA tests, plus 146
+2. `nvalchemiops`' own PME test-suite passes here: 78 CUDA tests, plus 146
    reference tests against `torch-pme` once that package is installed (they
    silently skip without it -- install it, or the tests that check *absolute*
    energies never run).
@@ -318,7 +315,7 @@ rather than ignored.
 
 **Validation.** The oracle is DeePMD-kit's own `ewald_reciprocal_energy` —
 the function its DPLR path uses — matched to 1e-7. That single comparison
-pins the split, the units, and the self-term convention at once (nvalchemi's
+pins the split, the units, and the self-term convention at once (nvalchemiops'
 `pme_reciprocal_space` returns k-space *minus* self; DeePMD-kit keeps it in,
 so the term adds it back).
 
@@ -443,7 +440,7 @@ data.
 > **Open question for the target science.** If the systems of interest are
 > the electrolyte clusters in `/home/admin/storage/dataset/electrolyte`, they
 > are non-periodic and charged, and **PME is the wrong engine for them** —
-> Ewald is only defined under PBC. nvalchemi ships `coulomb` and `dsf`
+> Ewald is only defined under PBC. nvalchemiops ships `coulomb` and `dsf`
 > (damped shifted force) for exactly that case, and both are already
 > differentiable with charge gradients. The charge head, the projection, the
 > model wiring and the derivative handling are all engine-agnostic; only
@@ -489,12 +486,13 @@ same 0.5 ps: drift is +10.7 meV/atom/ps at dt = 1.0 fs, −0.40 at 0.5 fs, and
 force that is the exact gradient of the reported energy; an inconsistent
 long-range force would leave a floor no timestep reduction removes.
 
-**Not done: the nvalchemi MD driver.** `nvalchemi-toolkit` (the driver, as
-distinct from `-ops`) is not installed here, and its DeePMD-kit adapter
-(`deepmd.pt.nvalchemi.DPA4Wrapper`) targets the `pt` backend and the frozen
-graph path — the same path that cannot carry this term. Wiring it up means
-giving that wrapper a cell-aware route, which is a larger change than ASE
-needed. ASE covers the stated Phase 0 requirement.
+**Out of scope: the nvalchemi MD driver.** `nvalchemi-toolkit` (the driver, as
+distinct from `-ops`) is deliberately not a dependency. It pulls
+`nvidia-physicsnemo` → `timm` → `torchvision`, and pip then resolves a newer
+`torch` than DeePMD-kit's compiled ops were built against. Its DeePMD-kit
+adapter (`deepmd.pt.nvalchemi.DPA4Wrapper`) also targets the `pt` backend and
+the frozen graph path — the same path that cannot carry this term. ASE covers
+the MD requirement, and only `nvalchemi-toolkit-ops` is needed for the physics.
 
 ## Status
 

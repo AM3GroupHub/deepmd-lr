@@ -26,7 +26,7 @@ network to learn to subtract something it can already describe.
 
 That is the same decomposition DeePMD-kit's own DPLR uses, and this term is
 checked against its ``ewald_reciprocal_energy`` (no real-space term, no self
-subtraction) as the reference. nvalchemi's ``pme_reciprocal_space`` returns
+subtraction) as the reference. nvalchemiops' ``pme_reciprocal_space`` returns
 the k-space sum *minus* the self term, so the self term is added back here to
 land on DeePMD-kit's convention.
 
@@ -92,7 +92,7 @@ from nvalchemiops.torch.interactions.electrostatics.slab import (
     compute_slab_correction,
 )
 
-#: Highest B-spline interpolation order nvalchemi computes correctly.
+#: Highest B-spline interpolation order nvalchemiops computes correctly.
 #:
 #: At order >= 7 ``pme_reciprocal_space`` silently drops the entire
 #: reciprocal-space sum and returns only the self-energy term, raising
@@ -214,7 +214,7 @@ class LongRangeEnergy(torch.nn.Module):
             if spline_order > MAX_SPLINE_ORDER:
                 raise ValueError(
                     f"spline_order={spline_order} exceeds the maximum order "
-                    f"nvalchemi computes correctly ({MAX_SPLINE_ORDER}). At "
+                    f"nvalchemiops computes correctly ({MAX_SPLINE_ORDER}). At "
                     "order >= 7 the reciprocal-space sum is silently dropped "
                     "and only the self-energy is returned, with no error."
                 )
@@ -422,7 +422,7 @@ class LongRangeEnergy(torch.nn.Module):
         if self.slab_correction:
             # Yeh-Berkowitz: cancels the interaction between a slab and its
             # periodic images across the vacuum. Added to the 3D result, as
-            # nvalchemi's own docstring prescribes.
+            # nvalchemiops' own docstring prescribes.
             energy = energy + compute_slab_correction(
                 positions,
                 charges,

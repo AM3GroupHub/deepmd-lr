@@ -111,10 +111,6 @@ spatial partitions — the descriptor is split, the reciprocal sum is gathered
 onto one device. Identical results, verified partition-count invariant. See
 TRAINING.md §10.
 
-For nvalchemi's own ensembles (`NVE`, `NVTLangevin`, `NVTNoseHoover`, `NPT`),
-`deepmd_lr.nvalchemi.LongRangeNVAlchemiModel` adapts the model to its dynamics
-engine, with the same optional partitioning — see `examples/lifsi/`.
-
 `dp freeze` is **refused** for a model with a `long_range` block: the exported
 graph lower receives edge vectors and no cell, so the artifact would silently
 contain only the short-range energy. See TRAINING.md §9.
@@ -156,6 +152,6 @@ global-sign degeneracy).
 
 `examples/lifsi/` is the worked example: a LiFSI/EC-DMC electrolyte against a
 lithium anode (6520 atoms, a 2D-periodic slab). It covers building the dataset
-from a UMA trajectory, the staged training schedule, and MD with nvalchemi's
+from a UMA trajectory, the staged training schedule, and MD with ASE's
 ensembles — serial or over spatial partitions. See that directory's README.
 Datasets are not vendored.

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "deepmd-lr"
 version = "0.1.0"
-description = "Long-range electrostatics for DPA4C via nvalchemi PME, as a DeePMD-kit plugin"
+description = "Long-range electrostatics for DPA4C via nvalchemiops PME, as a DeePMD-kit plugin"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
 license = "LGPL-3.0-or-later"

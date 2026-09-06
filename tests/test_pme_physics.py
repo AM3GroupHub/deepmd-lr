@@ -1,10 +1,10 @@
-"""Phase 0 physics validation of the nvalchemi PME engine.
+"""Phase 0 physics validation of the nvalchemiops PME engine.
 
 These tests pin down the two things the whole long-range design rests on:
 the PME energy is correct in absolute terms, and it is twice differentiable
 (needed to train against force labels through an autograd-derived force).
 
-They also guard the `spline_order` hazard: at order >= 7 nvalchemi silently
+They also guard the `spline_order` hazard: at order >= 7 nvalchemiops silently
 drops the entire reciprocal-space sum and returns only the self-energy, with
 no error raised. See PLAN.md, Phase 0.
 """

@@ -1,6 +1,6 @@
 """Phase 3: the long-range (reciprocal-space) electrostatic term.
 
-`tests/test_pme_physics.py` validates the nvalchemi engine itself. This file
+`tests/test_pme_physics.py` validates the nvalchemiops engine itself. This file
 validates *our wrapper*: that it computes the reciprocal half of the Ewald
 decomposition in DeePMD-kit's own convention and units, that the boundary
 conditions Ewald is invalid under are rejected rather than silently computed,
@@ -9,7 +9,7 @@ and that gradients reach both the coordinates and the charges.
 The oracle is DeePMD-kit's `ewald_reciprocal_energy`, the function its DPLR
 path uses. Matching it is the whole specification: same half of the split,
 same units, same treatment of the self term (DeePMD-kit keeps it in;
-nvalchemi subtracts it, so the wrapper adds it back).
+nvalchemiops subtracts it, so the wrapper adds it back).
 """
 
 import itertools
@@ -474,7 +474,7 @@ class TestBatching:
         """Cheap, sharp check that per-frame bookkeeping is right.
 
         This caught a real bug when the term still built a real-space
-        neighbour list: nvalchemi's batched `naive` builder silently
+        neighbour list: nvalchemiops' batched `naive` builder silently
         under-reported neighbours for every frame after the first. The
         reciprocal-only term has no neighbour list, so that failure mode is
         gone by construction -- but the invariant is cheap to keep.

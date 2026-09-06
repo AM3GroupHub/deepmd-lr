@@ -29,20 +29,12 @@ An integer means "that many partitions on the current device" — identical
 arithmetic to that many GPUs, which is how the partitioning is exercised
 without multi-GPU hardware.
 
-The same thing with nvalchemi's ensembles instead of ASE:
+`md.py` is the same thing with a CLI and a choice of `nve`, `nvt-langevin` or
+`nvt-nose-hoover`:
 
-```python
-from nvalchemi.dynamics.integrators import NVTLangevin
-from deepmd_lr.nvalchemi import LongRangeNVAlchemiModel
-from deepmd_lr.ase import load_model
-
-model = LongRangeNVAlchemiModel(load_model("run_joint/model.ckpt.pt"),
-                                devices=["cuda:0"] * 4)
-NVTLangevin(model, dt=0.5, temperature=300.0, friction=0.01).run(batch)
+```bash
+python md.py --ensemble nvt-langevin --temperature 300 --partitions 4
 ```
-
-`md_nvalchemi.py` is that with a CLI and a choice of `nve`, `nvt-langevin` or
-`nvt-nose-hoover`. Temperatures are in **Kelvin** throughout.
 
 The rest of this README is how to get to a trained model from the raw
 trajectory.
@@ -122,18 +114,18 @@ Also train `input_baseline.json` (same budget, no `long_range`) and
 system the apparent 1.11× force gain over the baseline turned out to be
 entirely the schedule. See `../../experiments/RESULTS_LiFSI.md` if you have it.
 
-## 3. Run MD, with nvalchemi's ensembles
+## 3. Run MD
 
 ```bash
 # constant energy, whole cell on one device
-python md_nvalchemi.py --model run_joint/model.ckpt.pt --ensemble nve --steps 200
+python md.py --model run_joint/model.ckpt.pt --ensemble nve --steps 200
 
 # Langevin thermostat at 300 K, model evaluated over 4 partitions
-python md_nvalchemi.py --ensemble nvt-langevin --temperature 300 --partitions 4
+python md.py --ensemble nvt-langevin --temperature 300 --partitions 4
 ```
 
-`NVE`, `NVTLangevin` and `NVTNoseHoover` come from
-`nvalchemi.dynamics.integrators`. Temperatures are in **Kelvin** throughout.
+The integrators are ASE's `VelocityVerlet`, `Langevin` and
+`NoseHooverChainNVT`, driven through `DistLongRangeCalculator`.
 
 ### Distributed evaluation
 
@@ -154,11 +146,10 @@ arithmetic is identical to four devices; only placement differs, which is how
 the partitioning is exercised without multi-GPU hardware. With more GPUs:
 
 ```bash
-python md_nvalchemi.py --devices cuda:0 cuda:1 cuda:2 cuda:3
+python md.py --devices cuda:0 cuda:1 cuda:2 cuda:3
 ```
 
-For ASE instead of nvalchemi, `deepmd_lr.distributed.DistLongRangeCalculator`
-offers the same thing behind an ASE calculator — see `../../TRAINING.md` §10.
+`DistLongRangeCalculator` is documented in `../../TRAINING.md` §10.
 
 ## 4. Inspect the model
 
