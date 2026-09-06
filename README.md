@@ -8,8 +8,8 @@ This is a **plugin package, not a fork** of DeePMD-kit. It registers itself
 through the `deepmd.pt_expt` entry point that DeePMD-kit already exposes, so
 it works against a stock `pip install deepmd-kit==3.2.0`.
 
-See [PLAN.md](PLAN.md) for the design, the phase breakdown, and the
-environment setup.
+See [TRAINING.md](TRAINING.md) for the physics, the training schedule and
+the deployment notes.
 
 ## Status
 
@@ -31,7 +31,7 @@ staged training schedules, what to monitor, and troubleshooting.
 
 ## Install
 
-Follow the environment section of [PLAN.md](PLAN.md) first, then:
+Into an environment with `deepmd-kit==3.2.0` and a matching `torch`:
 
 ```bash
 pip install -e . --no-deps
@@ -86,7 +86,7 @@ screened part `erfc(alpha r) / r` and this term supplies the rest, so `alpha`
 must be large enough that the network's share dies inside the descriptor
 cutoff (`alpha = 0.4` leaves `erfc(2.4) = 7e-4` at 6 A), and it must match
 between training and MD. Prefer `mesh_dimensions` over `mesh_spacing`
-whenever the cell can change — see PLAN.md, Phases 3 and 4.
+whenever the cell can change — see TRAINING.md §2.
 
 Only the long-range (reciprocal-space) half of the Ewald sum is computed
 here; the short-range half is already covered by the descriptor.
@@ -103,8 +103,6 @@ rather than a production one.
 from deepmd_lr.ase import LongRangeCalculator
 atoms.calc = LongRangeCalculator("run_joint/model.ckpt.pt")
 ```
-
-`examples/lifsi/md_minimal.py` is a ten-line distributed MD run.
 
 For larger systems, `DistLongRangeCalculator` evaluates the same model over
 spatial partitions — the descriptor is split, the reciprocal sum is gathered
@@ -123,7 +121,7 @@ pytest tests/ -q
 
 - `tests/test_pme_physics.py` — PME against the NaCl Madelung constant,
   `gradcheck`/`gradgradcheck`, and a guard for the `spline_order >= 7`
-  silent-failure mode (see PLAN.md, Phase 0).
+  silent-failure mode.
 - `tests/test_plugin_registration.py` — entry-point registration, input-schema
   acceptance, equivalence to the standard model, and serialization round-trip.
 - `tests/test_charge_head.py` — the total-charge projection (exactness,
@@ -150,8 +148,8 @@ global-sign degeneracy).
 
 ## Example
 
-`examples/lifsi/` is the worked example: a LiFSI/EC-DMC electrolyte against a
-lithium anode (6520 atoms, a 2D-periodic slab). It covers building the dataset
-from a UMA trajectory, the staged training schedule, and MD with ASE's
-ensembles — serial or over spatial partitions. See that directory's README.
-Datasets are not vendored.
+`examples/` is the worked example: a LiFSI/EC-DMC electrolyte against a
+lithium anode (6520 atoms, a 2D-periodic slab). Three steps — build the
+dataset, train, then run under ASE and across several GPUs, with the
+multi-GPU result verified against the single-GPU one. It is kept out of git
+because it points at datasets and checkpoints that live outside the repo.

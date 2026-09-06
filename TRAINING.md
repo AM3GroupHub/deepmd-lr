@@ -345,7 +345,7 @@ The joint model runs the descriptor twice — the short-range path consumes and
 discards its own descriptor output, and the charge head needs it again.
 Measured at **~3× per training step** on small systems (24 atoms: 15 → 45 ms;
 96 atoms: 14 → 46 ms). Those sizes are launch-overhead dominated, so expect
-the ratio to improve with system size. Budget accordingly; PLAN.md Phase 4
+the ratio to improve with system size. Budget accordingly; §4
 describes the single-pass optimization if it becomes the constraint.
 
 ---
@@ -386,9 +386,8 @@ The sharpest end-to-end test that the forces really are the gradient of the
 energy, long-range term included:
 
 ```bash
-python examples/lifsi/md.py \
-    --model run_joint/model.ckpt.pt --ensemble nve \
-    --steps 1000 --timestep 0.5
+python examples/run_ase.py \
+    --model run/model.ckpt.pt --steps 1000 --timestep 0.5
 ```
 
 Measured on the water model (192 atoms, 340 K):
@@ -415,7 +414,7 @@ silently pretend. The charge head, the total-charge projection, the model
 wiring and the force/virial handling are all engine-agnostic — only the
 energy term itself would need a sibling built on `nvalchemiops`'s `coulomb`
 or `dsf` (damped shifted force), both of which are already differentiable
-with charge gradients. See PLAN.md, Phase 5.
+with charge gradients.
 
 ---
 
@@ -452,7 +451,7 @@ identical either way; only placement differs.
 
 The reciprocal sum is gathered rather than decomposed because it does not
 survive spatial decomposition — splitting it gave 2.0% error on 2 ranks and
-36.5% on 8 (`LAMMPS.md`). That is affordable because it is under 10% of the
+36.5% on 8. That is affordable because it is under 10% of the
 step and the round trip is ~230 KB. Only the descriptor is worth splitting.
 
 The charge-response force, `-Σⱼ (dE/dqⱼ) ∂qⱼ/∂rᵢ`, stays partitioned: `∂qⱼ/∂rᵢ`

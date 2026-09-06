@@ -18,14 +18,12 @@ model.ckpt*
 out.json
 input_v2_compat.json
 
-# Data. Datasets are never vendored -- examples/water_lr/README.md and
-# experiments/RESULTS.md say where each one comes from and how to regenerate
-# or copy it in. Tracking a bare type.raw without its set.000/*.npy just
-# leaves a confusing fragment in a fresh clone.
+# Data. Datasets are never vendored: examples/README.md says how to rebuild
+# them. Tracking a bare type.raw without its set.000/*.npy just leaves a
+# confusing fragment in a fresh clone.
 *.npy
 *.hdf5
 *.h5
-examples/water_lr/data/
 experiments/water_real/data
 
 # Warp / torch caches
@@ -37,20 +35,19 @@ warp_cache/
 .idea/
 .DS_Store
 
-# Example run and data directories. Datasets are never vendored --
-# examples/lifsi/README.md says how to build them. No trailing slash: these
-# are often symlinks to a scratch location, and a `dir/` pattern matches only
-# real directories, so the symlinks would show up as untracked.
-examples/**/run_*
-examples/**/data
+# The example is kept local, not vendored: it points at datasets and
+# checkpoints that live outside the repo. No trailing slash -- `data` and
+# `run` there are usually symlinks to scratch, and a `dir/` pattern matches
+# only real directories.
+examples
+PLAN.md
 
 # Experiment data and run directories. Scoped deliberately: a bare
 # `experiments/` here once swallowed the whole tree, so new analysis scripts
 # were silently unaddable while already-tracked ones kept working.
 experiments/
 
-# Uploaded trajectories and anything derived from them. The LiFSI xyz alone is
-# 3.3 GB; experiments/lifsi/TRAINING_LiFSI.md says how to regenerate the
-# dataset from it with prepare_dataset.py.
+# Uploaded trajectories and anything derived from them. The LiFSI xyz alone
+# is 3.1 GB; examples/README.md says how to rebuild the dataset from it.
 *.xyz
 *.traj
