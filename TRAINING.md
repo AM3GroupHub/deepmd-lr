@@ -478,7 +478,26 @@ results — there is a test asserting exactly that.
 
 - **`stress` is not provided.** The partitioned path assembles energy and
   forces only. Use `LongRangeCalculator` when the virial is needed.
-- **Multi-GPU is untested.** This was developed on a single-GPU machine.
-  Correctness is established by partition-count invariance — 1, 2, 4 and 8
-  partitions agree with the serial calculator to ~1e-15 (float64) or the
-  float32 noise floor — but scaling and concurrency are not benchmarked.
+- **Multi-GPU is correct but not yet faster.** Verified on 2 × A40: results
+  are identical across `cuda:0`, `cuda:0`×2 and `cuda:0`+`cuda:1` (ΔE = 0 at
+  768 and 2592 atoms, 9.1e-13 at 6144), and the 43 partition-invariance tests
+  pass on real devices. But the measured speedup from a second GPU is
+  **0.92–1.03×** — i.e. none.
+
+  The reason is measured, not guessed: with the partition loop staged so that
+  all devices are launched before any host transfer, **the step is still
+  ~100% CPU-bound** — at 768 atoms there is 0 ms of GPU work outstanding when
+  the launch loop returns, and 2.4 ms (8%) at 2592. The ~11 ms per partition
+  is eager-PyTorch dispatch in the descriptor and charge head, not GPU
+  compute, so a second device has nothing to overlap with.
+
+  Adding GPUs will not help until that per-partition CPU cost comes down —
+  through a compiled descriptor, CUDA graphs, or per-device launch threads.
+  Partitioning also *multiplies* that fixed cost, so fewer, larger partitions
+  are cheaper than many small ones until then.
+
+- **The neighbour search is deepmd's O(N²) reference builder.**
+  `build_neighbor_graph` documents itself as a "correctness oracle"; the O(N)
+  backends are not yet wired up. Measured 473 ms at 6144 atoms against 146 ms
+  for `build_neighbor_graph_ase` (ASE cell list). Below ~2000 atoms the dense
+  search is actually faster; above it the gap widens with N.
