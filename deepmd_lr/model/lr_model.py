@@ -230,6 +230,7 @@ class LongRangeEnergyModel(EnergyModel):
         box: torch.Tensor,
         charge_spin: torch.Tensor | None,
         mask: torch.Tensor | None,
+        strain: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Per-atom charges satisfying the frame's total-charge constraint.
 
@@ -237,19 +238,37 @@ class LongRangeEnergyModel(EnergyModel):
         then applies the projection here rather than inside the head -- the
         head sees a flat node axis with no frame structure and so cannot
         express a per-frame reduction (see ``deepmd_lr.fitting.charge``).
+
+        ``strain`` is a per-frame ``(nf, 3, 3)`` matrix, ``I + sym(eps)``,
+        applied to the edge vectors AFTER the graph is built -- see below for
+        why it is not applied to the coordinates and cell before.
         """
         descriptor = self.atomic_model.descriptor
-        # `method="dense"` is required, not a default. `_long_range` gets the
-        # virial by differentiating this prediction with respect to a strain
-        # applied to both coordinates AND the cell, so `edge_vec` has to carry
-        # the cell derivative. Of DeePMD-kit's four builders only the dense
-        # one does: `ase` and `vesin` raise on a box that requires grad, and
-        # `nv` returns a cell gradient of exactly 0.0 -- silently, which would
-        # give plausible forces and a wrong virial.
-        # `tests/test_neighbors.py` pins this.
-        graph = build_neighbor_graph_fast(
-            coord, atype, box, descriptor.get_rcut(), method="dense"
-        )
+        graph = build_neighbor_graph_fast(coord, atype, box, descriptor.get_rcut())
+        if strain is not None:
+            # The virial needs d(charge)/d(strain). Building the graph from
+            # strained coordinates and a strained cell would route that
+            # derivative through the box -- and of DeePMD-kit's four
+            # neighbour builders only the dense O(N^2) one carries
+            # d(edge_vec)/d(box); `nv` returns 6.7e-13 for it, silently. At
+            # 6520 atoms the dense build cost 63 GB and 3 s per training step.
+            #
+            # But the strain is affine, and an edge vector is
+            # ``coord[j] + S @ box - coord[i]``: every term transforms by the
+            # same ``(I + eps)^T``, so straining the finished edge vectors is
+            # identical to straining the inputs, and the derivative now flows
+            # through ``edge_vec`` alone. That is what lets the O(N) builder
+            # be used here. The partitioned path relies on the same fact.
+            #
+            # Edges are flat over all frames, frames occupy contiguous node
+            # blocks of ``nloc``, and both ends of an edge are in the same
+            # frame -- so the destination node picks the frame's strain.
+            # Dummy (masked) edges have zero vectors and stay zero.
+            nloc = coord.shape[1]
+            frame_of_edge = graph.edge_index[1] // nloc
+            graph.edge_vec = torch.einsum(
+                "eab,eb->ea", strain[frame_of_edge], graph.edge_vec
+            )
         atype_flat = atype.reshape(-1)
         # The charge head must see the SAME frame conditioning as the energy
         # head, or the two descriptor passes disagree about what system they
@@ -324,8 +343,13 @@ class LongRangeEnergyModel(EnergyModel):
         strained_box = torch.bmm(base_box, strain.transpose(-1, -2))
 
         mask = self.atomic_model.make_atom_mask(atype)
+        # The charge graph is built from the UNstrained geometry and the strain
+        # is applied to its edge vectors inside -- `_predict_charges` explains
+        # why that is both exact and what makes the O(N) neighbour builder
+        # usable here. `leaf_coord` (not `base_coord`) so d(charge)/d(coord)
+        # still reaches the force.
         charge = self._predict_charges(
-            strained_coord, atype, strained_box, charge_spin, mask
+            leaf_coord, atype, base_box, charge_spin, mask, strain=strain
         )
         atom_energy = self.long_range_energy(
             strained_coord, charge, strained_box, mask=mask

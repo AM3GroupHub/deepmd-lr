@@ -818,22 +818,33 @@ results — there is a test asserting exactly that.
   own `resolve_neighbor_graph_method("auto", device)`, so CPU or a missing
   nvalchemiops degrades to `dense` instead of raising.
 
-- **Only the `dense` builder carries a cell derivative.** Measured
-  `d(edge_vec)/d(box)`: `dense` 1932.8, `nv` **6.7e-13**, `ase` and `vesin`
-  raise. `nv` returning round-off rather than an error is the dangerous part —
-  forces stay correct and the virial goes silently wrong. So
-  `_predict_charges` pins `method="dense"`: `_long_range` gets the virial by
-  differentiating the charge prediction through a strain applied to
-  coordinates *and* cell.
+- **Only the `dense` builder carries a cell derivative — and nothing here
+  needs one any more.** Measured `d(edge_vec)/d(box)`: `dense` 1932.8, `nv`
+  **6.7e-13**, `ase` and `vesin` raise. `nv` returning round-off rather than
+  an error is the dangerous part: forces stay correct and a virial that
+  leaned on it would go silently wrong.
 
-  This was a live bug between commits `78a690e` and `b0f9d0f`: the charge
-  graph switched to a cell-blind builder above 512 atoms, and the virial test
-  used 96-atom frames, so it never fired. `tests/test_joint_model.py` now
-  checks the virial at 576 atoms as well, which catches it at 1.1 eV.
+  `_long_range` gets the virial by differentiating the charge prediction
+  through a strain. For a while `_predict_charges` therefore built its graph
+  from strained coordinates and a strained cell, which routes the derivative
+  through the box and forced the dense builder. At 6520 atoms that cost
+  **63 GB and 3.0 s per training step** — it could not train on a 48 GB A40
+  at all.
 
-  The cost is that the charge graph stays O(N²): the serial calculator peaks
-  near 59 GB at 6520 atoms. **Use the partitioned path for large cells** — its
-  partitions are non-periodic, need no cell derivative, and run `nv`.
+  It now builds the graph from the *unstrained* geometry and applies the
+  strain to the finished edge vectors. That is exact: the strain is affine
+  and an edge vector is `coord[j] + S·box − coord[i]`, every term of which
+  transforms by the same `(I+ε)ᵀ`. The derivative then flows through
+  `edge_vec` alone, the box derivative is never needed, and the O(N) builder
+  is used: **8.3 GB and 0.92 s per step**, same virial to finite-difference
+  precision at 96 and 576 atoms. The partitioned path always worked this way;
+  the serial path now matches it.
+
+  There was a live bug between commits `78a690e` and `b0f9d0f`: the charge
+  graph switched to a cell-blind builder above 512 atoms *without* this
+  edge-vector strain, and the virial test used 96-atom frames, so it never
+  fired. `tests/test_joint_model.py` checks the virial at 576 atoms as well,
+  which catches that failure at 1.1 eV.
 
 - **The neighbour-graph choice in `deepmd_lr/neighbors.py`.** DeePMD-kit's `build_neighbor_graph` calls itself a "correctness
   oracle" and is O(N²); `deepmd_lr/neighbors.py` swaps in

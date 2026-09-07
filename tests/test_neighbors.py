@@ -90,19 +90,20 @@ def test_rejects_an_unknown_method():
 @CUDA
 @pytest.mark.parametrize("method", ["dense", "ase", "vesin", "nv"])
 def test_only_dense_carries_the_cell_derivative(method):
-    """Which builders can be used where a virial is needed.
+    """Which builders carry a cell derivative -- a fact about DeePMD-kit.
 
-    `LongRangeEnergyModel._long_range` gets the virial by differentiating the
-    charge prediction with respect to a strain applied to both coordinates
-    and the cell, so `edge_vec` has to depend on the box. Only the dense
-    builder does. `nv` is the dangerous one: it returns a cell gradient of
-    6.7e-13 -- float64 round-off, fifteen orders below the dense builder's
-    1932.8 -- rather than raising, which yields correct forces and a silently
-    wrong virial.
+    Only the dense builder does. `nv` is the dangerous one: it returns a cell
+    gradient of 6.7e-13 -- float64 round-off, fifteen orders below the dense
+    builder's 1932.8 -- rather than raising, so a virial that leaned on it
+    would be silently wrong while the forces stayed right.
 
-    Pinned as a parametrised fact rather than an assertion about one builder,
-    so that a future DeePMD-kit release fixing `nv` shows up here as a
-    failure inviting the faster path back in.
+    This package no longer leans on it. `_predict_charges` builds its graph
+    from the unstrained geometry and applies the strain to the finished edge
+    vectors, so d(charge)/d(strain) flows through `edge_vec` and the box
+    derivative is never needed -- which is what lets the charge graph use the
+    O(N) builder (63 GB and 3 s per training step at 6520 atoms, down to
+    8 GB and 0.9 s). The fact is pinned here anyway, because anyone who
+    builds a strained graph from a strained box will hit it.
     """
     from deepmd.pt_expt.utils.graph_builder import build_neighbor_graph_for_method
 
@@ -129,7 +130,7 @@ def test_only_dense_carries_the_cell_derivative(method):
         # The dense builder gives ~1.9e3 here, so anything below 1e-6 is
         # round-off rather than a real derivative.
         assert norm < 1e-6, (
-            f"{method!r} now carries a cell gradient ({norm:.4e}). If that is "
-            "correct, it can replace 'dense' in _predict_charges and the "
-            "charge graph stops being O(N^2)."
+            f"{method!r} now carries a cell gradient ({norm:.4e}). Nothing "
+            "here depends on that any more, but the docstring above is now "
+            "wrong and should say so."
         )
