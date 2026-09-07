@@ -63,7 +63,7 @@ BOLTZMANN_EV_PER_K = 8.617333262e-5
 #: One femtosecond in ASE time units (``A * sqrt(amu/eV)``).
 FS = 0.09822694788464063
 
-ENSEMBLES = ("nve", "nvt-langevin")
+ENSEMBLES = ("nve", "nvt-langevin", "nvt-nose-hoover")
 
 
 def kelvin_to_energy(temperature_k: float) -> float:
@@ -85,13 +85,20 @@ class DistributedMD:
         partitioning arithmetic -- see the note in
         ``examples/run_distributed.py``.
     ensemble
-        ``"nve"`` (velocity Verlet) or ``"nvt-langevin"`` (BAOAB).
+        ``"nve"`` (velocity Verlet), ``"nvt-langevin"`` (BAOAB) or
+        ``"nvt-nose-hoover"`` (Nose-Hoover chain, Martyna-Tobias-Klein).
     timestep
         In femtoseconds.
     temperature
         In **Kelvin**; converted internally.
     friction
-        Langevin friction, in 1/fs.
+        Langevin friction, in 1/fs. ``nvt-langevin`` only.
+    tdamp
+        Nose-Hoover coupling time, in fs. ``nvt-nose-hoover`` only. A few
+        hundred timesteps is the usual choice: too short and the thermostat
+        rings, too long and it barely couples.
+    chain_length, nloops
+        Nose-Hoover chain length and Yoshida-Suzuki sub-steps.
     skin
         Halo padding beyond ``rcut``. The partitioning is reused until an
         atom has moved far enough to invalidate it.
@@ -112,6 +119,9 @@ class DistributedMD:
         timestep: float = 0.5,
         temperature: float = 300.0,
         friction: float = 0.01,
+        tdamp: float = 100.0,
+        chain_length: int = 3,
+        nloops: int = 1,
         skin: float = 1.0,
         repartition_every: int | None = None,
         masses: np.ndarray | None = None,
@@ -132,6 +142,9 @@ class DistributedMD:
         self.timestep = float(timestep)
         self.temperature = float(temperature)
         self.friction = float(friction)
+        self.tdamp = float(tdamp)
+        self.chain_length = int(chain_length)
+        self.nloops = int(nloops)
         self.skin = float(skin)
         self.repartition_every = repartition_every
         self.seed = int(seed)
@@ -159,6 +172,9 @@ class DistributedMD:
         self._dt = tensor(np.array([self.timestep * FS]))
         self._kT = tensor(np.array([kelvin_to_energy(self.temperature)]))
         self._friction = tensor(np.array([self.friction / FS]))
+        self._chain = (
+            self._make_chain(tensor) if ensemble == "nvt-nose-hoover" else None
+        )
 
         # Built once for the life of the device list, not per step.
         self._replicas = device_replicas(model, self.devices)
@@ -180,6 +196,109 @@ class DistributedMD:
             [atomic_masses[atomic_numbers[name]] for name in type_map]
         )
         return table[self.atype]
+
+    def _make_chain(self, tensor) -> dict:
+        """Allocate the Nose-Hoover chain state and its scratch arrays.
+
+        ``eta`` and ``eta_dot`` are the chain positions and velocities;
+        ``eta_mass`` comes from ``nhc_compute_masses`` given the coupling
+        time. The rest are scratch the kernel needs handed to it -- there is
+        no internal allocation, which is what makes the kernel stateless.
+        """
+        import warp as wp
+        from nvalchemiops.dynamics.integrators import (
+            nhc_compute_masses,
+        )
+
+        n_atoms = self.positions.shape[0]
+        # 3N - 3: the centre of mass is removed when velocities are drawn.
+        #
+        # Two copies, because the kernels disagree about the dtype:
+        # `nhc_compute_masses` requires int32, while
+        # `nhc_thermostat_chain_update` and `nhc_compute_chain_energy` take
+        # float64 -- and the mismatch is a launch error, not a cast.
+        chain = {
+            "eta": tensor(np.zeros(self.chain_length)),
+            "eta_dot": tensor(np.zeros(self.chain_length)),
+            "eta_mass": tensor(np.zeros(self.chain_length)),
+            "ndof": tensor(np.array([3.0 * n_atoms - 3.0])),
+            "ndof_int": torch.tensor(
+                [3 * n_atoms - 3], dtype=torch.int32, device=self.home
+            ),
+            "ke2": tensor(np.zeros(1)),
+            "total_scale": tensor(np.ones(1)),
+            "step_scale": tensor(np.zeros(1)),
+            "dt_chain": tensor(np.zeros(1)),
+            "tau": tensor(np.array([self.tdamp * FS])),
+        }
+        nhc_compute_masses(
+            wp.from_torch(chain["ndof_int"]),
+            wp.from_torch(self._kT),
+            wp.from_torch(chain["tau"]),
+            self.chain_length,
+            wp.from_torch(chain["eta_mass"]),
+        )
+        wp.synchronize()
+        return chain
+
+    def chain_energy(self) -> float:
+        """Thermostat kinetic + potential energy, in eV.
+
+        For Nose-Hoover the conserved quantity is the physical energy *plus*
+        this -- the physical total alone drifts by design, because the
+        thermostat exchanges energy with the system.
+        """
+        if self._chain is None:
+            return 0.0
+        import warp as wp
+        from nvalchemiops.dynamics.integrators import (
+            nhc_compute_chain_energy,
+        )
+
+        chain = self._chain
+        ke = torch.zeros(1, dtype=torch.float64, device=self.home)
+        pe = torch.zeros(1, dtype=torch.float64, device=self.home)
+        nhc_compute_chain_energy(
+            wp.from_torch(chain["eta"]),
+            wp.from_torch(chain["eta_dot"]),
+            wp.from_torch(chain["eta_mass"]),
+            wp.from_torch(self._kT),
+            wp.from_torch(chain["ndof"]),
+            wp.from_torch(ke),
+            wp.from_torch(pe),
+        )
+        wp.synchronize()
+        return float(ke) + float(pe)
+
+    def conserved_energy(self) -> float:
+        """The quantity that should stay flat for the chosen ensemble."""
+        return self.total_energy() + self.chain_energy()
+
+    def _chain_half_step(self) -> None:
+        """Apply half a thermostat step, rescaling the velocities."""
+        import warp as wp
+        from nvalchemiops.dynamics.integrators import (
+            nhc_thermostat_chain_update,
+        )
+
+        chain = self._chain
+        # The kernel requires this reset by the caller on every call.
+        chain["total_scale"].fill_(1.0)
+        nhc_thermostat_chain_update(
+            wp.from_torch(self.velocities, dtype=wp.vec3d),
+            wp.from_torch(self.masses),
+            wp.from_torch(chain["eta"]),
+            wp.from_torch(chain["eta_dot"]),
+            wp.from_torch(chain["eta_mass"]),
+            wp.from_torch(self._kT),
+            wp.from_torch(self._dt),
+            wp.from_torch(chain["ndof"]),
+            wp.from_torch(chain["ke2"]),
+            wp.from_torch(chain["total_scale"]),
+            wp.from_torch(chain["step_scale"]),
+            wp.from_torch(chain["dt_chain"]),
+            nloops=self.nloops,
+        )
 
     def set_temperature(self, temperature_k: float, seed: int | None = None) -> None:
         """Draw velocities from Maxwell-Boltzmann and remove COM drift."""
@@ -307,6 +426,22 @@ class DistributedMD:
             velocity_verlet_velocity_finalize(
                 velocities, vec(self.forces), masses, dt
             )
+        elif self.ensemble == "nvt-nose-hoover":
+            from nvalchemiops.dynamics.integrators import (
+                nhc_position_update,
+                nhc_velocity_half_step,
+            )
+
+            # Tuckerman's time-reversible splitting. Both the chain update
+            # and `nhc_velocity_half_step` apply their own factor of 1/2, so
+            # the full dt goes to every call -- verified numerically:
+            # dv = (F/m) dt/2 and dr = v dt.
+            self._chain_half_step()
+            nhc_velocity_half_step(velocities, vec(self.forces), masses, dt)
+            nhc_position_update(positions, velocities, dt)
+            self._compute_forces()
+            nhc_velocity_half_step(velocities, vec(self.forces), masses, dt)
+            self._chain_half_step()
         else:
             from nvalchemiops.dynamics.integrators import (
                 langevin_baoab_finalize,

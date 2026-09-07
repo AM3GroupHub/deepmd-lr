@@ -364,7 +364,67 @@ class TestDistributedMD:
         reference = serial["force"][0].detach().cpu().numpy()
         assert np.abs(md.forces.cpu().numpy() - reference).max() < 1e-8
 
-    @pytest.mark.parametrize("ensemble", ["nve", "nvt-langevin"])
+    def test_nose_hoover_chain_absorbs_energy(self, model, system):
+        """The chain must actually couple, and its energy is real.
+
+        `chain_energy` is checked against the MTK expression directly --
+        `sum_k Q_k eta_dot_k^2 / 2 + N_dof kT eta_1 + kT sum_{k>1} eta_k` --
+        because a thermostat that silently does nothing still produces a
+        plausible-looking trajectory.
+        """
+        md = self._md(
+            model, system, ensemble="nvt-nose-hoover", timestep=0.5,
+            temperature=300.0, tdamp=50.0, seed=1,
+        )
+        md.set_temperature(300.0, seed=1)
+        assert md.chain_energy() == 0.0
+        md.run(20)
+        assert md.chain_energy() > 0.0, "the chain never coupled"
+
+        chain = md._chain
+        eta = chain["eta"].cpu().numpy()
+        eta_dot = chain["eta_dot"].cpu().numpy()
+        q = chain["eta_mass"].cpu().numpy()
+        kT = float(md._kT)
+        ndof = float(chain["ndof"])
+        expected = (
+            0.5 * float((q * eta_dot**2).sum())
+            + ndof * kT * float(eta[0])
+            + kT * float(eta[1:].sum())
+        )
+        assert abs(md.chain_energy() - expected) < 1e-9 * max(1.0, abs(expected))
+
+    def test_nose_hoover_masses_follow_the_coupling_time(self, model, system):
+        """Q_1 = N_dof kT tau^2 and Q_k = kT tau^2, from the MTK paper."""
+        md = self._md(
+            model, system, ensemble="nvt-nose-hoover",
+            temperature=300.0, tdamp=50.0, chain_length=3,
+        )
+        q = md._chain["eta_mass"].cpu().numpy()
+        kT = float(md._kT)
+        tau = float(md._chain["tau"])
+        ndof = float(md._chain["ndof"])
+        assert abs(q[0] - ndof * kT * tau**2) < 1e-9 * q[0]
+        for later in q[1:]:
+            assert abs(later - kT * tau**2) < 1e-9 * later
+
+    def test_nose_hoover_drives_the_temperature_toward_the_target(
+        self, model, system
+    ):
+        """Started hot, the chain has to take energy out."""
+        md = self._md(
+            model, system, ensemble="nvt-nose-hoover", timestep=0.5,
+            temperature=100.0, tdamp=20.0, seed=2,
+        )
+        md.set_temperature(1500.0, seed=2)
+        hot = md.temperature_k()
+        md.run(60)
+        assert md.temperature_k() < hot, (
+            f"T went {hot:.0f} -> {md.temperature_k():.0f} K with a 100 K target"
+        )
+        assert md.chain_energy() > 0.0
+
+    @pytest.mark.parametrize("ensemble", ["nve", "nvt-langevin", "nvt-nose-hoover"])
     def test_both_ensembles_advance_the_system(self, model, system, ensemble):
         md = self._md(model, system, ensemble=ensemble, timestep=0.5)
         md.set_temperature(300.0)

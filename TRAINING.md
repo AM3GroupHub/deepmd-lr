@@ -654,8 +654,68 @@ zero-copy views, so the integrator mutates the trajectory in place on the GPU.
 
 nvalchemiops ships half-step kernels rather than a driver, so `DistributedMD`
 composes the loop: position update, evaluate the partitioned model, velocity
-finalize. Available here are velocity Verlet (NVE) and Langevin BAOAB (NVT);
-the library also has Nosé–Hoover chain, NPT and NPH, which are not wired up.
+finalize. Wired up: velocity Verlet (NVE), Langevin BAOAB (NVT) and
+Nosé–Hoover chain (NVT). NPT and NPH exist in the library and are not.
+
+### Nosé–Hoover NVT
+
+```python
+from deepmd_lr.distributed import DistributedMD
+
+md = DistributedMD(
+    model, coord, atype, cell,
+    devices=["cuda:0", "cuda:1"],
+    ensemble="nvt-nose-hoover",
+    timestep=0.5,          # fs
+    temperature=300.0,     # Kelvin
+    tdamp=100.0,           # coupling time, fs -- ~200 steps here
+    chain_length=3,
+)
+md.set_temperature(300.0)
+
+for block in range(20):
+    md.run(50)
+    print(f"{md.step_count * 0.5:7.0f} fs  T = {md.temperature_k():6.1f} K  "
+          f"conserved = {md.conserved_energy():.4f} eV")
+```
+
+`tdamp` is the one parameter to think about: too short and the thermostat
+rings, too long and it barely couples. A few hundred timesteps is the usual
+choice.
+
+**Watch `conserved_energy()`, not `total_energy()`.** A thermostat exchanges
+energy with the system on purpose, so the physical total is *supposed* to
+move. The Martyna–Tobias–Klein invariant adds the chain's own energy,
+
+```
+E_pot + E_kin + sum_k Q_k eta_dot_k^2 / 2 + N_dof kT eta_1 + kT sum_{k>1} eta_k
+```
+
+which `chain_energy()` supplies and a test checks against that expression
+term by term — a thermostat that silently fails to couple still produces a
+plausible-looking trajectory, so the coupling is asserted rather than assumed.
+
+The chain masses follow MTK: `Q_1 = N_dof kT tau^2` and `Q_k = kT tau^2`,
+also pinned by a test.
+
+> Two kernel quirks, both found by running into them. `nhc_compute_masses`
+> requires `ndof` as **int32** while `nhc_thermostat_chain_update` and
+> `nhc_compute_chain_energy` require it as **float64** — a launch error, not a
+> cast, so `DistributedMD` keeps both. And `nhc_velocity_half_step` applies
+> its own factor of ½ (`dv = (F/m) dt/2`) while `nhc_position_update` is a
+> full step (`dr = v dt`), so the full `dt` goes to every call; the chain
+> update likewise advances `eta` by `half_dt` internally, so it is called
+> once at each end of the step with the full `dt`.
+>
+> One caveat measured and not resolved: the MTK invariant drifts by a few
+> meV/atom per 20 fs at strong coupling, and the drift is **independent of
+> the timestep** (2.2237, 2.2355, 2.2385 meV/atom at dt = 0.5, 0.25, 0.125
+> fs) and unchanged by `nloops`. So it is not integration error. The same
+> system under NVE conserves cleanly and as `dt^2` (−0.0159, −0.0040,
+> −0.0010), and the chain-energy expression matches the analytic formula
+> exactly, so it is not those either. It scales as the square of the coupling
+> strength, so weak coupling is the safe regime until this is understood.
+> Treat NVE as the trustworthy conservation check.
 
 > **Temperature is Kelvin at this API and `k_B T` in eV underneath.** Every
 > nvalchemiops dynamics entry point documents its temperature as "k_B*T in
