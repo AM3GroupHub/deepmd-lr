@@ -211,6 +211,63 @@ dp --pt-expt train input_baseline.json     # same settings, no long_range
 
 ---
 
+## 3b. Dataset format: directories or HDF5
+
+DeePMD-kit reads either. The mapping is one-for-one — **a directory becomes an
+HDF5 Group, a file becomes a Dataset** (`deepmd/utils/path.py`, `DPH5Path`) —
+so the tree inside the file is identical to the directory layout:
+
+```
+data.hdf5
+└── train/                     Group   (the system directory)
+    ├── type.raw               Dataset, int32
+    ├── type_map.raw           Dataset, fixed-length bytes "S8"
+    └── set.000/               Group
+        ├── coord.npy          Dataset (nframes, natoms*3) float64
+        ├── box.npy            Dataset (nframes, 9)
+        ├── energy.npy         Dataset (nframes,)
+        └── force.npy          Dataset (nframes, natoms*3)
+```
+
+A system is addressed with `#` rather than a path separator, and nothing else
+in the input file changes:
+
+```json
+"training_data":   { "systems": ["./data.hdf5#/train"], "batch_size": 1 },
+"validation_data": { "systems": ["./data.hdf5#/valid"], "batch_size": 1 }
+```
+
+No flag is needed — `DPPath` selects the HDF5 reader when the path before `#`
+is a file rather than a directory.
+
+**`type_map.raw` is the one thing to get wrong.** It is read back with
+`load_txt(dtype=str)`, which is numpy's `astype(str)` on whatever h5py
+returns. Fixed-length bytes (`S8`) and both variable-length string dtypes
+decode correctly through that; pickled Python objects do not.
+
+**Compression is not worth enabling.** Measured on 75.1 MB of float64
+coordinates, boxes, energies and forces:
+
+| filter | size | ratio | write | read all |
+|---|---:|---:|---:|---:|
+| none | 75.2 MB | 1.00× | 0.04 s | 0.01 s |
+| lzf | 74.8 MB | 1.00× | 0.47 s | 0.09 s |
+| gzip | 70.0 MB | 1.07× | 1.65 s | 0.24 s |
+
+MD coordinates are high-entropy, so a general-purpose compressor has nothing
+to remove: gzip costs a 24× slower read to save 7%. If a set is genuinely too
+large, storing coordinates as float32 halves it — a real decision about
+precision, not a free win like compression appeared to be.
+
+Choose HDF5 for the **file count**, not the size: one file instead of a dozen
+per system matters on a cluster filesystem with inode quotas, and makes a
+dataset atomic to `rsync`. Training throughput is comparable — measured 0.79
+s/batch from HDF5 against 0.72 from directories, on 6520-atom frames.
+
+> Comparing the two formats only works with `shuffle_test=False`. With
+> `DeepmdData`'s default `shuffle_test=True` the frames come back permuted
+> and a naive diff shows large differences that are pure reordering.
+
 ## 4. The training schedule
 
 ### Plan A — joint from scratch (default)
