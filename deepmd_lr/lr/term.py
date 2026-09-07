@@ -435,8 +435,3 @@ class LongRangeEnergy(torch.nn.Module):
         energy = energy * ELECTROSTATIC_CONVERSION
         return energy.reshape(nf, nloc, 1)
 
-
-#: Backwards-compatible alias. The previous class computed the *full* Ewald
-#: sum; this one computes only its long-range half, so the name changed with
-#: the behaviour.
-PMEEnergy = LongRangeEnergy
