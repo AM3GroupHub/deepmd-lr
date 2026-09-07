@@ -265,6 +265,62 @@ Two consequences:
   fails loudly: `ValueError: Elements ['Xe'] are not present in the provided
   type_map`.
 
+### Several compositions in one training set
+
+A system has a fixed atom count, so **different compositions go in different
+systems** — one directory (or HDF5 Group) each. Do not hand-sort them:
+
+```python
+import dpdata
+ms = dpdata.MultiSystems()
+for frame in whatever_you_have:      # any dpdata LabeledSystem
+    ms.append(frame)
+ms.to_deepmd_npy("data")             # or ms.to_deepmd_hdf5("data.hdf5")
+```
+
+`MultiSystems` groups frames by formula and writes one system per group,
+merging repeats:
+
+```
+data/
+├── H2O1Cl0Na0/     9 frames,  3 atoms      type.raw = [1 0 0]
+├── H4O2Cl0Na0/     4 frames,  6 atoms      type.raw = [1 0 0 1 0 0]
+└── H0O0Cl1Na1/     5 frames,  2 atoms      type.raw = [3 2]
+```
+
+It gives every system the **same union `type_map.raw`** (`H O Cl Na` here), so
+the local indices agree across systems even though the compositions do not.
+That is a convenience, not a requirement — the remapping in the table above
+means each system could equally carry its own short map.
+
+**Point `systems` at the parent, not at each child.** `expand_sys_str`
+recurses and takes every directory containing a `type.raw`
+(`deepmd/common.py:204`), so nesting depth is free:
+
+```json
+"training_data": { "systems": ["./data"], "batch_size": "auto:8" }
+```
+
+```
+                       system  natoms  bch_sz  n_bch   prob      pbc
+              data/H2O1Cl0Na0       3       3      3  5.000e-01   T
+              data/H0O0Cl1Na1       2       4      1  1.667e-01   T
+              data/H4O2Cl0Na0       6       2      2  3.333e-01   T
+```
+
+The same works for one HDF5 file holding many systems —
+`"systems": ["./data.hdf5"]` expands to `data.hdf5#/H2O1Cl0Na0` and the rest.
+
+Two knobs matter once the systems differ in size:
+
+- **`"batch_size": "auto:N"`** targets ~N atoms per batch rather than N
+  frames, so it gave 3, 4 and 2 frames for the 3-, 2- and 6-atom systems
+  above. A fixed `batch_size` makes the large systems dominate each step.
+- **`auto_prob`** (default `prob_sys_size`) sets how often each system is
+  drawn. Above, `prob` came out exactly proportional to `n_bch` — 3:1:2. Use
+  `"auto_prob": "prob_uniform"` to weight every system equally instead, or
+  `sys_probs` to set them by hand.
+
 ### Composition that varies frame to frame
 
 If the *atom count* is fixed but which element sits at each site changes per
