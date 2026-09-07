@@ -38,15 +38,18 @@ from deepmd.dpmodel.utils.neighbor_graph import (
     build_neighbor_graph,
 )
 
-# `deepmd.pt_expt` is imported lazily below. Importing it at module level
-# re-enters DeePMD-kit's `load_entry_point("deepmd.pt_expt")`, which imports
-# this package again and leaves it half-initialised.
+# Everything NV-related is imported inside the function below, and has to be.
+# At module level, `deepmd.pt_expt.utils.nv_graph_builder` re-enters
+# DeePMD-kit's `load_entry_point("deepmd.pt_expt")`, which imports this
+# package again and leaves it half-initialised -- `import deepmd_lr.neighbors`
+# then fails outright. `deepmd.pt.utils.nv_nlist` is no safer: reaching it
+# first opens a cycle inside DeePMD-kit itself, where `nv_graph_builder` wants
+# `_input_device_context` from the module still being initialised.
 
 __all__ = [
     "CELL_LIST_MIN_ATOMS_FREE",
     "CELL_LIST_MIN_ATOMS_PBC",
     "build_neighbor_graph_fast",
-    "nv_is_available",
 ]
 
 #: With a cell the GPU cell list wins at every size measured, down to 192
@@ -56,15 +59,6 @@ CELL_LIST_MIN_ATOMS_PBC = 0
 #: Without a cell the dense search has no ghost images to materialise and
 #: stays cheaper up to about a thousand atoms. Partitions are this case.
 CELL_LIST_MIN_ATOMS_FREE = 1024
-
-
-def nv_is_available() -> bool:
-    """Whether the nvalchemiops-backed builder can run here."""
-    from deepmd.pt.utils.nv_nlist import (
-        is_nv_available,
-    )
-
-    return bool(is_nv_available())
 
 
 def build_neighbor_graph_fast(
@@ -92,12 +86,14 @@ def build_neighbor_graph_fast(
 
     nloc = coord.reshape(coord.shape[0], -1, 3).shape[1]
     threshold = CELL_LIST_MIN_ATOMS_FREE if box is None else CELL_LIST_MIN_ATOMS_PBC
-    use_cell_list = method == "cell_list" or (
-        method == "auto"
-        and nloc >= threshold
-        and coord.device.type == "cuda"
-        and nv_is_available()
-    )
+    use_cell_list = method == "cell_list"
+    if method == "auto" and nloc >= threshold and coord.device.type == "cuda":
+        from deepmd.pt.utils.nv_nlist import (
+            is_nv_available,
+        )
+
+        use_cell_list = bool(is_nv_available())
+
     if use_cell_list:
         from deepmd.pt_expt.utils.nv_graph_builder import (
             build_neighbor_graph_nv,
