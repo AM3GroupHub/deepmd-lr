@@ -95,6 +95,11 @@ class DistributedForces:
     repartition_every
         Force a rebuild every N calls regardless. ``None`` uses the skin
         criterion alone, which is exact rather than merely usually right.
+    compute_virial
+        Also assemble the virial, exposed as :attr:`virial` (eV) and
+        :attr:`stress` (eV/angstrom^3, ASE sign convention) after each call.
+        Off by default because it costs an extra strain leaf per partition
+        and a second backward through the charge head.
 
     Notes
     -----
@@ -113,6 +118,7 @@ class DistributedForces:
         devices: list[Any],
         skin: float = 1.0,
         repartition_every: int | None = None,
+        compute_virial: bool = False,
     ) -> None:
         if not devices:
             raise ValueError("DistributedForces needs at least one device")
@@ -123,6 +129,7 @@ class DistributedForces:
         self.devices = list(devices)
         self.skin = float(skin)
         self.repartition_every = repartition_every
+        self.compute_virial = bool(compute_virial)
         self.home = next(model.parameters()).device
         self.atype = np.asarray(atype, dtype=np.int64).reshape(-1)
         self.cell = np.asarray(cell, dtype=np.float64).reshape(3, 3)
@@ -136,6 +143,7 @@ class DistributedForces:
 
         self.rebuild_count = 0
         self.results: dict[str, Any] = {}
+        self.virial: np.ndarray | None = None
         self.forces = torch.zeros(
             (len(self.atype), 3), dtype=torch.float64, device=self.home
         )
@@ -143,6 +151,20 @@ class DistributedForces:
     @property
     def n_atoms(self) -> int:
         return len(self.atype)
+
+    @property
+    def volume(self) -> float:
+        return abs(float(np.linalg.det(self.cell)))
+
+    @property
+    def stress(self) -> np.ndarray | None:
+        """Stress in eV/angstrom^3, ``-virial / volume`` as ASE defines it.
+
+        ``None`` until a call has run with ``compute_virial``.
+        """
+        if self.virial is None:
+            return None
+        return -self.virial / self.volume
 
     def masses(self) -> np.ndarray:
         """Standard masses for this system, in amu."""
@@ -173,6 +195,10 @@ class DistributedForces:
         is mutating in place -- or anything ``np.asarray`` accepts. The
         returned tensor is reused between calls, so copy it if you need to
         keep a previous step's forces.
+
+        With ``compute_virial``, :attr:`virial` and :attr:`stress` are also
+        refreshed. They are not returned, so the ``(energy, forces)``
+        signature an integrator consumes stays the same either way.
         """
         if isinstance(positions, torch.Tensor):
             tracked = positions.detach().to(
@@ -213,8 +239,10 @@ class DistributedForces:
             devices=self.devices,
             partitions=self._partitions,
             replicas=self._replicas,
+            compute_virial=self.compute_virial,
         )
         self.results = out
+        self.virial = out.get("virial")
         self.forces.copy_(
             torch.as_tensor(out["force"], dtype=torch.float64, device=self.home)
         )

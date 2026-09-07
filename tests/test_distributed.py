@@ -417,6 +417,74 @@ class TestDistributedForces:
             assert np.abs(a.cpu().numpy() - b.cpu().numpy()).max() < 1e-8
         assert eager.rebuild_count > cached.rebuild_count
 
+    def test_virial_matches_the_unpartitioned_model(self, model, system):
+        """The partitioned virial must equal the serial one, which is itself
+        finite-difference checked in `tests/test_joint_model.py`."""
+        coord, atype, cell, coord_t, atype_t, cell_t = system
+        reference = (
+            model(coord_t, atype_t, box=cell_t)["virial"]
+            .reshape(3, 3)
+            .detach()
+            .cpu()
+            .numpy()
+        )
+        driver = self._driver(model, system, compute_virial=True)
+        driver(coord)
+        assert np.abs(driver.virial - reference).max() < 1e-10
+
+    @pytest.mark.parametrize("n", PARTITION_COUNTS)
+    def test_virial_is_partition_count_invariant(self, model, system, n):
+        """Each edge lives in exactly one partition, so the per-partition
+        virials sum to the global one -- the ownership argument that makes
+        the forces exact applies unchanged."""
+        driver = self._driver(
+            model, system, devices=[str(DEVICE)] * n, compute_virial=True
+        )
+        driver(system[0])
+        single = self._driver(model, system, compute_virial=True)
+        single(system[0])
+        assert np.abs(driver.virial - single.virial).max() < 1e-10
+
+    def test_virial_is_symmetric(self, model, system):
+        """A rotation-invariant energy has a symmetric virial."""
+        driver = self._driver(model, system, compute_virial=True)
+        driver(system[0])
+        assert np.abs(driver.virial - driver.virial.T).max() < 1e-10
+
+    def test_virial_splits_into_its_three_contributions(self, model, system):
+        """Short-range, reciprocal and charge-response, and they must add up.
+
+        The charge-response piece is the one that could plausibly be dropped
+        without anything looking wrong, so its presence is asserted.
+        """
+        driver = self._driver(model, system, compute_virial=True)
+        driver(system[0])
+        parts = [
+            driver.results[key]
+            for key in (
+                "virial_short_range",
+                "virial_long_range",
+                "virial_charge_response",
+            )
+        ]
+        assert np.abs(sum(parts) - driver.virial).max() < 1e-12
+        assert np.abs(parts[2]).max() > 0.0, "charge-response virial is zero"
+
+    def test_stress_is_minus_virial_over_volume(self, model, system):
+        driver = self._driver(model, system, compute_virial=True)
+        driver(system[0])
+        expected = -driver.virial / abs(np.linalg.det(system[2]))
+        assert np.abs(driver.stress - expected).max() < 1e-14
+
+    def test_no_virial_unless_asked(self, model, system):
+        """It costs a strain leaf per partition and a second backward, so it
+        is opt-in; asking for `stress` without it gives None, not zeros."""
+        driver = self._driver(model, system)
+        driver(system[0])
+        assert driver.virial is None
+        assert driver.stress is None
+        assert "virial" not in driver.results
+
     def test_rejects_an_empty_device_list(self, model, system):
         with pytest.raises(ValueError, match="at least one device"):
             self._driver(model, system, devices=[])

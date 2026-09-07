@@ -98,7 +98,8 @@ def partition_charges(model, graph, node_type, n_owned: int):
 
 def partition_graph(part: Partition, coord: np.ndarray, atype: np.ndarray,
                     rcut: float, device: Any, dtype=torch.float64,
-                    requires_grad: bool = False):
+                    requires_grad: bool = False,
+                    strain: torch.Tensor | None = None):
     """Build one partition's neighbour graph, keeping only owned destinations.
 
     Built with ``box=None`` -- non-periodic. The halo already carries explicit
@@ -114,7 +115,17 @@ def partition_graph(part: Partition, coord: np.ndarray, atype: np.ndarray,
     this graph instead of rebuilding it -- the search is the expensive part,
     and it is identical either way.
 
-    Returns ``(graph, node_type_flat, node_coord)``.
+    With ``strain`` (a ``(3, 3)`` matrix, typically ``I + sym(eps)``), the
+    node coordinates are deformed by it before the search. That is all the
+    virial needs here: a ghost's Cartesian offset is a lattice-vector
+    combination ``n A``, which deforms as ``n A (I+eps)^T`` -- the same
+    transform as a coordinate -- so straining the assembled node set is
+    exact, and the strain reaches ``edge_vec`` through the coordinates rather
+    than through a box. That is why the partitioned virial does not need a
+    cell-differentiable neighbour builder, unlike the serial path.
+
+    Returns ``(graph, node_type_flat, node_coord)``. ``node_coord`` is the
+    unstrained leaf, so a backward reaches both it and the strain.
     """
     node_coord = torch.tensor(
         part.coordinates(coord)[None, ...],
@@ -125,7 +136,12 @@ def partition_graph(part: Partition, coord: np.ndarray, atype: np.ndarray,
     node_type = torch.tensor(
         part.types(atype)[None, ...], dtype=torch.int64, device=device
     )
-    graph = build_neighbor_graph_fast(node_coord, node_type, None, rcut)
+    search_coord = (
+        node_coord
+        if strain is None
+        else torch.bmm(node_coord, strain.transpose(-1, -2).unsqueeze(0))
+    )
+    graph = build_neighbor_graph_fast(search_coord, node_type, None, rcut)
 
     owned_dst = graph.edge_index[1] < part.n_owned
     graph.edge_mask = graph.edge_mask & owned_dst
@@ -144,6 +160,7 @@ def evaluate_partitioned(
     gather_device: Any | None = None,
     partitions: list[Partition] | None = None,
     replicas: dict | None = None,
+    compute_virial: bool = False,
 ) -> dict[str, Any]:
     """Run ``model`` over spatial partitions and assemble the global result.
 
@@ -195,11 +212,24 @@ def evaluate_partitioned(
     # one after the other. Kernel launches are asynchronous and each device has
     # its own stream, so deferring the transfers is what buys the overlap.
     launched = []
+    virial = np.zeros((3, 3)) if compute_virial else None
     for part, device in zip(parts, devices, strict=True):
         local = replicas[torch.device(device)]
+        # One strain leaf per partition. They cannot be shared -- a leaf
+        # lives on one device -- but the virial is a sum of contributions,
+        # so per-device leaves and summed gradients are equivalent.
+        eps = strain = None
+        if compute_virial:
+            eps = torch.zeros(
+                (3, 3), dtype=dtype, device=device, requires_grad=True
+            )
+            strain = torch.eye(3, dtype=dtype, device=device) + 0.5 * (
+                eps + eps.transpose(-1, -2)
+            )
         # `requires_grad` only when the charge-response backward will need it.
         graph, node_type, node_coord = partition_graph(
-            part, coord, atype, rcut, device, dtype, requires_grad=long_range
+            part, coord, atype, rcut, device, dtype,
+            requires_grad=long_range, strain=strain,
         )
         n_node = torch.tensor([part.n_node], dtype=torch.int64, device=device)
         n_local = torch.tensor([part.n_owned], dtype=torch.int64, device=device)
@@ -220,13 +250,20 @@ def evaluate_partitioned(
             if long_range
             else None
         )
-        launched.append((part, device, out, raw, node_coord))
+        launched.append((part, device, out, raw, node_coord, eps))
 
     # ---- gather phase -------------------------------------------------------
     # Now synchronise. Every device has been given its work, so the transfers
     # below wait on kernels that have been running concurrently.
-    for part, _device, out, raw, _node_coord in launched:
+    for part, _device, out, raw, _node_coord, _eps in launched:
         ids = part.global_ids()
+        if compute_virial:
+            # Each edge survives in exactly one partition, so the per-partition
+            # virials sum to the global one exactly -- the same ownership
+            # argument as the forces.
+            virial += (
+                out["energy_derv_c_redu"].reshape(3, 3).detach().cpu().numpy()
+            )
         # Energy: owned atoms only. Each atom is scored by exactly one owner.
         per_atom = out["energy"].reshape(-1).detach().cpu().numpy()
         atom_energy[part.owned] += per_atom[: part.n_owned]
@@ -246,6 +283,9 @@ def evaluate_partitioned(
             raw_charge[part.owned] = raw.detach().cpu().numpy()
 
     result = {"energy": energy, "force": force, "atom_energy": atom_energy}
+    if compute_virial:
+        result["virial"] = virial.copy()
+        result["virial_short_range"] = virial.copy()
     if not long_range:
         return result
 
@@ -259,19 +299,30 @@ def evaluate_partitioned(
             raw_charge,
             gather,
             dtype,
+            compute_virial=compute_virial,
         )
     )
     result["energy"] = result["energy_short_range"] + result["energy_long_range"]
     result["force"] = result["force"] + result["force_long_range"]
 
-    result["force_charge_response"] = _charge_response_force(
-        launched, len(coord), result["dE_dq"]
+    response_force, response_virial = _charge_response_force(
+        launched, len(coord), result["dE_dq"], compute_virial=compute_virial
     )
-    result["force"] = result["force"] + result["force_charge_response"]
+    result["force_charge_response"] = response_force
+    result["force"] = result["force"] + response_force
+    if compute_virial:
+        result["virial"] = (
+            result["virial"]
+            + result["virial_long_range"]
+            + response_virial
+        )
+        result["virial_charge_response"] = response_virial
     return result
 
 
-def _charge_response_force(launched, n_atoms: int, dE_dq) -> np.ndarray:
+def _charge_response_force(
+    launched, n_atoms: int, dE_dq, compute_virial: bool = False
+) -> tuple[np.ndarray, np.ndarray | None]:
     r"""The force from charges shifting as atoms move.
 
     Because the charges are predicted rather than fixed, the long-range force
@@ -303,27 +354,33 @@ def _charge_response_force(launched, n_atoms: int, dE_dq) -> np.ndarray:
     """
     cotangent = dE_dq - dE_dq.mean()
     force = np.zeros((n_atoms, 3))
+    virial = np.zeros((3, 3)) if compute_virial else None
 
     # Launch every backward first, then transfer, for the same reason the
     # forward pass is staged: a `.cpu()` between them serialises the devices.
     gradients = []
-    for part, _device, _out, raw, node_coord in launched:
+    for part, _device, _out, raw, node_coord, eps in launched:
         weights = torch.tensor(
             cotangent[part.owned], dtype=raw.dtype, device=raw.device
         )
-        (gradient,) = torch.autograd.grad((raw * weights).sum(), node_coord)
-        gradients.append((part, gradient))
+        targets = [node_coord] if eps is None else [node_coord, eps]
+        grads = torch.autograd.grad((raw * weights).sum(), targets)
+        gradients.append((part, grads[0], grads[1] if eps is not None else None))
 
-    for part, gradient in gradients:
+    for part, gradient, grad_eps in gradients:
         np.add.at(
             force,
             part.global_ids(),
             -gradient.reshape(part.n_node, 3).detach().cpu().numpy(),
         )
-    return force
+        if compute_virial:
+            virial -= grad_eps.reshape(3, 3).detach().cpu().numpy()
+    return force, virial
 
 
-def _long_range_global(model, coord, cell, raw_charge, device, dtype) -> dict:
+def _long_range_global(
+    model, coord, cell, raw_charge, device, dtype, compute_virial: bool = False
+) -> dict:
     """The global half: project the charges, then evaluate the reciprocal sum.
 
     Returns the direct force ``-dE/dr`` at fixed charge, and ``dE/dq``. The
@@ -340,10 +397,27 @@ def _long_range_global(model, coord, cell, raw_charge, device, dtype) -> dict:
         raw_charge[None, ...], dtype=dtype, device=device, requires_grad=True
     )
 
+    eps = None
+    if compute_virial:
+        # Strain coordinates and cell together; the reciprocal sum is
+        # evaluated on one device, so this is the same construction the
+        # serial model uses.
+        eps = torch.zeros((3, 3), dtype=dtype, device=device, requires_grad=True)
+        strain = torch.eye(3, dtype=dtype, device=device) + 0.5 * (
+            eps + eps.transpose(-1, -2)
+        )
+        transform = strain.transpose(-1, -2).unsqueeze(0)
+        coord_in = torch.bmm(coord_t, transform)
+        cell_in = torch.bmm(cell_t, transform)
+    else:
+        coord_in, cell_in = coord_t, cell_t
+
     charge = project_to_total_charge(charge_t, 0.0)
-    atom_energy = model.long_range_energy(coord_t, charge, cell_t)
+    atom_energy = model.long_range_energy(coord_in, charge, cell_in)
     total = atom_energy.sum()
-    grad_coord, grad_charge = torch.autograd.grad(total, [coord_t, charge_t])
+    targets = [coord_t, charge_t] if eps is None else [coord_t, charge_t, eps]
+    grads = torch.autograd.grad(total, targets)
+    grad_coord, grad_charge = grads[0], grads[1]
 
     return {
         "charge": charge.reshape(-1).detach().cpu().numpy(),
@@ -351,4 +425,9 @@ def _long_range_global(model, coord, cell, raw_charge, device, dtype) -> dict:
         "atom_energy_long_range": atom_energy.reshape(-1).detach().cpu().numpy(),
         "force_long_range": -grad_coord.reshape(n_atoms, 3).detach().cpu().numpy(),
         "dE_dq": grad_charge.reshape(-1).detach().cpu().numpy(),
+        **(
+            {"virial_long_range": -grads[2].reshape(3, 3).detach().cpu().numpy()}
+            if eps is not None
+            else {}
+        ),
     }

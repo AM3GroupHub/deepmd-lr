@@ -761,8 +761,31 @@ results — there is a test asserting exactly that.
 
 ### Limits
 
-- **`stress` is not provided.** The partitioned path assembles energy and
-  forces only. Use `LongRangeCalculator` when the virial is needed.
+- **`stress` is available, opt-in.** Pass `compute_virial=True` and read
+  `driver.virial` (eV) or `driver.stress` (eV/Å³, ASE's sign convention)
+  after each call. It is off by default because it costs a strain leaf per
+  partition and a second backward through the charge head; the
+  `(energy, forces)` return signature is unchanged either way, so an
+  integrator does not care.
+
+  All three contributions decompose. The short-range virial is the sum of the
+  per-partition `energy_derv_c_redu` — each edge survives in exactly one
+  partition, the same ownership argument that makes the forces exact. The
+  reciprocal virial is a strain derivative taken on the gather device. The
+  charge-response virial, `−Σⱼ (∂E/∂qⱼ) ∂qⱼ/∂ε`, comes from straining each
+  partition's node coordinates and backpropagating `dE/dq` into the strain
+  leaf. `driver.results` carries all three separately.
+
+  The trick that makes the last one work: a ghost's Cartesian offset is a
+  lattice-vector combination `n A`, which deforms as `n A (I+ε)ᵀ` — the same
+  transform as a coordinate. So straining the assembled node set is exact,
+  and the strain reaches `edge_vec` through the coordinates rather than
+  through a box. That is why the partitioned virial needs **no**
+  cell-differentiable neighbour builder and stays O(N), unlike the serial
+  charge graph which is pinned to `dense` for exactly that reason (§3b).
+
+  Verified against the serial virial — itself finite-difference checked — to
+  ~6e-15, symmetric, and identical at 1, 2, 4 and 8 partitions.
 - **Multi-GPU is correct but not yet faster.** Verified on 2 × A40: results
   are identical across `cuda:0`, `cuda:0`×2 and `cuda:0`+`cuda:1` (ΔE = 0 at
   768 and 2592 atoms, 9.1e-13 at 6144), and the 43 partition-invariance tests
