@@ -104,7 +104,7 @@ from deepmd_lr.ase import LongRangeCalculator
 atoms.calc = LongRangeCalculator("run_joint/model.ckpt.pt")
 ```
 
-For larger systems, `DistributedForces` evaluates the same model over spatial
+For larger systems, `DistributedEvaluator` evaluates the same model over spatial
 partitions — one per GPU, the descriptor split and the reciprocal sum gathered
 onto one device — and returns energy and forces on the GPU, ready for
 nvalchemiops' integrator kernels. It carries no MD settings of its own: the

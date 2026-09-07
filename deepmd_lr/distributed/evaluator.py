@@ -1,10 +1,15 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""Energy and forces from the model, evaluated across several devices.
+"""Evaluate the model across several devices: energy, forces, virial.
 
-This is the force driver an MD engine calls. It owns the partitioning, the
-ghost halo, the per-device model replicas and the decision of when the halo
-needs rebuilding -- and nothing else. It has no timestep, no ensemble, no
+This is the driver an MD engine calls. It owns the partitioning, the ghost
+halo, the per-device model replicas and the decision of when the halo needs
+rebuilding -- and nothing else. It has no timestep, no ensemble, no
 thermostat and no velocities: those belong to whoever is integrating.
+
+Energy and forces always; the virial and stress on request, since they cost
+an extra strain leaf per partition and a second backward through the charge
+head. The ``(energy, forces)`` return signature does not change either way,
+so an integrator is unaffected by the choice.
 
 nvalchemiops' integrators are half-step kernels with no driver of their own,
 so the caller composes the loop and asks this for the force term:
@@ -14,7 +19,7 @@ so the caller composes the loop and asks this for the force term:
         velocity_verlet_velocity_finalize,
     )
 
-    driver = DistributedForces(model, atype, cell, devices=["cuda:0", "cuda:1"])
+    driver = DistributedEvaluator(model, atype, cell, devices=["cuda:0", "cuda:1"])
     energy, forces = driver(positions)
     for _ in range(steps):
         velocity_verlet_position_update(r, v, f, m, dt)   # Warp views
@@ -52,7 +57,7 @@ from deepmd_lr.distributed.partition import (
 
 __all__ = [
     "FS",
-    "DistributedForces",
+    "DistributedEvaluator",
     "atomic_masses",
 ]
 
@@ -76,7 +81,7 @@ def atomic_masses(model: Any, atype: np.ndarray) -> np.ndarray:
     return masses[np.asarray(atype, dtype=np.int64).reshape(-1)]
 
 
-class DistributedForces:
+class DistributedEvaluator:
     """Evaluate a ``dp_lr`` model over spatial partitions, one per device.
 
     Parameters
@@ -121,7 +126,7 @@ class DistributedForces:
         compute_virial: bool = False,
     ) -> None:
         if not devices:
-            raise ValueError("DistributedForces needs at least one device")
+            raise ValueError("DistributedEvaluator needs at least one device")
         if skin < 0:
             raise ValueError(f"skin must be non-negative, got {skin}")
 

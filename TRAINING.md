@@ -628,21 +628,22 @@ with charge gradients.
 ## 10. Running MD over partitions
 
 `deepmd_lr.ase.LongRangeCalculator` is single-process and single-device. For
-larger systems, `DistributedForces` evaluates the model over spatial
-partitions — one per GPU — and hands back energy and forces:
+larger systems, `DistributedEvaluator` evaluates the model over spatial
+partitions — one per GPU:
 
 ```python
-from deepmd_lr.distributed import DistributedForces
+from deepmd_lr.distributed import DistributedEvaluator
 
-driver = DistributedForces(
+evaluator = DistributedEvaluator(
     model, atype, cell,
     devices=["cuda:0", "cuda:1", "cuda:2", "cuda:3"],
     skin=1.0,
+    compute_virial=False,       # True also fills .virial and .stress
 )
-energy, forces = driver(positions)      # eV, eV/angstrom
+energy, forces = evaluator(positions)      # eV, eV/angstrom
 ```
 
-**That is the whole driver.** It owns the partitioning, the ghost halo, the
+**That is the whole object.** It owns the partitioning, the ghost halo, the
 per-device replicas and the decision of when to rebuild — and nothing else.
 No timestep, no ensemble, no thermostat, no velocities: those belong to
 whoever is integrating. Swapping NVE for NPT changes your loop and not this.
@@ -651,8 +652,8 @@ whoever is integrating. Swapping NVE for NPT changes your loop and not this.
 mutating in place — or anything `np.asarray` accepts. Forces come back as a
 float64 tensor on the model's device, which `wp.from_torch` turns into a
 zero-copy Warp view, so **the trajectory never leaves the GPU** for the
-integrator's sake. `driver.results` carries the energy split and charges;
-`driver.masses()` is a convenience that reads the element order off the
+integrator's sake. `evaluator.results` carries the energy split and charges;
+`evaluator.masses()` is a convenience that reads the element order off the
 model's own `type_map`.
 
 **There is deliberately no ASE calculator in this path.** ASE's interface
@@ -670,13 +671,13 @@ from nvalchemiops.dynamics.integrators import (
 )
 vec = lambda t: wp.from_torch(t, dtype=wp.vec3d)
 
-energy, forces = driver(positions)
+energy, forces = evaluator(positions)
 for _ in range(steps):
     velocity_verlet_position_update(
         vec(positions), vec(velocities), vec(forces),
         wp.from_torch(masses), wp.from_torch(dt),
     )
-    energy, forces = driver(positions)
+    energy, forces = evaluator(positions)
     velocity_verlet_velocity_finalize(
         vec(velocities), vec(forces), wp.from_torch(masses), wp.from_torch(dt),
     )
@@ -752,7 +753,7 @@ once atoms have moved far enough to threaten it (the Verlet criterion,
 of 40, with results identical to rebuilding every step.
 
 ```python
-DistributedForces(model, atype, cell, devices=..., skin=1.0,
+DistributedEvaluator(model, atype, cell, devices=..., skin=1.0,
                   repartition_every=None)
 ```
 
@@ -762,7 +763,7 @@ results — there is a test asserting exactly that.
 ### Limits
 
 - **`stress` is available, opt-in.** Pass `compute_virial=True` and read
-  `driver.virial` (eV) or `driver.stress` (eV/Å³, ASE's sign convention)
+  `evaluator.virial` (eV) or `evaluator.stress` (eV/Å³, ASE's sign convention)
   after each call. It is off by default because it costs a strain leaf per
   partition and a second backward through the charge head; the
   `(energy, forces)` return signature is unchanged either way, so an
@@ -774,7 +775,7 @@ results — there is a test asserting exactly that.
   reciprocal virial is a strain derivative taken on the gather device. The
   charge-response virial, `−Σⱼ (∂E/∂qⱼ) ∂qⱼ/∂ε`, comes from straining each
   partition's node coordinates and backpropagating `dE/dq` into the strain
-  leaf. `driver.results` carries all three separately.
+  leaf. `evaluator.results` carries all three separately.
 
   The trick that makes the last one work: a ghost's Cartesian offset is a
   lattice-vector combination `n A`, which deforms as `n A (I+ε)ᵀ` — the same

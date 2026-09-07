@@ -16,7 +16,7 @@ import torch
 from deepmd.pt_expt.utils.env import DEVICE
 
 from deepmd_lr.distributed import (
-    DistributedForces,
+    DistributedEvaluator,
     evaluate_partitioned,
     partition_graph,
     partition_system,
@@ -332,7 +332,7 @@ class TestGatheredLongRange:
                 assert abs(numeric - force[atom, axis]) < 1e-6
 
 
-class TestDistributedForces:
+class TestDistributedEvaluator:
     """The force driver: energy and forces across devices, nothing else.
 
     No timestep, ensemble or thermostat lives here -- those are the caller's.
@@ -347,7 +347,7 @@ class TestDistributedForces:
     @staticmethod
     def _driver(model, system, **kwargs):
         kwargs.setdefault("devices", [str(DEVICE)])
-        return DistributedForces(model, system[1], system[2], **kwargs)
+        return DistributedEvaluator(model, system[1], system[2], **kwargs)
 
     def test_matches_the_unpartitioned_model(self, model, system):
         coord, atype, cell, coord_t, atype_t, cell_t = system
