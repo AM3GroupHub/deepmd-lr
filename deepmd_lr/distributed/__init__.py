@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""Distributed evaluation and MD: spatial partitioning with a ghost halo.
+"""Distributed evaluation: spatial partitioning with a ghost halo.
 
-MD in this path runs on nvalchemiops' integrator kernels via
-:class:`DistributedMD`, not through an ASE calculator. The serial
-:class:`deepmd_lr.ase.LongRangeCalculator` remains for single-device work,
-where ASE's ecosystem is worth having.
+:class:`DistributedForces` is the force driver an MD engine calls -- energy
+and forces across several devices, and nothing else. The integrator,
+ensemble and thermostat belong to the caller;
+``nvalchemiops.dynamics.integrators`` supplies the half-step kernels and
+consumes the returned tensor through ``wp.from_torch`` without a copy.
 """
 
 from deepmd_lr.distributed.driver import (
@@ -12,10 +13,10 @@ from deepmd_lr.distributed.driver import (
     evaluate_partitioned,
     partition_graph,
 )
-from deepmd_lr.distributed.md import (
-    ENSEMBLES,
-    DistributedMD,
-    kelvin_to_energy,
+from deepmd_lr.distributed.forces import (
+    FS,
+    DistributedForces,
+    atomic_masses,
 )
 from deepmd_lr.distributed.partition import (
     Partition,
@@ -23,12 +24,12 @@ from deepmd_lr.distributed.partition import (
 )
 
 __all__ = [
-    "ENSEMBLES",
-    "DistributedMD",
+    "FS",
+    "DistributedForces",
     "Partition",
+    "atomic_masses",
     "device_replicas",
     "evaluate_partitioned",
-    "kelvin_to_energy",
     "partition_graph",
     "partition_system",
 ]

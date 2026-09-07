@@ -628,101 +628,102 @@ with charge gradients.
 ## 10. Running MD over partitions
 
 `deepmd_lr.ase.LongRangeCalculator` is single-process and single-device. For
-larger systems, `DistributedMD` evaluates the model over spatial partitions
-— one per GPU — and integrates with nvalchemiops' kernels:
+larger systems, `DistributedForces` evaluates the model over spatial
+partitions — one per GPU — and hands back energy and forces:
 
 ```python
-from deepmd_lr.distributed import DistributedMD
+from deepmd_lr.distributed import DistributedForces
 
-md = DistributedMD(
-    model, coord, atype, cell,
+driver = DistributedForces(
+    model, atype, cell,
     devices=["cuda:0", "cuda:1", "cuda:2", "cuda:3"],
-    ensemble="nve",          # or "nvt-langevin"
-    timestep=0.5,            # fs
-    temperature=300.0,       # KELVIN -- converted internally
+    skin=1.0,
 )
-md.set_temperature(300.0)
-md.run(1000)
+energy, forces = driver(positions)      # eV, eV/angstrom
 ```
 
-**There is deliberately no ASE calculator in this path.** ASE's calculator
-interface returns energy and forces for one configuration at a time, so the
-trajectory state goes through the host on every step, and ASE's integrators
-cannot use the on-device state the partitioned evaluation already holds.
-nvalchemiops' kernels take Warp arrays, which `wp.from_torch` provides as
-zero-copy views, so the integrator mutates the trajectory in place on the GPU.
+**That is the whole driver.** It owns the partitioning, the ghost halo, the
+per-device replicas and the decision of when to rebuild — and nothing else.
+No timestep, no ensemble, no thermostat, no velocities: those belong to
+whoever is integrating. Swapping NVE for NPT changes your loop and not this.
 
-nvalchemiops ships half-step kernels rather than a driver, so `DistributedMD`
-composes the loop: position update, evaluate the partitioned model, velocity
-finalize. Wired up: velocity Verlet (NVE), Langevin BAOAB (NVT) and
-Nosé–Hoover chain (NVT). NPT and NPH exist in the library and are not.
+`positions` may be a torch tensor — including the one an integrator is
+mutating in place — or anything `np.asarray` accepts. Forces come back as a
+float64 tensor on the model's device, which `wp.from_torch` turns into a
+zero-copy Warp view, so **the trajectory never leaves the GPU** for the
+integrator's sake. `driver.results` carries the energy split and charges;
+`driver.masses()` is a convenience that reads the element order off the
+model's own `type_map`.
 
-### Nosé–Hoover NVT
+**There is deliberately no ASE calculator in this path.** ASE's interface
+returns energy and forces one configuration at a time and its integrators
+cannot touch on-device state, which is the point of this path.
+
+### Driving it with nvalchemiops
+
+nvalchemiops ships half-step kernels and no driver, so the loop is yours. NVE
+is four lines:
 
 ```python
-from deepmd_lr.distributed import DistributedMD
-
-md = DistributedMD(
-    model, coord, atype, cell,
-    devices=["cuda:0", "cuda:1"],
-    ensemble="nvt-nose-hoover",
-    timestep=0.5,          # fs
-    temperature=300.0,     # Kelvin
-    tdamp=100.0,           # coupling time, fs -- ~200 steps here
-    chain_length=3,
+from nvalchemiops.dynamics.integrators import (
+    velocity_verlet_position_update, velocity_verlet_velocity_finalize,
 )
-md.set_temperature(300.0)
+vec = lambda t: wp.from_torch(t, dtype=wp.vec3d)
 
-for block in range(20):
-    md.run(50)
-    print(f"{md.step_count * 0.5:7.0f} fs  T = {md.temperature_k():6.1f} K  "
-          f"conserved = {md.conserved_energy():.4f} eV")
+energy, forces = driver(positions)
+for _ in range(steps):
+    velocity_verlet_position_update(
+        vec(positions), vec(velocities), vec(forces),
+        wp.from_torch(masses), wp.from_torch(dt),
+    )
+    energy, forces = driver(positions)
+    velocity_verlet_velocity_finalize(
+        vec(velocities), vec(forces), wp.from_torch(masses), wp.from_torch(dt),
+    )
 ```
 
-`tdamp` is the one parameter to think about: too short and the thermostat
-rings, too long and it barely couples. A few hundred timesteps is the usual
-choice.
+`examples/run_distributed.py` is the full worked version, with a
+Nosé–Hoover chain thermostat, the 1-GPU-versus-N-GPU check, and the
+Maxwell–Boltzmann start. Available kernels: velocity Verlet (NVE), Langevin
+BAOAB, Nosé–Hoover chain, NPT and NPH (MTK), and velocity rescaling.
 
-**Watch `conserved_energy()`, not `total_energy()`.** A thermostat exchanges
-energy with the system on purpose, so the physical total is *supposed* to
-move. The Martyna–Tobias–Klein invariant adds the chain's own energy,
+Three conventions to respect, none of them guessable from the signatures, all
+found by running into them:
+
+- **Temperature is `k_B T` in energy units, not Kelvin.** Every nvalchemiops
+  dynamics entry point documents it that way — the *opposite* of the heavy
+  `nvalchemi-toolkit`, whose thermostats took Kelvin, where passing kT
+  silently gave a system at rest. For eV, `kT = 8.617333262e-5 * T[K]`.
+- **Half-step factors are inconsistent between kernels.** Measured:
+  `nhc_velocity_half_step` and `velocity_verlet_position_update` apply their
+  own factor of ½ (`dv = (F/m) dt/2`), `nhc_position_update` does not
+  (`dr = v dt`), and `nhc_thermostat_chain_update` advances `eta` by
+  `half_dt` internally. So the **full `dt`** goes to every call, and the
+  chain update is called once at each end of the step.
+- **`ndof` dtypes disagree.** `nhc_compute_masses` requires int32 while
+  `nhc_thermostat_chain_update` and `nhc_compute_chain_energy` require
+  float64. That is a Warp launch error, not a cast, so keep both.
+
+Units: the model works in angstrom and eV. Pair that with masses in amu and a
+timestep in ASE time units (`A sqrt(amu/eV)`) and the set is self-consistent;
+`deepmd_lr.distributed.FS` is the fs conversion.
+
+With a thermostat, watch the **MTK invariant** rather than the physical
+total — a thermostat moves the latter on purpose:
 
 ```
 E_pot + E_kin + sum_k Q_k eta_dot_k^2 / 2 + N_dof kT eta_1 + kT sum_{k>1} eta_k
 ```
 
-which `chain_energy()` supplies and a test checks against that expression
-term by term — a thermostat that silently fails to couple still produces a
-plausible-looking trajectory, so the coupling is asserted rather than assumed.
-
-The chain masses follow MTK: `Q_1 = N_dof kT tau^2` and `Q_k = kT tau^2`,
-also pinned by a test.
-
-> Two kernel quirks, both found by running into them. `nhc_compute_masses`
-> requires `ndof` as **int32** while `nhc_thermostat_chain_update` and
-> `nhc_compute_chain_energy` require it as **float64** — a launch error, not a
-> cast, so `DistributedMD` keeps both. And `nhc_velocity_half_step` applies
-> its own factor of ½ (`dv = (F/m) dt/2`) while `nhc_position_update` is a
-> full step (`dr = v dt`), so the full `dt` goes to every call; the chain
-> update likewise advances `eta` by `half_dt` internally, so it is called
-> once at each end of the step with the full `dt`.
->
-> One caveat measured and not resolved: the MTK invariant drifts by a few
-> meV/atom per 20 fs at strong coupling, and the drift is **independent of
-> the timestep** (2.2237, 2.2355, 2.2385 meV/atom at dt = 0.5, 0.25, 0.125
-> fs) and unchanged by `nloops`. So it is not integration error. The same
-> system under NVE conserves cleanly and as `dt^2` (−0.0159, −0.0040,
-> −0.0010), and the chain-energy expression matches the analytic formula
-> exactly, so it is not those either. It scales as the square of the coupling
-> strength, so weak coupling is the safe regime until this is understood.
+> One caveat, measured and unresolved. That invariant drifts a few meV/atom
+> per 20 fs at strong Nosé–Hoover coupling, and the drift is **independent of
+> the timestep** — 2.2237, 2.2355, 2.2385 meV/atom at dt = 0.5, 0.25, 0.125
+> fs — and unchanged by the Yoshida–Suzuki `nloops`. So it is not integration
+> error. The same system under NVE conserves cleanly and as `dt^2` (−0.0159,
+> −0.0040, −0.0010), and the chain-energy expression matches the analytic
+> formula exactly, so it is neither the forces nor the bookkeeping. It scales
+> as the square of the coupling strength, so weak coupling is the safe regime.
 > Treat NVE as the trustworthy conservation check.
-
-> **Temperature is Kelvin at this API and `k_B T` in eV underneath.** Every
-> nvalchemiops dynamics entry point documents its temperature as "k_B*T in
-> energy units" — the *opposite* of the heavy `nvalchemi-toolkit`, whose
-> thermostats took Kelvin, where passing kT silently gave a system at rest.
-> `kelvin_to_energy` is the single place the conversion happens, and a test
-> pins it: confusing the two is a factor of ~11600.
 
 ### What is split and what is not
 
@@ -751,8 +752,8 @@ once atoms have moved far enough to threaten it (the Verlet criterion,
 of 40, with results identical to rebuilding every step.
 
 ```python
-DistributedMD(model, coord, atype, cell, devices=..., skin=1.0,
-              repartition_every=None)
+DistributedForces(model, atype, cell, devices=..., skin=1.0,
+                  repartition_every=None)
 ```
 
 `repartition_every=1` forces a rebuild each step; it changes timing, never

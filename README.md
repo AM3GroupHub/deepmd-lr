@@ -104,11 +104,12 @@ from deepmd_lr.ase import LongRangeCalculator
 atoms.calc = LongRangeCalculator("run_joint/model.ckpt.pt")
 ```
 
-For larger systems, `DistributedMD` evaluates the same model over spatial
+For larger systems, `DistributedForces` evaluates the same model over spatial
 partitions — one per GPU, the descriptor split and the reciprocal sum gathered
-onto one device — and integrates with nvalchemiops' kernels rather than
-through ASE. Identical results, verified against the single-GPU answer. See
-TRAINING.md §10.
+onto one device — and returns energy and forces on the GPU, ready for
+nvalchemiops' integrator kernels. It carries no MD settings of its own: the
+ensemble is the caller's. Identical results, verified against the single-GPU
+answer. See TRAINING.md §10.
 
 `dp freeze` is **refused** for a model with a `long_range` block: the exported
 graph lower receives edge vectors and no cell, so the artifact would silently

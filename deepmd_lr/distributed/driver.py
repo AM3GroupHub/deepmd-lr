@@ -154,7 +154,7 @@ def evaluate_partitioned(
     partitions
         Reuse a previously built partitioning instead of rebuilding. Valid as
         long as its halo still covers every neighbour -- see the skin logic in
-        :class:`~deepmd_lr.distributed.md.DistributedMD`.
+        :class:`~deepmd_lr.distributed.forces.DistributedForces`.
 
     Returns
     -------

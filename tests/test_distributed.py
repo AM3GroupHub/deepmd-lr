@@ -16,14 +16,10 @@ import torch
 from deepmd.pt_expt.utils.env import DEVICE
 
 from deepmd_lr.distributed import (
-    DistributedMD,
+    DistributedForces,
     evaluate_partitioned,
     partition_graph,
     partition_system,
-)
-from deepmd_lr.distributed.md import (
-    BOLTZMANN_EV_PER_K,
-    kelvin_to_energy,
 )
 
 from .test_joint_model import build, frame
@@ -336,172 +332,142 @@ class TestGatheredLongRange:
                 assert abs(numeric - force[atom, axis]) < 1e-6
 
 
-class TestDistributedMD:
-    """MD on nvalchemiops' integrators, over a reused partitioning.
+class TestDistributedForces:
+    """The force driver: energy and forces across devices, nothing else.
 
-    There is no ASE calculator in this path. ASE's interface returns energy
-    and forces for one configuration at a time, which drags the trajectory
-    state through the host every step and cannot use the on-device state the
-    partitioned evaluation already holds.
+    No timestep, ensemble or thermostat lives here -- those are the caller's.
+    The last test checks the driver is actually usable by nvalchemiops'
+    integrators, which is the contract that matters.
     """
-
-    @staticmethod
-    def _md(model, system, **kwargs):
-        coord, atype, cell = system[0], system[1], system[2]
-        kwargs.setdefault("devices", [str(DEVICE)])
-        return DistributedMD(model, coord, atype, cell, **kwargs)
 
     @pytest.fixture(scope="class")
     def model(self):
         return build(long_range=True).eval()
 
-    def test_forces_match_the_serial_calculator(self, model, system):
-        """The driver must not change the physics -- only how it is scheduled."""
+    @staticmethod
+    def _driver(model, system, **kwargs):
+        kwargs.setdefault("devices", [str(DEVICE)])
+        return DistributedForces(model, system[1], system[2], **kwargs)
+
+    def test_matches_the_unpartitioned_model(self, model, system):
         coord, atype, cell, coord_t, atype_t, cell_t = system
-        serial = model(coord_t, atype_t, box=cell_t)
-        md = self._md(model, system)
-        assert abs(md.potential_energy - float(serial["energy"])) < 1e-8
-        reference = serial["force"][0].detach().cpu().numpy()
-        assert np.abs(md.forces.cpu().numpy() - reference).max() < 1e-8
+        reference = model(coord_t, atype_t, box=cell_t)
+        driver = self._driver(model, system)
+        energy, forces = driver(coord)
+        assert abs(energy - float(reference["energy"])) < 1e-8
+        expected = reference["force"][0].detach().cpu().numpy()
+        assert np.abs(forces.cpu().numpy() - expected).max() < 1e-8
 
-    def test_nose_hoover_chain_absorbs_energy(self, model, system):
-        """The chain must actually couple, and its energy is real.
-
-        `chain_energy` is checked against the MTK expression directly --
-        `sum_k Q_k eta_dot_k^2 / 2 + N_dof kT eta_1 + kT sum_{k>1} eta_k` --
-        because a thermostat that silently does nothing still produces a
-        plausible-looking trajectory.
-        """
-        md = self._md(
-            model, system, ensemble="nvt-nose-hoover", timestep=0.5,
-            temperature=300.0, tdamp=50.0, seed=1,
-        )
-        md.set_temperature(300.0, seed=1)
-        assert md.chain_energy() == 0.0
-        md.run(20)
-        assert md.chain_energy() > 0.0, "the chain never coupled"
-
-        chain = md._chain
-        eta = chain["eta"].cpu().numpy()
-        eta_dot = chain["eta_dot"].cpu().numpy()
-        q = chain["eta_mass"].cpu().numpy()
-        kT = float(md._kT)
-        ndof = float(chain["ndof"])
-        expected = (
-            0.5 * float((q * eta_dot**2).sum())
-            + ndof * kT * float(eta[0])
-            + kT * float(eta[1:].sum())
-        )
-        assert abs(md.chain_energy() - expected) < 1e-9 * max(1.0, abs(expected))
-
-    def test_nose_hoover_masses_follow_the_coupling_time(self, model, system):
-        """Q_1 = N_dof kT tau^2 and Q_k = kT tau^2, from the MTK paper."""
-        md = self._md(
-            model, system, ensemble="nvt-nose-hoover",
-            temperature=300.0, tdamp=50.0, chain_length=3,
-        )
-        q = md._chain["eta_mass"].cpu().numpy()
-        kT = float(md._kT)
-        tau = float(md._chain["tau"])
-        ndof = float(md._chain["ndof"])
-        assert abs(q[0] - ndof * kT * tau**2) < 1e-9 * q[0]
-        for later in q[1:]:
-            assert abs(later - kT * tau**2) < 1e-9 * later
-
-    def test_nose_hoover_drives_the_temperature_toward_the_target(
+    def test_accepts_a_torch_tensor_and_returns_one_on_the_model_device(
         self, model, system
     ):
-        """Started hot, the chain has to take energy out."""
-        md = self._md(
-            model, system, ensemble="nvt-nose-hoover", timestep=0.5,
-            temperature=100.0, tdamp=20.0, seed=2,
-        )
-        md.set_temperature(1500.0, seed=2)
-        hot = md.temperature_k()
-        md.run(60)
-        assert md.temperature_k() < hot, (
-            f"T went {hot:.0f} -> {md.temperature_k():.0f} K with a 100 K target"
-        )
-        assert md.chain_energy() > 0.0
+        coord = system[0]
+        driver = self._driver(model, system)
+        tensor_in = torch.tensor(coord, dtype=torch.float64, device=DEVICE)
+        _, forces = driver(tensor_in)
+        assert forces.device == next(model.parameters()).device
+        assert forces.dtype == torch.float64
+        assert forces.shape == (driver.n_atoms, 3)
 
-    @pytest.mark.parametrize("ensemble", ["nve", "nvt-langevin", "nvt-nose-hoover"])
-    def test_both_ensembles_advance_the_system(self, model, system, ensemble):
-        md = self._md(model, system, ensemble=ensemble, timestep=0.5)
-        md.set_temperature(300.0)
-        before = md.positions.clone()
-        md.run(5)
-        assert md.step_count == 5
-        assert float((md.positions - before).norm(dim=1).max()) > 0.0
-
-    def test_nve_conserves_energy(self, model, system):
-        """The integrator and the force must agree about what energy they are
-        moving on. Getting the unit system wrong shows up here first."""
-        md = self._md(model, system, ensemble="nve", timestep=0.25)
-        md.set_temperature(300.0)
-        start = md.total_energy()
-        md.run(30)
-        drift = abs(md.total_energy() - start) / md.positions.shape[0] * 1000
-        assert drift < 1.0, f"drift {drift:.4f} meV/atom over 30 steps"
-
-    def test_temperature_is_kelvin_at_the_boundary(self, model, system):
-        """`k_B T` in eV is what the kernels take; Kelvin is what we take.
-
-        nvalchemiops documents every dynamics temperature as "k_B*T in energy
-        units", the opposite of the heavy `nvalchemi-toolkit`, whose
-        thermostats took Kelvin. Confusing them is a factor of ~11600, so the
-        conversion is pinned rather than trusted.
-        """
-        md = self._md(model, system)
-        n_atoms = md.positions.shape[0]
-        md.set_temperature(300.0, seed=3)
-        exact = 1.5 * n_atoms * BOLTZMANN_EV_PER_K * 300.0
-        # One draw fluctuates by ~sqrt(2/3N); the failure this guards against
-        # is four orders of magnitude, not four percent.
-        assert 0.5 < md.kinetic_energy() / exact < 2.0
-        assert abs(kelvin_to_energy(300.0) - 0.0258520) < 1e-6
-
-    def test_reused_partitioning_stays_correct_under_motion(self, model, system):
-        """The point of the skin: atoms move, the halo is reused, and the
-        forces stay exact until the Verlet criterion trips."""
-        md = self._md(model, system, skin=1.0, ensemble="nve")
-        md.set_temperature(300.0)
-        md.run(10)
-        # Re-evaluate from scratch at the current geometry.
-        fresh = self._md(model, (md.positions.cpu().numpy(), system[1], system[2]))
-        assert np.abs(md.forces.cpu().numpy() - fresh.forces.cpu().numpy()).max() < 1e-8
-
-    def test_forcing_a_rebuild_every_step_changes_nothing(self, model, system):
-        """Caching must be an optimisation, not a physics knob."""
-        cached = self._md(model, system, skin=1.0, ensemble="nve")
-        eager = self._md(model, system, skin=1.0, repartition_every=1, ensemble="nve")
-        for md in (cached, eager):
-            md.set_temperature(300.0, seed=7)
-        cached.run(6)
-        eager.run(6)
-        assert eager.rebuild_count > cached.rebuild_count
-        assert np.abs(
-            cached.positions.cpu().numpy() - eager.positions.cpu().numpy()
-        ).max() < 1e-10
-
-    def test_caching_actually_avoids_rebuilds(self, model, system):
-        md = self._md(model, system, skin=5.0, ensemble="nve")
-        md.set_temperature(50.0)
-        md.run(8)
-        assert md.rebuild_count < 8
+    def test_rejects_the_wrong_number_of_atoms(self, model, system):
+        driver = self._driver(model, system)
+        with pytest.raises(ValueError, match="expected positions of shape"):
+            driver(system[0][:-1])
 
     def test_exposes_the_energy_split_and_charges(self, model, system):
-        md = self._md(model, system)
+        driver = self._driver(model, system)
+        driver(system[0])
         for key in ("energy_short_range", "energy_long_range", "charge"):
-            assert key in md.results
+            assert key in driver.results
 
-    def test_rejects_an_unknown_ensemble(self, model, system):
-        with pytest.raises(ValueError, match="unknown ensemble"):
-            self._md(model, system, ensemble="npt")
+    def test_masses_come_from_the_models_type_map(self, model, system):
+        driver = self._driver(model, system)
+        masses = driver.masses()
+        assert masses.shape == (driver.n_atoms,)
+        # The synthetic system is water: oxygen first, then two hydrogens.
+        type_map = model.get_type_map()
+        for index, mass in zip(driver.atype[:3], masses[:3], strict=True):
+            expected = {"O": 15.999, "H": 1.008}[type_map[index]]
+            assert abs(mass - expected) < 0.01
+
+    def test_reused_halo_stays_exact_under_motion(self, model, system):
+        """The point of the skin: positions move, the halo is reused, and the
+        forces stay equal to a driver that has just rebuilt."""
+        coord = system[0]
+        driver = self._driver(model, system, skin=1.0)
+        driver(coord)
+        moved = coord + np.random.default_rng(0).normal(0, 0.05, coord.shape)
+        _, reused = driver(moved)
+        fresh = self._driver(model, system, skin=1.0)
+        _, rebuilt = fresh(moved)
+        assert np.abs(
+            reused.cpu().numpy() - rebuilt.cpu().numpy()
+        ).max() < 1e-8
+
+    def test_forcing_a_rebuild_every_call_changes_nothing(self, model, system):
+        """Caching must be an optimisation, not a physics knob."""
+        coord = system[0]
+        cached = self._driver(model, system, skin=5.0)
+        eager = self._driver(model, system, skin=5.0, repartition_every=1)
+        rng = np.random.default_rng(1)
+        for _ in range(4):
+            coord = coord + rng.normal(0, 0.02, coord.shape)
+            _, a = cached(coord)
+            _, b = eager(coord)
+            assert np.abs(a.cpu().numpy() - b.cpu().numpy()).max() < 1e-8
+        assert eager.rebuild_count > cached.rebuild_count
 
     def test_rejects_an_empty_device_list(self, model, system):
         with pytest.raises(ValueError, match="at least one device"):
-            self._md(model, system, devices=[])
+            self._driver(model, system, devices=[])
 
     def test_rejects_a_negative_skin(self, model, system):
         with pytest.raises(ValueError, match="skin must be non-negative"):
-            self._md(model, system, skin=-1.0)
+            self._driver(model, system, skin=-1.0)
+
+    def test_drives_an_nvalchemiops_integrator(self, model, system):
+        """The contract: the returned tensor feeds the Warp kernels directly.
+
+        This is the whole reason the driver returns a device tensor rather
+        than a NumPy array -- `wp.from_torch` is a zero-copy view, so the
+        trajectory never leaves the GPU. Velocity Verlet is used because it
+        conserves energy, which is what catches a units or sequencing
+        mistake; the ensemble itself is not the driver's business.
+        """
+        import warp as wp
+        from nvalchemiops.dynamics.integrators import (
+            velocity_verlet_position_update,
+            velocity_verlet_velocity_finalize,
+        )
+
+        from deepmd_lr.distributed import FS
+
+        driver = self._driver(model, system, skin=1.0)
+        positions = torch.tensor(
+            system[0], dtype=torch.float64, device=DEVICE
+        ).contiguous()
+        velocities = torch.zeros_like(positions)
+        masses = torch.tensor(
+            driver.masses(), dtype=torch.float64, device=DEVICE
+        )
+        dt = torch.tensor([0.25 * FS], dtype=torch.float64, device=DEVICE)
+
+        energy, forces = driver(positions)
+        vec = lambda t: wp.from_torch(t, dtype=wp.vec3d)  # noqa: E731
+        kinetic = lambda: float(  # noqa: E731
+            0.5 * (masses.unsqueeze(-1) * velocities**2).sum()
+        )
+        start = energy + kinetic()
+        for _ in range(20):
+            velocity_verlet_position_update(
+                vec(positions), vec(velocities), vec(forces),
+                wp.from_torch(masses), wp.from_torch(dt),
+            )
+            energy, forces = driver(positions)
+            velocity_verlet_velocity_finalize(
+                vec(velocities), vec(forces),
+                wp.from_torch(masses), wp.from_torch(dt),
+            )
+            wp.synchronize()
+        drift = abs(energy + kinetic() - start) / driver.n_atoms * 1000
+        assert drift < 1.0, f"drift {drift:.4f} meV/atom over 20 steps"
