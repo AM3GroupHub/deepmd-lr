@@ -68,7 +68,7 @@ Add a `long_range` block to switch the electrostatics on:
     "fitting_net": { "neuron": [192, 192, 192] },
     "long_range": {
       "charge_net": { "neuron": [64, 64] },
-      "pme": { "alpha": 0.4, "mesh_dimensions": [16, 16, 16] }
+      "reciprocal": { "alpha": 0.4, "mesh_dimensions": [16, 16, 16] }
     }
   }
 }

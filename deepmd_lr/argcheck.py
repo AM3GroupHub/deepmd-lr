@@ -23,8 +23,10 @@ from deepmd_lr.fitting.charge import (
     CHARGE_VAR_NAME,
 )
 from deepmd_lr.model.lr_model import (
+    _LEGACY_RECIPROCAL_KEY,
     LONG_RANGE_KEY,
     MODEL_TYPE,
+    RECIPROCAL_KEY,
 )
 
 
@@ -35,7 +37,8 @@ def dp_lr_model_args() -> Argument:
     Mirrors the built-in ``standard`` model -- a descriptor plus a fitting
     net -- and reuses the same variant helpers, so every descriptor and
     fitting DeePMD-kit knows about stays available here and new ones appear
-    automatically. The long-range block (charge head and PME parameters)
+    automatically. The long-range block (charge head and reciprocal-sum
+    parameters)
     is added in Phase 4; keeping it out now means a Phase 1 config is
     exactly a standard config with a different type, which is what makes
     the baseline comparison meaningful.
@@ -62,7 +65,8 @@ def dp_lr_model_args() -> Argument:
         ],
         doc=(
             "Energy model with an explicit long-range electrostatic term "
-            "(PME, via nvalchemi-toolkit-ops). Without a `long_range` block "
+            "(PME or Ewald, via nvalchemi-toolkit-ops). Without a `long_range` "
+            "block "
             "it is exactly the standard energy model."
         ),
     )
@@ -157,8 +161,8 @@ def _long_range_args() -> Argument:
         charge_fitting_args(),
         doc="The head predicting per-atom charges from the shared descriptor.",
     )
-    pme = Argument(
-        "pme",
+    reciprocal = Argument(
+        RECIPROCAL_KEY,
         dict,
         [
             Argument(
@@ -256,6 +260,7 @@ def _long_range_args() -> Argument:
                 "none when it is off.",
             ),
         ],
+        alias=[_LEGACY_RECIPROCAL_KEY],
         optional=True,
         default={},
         doc="Reciprocal-space (long-range) electrostatics. Only the "
@@ -267,7 +272,7 @@ def _long_range_args() -> Argument:
     return Argument(
         LONG_RANGE_KEY,
         dict,
-        [charge_net, pme],
+        [charge_net, reciprocal],
         optional=True,
         default=None,
         doc="The long-range electrostatic term. Omit for a pure short-range "

@@ -49,7 +49,7 @@ LONG_RANGE = {
     # samples it. Pinning the mesh keeps the energy smooth in the cell.
     # No rcut: only the reciprocal half is computed, so there is no
     # real-space cutoff to set.
-    "pme": {"alpha": 0.4, "mesh_dimensions": [15, 15, 15], "spline_order": 6},
+    "reciprocal": {"alpha": 0.4, "mesh_dimensions": [15, 15, 15], "spline_order": 6},
 }
 
 
@@ -274,6 +274,43 @@ class TestTraining:
 
 
 class TestGuards:
+    def test_accepts_the_legacy_pme_block_name(self):
+        """`long_range.pme` was renamed to `long_range.reciprocal`.
+
+        The old name was wrong as soon as `method: "ewald"` existed -- a block
+        called `pme` configuring an explicit k-vector sum. It stays accepted
+        because it appears in every config written before the rename.
+        """
+        cfg = {
+            "type": "dp_lr",
+            "type_map": ["O", "H"],
+            "descriptor": copy.deepcopy(DESCRIPTOR),
+            "fitting_net": copy.deepcopy(FITTING),
+            "long_range": copy.deepcopy(LONG_RANGE),
+        }
+        legacy = copy.deepcopy(cfg)
+        legacy["long_range"]["pme"] = legacy["long_range"].pop("reciprocal")
+
+        new, old = get_model(cfg), get_model(legacy)
+        assert new.has_long_range and old.has_long_range
+        assert (
+            new.long_range_energy.serialize()
+            == old.long_range_energy.serialize()
+        )
+
+    def test_deserializes_a_checkpoint_written_before_the_rename(self):
+        """Old checkpoints carry the long-range block under `pme`."""
+        model = build(long_range=True)
+        data = model.serialize()
+        assert "reciprocal" in data["long_range"]
+        data["long_range"]["pme"] = data["long_range"].pop("reciprocal")
+        restored = type(model).deserialize(data)
+        assert restored.has_long_range
+        assert (
+            restored.long_range_energy.serialize()
+            == model.long_range_energy.serialize()
+        )
+
     def test_accepts_comment_keys_in_a_raw_config(self):
         """`_comment` is DeePMD-kit's annotation convention.
 
@@ -292,7 +329,7 @@ class TestGuards:
             "long_range": copy.deepcopy(LONG_RANGE),
         }
         cfg["long_range"]["_comment"] = "explaining the block"
-        cfg["long_range"]["pme"]["_comment_alpha"] = "why this alpha"
+        cfg["long_range"]["reciprocal"]["_comment_alpha"] = "why this alpha"
         cfg["long_range"]["charge_net"]["_comment"] = "why this width"
         model = get_model(cfg)
         assert model.has_long_range
@@ -306,7 +343,7 @@ class TestGuards:
             "fitting_net": copy.deepcopy(FITTING),
             "long_range": copy.deepcopy(LONG_RANGE),
         }
-        cfg["long_range"]["pme"]["rcut"] = 4.0
+        cfg["long_range"]["reciprocal"]["rcut"] = 4.0
         with pytest.raises(TypeError, match="rcut"):
             get_model(cfg)
 
@@ -331,7 +368,7 @@ class TestGuards:
             "fitting_net": copy.deepcopy(FITTING),
             "long_range": copy.deepcopy(LONG_RANGE),
         }
-        cfg["long_range"]["pme"]["spline_order"] = 8
+        cfg["long_range"]["reciprocal"]["spline_order"] = 8
         with pytest.raises(ValueError, match="silently dropped"):
             get_model(cfg)
 

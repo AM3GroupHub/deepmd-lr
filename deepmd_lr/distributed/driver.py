@@ -341,7 +341,7 @@ def _long_range_global(model, coord, cell, raw_charge, device, dtype) -> dict:
     )
 
     charge = project_to_total_charge(charge_t, 0.0)
-    atom_energy = model.pme(coord_t, charge, cell_t)
+    atom_energy = model.long_range_energy(coord_t, charge, cell_t)
     total = atom_energy.sum()
     grad_coord, grad_charge = torch.autograd.grad(total, [coord_t, charge_t])
 

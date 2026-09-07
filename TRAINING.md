@@ -169,8 +169,9 @@ Annotated; the `_comment` keys are ignored by DeePMD-kit.
         "precision": "float64"
       },
 
-      "pme": {
-        "_comment": "method defaults to 'pme'; set 'ewald' for the exact k-sum (see section 1).",
+      "reciprocal": {
+        "_comment": "Was called `pme` before; that name is still accepted. Renamed because `method` selects between 'pme' and 'ewald', so a block named `pme` holding method='ewald' read as nonsense.",
+        "_comment_method": "method defaults to 'pme'; set 'ewald' for the exact k-sum (see section 1).",
         "_comment_alpha": "alpha 0.4 pairs with rcut 6.0 (erfc(2.4) = 7e-4).",
         "alpha": 0.4,
         "_comment_mesh": "Fixed mesh, ~1.25 A spacing for a 20 A cell.",

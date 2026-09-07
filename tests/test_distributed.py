@@ -246,7 +246,7 @@ class TestGatheredLongRange:
         model, serial = joint
         frozen = serial["charge"].detach()
         positions = coord_t.clone().requires_grad_(True)
-        energy = model.pme(positions, frozen, cell_t).sum()
+        energy = model.long_range_energy(positions, frozen, cell_t).sum()
         reference = (
             -torch.autograd.grad(energy, positions)[0][0].cpu().numpy()
         )

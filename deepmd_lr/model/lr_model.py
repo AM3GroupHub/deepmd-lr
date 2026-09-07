@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""The ``dp_lr`` model type: a DPA4C energy model with room for a PME term.
+"""The ``dp_lr`` model type: a DPA4C energy model with a long-range term.
 
 Why this is a *model* type and not an *atomic model* type
 --------------------------------------------------------
@@ -8,7 +8,7 @@ DeePMD-kit's atomic-model contract gives neither: ``forward_common_atomic``
 receives extended coordinates plus a neighbour list, and the graph route is
 narrower still -- ``NeighborGraph`` states that geometry enters the model
 ONLY through ``edge_vec``. The cell is available exactly one level up, at
-``call_common(coord, atype, box, ...)``. So the PME term has to hang off the
+``call_common(coord, atype, box, ...)``. So the long-range term hangs off the
 top-level model, which is what this class is.
 
 Why the long-range energy is added at the model level, not to the atomic energy
@@ -90,6 +90,15 @@ _ATOMIC_MODEL_TYPE = "standard"
 #: Key of the optional long-range block in the model config.
 LONG_RANGE_KEY = "long_range"
 
+#: Key of the reciprocal-sum settings inside that block. Named after what it
+#: configures -- the reciprocal-space sum -- rather than after one way of
+#: evaluating it, since `method` selects between `pme` and `ewald`.
+RECIPROCAL_KEY = "reciprocal"
+
+#: The name this block had before the rename. Still accepted, in configs and
+#: in serialized checkpoints, so existing inputs and models keep working.
+_LEGACY_RECIPROCAL_KEY = "pme"
+
 
 def _strip_comments(block: dict) -> dict:
     """Drop DeePMD-kit's ``_comment`` annotation keys from a config block.
@@ -118,14 +127,14 @@ class LongRangeEnergyModel(EnergyModel):
         self,
         *args: Any,
         charge_fitting: Any = None,
-        pme: LongRangeEnergy | None = None,
+        long_range_energy: LongRangeEnergy | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
         # Registered as submodules so they move with `.to(device)`, appear in
         # `state_dict()`, and are picked up by the optimizer.
         self.charge_fitting = charge_fitting
-        self.pme = pme
+        self.long_range_energy = long_range_energy
 
     @property
     def has_long_range(self) -> bool:
@@ -135,7 +144,9 @@ class LongRangeEnergyModel(EnergyModel):
         energy model, which is what makes "Phase 4 reduces to Phase 1" a
         testable property rather than an aspiration.
         """
-        return self.charge_fitting is not None and self.pme is not None
+        return (
+            self.charge_fitting is not None and self.long_range_energy is not None
+        )
 
     @classmethod
     def get_model(cls, model_params: dict) -> "LongRangeEnergyModel":
@@ -165,7 +176,7 @@ class LongRangeEnergyModel(EnergyModel):
                 "electrostatic term is only defined as an energy contribution."
             )
 
-        charge_fitting, pme = cls._build_long_range(data, descriptor)
+        charge_fitting, long_range_energy = cls._build_long_range(data, descriptor)
 
         model = cls(
             descriptor=descriptor,
@@ -174,7 +185,7 @@ class LongRangeEnergyModel(EnergyModel):
             atom_exclude_types=data.get("atom_exclude_types", []),
             pair_exclude_types=data.get("pair_exclude_types", []),
             charge_fitting=charge_fitting,
-            pme=pme,
+            long_range_energy=long_range_energy,
         )
         model.model_def_script = json.dumps(model_params_old)
         return model
@@ -183,7 +194,7 @@ class LongRangeEnergyModel(EnergyModel):
     def _build_long_range(
         cls, data: dict, descriptor: Any
     ) -> tuple[Any, LongRangeEnergy | None]:
-        """Build the charge head and PME term from the ``long_range`` block.
+        """Build the charge head and the reciprocal term from ``long_range``.
 
         Returns ``(None, None)`` when the block is absent, which leaves this
         model behaviourally identical to the standard energy model.
@@ -201,8 +212,15 @@ class LongRangeEnergyModel(EnergyModel):
         charge_net["type_map"] = copy.deepcopy(data["type_map"])
         charge_fitting = BaseFitting.get_class_by_type("charge")(**charge_net)
 
-        pme = LongRangeEnergy(**_strip_comments(copy.deepcopy(block.get("pme", {}))))
-        return charge_fitting, pme
+        # `reciprocal` is the current name; `pme` is the old one, kept working
+        # because it appears in every config written before the rename. The
+        # block configures the reciprocal sum however it is evaluated, so
+        # naming it `pme` was wrong the moment `method: "ewald"` existed.
+        settings = block.get(RECIPROCAL_KEY, block.get(_LEGACY_RECIPROCAL_KEY, {}))
+        long_range_energy = LongRangeEnergy(
+            **_strip_comments(copy.deepcopy(settings))
+        )
+        return charge_fitting, long_range_energy
 
 
     def _predict_charges(
@@ -261,7 +279,7 @@ class LongRangeEnergyModel(EnergyModel):
     ) -> dict[str, torch.Tensor]:
         """Long-range energy with its own force and virial.
 
-        The derivatives are taken here rather than inherited because the PME
+        The derivatives are taken here rather than inherited because the
         energy is not a function of ``edge_vec``; see the module docstring.
 
         Coordinates and cell are strained together by a symmetric ``eps`` so
@@ -299,7 +317,9 @@ class LongRangeEnergyModel(EnergyModel):
         charge = self._predict_charges(
             strained_coord, atype, strained_box, charge_spin, mask
         )
-        atom_energy = self.pme(strained_coord, charge, strained_box, mask=mask)
+        atom_energy = self.long_range_energy(
+            strained_coord, charge, strained_box, mask=mask
+        )
         energy = atom_energy.sum()
 
         create_graph = self.training
@@ -434,7 +454,7 @@ class LongRangeEnergyModel(EnergyModel):
         if self.has_long_range:
             data[LONG_RANGE_KEY] = {
                 "charge_net": self.charge_fitting.serialize(),
-                "pme": self.pme.serialize(),
+                RECIPROCAL_KEY: self.long_range_energy.serialize(),
             }
         return data
 
@@ -447,5 +467,8 @@ class LongRangeEnergyModel(EnergyModel):
         model = super().deserialize(data)
         if block is not None:
             model.charge_fitting = BaseFitting.deserialize(block["charge_net"])
-            model.pme = LongRangeEnergy.deserialize(block["pme"])
+            # Accept the old key so checkpoints written before the rename
+            # still load.
+            settings = block.get(RECIPROCAL_KEY, block.get(_LEGACY_RECIPROCAL_KEY))
+            model.long_range_energy = LongRangeEnergy.deserialize(settings)
         return model
