@@ -211,6 +211,79 @@ dp --pt-expt train input_baseline.json     # same settings, no long_range
 
 ---
 
+## 3a. Several systems: `type.raw` and `type_map.raw`
+
+**One system = one composition and one fixed atom ordering.** `type.raw` and
+`type_map.raw` live at the *system root*, not inside `set.000`, so every
+`set.*` in a system shares them — the sets are frame batches, not different
+compositions:
+
+```
+data/water/type.raw          <- here, shared by all sets
+data/water/type_map.raw      <- here
+data/water/set.000/coord.npy
+data/water/set.001/coord.npy
+```
+
+Different composition, different atom count, or different ordering means a
+**separate system**, each with its own pair of files. List them all:
+
+```json
+"training_data": { "systems": ["./data/water", "./data/nacl"], "batch_size": 1 }
+```
+
+DeePMD-kit reports what it found, and samples across them:
+
+```
+                system  natoms  bch_sz  n_bch   prob   pbc
+                 water       3       1      4  5.000e-01  T
+                  nacl       4       1      4  5.000e-01  T
+```
+
+### The indices in `type.raw` are LOCAL to that system
+
+`type.raw` indexes that system's *own* `type_map.raw`, and DeePMD-kit remaps
+into the model's global `type_map` at load time
+(`deepmd/utils/data.py`: `old_to_new_type_idx[self.atom_type]`). So each
+system's `type_map.raw` may be shorter, and in a different order, than the
+model's — it only has to contain the elements that system actually uses.
+
+With model `type_map = ["Cl", "H", "Na", "O"]`:
+
+| system | `type_map.raw` | `type.raw` | remapped | elements |
+|---|---|---|---|---|
+| water | `["H", "O"]` | `[1, 0, 0]` | `[3, 1, 1]` | O H H |
+| nacl | `["Cl", "Na"]` | `[0, 1, 0, 1]` | `[0, 2, 0, 2]` | Cl Na Cl Na |
+
+Two consequences:
+
+- **Always write `type_map.raw`.** Without it there is nothing to remap
+  against, so the indices are taken as *global* — and this fails **silently**.
+  The water system above, minus its `type_map.raw`, loads as H-Cl-Cl instead
+  of O-H-H with no error at all.
+- An element in a system's `type_map.raw` that the model's `type_map` lacks
+  fails loudly: `ValueError: Elements ['Xe'] are not present in the provided
+  type_map`.
+
+### Composition that varies frame to frame
+
+If the *atom count* is fixed but which element sits at each site changes per
+frame, that is one system in **`mixed_type`** format: add
+`real_atom_types.npy` of shape `(nframes, natoms)` to each set, holding local
+indices, with `-1` for a virtual (padding) atom. Its presence is what selects
+the mode (`_check_mode`), it must be present in *every* set of the system,
+and `type_map.raw` becomes mandatory. `type.raw` is still required — it fixes
+`natoms`. The loader then returns a per-frame `type` array, already remapped:
+
+```
+frame 0: [3, 1, 1] -> O H H
+frame 1: [1, 1, 1] -> H H H
+frame 2: [3, 3, 1] -> O O H
+```
+
+In HDF5 none of this changes — each system is a Group holding the same
+`type.raw` and `type_map.raw` datasets, addressed as `data.hdf5#/water`.
+
 ## 3b. Dataset format: directories or HDF5
 
 DeePMD-kit reads either. The mapping is one-for-one — **a directory becomes an
