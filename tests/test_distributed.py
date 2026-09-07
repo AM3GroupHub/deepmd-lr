@@ -13,6 +13,7 @@ gathered onto one device.
 import numpy as np
 import pytest
 import torch
+from ase import units as ase_units
 from deepmd.pt_expt.utils.env import DEVICE
 
 from deepmd_lr.distributed import (
@@ -508,8 +509,6 @@ class TestDistributedEvaluator:
             velocity_verlet_velocity_finalize,
         )
 
-        from deepmd_lr.distributed import FS
-
         driver = self._driver(model, system, skin=1.0)
         positions = torch.tensor(
             system[0], dtype=torch.float64, device=DEVICE
@@ -518,7 +517,10 @@ class TestDistributedEvaluator:
         masses = torch.tensor(
             driver.masses(), dtype=torch.float64, device=DEVICE
         )
-        dt = torch.tensor([0.25 * FS], dtype=torch.float64, device=DEVICE)
+        # ASE's unit system: angstrom, eV, amu, time in A sqrt(amu/eV).
+        dt = torch.tensor(
+            [0.25 * ase_units.fs], dtype=torch.float64, device=DEVICE
+        )
 
         energy, forces = driver(positions)
         vec = lambda t: wp.from_torch(t, dtype=wp.vec3d)  # noqa: E731

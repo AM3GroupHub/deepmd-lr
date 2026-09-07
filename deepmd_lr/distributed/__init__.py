@@ -14,7 +14,6 @@ from deepmd_lr.distributed.driver import (
     partition_graph,
 )
 from deepmd_lr.distributed.evaluator import (
-    FS,
     DistributedEvaluator,
     atomic_masses,
 )
@@ -24,7 +23,6 @@ from deepmd_lr.distributed.partition import (
 )
 
 __all__ = [
-    "FS",
     "DistributedEvaluator",
     "Partition",
     "atomic_masses",

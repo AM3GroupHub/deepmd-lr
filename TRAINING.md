@@ -694,7 +694,7 @@ found by running into them:
 - **Temperature is `k_B T` in energy units, not Kelvin.** Every nvalchemiops
   dynamics entry point documents it that way — the *opposite* of the heavy
   `nvalchemi-toolkit`, whose thermostats took Kelvin, where passing kT
-  silently gave a system at rest. For eV, `kT = 8.617333262e-5 * T[K]`.
+  silently gave a system at rest. For eV, `kT = ase.units.kB * T[K]`.
 - **Half-step factors are inconsistent between kernels.** Measured:
   `nhc_velocity_half_step` and `velocity_verlet_position_update` apply their
   own factor of ½ (`dv = (F/m) dt/2`), `nhc_position_update` does not
@@ -706,8 +706,10 @@ found by running into them:
   float64. That is a Warp launch error, not a cast, so keep both.
 
 Units: the model works in angstrom and eV. Pair that with masses in amu and a
-timestep in ASE time units (`A sqrt(amu/eV)`) and the set is self-consistent;
-`deepmd_lr.distributed.FS` is the fs conversion.
+timestep in ASE time units (`A sqrt(amu/eV)`) and the set is self-consistent.
+Take both constants from ASE — `from ase.units import fs, kB` — rather than
+redefining them; `atomic_masses` already reads the element table from there,
+so it is the one source for this.
 
 With a thermostat, watch the **MTK invariant** rather than the physical
 total — a thermostat moves the latter on purpose:

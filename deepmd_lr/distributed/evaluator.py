@@ -33,11 +33,6 @@ has to leave the GPU for the integrator's sake.
 There is deliberately no ASE calculator here. ASE's interface returns energy
 and forces for one configuration at a time and its integrators cannot use
 on-device state, which is the whole point of this path.
-
-Units are whatever the model uses -- angstrom and eV for a DeePMD-kit model.
-Pair them with masses in amu and a timestep in ASE time units
-(``A sqrt(amu/eV)``, ``1 fs = 0.0982269...``) and the set is self-consistent;
-:data:`FS` is provided for that conversion and is the only unit constant here.
 """
 
 from typing import (
@@ -56,14 +51,9 @@ from deepmd_lr.distributed.partition import (
 )
 
 __all__ = [
-    "FS",
     "DistributedEvaluator",
     "atomic_masses",
 ]
-
-#: One femtosecond in ASE time units (``A * sqrt(amu/eV)``), for pairing a
-#: timestep in fs with eV/angstrom forces and amu masses.
-FS = 0.09822694788464063
 
 
 def atomic_masses(model: Any, atype: np.ndarray) -> np.ndarray:
