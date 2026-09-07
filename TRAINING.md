@@ -702,8 +702,35 @@ results — there is a test asserting exactly that.
   Partitioning also *multiplies* that fixed cost, so fewer, larger partitions
   are cheaper than many small ones until then.
 
-- **The neighbour search uses nvalchemiops' GPU cell list above a size
-  threshold.** DeePMD-kit's `build_neighbor_graph` calls itself a "correctness
+- **The short-range path needs `neighbor_graph_method` set for inference.**
+  DeePMD-kit resolves it once at *training* startup (default `auto`, which is
+  `nv` — its own nvalchemiops GPU cell list — on CUDA) and does not record it
+  in the checkpoint. A model rebuilt for inference therefore falls back to the
+  `dense` O(N²) builder. On the 6520-atom LiFSI frame that is **48.2 GB and
+  724 ms** against **4.0 GB and 201 ms** for `nv`, at a bit-identical energy —
+  and 48 GB does not fit on a 48 GB card, which is how it first showed up, as
+  an OOM on an A40. `deepmd_lr.ase.load_model` now sets it via DeePMD-kit's
+  own `resolve_neighbor_graph_method("auto", device)`, so CPU or a missing
+  nvalchemiops degrades to `dense` instead of raising.
+
+- **Only the `dense` builder carries a cell derivative.** Measured
+  `d(edge_vec)/d(box)`: `dense` 1932.8, `nv` **6.7e-13**, `ase` and `vesin`
+  raise. `nv` returning round-off rather than an error is the dangerous part —
+  forces stay correct and the virial goes silently wrong. So
+  `_predict_charges` pins `method="dense"`: `_long_range` gets the virial by
+  differentiating the charge prediction through a strain applied to
+  coordinates *and* cell.
+
+  This was a live bug between commits `78a690e` and `b0f9d0f`: the charge
+  graph switched to a cell-blind builder above 512 atoms, and the virial test
+  used 96-atom frames, so it never fired. `tests/test_joint_model.py` now
+  checks the virial at 576 atoms as well, which catches it at 1.1 eV.
+
+  The cost is that the charge graph stays O(N²): the serial calculator peaks
+  near 59 GB at 6520 atoms. **Use the partitioned path for large cells** — its
+  partitions are non-periodic, need no cell derivative, and run `nv`.
+
+- **The neighbour-graph choice in `deepmd_lr/neighbors.py`.** DeePMD-kit's `build_neighbor_graph` calls itself a "correctness
   oracle" and is O(N²); `deepmd_lr/neighbors.py` swaps in
   `nvalchemiops.torch.neighbors.cell_list` once a frame is big enough to pay
   for it (512 atoms periodic, 3072 non-periodic — partitions are the latter,

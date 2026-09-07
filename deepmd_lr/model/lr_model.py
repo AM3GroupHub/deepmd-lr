@@ -239,7 +239,17 @@ class LongRangeEnergyModel(EnergyModel):
         express a per-frame reduction (see ``deepmd_lr.fitting.charge``).
         """
         descriptor = self.atomic_model.descriptor
-        graph = build_neighbor_graph_fast(coord, atype, box, descriptor.get_rcut())
+        # `method="dense"` is required, not a default. `_long_range` gets the
+        # virial by differentiating this prediction with respect to a strain
+        # applied to both coordinates AND the cell, so `edge_vec` has to carry
+        # the cell derivative. Of DeePMD-kit's four builders only the dense
+        # one does: `ase` and `vesin` raise on a box that requires grad, and
+        # `nv` returns a cell gradient of exactly 0.0 -- silently, which would
+        # give plausible forces and a wrong virial.
+        # `tests/test_neighbors.py` pins this.
+        graph = build_neighbor_graph_fast(
+            coord, atype, box, descriptor.get_rcut(), method="dense"
+        )
         atype_flat = atype.reshape(-1)
         # The charge head must see the SAME frame conditioning as the energy
         # head, or the two descriptor passes disagree about what system they

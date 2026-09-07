@@ -237,6 +237,44 @@ class TestConservation:
             f"max |diff| = {float((analytic - numeric).abs().max()):.3e}"
         )
 
+    def test_virial_is_right_above_the_neighbour_crossover(self):
+        """The virial must not depend on which neighbour backend ran.
+
+        `_predict_charges` chooses its builder by frame size, and only the
+        dense one carries a cell derivative -- `nv` returns 6.7e-13 where
+        dense gives 1.9e3. A size-based switch therefore had the power to
+        break the virial for large frames only, which the 96-atom check above
+        cannot see. This one runs above any plausible crossover.
+        """
+        model = build()
+        coord, atype, cell = frame(n_mol=192, box=32.0)  # 576 atoms
+        analytic = model(coord, atype, box=cell)["virial"].reshape(3, 3)
+
+        h = 1e-5
+        eye = torch.eye(3, dtype=DT, device=DEVICE)
+        numeric = torch.zeros((3, 3), dtype=DT, device=DEVICE)
+        for i in range(3):
+            for j in range(3):
+                delta = torch.zeros((3, 3), dtype=DT, device=DEVICE)
+                delta[i, j] = h
+                delta = 0.5 * (delta + delta.T)
+                energies = []
+                for sign in (1.0, -1.0):
+                    strain = eye + sign * delta
+                    energies.append(
+                        float(
+                            model(
+                                coord @ strain.T, atype, box=cell @ strain.T
+                            )["energy"]
+                        )
+                    )
+                numeric[i, j] = -(energies[0] - energies[1]) / (2 * h)
+
+        assert torch.allclose(analytic, numeric, atol=2e-4, rtol=2e-3), (
+            f"max |diff| = {float((analytic - numeric).abs().max()):.3e} -- a "
+            "cell-blind neighbour builder reached the charge graph"
+        )
+
     def test_virial_is_symmetric(self):
         """A rotation-invariant energy has a symmetric virial."""
         model = build()

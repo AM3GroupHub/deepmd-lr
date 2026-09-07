@@ -30,7 +30,7 @@ from ase.calculators.calculator import (
 from deepmd.pt_expt.model.get_model import get_model
 from deepmd.pt_expt.utils.env import DEVICE
 
-__all__ = ["LongRangeCalculator"]
+__all__ = ["LongRangeCalculator", "load_model", "select_neighbor_graph_method"]
 
 #: eV/A^3 is what ASE expects for stress; DeePMD-kit reports the virial in eV.
 _STATE_PREFIX = "model.Default."
@@ -58,7 +58,35 @@ def load_model(checkpoint: str, device: str | torch.device = DEVICE) -> Any:
             f"{len(missing)} missing (e.g. {missing[:3]}) and "
             f"{len(unexpected)} unexpected (e.g. {unexpected[:3]})"
         )
-    return model.to(device).eval()
+    model = model.to(device).eval()
+    select_neighbor_graph_method(model)
+    return model
+
+
+def select_neighbor_graph_method(model: Any) -> str:
+    """Point the short-range path at the GPU cell list where possible.
+
+    DeePMD-kit resolves ``neighbor_graph_method`` once at *training* startup
+    and does not record it in the checkpoint, so a model rebuilt for
+    inference has no such attribute and
+    ``make_model._resolve_graph_method`` falls back to ``"dense"`` -- its
+    O(N^2) all-pairs builder. That is invisible until the system is large:
+    on the 6520-atom LiFSI frame the dense path peaks at **48.2 GB** and
+    takes 724 ms, against **4.0 GB** and 201 ms through ``"nv"``, for a
+    bit-identical energy. 48 GB does not fit on a 48 GB card, which is how
+    this first showed up -- as an out-of-memory error on an A40.
+
+    Resolved through DeePMD-kit's own helper, so a CPU model or a missing
+    nvalchemiops degrades to ``"dense"`` rather than raising.
+    """
+    from deepmd.pt_expt.utils.graph_builder import (
+        resolve_neighbor_graph_method,
+    )
+
+    device = next(model.parameters()).device
+    method = resolve_neighbor_graph_method("auto", device)
+    model.neighbor_graph_method = method
+    return method
 
 
 class LongRangeCalculator(Calculator):

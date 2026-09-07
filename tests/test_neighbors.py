@@ -17,6 +17,7 @@ import torch
 from deepmd.dpmodel.utils.neighbor_graph import build_neighbor_graph
 
 from deepmd_lr.neighbors import (
+    CELL_LIST_MIN_ATOMS_FREE,
     CELL_LIST_MIN_ATOMS_PBC,
     build_neighbor_graph_fast,
 )
@@ -62,16 +63,73 @@ def test_edge_vec_is_differentiable():
 
 
 @CUDA
-def test_auto_keeps_small_frames_on_the_dense_search():
-    """The cell list has a fixed setup cost a small frame never earns back."""
-    small = 32  # 96 atoms, comfortably under the threshold
-    assert small * 3 < CELL_LIST_MIN_ATOMS_PBC
-    coord, atype, cell = frame(n_mol=small, box=18.0)
-    auto = build_neighbor_graph_fast(coord, atype, cell, RCUT, method="auto")
-    assert edge_set(auto) == edge_set(build_neighbor_graph(coord, atype, cell, RCUT))
+@pytest.mark.parametrize("periodic", [True, False])
+def test_auto_agrees_with_the_oracle_on_both_sides_of_the_crossover(periodic):
+    """`auto` switches backend by size; the graph must not switch with it.
+
+    With a cell the GPU cell list wins at every measured size, so the
+    periodic threshold is 0. Without one, a partition's dense search has no
+    ghost images to materialise and stays cheaper to about a thousand atoms.
+    """
+    threshold = CELL_LIST_MIN_ATOMS_PBC if periodic else CELL_LIST_MIN_ATOMS_FREE
+    for n_mol, box in [(32, 18.0), (512, 44.0)]:
+        coord, atype, cell = frame(n_mol=n_mol, box=box)
+        b = cell if periodic else None
+        auto = build_neighbor_graph_fast(coord, atype, b, RCUT, method="auto")
+        assert edge_set(auto) == edge_set(
+            build_neighbor_graph(coord, atype, b, RCUT)
+        ), f"{n_mol * 3} atoms, threshold {threshold}, periodic={periodic}"
 
 
 def test_rejects_an_unknown_method():
     coord, atype, cell = frame(n_mol=8, box=12.0)
     with pytest.raises(ValueError, match="unknown neighbour method"):
         build_neighbor_graph_fast(coord, atype, cell, RCUT, method="octree")
+
+
+@CUDA
+@pytest.mark.parametrize("method", ["dense", "ase", "vesin", "nv"])
+def test_only_dense_carries_the_cell_derivative(method):
+    """Which builders can be used where a virial is needed.
+
+    `LongRangeEnergyModel._long_range` gets the virial by differentiating the
+    charge prediction with respect to a strain applied to both coordinates
+    and the cell, so `edge_vec` has to depend on the box. Only the dense
+    builder does. `nv` is the dangerous one: it returns a cell gradient of
+    6.7e-13 -- float64 round-off, fifteen orders below the dense builder's
+    1932.8 -- rather than raising, which yields correct forces and a silently
+    wrong virial.
+
+    Pinned as a parametrised fact rather than an assertion about one builder,
+    so that a future DeePMD-kit release fixing `nv` shows up here as a
+    failure inviting the faster path back in.
+    """
+    from deepmd.pt_expt.utils.graph_builder import build_neighbor_graph_for_method
+
+    coord, atype, cell = frame(n_mol=32, box=18.0)
+    tracked_box = cell.clone().requires_grad_(True)
+    try:
+        graph = build_neighbor_graph_for_method(
+            method, coord, atype, tracked_box, RCUT, None
+        )
+        valid = graph.edge_vec[graph.edge_mask.reshape(-1).bool()]
+        (grad,) = torch.autograd.grad(
+            (valid**2).sum(), tracked_box, allow_unused=True
+        )
+        norm = 0.0 if grad is None else float(grad.norm())
+    except RuntimeError:
+        norm = 0.0  # cannot backward to the box at all
+
+    if method == "dense":
+        assert norm > 1.0, (
+            "the dense builder must stay cell-differentiable; the long-range "
+            "virial depends on it"
+        )
+    else:
+        # The dense builder gives ~1.9e3 here, so anything below 1e-6 is
+        # round-off rather than a real derivative.
+        assert norm < 1e-6, (
+            f"{method!r} now carries a cell gradient ({norm:.4e}). If that is "
+            "correct, it can replace 'dense' in _predict_charges and the "
+            "charge graph stops being O(N^2)."
+        )
