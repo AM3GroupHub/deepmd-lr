@@ -24,11 +24,24 @@ like ``erfc(alpha r)/r`` and is already inside the descriptor's cutoff, so the
 short-range model represents it directly -- adding it here would ask the
 network to learn to subtract something it can already describe.
 
-That is the same decomposition DeePMD-kit's own DPLR uses, and this term is
-checked against its ``ewald_reciprocal_energy`` (no real-space term, no self
-subtraction) as the reference. nvalchemiops' ``pme_reciprocal_space`` returns
-the k-space sum *minus* the self term, so the self term is added back here to
-land on DeePMD-kit's convention.
+**The self term stays subtracted.** The bare k-space sum counts each Gaussian
+interacting with itself -- an artifact of replacing point charges with clouds,
+not a physical interaction -- so the Ewald decomposition removes it. Both
+backends already return ``recip - self``, and that is what this module
+returns: the physically meaningful long-range contribution, leaving the
+network the clean screened real-space sum and nothing else.
+
+Verified independently against the textbook formula written out directly:
+``recip = 11.37766014``, ``self = 20.63445128``, ``recip - self =
+-9.25679114`` eV for a random 8-charge cell, against nvalchemiops'
+``-9.25679220``.
+
+An earlier version added the self term back, to match DeePMD-kit's DPLR
+``ewald_reciprocal_energy``, which reports the bare k-space sum. That put a
+spurious self-interaction inside the quantity called "long-range energy" --
+on the LiFSI frame, 103.0 eV of a reported 208.8 eV -- and since it is
+positive-definite in ``q_i^2`` it also biases training toward small charges.
+Nothing in this package uses DPLR, so there is no convention to match.
 
 Because there is no real-space part, this module needs **no neighbour list**:
 no cutoff, no capacity to size, no ``rcut < L/2`` constraint.
@@ -95,7 +108,7 @@ from nvalchemiops.torch.interactions.electrostatics.slab import (
 #: Highest B-spline interpolation order nvalchemiops computes correctly.
 #:
 #: At order >= 7 ``pme_reciprocal_space`` silently drops the entire
-#: reciprocal-space sum and returns only the self-energy term, raising
+#: reciprocal-space sum and returns minus the self-energy term alone, raising
 #: nothing. The result stays plausible and still varies with alpha, so it
 #: reads as a convergence problem rather than a bug -- in testing it produced
 #: a 7% error in the NaCl Madelung constant that was invariant to mesh size.
@@ -105,9 +118,10 @@ MAX_SPLINE_ORDER = 6
 #: Default B-spline order: the highest that is correct.
 DEFAULT_SPLINE_ORDER = 6
 
-#: Default Ewald splitting parameter, in inverse angstrom. Matches the DPLR
-#: default (``ewald_beta``) and leaves erfc(alpha * 6 A) = 7e-4 for a 6 A
-#: descriptor cutoff.
+#: Default Ewald splitting parameter, in inverse angstrom. Chosen so that
+#: erfc(alpha * 6 A) = 7e-4 for a 6 A descriptor cutoff -- i.e. the part left
+#: to the network dies inside its own reach. A modelling choice, not a fitted
+#: parameter, and it must match between training and MD (TRAINING.md, 2).
 DEFAULT_ALPHA = 0.4
 
 #: Supported ways of evaluating the reciprocal sum.
@@ -380,10 +394,10 @@ class LongRangeEnergy(torch.nn.Module):
         )
         pbc = torch.tensor(self.pbc, dtype=torch.bool, device=coord.device)
 
-        # Both backends return the k-space sum MINUS the self term;
-        # DeePMD-kit's DPLR convention is the k-space sum alone, so the self
-        # term is added back below. It is per-atom and charge-quadratic, so
-        # it lands naturally on the per-atom axis.
+        # Both backends return the k-space sum MINUS the Ewald self term,
+        # which is what we want: the bare k-space sum counts each Gaussian
+        # interacting with itself, an artifact of the smearing rather than a
+        # physical interaction. See the module docstring.
         if self.method == "pme":
             energy = pme_reciprocal_space(
                 positions,
@@ -416,9 +430,6 @@ class LongRangeEnergy(torch.nn.Module):
                 batch_idx=batch_idx,
                 energy_reduction="atom",
             )
-        self_energy = (self.alpha / math.sqrt(math.pi)) * charges * charges
-        energy = energy + self_energy
-
         if self.slab_correction:
             # Yeh-Berkowitz: cancels the interaction between a slab and its
             # periodic images across the vacuum. Added to the 3D result, as

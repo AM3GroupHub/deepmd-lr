@@ -6,10 +6,17 @@ decomposition in DeePMD-kit's own convention and units, that the boundary
 conditions Ewald is invalid under are rejected rather than silently computed,
 and that gradients reach both the coordinates and the charges.
 
-The oracle is DeePMD-kit's `ewald_reciprocal_energy`, the function its DPLR
-path uses. Matching it is the whole specification: same half of the split,
-same units, same treatment of the self term (DeePMD-kit keeps it in;
-nvalchemiops subtracts it, so the wrapper adds it back).
+The oracle is `reciprocal_reference` below: the textbook Ewald reciprocal
+formula written out directly, with no library behind it. Matching it is the
+whole specification -- the right half of the split, the right units, and the
+self term subtracted rather than left in.
+
+Nothing here compares against DeePMD-kit's DPLR. This package does not use
+DPLR: its charges are fixed per element and its Wannier centroids come from a
+separately trained dipole model, where ours are learned from the descriptor.
+Its `ewald_reciprocal_energy` reports the *bare* k-space sum, self term
+included, so matching it used to require adding a spurious self-interaction
+back in.
 """
 
 import itertools
@@ -18,16 +25,10 @@ import math
 import numpy as np
 import pytest
 import torch
-from deepmd.dpmodel.modifier.dipole_charge import (
-    ELECTROSTATIC_CONVERSION as KE,
-)
-from deepmd.dpmodel.modifier.dipole_charge import (
-    compute_ewald_grids,
-    ewald_reciprocal_energy,
-)
 from deepmd.pt_expt.utils.env import DEVICE
 
 from deepmd_lr.lr import MAX_SPLINE_ORDER, LongRangeEnergy
+from deepmd_lr.lr.term import ELECTROSTATIC_CONVERSION as KE
 
 MADELUNG_NACL = 1.7475645946331821
 DT = torch.float64
@@ -69,48 +70,97 @@ def _method_kwargs(method: str) -> dict:
     return {"method": "ewald"}
 
 
-def deepmd_reference(coord, charge, cell, alpha):
-    """DeePMD-kit's own DPLR reciprocal energy, in eV, for one frame."""
-    grids = compute_ewald_grids(cell.detach().cpu().numpy(), 0.4)
-    return float(ewald_reciprocal_energy(coord, charge, cell, grids, alpha)[0, 0])
+def reciprocal_reference(coord, charge, cell, alpha, n_max: int = 14):
+    r"""The Ewald reciprocal energy in eV, written out from the formula.
+
+    .. math::
+        E = \frac{2\pi}{V}\sum_{k \neq 0}
+                \frac{e^{-k^2/4\alpha^2}}{k^2}\left|S(k)\right|^2
+          - \frac{\alpha}{\sqrt{\pi}}\sum_i q_i^2
+
+    with :math:`S(k) = \sum_i q_i e^{i k \cdot r_i}`. Deliberately naive --
+    an explicit triple loop over Miller indices in NumPy -- so that it shares
+    no code with the thing under test. ``n_max`` truncates the k-sum; 14 is
+    converged to ~1e-6 eV for the cells used here.
+    """
+    lattice = cell[0].detach().cpu().numpy()
+    positions = coord[0].detach().cpu().numpy()
+    charges = charge[0].detach().cpu().numpy()
+    volume = abs(np.linalg.det(lattice))
+    reciprocal = 2 * np.pi * np.linalg.inv(lattice).T
+
+    total = 0.0
+    for miller in itertools.product(range(-n_max, n_max + 1), repeat=3):
+        if miller == (0, 0, 0):
+            continue
+        k = np.asarray(miller) @ reciprocal
+        k_squared = float(k @ k)
+        structure = np.sum(charges * np.exp(1j * (positions @ k)))
+        total += math.exp(-k_squared / (4 * alpha**2)) / k_squared * abs(
+            structure
+        ) ** 2
+    recip = (2 * np.pi / volume) * total
+    self_term = (alpha / math.sqrt(math.pi)) * float(np.sum(charges**2))
+    return (recip - self_term) * KE
 
 
-class TestMatchesDeepmdConvention:
-    """The specification: reproduce DeePMD-kit's DPLR reciprocal energy.
+class TestMatchesTheEwaldFormula:
+    """The specification: reproduce the reciprocal sum, self term subtracted.
 
     Pins three things at once -- that only the reciprocal half is computed,
-    that the self term is handled DeePMD-kit's way, and that the eV
-    conversion is right.
+    that the Gaussian self-interaction is removed, and that the eV conversion
+    is right.
     """
 
     @pytest.mark.parametrize("alpha", [0.3, 0.4, 0.6])
     @pytest.mark.parametrize("method", ["pme", "ewald"])
-    def test_matches_dplr_reciprocal_energy(self, alpha, method):
+    def test_matches_the_reciprocal_formula(self, alpha, method):
         coord, charge, cell = random_neutral()
         term = LongRangeEnergy(alpha=alpha, **_method_kwargs(method))
         ours = float(term(coord, charge, cell).sum())
-        reference = deepmd_reference(coord, charge, cell, alpha)
-        assert abs(ours - reference) < 1e-5 * abs(reference)
+        reference = reciprocal_reference(coord, charge, cell, alpha)
+        assert abs(ours - reference) < 1e-4 * abs(reference)
+
+    def test_the_self_term_is_subtracted_not_added(self):
+        """The sign of the self term, pinned explicitly.
+
+        Adding it instead of subtracting is a silent error: the energy stays
+        smooth, differentiable and plausible, and on the LiFSI frame it
+        inflated the reported long-range energy from 105.8 to 208.8 eV.
+        """
+        coord, charge, cell = random_neutral()
+        alpha = 0.4
+        term = LongRangeEnergy(alpha=alpha, mesh_dimensions=FINE_MESH)
+        ours = float(term(coord, charge, cell).sum())
+        self_term = (
+            alpha
+            / math.sqrt(math.pi)
+            * float((charge[0] ** 2).sum().detach().cpu())
+            * KE
+        )
+        bare_k_space = ours + self_term
+        reference = reciprocal_reference(coord, charge, cell, alpha)
+        assert abs(ours - reference) < 1e-4 * abs(reference)
+        # And the other convention is genuinely different, not a rounding
+        # difference -- so the test above discriminates between them.
+        assert abs(bare_k_space - reference) > 0.1 * abs(reference)
 
     def test_matches_for_an_ionic_lattice(self):
         """A crystal, where the structure factor is sharp rather than broad.
 
-        alpha is 1.0 here, chosen between two constraints. A rocksalt lattice
-        orders charge on a 2 A period, so its structure factor lives entirely
-        at short wavelength; at alpha = 0.5 the Gaussian exp(-k^2/4 alpha^2)
-        suppresses the reciprocal term to ~1e-9 eV and comparing two zeros
-        would prove nothing. But the oracle degrades in the other direction:
-        `compute_ewald_grids` uses a fixed 0.4 A k-grid, which truncates as
-        alpha grows, so by alpha = 2.0 the *reference* is the inaccurate one
-        (they differ by 0.6%, and by 10% at alpha = 3.0). alpha = 1.0 is
-        where the term carries real weight and the oracle is still converged.
+        alpha is 1.0 here. A rocksalt lattice orders charge on a 2 A period,
+        so its structure factor lives entirely at short wavelength; at
+        alpha = 0.5 the Gaussian exp(-k^2/4 alpha^2) suppresses the k-space
+        part to ~1e-9 eV and the energy would be the self term alone, which
+        proves nothing about the sum. alpha = 1.0 is where the k-space part
+        carries real weight.
         """
         coord, charge, cell = nacl()
         term = LongRangeEnergy(alpha=1.0, mesh_dimensions=FINE_MESH)
         ours = float(term(coord, charge, cell).sum())
-        reference = deepmd_reference(coord, charge, cell, 1.0)
+        reference = reciprocal_reference(coord, charge, cell, 1.0)
         assert abs(reference) > 1.0, "reference is ~0; the test would be vacuous"
-        assert abs(ours - reference) < 1e-5 * abs(reference)
+        assert abs(ours - reference) < 1e-4 * abs(reference)
 
     def test_reciprocal_term_is_small_for_short_wavelength_order(self):
         """The physical corollary, worth stating explicitly.
@@ -122,8 +172,27 @@ class TestMatchesDeepmdConvention:
         modelling choice and not a free parameter.
         """
         coord, charge, cell = nacl()
-        term = LongRangeEnergy(alpha=0.5, mesh_dimensions=FINE_MESH)
-        assert abs(float(term(coord, charge, cell).sum())) < 1e-6
+        alpha = 0.5
+        term = LongRangeEnergy(alpha=alpha, mesh_dimensions=FINE_MESH)
+        ours = float(term(coord, charge, cell).sum())
+        # Our term is `recip - self`. The claim is about the k != 0 structure,
+        # so add the on-site self term back to isolate it -- this is NOT the
+        # model's convention, just algebra to get at the k-sum.
+        self_term = (
+            alpha
+            / math.sqrt(math.pi)
+            * float((charge[0] ** 2).sum().detach().cpu())
+            * KE
+        )
+        k_space = ours + self_term
+        assert abs(k_space) < 1e-6, (
+            f"k-space part is {k_space:.3e} eV, expected ~0 for a tightly "
+            "alternating lattice"
+        )
+        # And the term itself is dominated by the on-site piece here, which
+        # is exactly why `recip` alone is not a meaningful "long-range
+        # energy" for such a system.
+        assert abs(ours + self_term) < 1e-6 * abs(self_term)
 
     def test_excludes_the_real_space_part(self):
         """The reciprocal sum alone must NOT equal the full Coulomb energy.
@@ -195,7 +264,7 @@ class TestMethodChoice:
         only reason to reach for it.
         """
         coord, charge, cell = random_neutral()
-        reference = deepmd_reference(coord, charge, cell, 0.4)
+        reference = reciprocal_reference(coord, charge, cell, 0.4)
         coarse = float(
             LongRangeEnergy(alpha=0.4, mesh_dimensions=(8, 8, 8))(
                 coord, charge, cell

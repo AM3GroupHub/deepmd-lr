@@ -476,9 +476,29 @@ The model returns three diagnostics beyond the usual outputs:
 ```python
 out = model(coord, atype, box=box)
 out["energy_short_range"]   # DPA4C
-out["energy_long_range"]    # the reciprocal term
+out["energy_long_range"]    # the reciprocal term, self term subtracted
 out["charge"]               # per-atom, after the total-charge projection
 ```
+
+> **Convention, and a breaking change.** `energy_long_range` is
+> `recip - self`: the reciprocal sum with the Ewald self term
+> `(alpha/sqrt(pi)) * sum q_i^2` **subtracted**, which is the standard Ewald
+> decomposition. Its complement is then exactly the screened real-space sum
+> `sum_{i<j} q_i q_j erfc(alpha r_ij) / r_ij`, and nothing else, for the
+> network to represent.
+>
+> Before 2026-09-07 the term added the self piece back, to match DeePMD-kit's
+> DPLR `ewald_reciprocal_energy`, which reports the bare k-space sum. That was
+> wrong for two reasons. It put a purely on-site quantity inside a number
+> called "long-range energy" — on the LiFSI frame, 103.0 eV of a reported
+> 208.8 eV. And `+(alpha/sqrt(pi)) sum q_i^2` is positive-definite and grows
+> with charge magnitude, so it biases the optimiser toward small charges,
+> which is the direction the LiFSI charge head actually collapsed in.
+>
+> **A checkpoint trained before that change is not comparable with one after
+> it.** The short-range network learned to complement the old split; loaded
+> into the new code its total energy shifts by the self term. Retrain, or pin
+> the old commit.
 
 | signal | healthy | trouble |
 |--------|---------|---------|
