@@ -15,12 +15,15 @@ import pytest
 import torch
 from deepmd.pt_expt.utils.env import DEVICE
 
-from deepmd_lr.ase import LongRangeCalculator
 from deepmd_lr.distributed import (
-    DistLongRangeCalculator,
+    DistributedMD,
     evaluate_partitioned,
     partition_graph,
     partition_system,
+)
+from deepmd_lr.distributed.md import (
+    BOLTZMANN_EV_PER_K,
+    kelvin_to_energy,
 )
 
 from .test_joint_model import build, frame
@@ -333,131 +336,112 @@ class TestGatheredLongRange:
                 assert abs(numeric - force[atom, axis]) < 1e-6
 
 
-class TestDistributedCalculator:
-    """Phase D: the ASE surface, and reuse of a partitioning across MD steps."""
+class TestDistributedMD:
+    """MD on nvalchemiops' integrators, over a reused partitioning.
+
+    There is no ASE calculator in this path. ASE's interface returns energy
+    and forces for one configuration at a time, which drags the trajectory
+    state through the host every step and cannot use the on-device state the
+    partitioned evaluation already holds.
+    """
 
     @staticmethod
-    def _atoms(n_mol=16, box=14.0):
-        from .test_ase_calculator import water_atoms
-
-        return water_atoms(n_mol=n_mol, box=box)
+    def _md(model, system, **kwargs):
+        coord, atype, cell = system[0], system[1], system[2]
+        kwargs.setdefault("devices", [str(DEVICE)])
+        return DistributedMD(model, coord, atype, cell, **kwargs)
 
     @pytest.fixture(scope="class")
-    def serial(self):
-        return LongRangeCalculator(build(long_range=True))
+    def model(self):
+        return build(long_range=True).eval()
 
-    @pytest.mark.parametrize("n", PARTITION_COUNTS)
-    def test_matches_the_serial_calculator(self, serial, n):
-        reference = self._atoms()
-        reference.calc = serial
-        energy, forces = reference.get_potential_energy(), reference.get_forces()
+    def test_forces_match_the_serial_calculator(self, model, system):
+        """The driver must not change the physics -- only how it is scheduled."""
+        coord, atype, cell, coord_t, atype_t, cell_t = system
+        serial = model(coord_t, atype_t, box=cell_t)
+        md = self._md(model, system)
+        assert abs(md.potential_energy - float(serial["energy"])) < 1e-8
+        reference = serial["force"][0].detach().cpu().numpy()
+        assert np.abs(md.forces.cpu().numpy() - reference).max() < 1e-8
 
-        atoms = self._atoms()
-        atoms.calc = DistLongRangeCalculator.from_existing(
-            serial
-        ).enable_distributed_mode(n)
-        assert abs(atoms.get_potential_energy() - energy) < 1e-10
-        assert np.abs(atoms.get_forces() - forces).max() < 1e-12
+    @pytest.mark.parametrize("ensemble", ["nve", "nvt-langevin"])
+    def test_both_ensembles_advance_the_system(self, model, system, ensemble):
+        md = self._md(model, system, ensemble=ensemble, timestep=0.5)
+        md.set_temperature(300.0)
+        before = md.positions.clone()
+        md.run(5)
+        assert md.step_count == 5
+        assert float((md.positions - before).norm(dim=1).max()) > 0.0
 
-    def test_enable_distributed_mode_accepts_a_count(self, serial):
-        """An integer means 'this many partitions on the current device' --
-        the configuration that exercises partitioning on a single-GPU box."""
-        calc = DistLongRangeCalculator.from_existing(serial)
-        calc.enable_distributed_mode(4)
-        assert len(calc.devices) == 4
+    def test_nve_conserves_energy(self, model, system):
+        """The integrator and the force must agree about what energy they are
+        moving on. Getting the unit system wrong shows up here first."""
+        md = self._md(model, system, ensemble="nve", timestep=0.25)
+        md.set_temperature(300.0)
+        start = md.total_energy()
+        md.run(30)
+        drift = abs(md.total_energy() - start) / md.positions.shape[0] * 1000
+        assert drift < 1.0, f"drift {drift:.4f} meV/atom over 30 steps"
 
-    def test_rejects_empty_device_list(self, serial):
-        with pytest.raises(ValueError, match="at least one device"):
-            DistLongRangeCalculator.from_existing(serial).enable_distributed_mode([])
+    def test_temperature_is_kelvin_at_the_boundary(self, model, system):
+        """`k_B T` in eV is what the kernels take; Kelvin is what we take.
 
-    def test_reused_partitioning_stays_correct_under_motion(self, serial):
-        """The point of the skin: atoms move, the partitioning is reused, and
-        the answer must not drift. A halo too tight would lose neighbours
-        silently -- energies stay plausible, forces quietly go wrong.
+        nvalchemiops documents every dynamics temperature as "k_B*T in energy
+        units", the opposite of the heavy `nvalchemi-toolkit`, whose
+        thermostats took Kelvin. Confusing them is a factor of ~11600, so the
+        conversion is pinned rather than trusted.
         """
-        from ase import units
-        from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
-        from ase.md.verlet import VelocityVerlet
+        md = self._md(model, system)
+        n_atoms = md.positions.shape[0]
+        md.set_temperature(300.0, seed=3)
+        exact = 1.5 * n_atoms * BOLTZMANN_EV_PER_K * 300.0
+        # One draw fluctuates by ~sqrt(2/3N); the failure this guards against
+        # is four orders of magnitude, not four percent.
+        assert 0.5 < md.kinetic_energy() / exact < 2.0
+        assert abs(kelvin_to_energy(300.0) - 0.0258520) < 1e-6
 
-        atoms = self._atoms()
-        calc = DistLongRangeCalculator.from_existing(serial, skin=1.0)
-        calc.enable_distributed_mode(4)
-        atoms.calc = calc
-        np.random.seed(0)
-        MaxwellBoltzmannDistribution(atoms, temperature_K=300.0)
-        VelocityVerlet(atoms, timestep=0.5 * units.fs).run(40)
+    def test_reused_partitioning_stays_correct_under_motion(self, model, system):
+        """The point of the skin: atoms move, the halo is reused, and the
+        forces stay exact until the Verlet criterion trips."""
+        md = self._md(model, system, skin=1.0, ensemble="nve")
+        md.set_temperature(300.0)
+        md.run(10)
+        # Re-evaluate from scratch at the current geometry.
+        fresh = self._md(model, (md.positions.cpu().numpy(), system[1], system[2]))
+        assert np.abs(md.forces.cpu().numpy() - fresh.forces.cpu().numpy()).max() < 1e-8
 
-        reference = self._atoms()
-        reference.positions = atoms.positions.copy()
-        reference.calc = serial
-        assert abs(
-            atoms.get_potential_energy() - reference.get_potential_energy()
-        ) < 1e-10
-        assert np.abs(atoms.get_forces() - reference.get_forces()).max() < 1e-11
+    def test_forcing_a_rebuild_every_step_changes_nothing(self, model, system):
+        """Caching must be an optimisation, not a physics knob."""
+        cached = self._md(model, system, skin=1.0, ensemble="nve")
+        eager = self._md(model, system, skin=1.0, repartition_every=1, ensemble="nve")
+        for md in (cached, eager):
+            md.set_temperature(300.0, seed=7)
+        cached.run(6)
+        eager.run(6)
+        assert eager.rebuild_count > cached.rebuild_count
+        assert np.abs(
+            cached.positions.cpu().numpy() - eager.positions.cpu().numpy()
+        ).max() < 1e-10
 
-    def test_caching_actually_avoids_rebuilds(self, serial):
-        """If it rebuilt every step the skin would be pointless overhead."""
-        from ase import units
-        from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
-        from ase.md.verlet import VelocityVerlet
+    def test_caching_actually_avoids_rebuilds(self, model, system):
+        md = self._md(model, system, skin=5.0, ensemble="nve")
+        md.set_temperature(50.0)
+        md.run(8)
+        assert md.rebuild_count < 8
 
-        atoms = self._atoms()
-        calc = DistLongRangeCalculator.from_existing(serial, skin=1.0)
-        calc.enable_distributed_mode(4)
-        atoms.calc = calc
-        np.random.seed(0)
-        MaxwellBoltzmannDistribution(atoms, temperature_K=300.0)
-        VelocityVerlet(atoms, timestep=0.5 * units.fs).run(40)
-        assert calc.rebuild_count < 20
+    def test_exposes_the_energy_split_and_charges(self, model, system):
+        md = self._md(model, system)
+        for key in ("energy_short_range", "energy_long_range", "charge"):
+            assert key in md.results
 
-    def test_forcing_a_rebuild_every_step_changes_nothing(self, serial):
-        """The plan's gate: caching must be an optimisation, not a physics knob."""
-        atoms = self._atoms()
-        eager = DistLongRangeCalculator.from_existing(
-            serial, skin=1.0, repartition_every=1
-        )
-        eager.enable_distributed_mode(4)
-        atoms.calc = eager
-        energy, forces = atoms.get_potential_energy(), atoms.get_forces()
+    def test_rejects_an_unknown_ensemble(self, model, system):
+        with pytest.raises(ValueError, match="unknown ensemble"):
+            self._md(model, system, ensemble="npt")
 
-        cached_atoms = self._atoms()
-        cached = DistLongRangeCalculator.from_existing(serial, skin=1.0)
-        cached.enable_distributed_mode(4)
-        cached_atoms.calc = cached
-        assert abs(cached_atoms.get_potential_energy() - energy) < 1e-12
-        assert np.abs(cached_atoms.get_forces() - forces).max() < 1e-12
+    def test_rejects_an_empty_device_list(self, model, system):
+        with pytest.raises(ValueError, match="at least one device"):
+            self._md(model, system, devices=[])
 
-    def test_refuses_stress_rather_than_returning_it_wrong(self, serial):
-        """The partitioned path assembles no virial, so `stress` is kept out
-        of `implemented_properties` and ASE refuses it before reaching us --
-        better than duplicating the check or returning a wrong virial."""
-        atoms = self._atoms()
-        atoms.calc = DistLongRangeCalculator.from_existing(
-            serial
-        ).enable_distributed_mode(2)
-        assert "stress" not in atoms.calc.implemented_properties
-        with pytest.raises(NotImplementedError, match="stress"):
-            atoms.get_stress()
-
-    def test_rejects_non_periodic_atoms(self, serial):
-        atoms = self._atoms()
-        atoms.pbc = False
-        atoms.calc = DistLongRangeCalculator.from_existing(
-            serial
-        ).enable_distributed_mode(2)
-        with pytest.raises(ValueError, match="fully periodic"):
-            atoms.get_potential_energy()
-
-    def test_exposes_the_energy_split_and_charges(self, serial):
-        atoms = self._atoms()
-        atoms.calc = DistLongRangeCalculator.from_existing(
-            serial
-        ).enable_distributed_mode(4)
-        atoms.get_potential_energy()
-        results = atoms.calc.results
-        assert results["charges"].shape == (len(atoms),)
-        assert abs(results["charges"].sum()) < 1e-10
-        assert abs(
-            results["energy"]
-            - (results["energy_short_range"] + results["energy_long_range"])
-        ) < 1e-9
+    def test_rejects_a_negative_skin(self, model, system):
+        with pytest.raises(ValueError, match="skin must be non-negative"):
+            self._md(model, system, skin=-1.0)

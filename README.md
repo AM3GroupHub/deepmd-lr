@@ -104,9 +104,10 @@ from deepmd_lr.ase import LongRangeCalculator
 atoms.calc = LongRangeCalculator("run_joint/model.ckpt.pt")
 ```
 
-For larger systems, `DistLongRangeCalculator` evaluates the same model over
-spatial partitions — the descriptor is split, the reciprocal sum is gathered
-onto one device. Identical results, verified partition-count invariant. See
+For larger systems, `DistributedMD` evaluates the same model over spatial
+partitions — one per GPU, the descriptor split and the reciprocal sum gathered
+onto one device — and integrates with nvalchemiops' kernels rather than
+through ASE. Identical results, verified against the single-GPU answer. See
 TRAINING.md §10.
 
 `dp freeze` is **refused** for a model with a `long_range` block: the exported

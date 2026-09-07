@@ -627,25 +627,42 @@ with charge gradients.
 
 ## 10. Running MD over partitions
 
-`deepmd_lr.ase.LongRangeCalculator` is single-process. For larger systems,
-`DistLongRangeCalculator` evaluates the same model over spatial partitions:
+`deepmd_lr.ase.LongRangeCalculator` is single-process and single-device. For
+larger systems, `DistributedMD` evaluates the model over spatial partitions
+— one per GPU — and integrates with nvalchemiops' kernels:
 
 ```python
-from deepmd_lr.distributed import DistLongRangeCalculator
+from deepmd_lr.distributed import DistributedMD
 
-atoms.calc = DistLongRangeCalculator("run_joint/model.ckpt.pt")
-atoms.calc.enable_distributed_mode(["cuda:0", "cuda:1", "cuda:2", "cuda:3"])
+md = DistributedMD(
+    model, coord, atype, cell,
+    devices=["cuda:0", "cuda:1", "cuda:2", "cuda:3"],
+    ensemble="nve",          # or "nvt-langevin"
+    timestep=0.5,            # fs
+    temperature=300.0,       # KELVIN -- converted internally
+)
+md.set_temperature(300.0)
+md.run(1000)
 ```
 
-or wrap a calculator you already have:
+**There is deliberately no ASE calculator in this path.** ASE's calculator
+interface returns energy and forces for one configuration at a time, so the
+trajectory state goes through the host on every step, and ASE's integrators
+cannot use the on-device state the partitioned evaluation already holds.
+nvalchemiops' kernels take Warp arrays, which `wp.from_torch` provides as
+zero-copy views, so the integrator mutates the trajectory in place on the GPU.
 
-```python
-atoms.calc = DistLongRangeCalculator.from_existing(calc).enable_distributed_mode(4)
-```
+nvalchemiops ships half-step kernels rather than a driver, so `DistributedMD`
+composes the loop: position update, evaluate the partitioned model, velocity
+finalize. Available here are velocity Verlet (NVE) and Langevin BAOAB (NVT);
+the library also has Nosé–Hoover chain, NPT and NPH, which are not wired up.
 
-Passing an integer means "that many partitions on the current device" — which
-is how the partitioning is exercised where only one GPU exists. Results are
-identical either way; only placement differs.
+> **Temperature is Kelvin at this API and `k_B T` in eV underneath.** Every
+> nvalchemiops dynamics entry point documents its temperature as "k_B*T in
+> energy units" — the *opposite* of the heavy `nvalchemi-toolkit`, whose
+> thermostats took Kelvin, where passing kT silently gave a system at rest.
+> `kelvin_to_energy` is the single place the conversion happens, and a test
+> pins it: confusing the two is a factor of ~11600.
 
 ### What is split and what is not
 
@@ -674,7 +691,8 @@ once atoms have moved far enough to threaten it (the Verlet criterion,
 of 40, with results identical to rebuilding every step.
 
 ```python
-DistLongRangeCalculator(model, skin=1.0, repartition_every=None)
+DistributedMD(model, coord, atype, cell, devices=..., skin=1.0,
+              repartition_every=None)
 ```
 
 `repartition_every=1` forces a rebuild each step; it changes timing, never
