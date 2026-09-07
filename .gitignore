@@ -26,6 +26,10 @@ input_v2_compat.json
 *.h5
 experiments/water_real/data
 
+# Tool caches
+.pytest_cache/
+.ruff_cache/
+
 # Warp / torch caches
 .cache/
 warp_cache/
