@@ -340,11 +340,20 @@ class LongRangeEnergyModel(EnergyModel):
                 )
             return out
 
+        # Whether the descriptor already carried its own ``call_graph``
+        # decides how to undo this. Assigning ``unhooked`` back would leave a
+        # bound method sitting in the instance dict, permanently shadowing the
+        # class attribute and holding a reference to the instance; deleting
+        # restores the descriptor to the state it was actually in.
+        had_own = "call_graph" in descriptor.__dict__
         descriptor.call_graph = capture
         try:
             yield captured
         finally:
-            descriptor.call_graph = unhooked
+            if had_own:
+                descriptor.call_graph = unhooked
+            else:
+                del descriptor.call_graph
 
     @staticmethod
     def _usable(captured: dict) -> dict | None:
@@ -611,6 +620,36 @@ class LongRangeEnergyModel(EnergyModel):
         if self.has_long_range:
             self._refuse_export("The lower (neighbour-list) interface")
         return super().forward_lower(*args, **kwargs)
+
+    def forward_ragged(self, *args: Any, **kwargs: Any) -> Any:
+        """Refuse the flat-node-axis path, which never reaches our forward.
+
+        ``ModelWrapper`` routes a batch to ``forward_ragged`` whenever the
+        dataset supplies ``n_node`` (``pt_expt/train/wrapper.py:255-257``), and
+        the inherited implementation goes straight to the base energy model --
+        so the long-range term is skipped and training silently optimizes a
+        pure short-range model.
+
+        Nothing triggers this today: ``pt_expt`` only turns ragged batching on
+        for datasets exposing ``use_ragged_batches``
+        (``pt_expt/train/training.py:2433-2443``), which is the LMDB dataset
+        alone, so npy and HDF5 runs always take the rectangular ``forward``.
+        But variable-size molecules are exactly what ragged batching is for,
+        and a wrong answer with no error is the worst outcome available. Fail
+        instead, and lift this once ``_long_range`` understands a flat node
+        axis with per-frame offsets.
+        """
+        if self.has_long_range:
+            raise NotImplementedError(
+                "Ragged (flat node axis) batches are not supported for a "
+                "'dp_lr' model with a long_range block. The long-range term "
+                "reads a rectangular (nf, nloc) layout, and the inherited "
+                "ragged path would return the short-range energy alone "
+                "without raising. Use a dataset that yields rectangular "
+                "batches (npy or HDF5 rather than LMDB), or drop the "
+                "`long_range` block."
+            )
+        return super().forward_ragged(*args, **kwargs)
 
     def serialize(self) -> dict[str, Any]:
         """Serialize, stamping our own type so the round-trip returns this class.

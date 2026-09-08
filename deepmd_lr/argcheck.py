@@ -37,11 +37,14 @@ def dp_lr_model_args() -> Argument:
     Mirrors the built-in ``standard`` model -- a descriptor plus a fitting
     net -- and reuses the same variant helpers, so every descriptor and
     fitting DeePMD-kit knows about stays available here and new ones appear
-    automatically. The long-range block (charge head and reciprocal-sum
-    parameters)
-    is added in Phase 4; keeping it out now means a Phase 1 config is
-    exactly a standard config with a different type, which is what makes
-    the baseline comparison meaningful.
+    automatically.
+
+    ``model_branch_alias`` and ``info`` are carried over from ``standard``
+    because a ``dp_lr`` branch inside a multi-task ``model_dict`` is
+    validated against *this* schema, not that one. Without them, writing
+    either key in a branch fails normalization with "undefined key ... is
+    not allowed in strict mode" -- the model is unusable in exactly the
+    place those keys exist for.
     """
     return Argument(
         MODEL_TYPE,
@@ -60,6 +63,30 @@ def dp_lr_model_args() -> Argument:
                 [],
                 [fitting_variant_type_args()],
                 doc="The fitting of physical properties. Must be an energy fitting.",
+            ),
+            Argument(
+                "model_branch_alias",
+                list[str],
+                optional=True,
+                default=[],
+                doc=(
+                    "List of aliases for this model branch. Multiple aliases "
+                    "can be defined, and any alias can reference this branch "
+                    "throughout the model usage. Used only in multi-task "
+                    "models."
+                ),
+            ),
+            Argument(
+                "info",
+                dict,
+                optional=True,
+                default={},
+                doc=(
+                    "Dictionary of metadata for this model or model branch. "
+                    "Store arbitrary key-value pairs with model- or "
+                    "branch-specific information. Used in both single- and "
+                    "multi-task models."
+                ),
             ),
             _long_range_args(),
         ],

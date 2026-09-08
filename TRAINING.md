@@ -398,6 +398,144 @@ s/batch from HDF5 against 0.72 from directories, on 6520-atom frames.
 > `DeepmdData`'s default `shuffle_test=True` the frames come back permuted
 > and a naive diff shows large differences that are pure reordering.
 
+## 3c. Several levels of theory at once: multi-head training
+
+If your datasets differ not just in composition but in **what produced the
+labels** — one at PBE, one at a hybrid functional, one at coupled cluster — a
+single energy head cannot fit them. The references and scales differ, so
+whatever the head learns is a compromise between incompatible targets. The same
+applies when the datasets differ in *boundary condition*: a slab, a bulk cell
+and an isolated molecule each need their own long-range settings.
+
+Both cases are the same fix: **one shared descriptor, several fitting heads**.
+DeePMD-kit calls this multi-task, and `dp_lr` works inside it unchanged.
+
+Multi-task is triggered by the presence of `model_dict` — there is no CLI flag:
+
+```jsonc
+{
+  "model": {
+    "shared_dict": {
+      "tm":  ["C", "F", "H", "Li", "N", "O", "S"],
+      "des": { "type": "dpa4c", "rcut": 6.0, "channels": 32, "lmax": 2,
+               "basis_type": "bessel", "n_radial": 16, "radial_modes": 4,
+               "precision": "float32", "seed": 1 }
+    },
+    "model_dict": {
+      "interface": {
+        "type": "dp_lr", "type_map": "tm", "descriptor": "des",
+        "fitting_net": { "neuron": [128, 128, 128], "precision": "float32" },
+        "long_range": {
+          "charge_net": { "neuron": [64, 64], "precision": "float32" },
+          "reciprocal": { "alpha": 0.4, "mesh_dimensions": [24, 24, 100],
+                          "slab_correction": true, "pbc": [true, true, false] }
+        }
+      },
+      "bulk": {
+        "type": "dp_lr", "type_map": "tm", "descriptor": "des",
+        "fitting_net": { "neuron": [128, 128, 128], "precision": "float32" },
+        "long_range": {
+          "charge_net": { "neuron": [64, 64], "precision": "float32" },
+          "reciprocal": { "alpha": 0.4, "mesh_dimensions": [32, 32, 32],
+                          "slab_correction": false, "pbc": [true, true, true] }
+        }
+      }
+    }
+  },
+  "loss_dict": {
+    "interface": { "type": "ener", "start_pref_f": 100, "limit_pref_f": 100 },
+    "bulk":      { "type": "ener", "start_pref_f": 100, "limit_pref_f": 100 }
+  },
+  "training": {
+    "model_prob": { "interface": 0.5, "bulk": 0.5 },
+    "data_dict": {
+      "interface": { "training_data":   { "systems": ["./data/interface/train"] },
+                     "validation_data": { "systems": ["./data/interface/valid"] } },
+      "bulk":      { "training_data":   { "systems": ["./data/bulk/train"] },
+                     "validation_data": { "systems": ["./data/bulk/valid"] } }
+    },
+    "numb_steps": 1000000, "disp_freq": 100, "save_freq": 1000
+  }
+}
+```
+
+### What is shared and what is not
+
+Only three keys can be shared: `type_map`, `descriptor`, `fitting_net`. Write
+the value once in `shared_dict` and reference it by name from each branch.
+
+`long_range.charge_net` is **not** shareable, so every branch gets its own
+charge head. That is the right default when the branches are different levels
+of theory — the charges genuinely differ — but it does mean the branches are
+only tied through the backbone.
+
+Sharing works by **aliasing the module objects**, not by copying and
+resynchronising: after setup the branches hold literally the same parameter
+tensors, so one optimizer step updates the backbone for all of them.
+
+DPA4C supports `shared_level: 0` only (share everything). It also checks that
+the structural parameters match *exactly* — `rcut`, `channels`, `lmax`,
+`n_radial`, `radial_modes`, `basis_type`, `type_map`, precision and
+`add_chg_spin_ebd`. That is why the descriptor is written once in
+`shared_dict` rather than copy-pasted per branch: a single typo becomes
+`ValueError: DPA4C parameter sharing requires identical structural parameters`.
+
+### Rules that will bite you
+
+- **One `type_map` for all heads.** DeePMD-kit asserts it. The map is the union
+  of elements across every dataset; per-system `type.raw` indices stay local
+  and are remapped through each system's own `type_map.raw`, exactly as in §3a.
+- **`pt_expt` does not inherit top-level defaults into branches.** Unlike the
+  `pt` backend, nothing cascades — combined with strict validation, every
+  option must be written out in every branch.
+- **`alpha` must be the same in every branch.** It sets the split between what
+  the network learns and what the term adds; one backbone cannot serve two
+  different splits. `mesh_dimensions` *should* differ per branch, because the
+  cells do.
+- **Set `start_pref_v: 0` for any branch without a cell.** There is no virial
+  to fit.
+- **Charged systems need `add_chg_spin_ebd: true`** on the descriptor, plus a
+  `charge_spin.npy` of shape `(nframes, 2)` holding `[charge, multiplicity]`.
+  Because that flag is part of the structural signature, turning it on for one
+  branch means turning it on for **all** of them — decide before the first long
+  run, since retrofitting it invalidates existing checkpoints.
+- **Then set `default_chg_spin: [0, 1]` too.** Once the descriptor is
+  charge-conditioned it demands a `charge_spin` for *every* frame, so the
+  neutral slab and bulk branches would otherwise fail with `A
+  charge-conditioned DPA4C requires a frame charge_spin`. The default supplies
+  the neutral singlet fallback, and only the systems that are actually charged
+  then need a `charge_spin.npy`. Unlike `add_chg_spin_ebd`, this key is
+  deliberately excluded from the structural signature, so it does not interfere
+  with sharing.
+
+### Running and reading it
+
+One head is chosen per optimizer step by a weighted random draw over
+`model_prob` (defaulting to weights proportional to each task's system count),
+and a single optimizer steps all parameters. Every head is still evaluated at
+each `disp_freq`, so `lcurve.out` gains per-head columns —
+`rmse_e_trn_interface`, `rmse_f_val_bulk`, and so on.
+
+Downstream commands need to be told which head to use:
+
+```bash
+dp --pt-expt train input.json
+dp --pt-expt show  model.ckpt.pt model-branch     # list the heads
+dp --pt-expt freeze -c . --head interface         # --head is REQUIRED here
+```
+
+Not available in multi-task mode: `zero_stage`, `validating.full_validation`,
+`lora`, and `change-bias`.
+
+### Is it working?
+
+The question worth asking is whether the shared backbone helps or hurts. Train
+the multi-head model, then compare each branch's validation RMSE against a
+single-task model trained on that dataset alone. Sharing should be roughly
+neutral-to-better per branch; if one branch is clearly worse, reweight with
+`model_prob` or train it separately — `shared_level` cannot be relaxed for
+DPA4C.
+
 ## 4. The training schedule
 
 ### Plan A — joint from scratch (default)
@@ -615,13 +753,56 @@ short step — and is nothing to do with the long-range term.)
 
 ## Non-periodic systems
 
-If your frames have no cell, none of the above applies: Ewald needs
-periodicity, and `LongRangeEnergy` will refuse a `box=None` frame rather than
-silently pretend. The charge head, the total-charge projection, the model
-wiring and the force/virial handling are all engine-agnostic — only the
-energy term itself would need a sibling built on `nvalchemiops`'s `coulomb`
-or `dsf` (damped shifted force), both of which are already differentiable
-with charge gradients.
+If your frames have no cell, Ewald does not apply: `LongRangeEnergy` refuses a
+`box=None` frame rather than silently pretending. Mark such a system with an
+empty `nopbc` file in its directory and DeePMD-kit's loader will hand the model
+`box = None`.
+
+**A short-range head already works this way today** — a `dp_lr` branch with no
+`long_range` block, or a plain `standard` model, runs on `box=None` frames with
+no special handling. In a multi-task config (§3c) that is how an
+isolated-molecule branch joins a slab and a bulk branch immediately.
+
+Adding a long-range term for such a branch needs one new energy term; nothing
+above it changes, since the charge head, the total-charge projection and the
+force handling never touch a cell.
+
+**What that term has to be is fixed, not a choice.** The periodic path splits
+Coulomb at the screening parameter α:
+
+```
+Σ qᵢqⱼ/r  =  Σ qᵢqⱼ erfc(αr)/r     ← short-ranged; the network learns this
+           + Σ qᵢqⱼ  erf(αr)/r     ← smooth and long-ranged
+```
+
+`LongRangeEnergy` returns the second sum, evaluated in reciprocal space. So for
+an isolated system the consistent term is that same sum evaluated directly, at
+the **same α**:
+
+```
+Eᵢ = ½ Σ_{j≠i} qᵢqⱼ erf(α rᵢⱼ) / rᵢⱼ
+```
+
+This is not an analogy. Put a cluster in a cube of side L and the periodic
+`recip − self` converges onto the direct `erf` sum as 1/L³ — measured at
+−6.6e-03, −8.3e-04 and −1.0e-04 eV for L = 80, 160 and 320 Å. It is the same
+physical quantity, which is what lets one shared backbone serve both branches:
+the remainder left to the network has the same `erfc(αr)/r` form either way.
+
+Three consequences worth knowing:
+
+- **No self term to subtract.** `erf(αr)/r → 2α/√π` as `r → 0`, and the Ewald
+  self term is exactly that times `½Σqᵢ²`. Summing `j ≠ i` already excludes it.
+- **Charged molecules are easier here than in a cell** — no neutralising
+  background is needed, so an ion is just an ion.
+- **No cutoff.** `erf(αr)/r` decays as `1/r`; truncating it would be wrong.
+
+An earlier version of this section suggested building on `nvalchemiops`'s
+`coulomb` or `dsf`. Both turn out to be unusable: `dsf_coulomb` is a
+shifted-force potential with a charge-dependent self term and no position
+autograd, and `coulomb_energy` raises under `create_graph=True`, so neither
+survives force-loss training. A direct dense evaluation of the expression above
+is exact, twice differentiable, and costs ~1 ms at 1000 atoms.
 
 ---
 
