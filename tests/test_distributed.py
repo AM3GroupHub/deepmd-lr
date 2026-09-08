@@ -333,6 +333,58 @@ class TestGatheredLongRange:
                 assert abs(numeric - force[atom, axis]) < 1e-6
 
 
+    @pytest.mark.parametrize("n", [1, 2, 4])
+    def test_assembled_virial_is_the_strain_derivative(self, system, joint, n):
+        """Finite-difference the partitioned virial against itself.
+
+        The companion to the force check above, and the same argument: the
+        distributed virial is otherwise only validated transitively -- equal
+        to the serial virial, which is equal to a finite difference. That
+        chain would hide an error common to both. This differentiates the
+        assembled energy directly.
+
+        It is the most intricate piece of the partitioned path: three
+        contributions summed, a strain leaf per partition, and the identity
+        that a ghost's Cartesian offset deforms like a coordinate. A sign
+        error in any of them lands here.
+        """
+        coord, atype, cell, *_ = system
+        model, _ = joint
+
+        def energy(positions, box):
+            return evaluate_partitioned(
+                model, positions, atype, box,
+                n_partitions=n, devices=[DEVICE] * n,
+            )["energy"]
+
+        analytic = evaluate_partitioned(
+            model, coord, atype, cell,
+            n_partitions=n, devices=[DEVICE] * n, compute_virial=True,
+        )["virial"]
+
+        step = 1e-5
+        numeric = np.zeros((3, 3))
+        for i in range(3):
+            for j in range(3):
+                delta = np.zeros((3, 3))
+                delta[i, j] = step
+                delta = 0.5 * (delta + delta.T)      # symmetric strain
+                energies = []
+                for sign in (1.0, -1.0):
+                    strain = np.eye(3) + sign * delta
+                    energies.append(
+                        energy(coord @ strain.T, cell @ strain.T)
+                    )
+                numeric[i, j] = -(energies[0] - energies[1]) / (2 * step)
+
+        worst = float(np.abs(analytic - numeric).max())
+        assert worst < 2e-5 * max(abs(np.trace(numeric)), 1.0), (
+            f"{n} partitions: max |diff| = {worst:.3e}, "
+            f"analytic trace {np.trace(analytic):.6f} vs "
+            f"numeric trace {np.trace(numeric):.6f}"
+        )
+
+
 class TestDistributedEvaluator:
     """The force driver: energy and forces across devices, nothing else.
 
