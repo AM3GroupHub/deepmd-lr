@@ -44,6 +44,7 @@ non-reducible keys), so the optimization is available later if profiling says
 it matters.
 """
 
+import contextlib
 import copy
 import json
 from typing import (
@@ -301,6 +302,62 @@ class LongRangeEnergyModel(EnergyModel):
         )
         return project_to_total_charge(raw, total, mask=mask)
 
+    @contextlib.contextmanager
+    def _capturing_backbone(self) -> Any:
+        """Yield a dict that fills with the descriptor's output as it runs.
+
+        The charge head reads the same features as the energy head, so the
+        backbone only needs to run once. Getting at them means observing
+        DeePMD-kit's own forward: the tensors we need are local to
+        ``forward_common_lower_graph``, which creates its own ``edge_vec``
+        leaf and hands it to the descriptor. Overriding that method does not
+        help -- it would still be DeePMD-kit's leaf the descriptor sees -- so
+        ``descriptor.call_graph`` is wrapped for the duration of one forward
+        and restored afterwards, exception or not.
+
+        Yields an empty dict when there is no long-range term to feed.
+        """
+        captured: dict = {}
+        if not self.has_long_range:
+            yield captured
+            return
+
+        descriptor = self.atomic_model.descriptor
+        unhooked = descriptor.call_graph
+
+        def capture(graph: Any, atype_flat: Any, *args: Any, **kwargs: Any) -> Any:
+            out = unhooked(graph, atype_flat, *args, **kwargs)
+            # Only the FIRST call is the energy head's. A later one is the
+            # fallback re-running the backbone, and must not overwrite this.
+            if not captured:
+                captured.update(
+                    features=out[0],
+                    rot_mat=out[1],
+                    edge_vec=graph.edge_vec,
+                    edge_index=graph.edge_index,
+                    edge_mask=graph.edge_mask,
+                    n_node=graph.n_node,
+                )
+            return out
+
+        descriptor.call_graph = capture
+        try:
+            yield captured
+        finally:
+            descriptor.call_graph = unhooked
+
+    @staticmethod
+    def _usable(captured: dict) -> dict | None:
+        """The capture, if it can actually carry the charge response.
+
+        An ``edge_vec`` without ``requires_grad`` means the energy path did
+        not route through the graph lower, so there is nothing to
+        differentiate and the backbone has to be run again.
+        """
+        if captured and captured["edge_vec"].requires_grad:
+            return captured
+        return None
+
     def _charges_from_features(
         self,
         features: torch.Tensor,
@@ -465,37 +522,10 @@ class LongRangeEnergyModel(EnergyModel):
         **kwargs: Any,
     ) -> dict[str, torch.Tensor]:
         """Short-range DPA4C energy plus the long-range electrostatic term."""
-        # Capture the backbone output on its way through the energy path, so
-        # the charge head can read the same features instead of re-running the
-        # descriptor. Measured at 6520 atoms, the second pass was 18% of the
-        # forward. `descriptor.call_graph` is hooked rather than
-        # `forward_common_lower_graph` overridden, because the leaf we need is
-        # created inside that method and only reaches us as `graph.edge_vec`.
-        shared: dict | None = None
-        descriptor = self.atomic_model.descriptor
-        unhooked = descriptor.call_graph
-        if self.has_long_range and box is not None:
-            captured: dict = {}
-
-            def capture(graph, atype_flat, *args, **kwargs):
-                out = unhooked(graph, atype_flat, *args, **kwargs)
-                # Only the FIRST call is the energy head's. Anything later is
-                # the fallback path re-running the backbone, which must not
-                # overwrite what we captured.
-                if not captured:
-                    captured.update(
-                        features=out[0],
-                        rot_mat=out[1],
-                        edge_vec=graph.edge_vec,
-                        edge_index=graph.edge_index,
-                        edge_mask=graph.edge_mask,
-                        n_node=graph.n_node,
-                    )
-                return out
-
-            descriptor.call_graph = capture
-
-        try:
+        # The backbone runs once, inside `super().forward()`, and the charge
+        # head reads its output -- the second descriptor pass this replaces
+        # was 18% of the forward at 6520 atoms.
+        with self._capturing_backbone() as captured:
             short_range = super().forward(
                 coord,
                 atype,
@@ -506,14 +536,6 @@ class LongRangeEnergyModel(EnergyModel):
                 charge_spin=charge_spin,
                 **kwargs,
             )
-        finally:
-            descriptor.call_graph = unhooked
-        if self.has_long_range and box is not None and captured:
-            # A captured `edge_vec` that carries no gradient means the energy
-            # path did not route through the graph lower; fall back rather
-            # than differentiate through a detached tensor.
-            if captured["edge_vec"].requires_grad:
-                shared = captured
         if not self.has_long_range:
             return short_range
         if box is None:
@@ -523,7 +545,12 @@ class LongRangeEnergyModel(EnergyModel):
             )
 
         long_range = self._long_range(
-            coord, atype, box, charge_spin, do_atomic_virial, shared=shared
+            coord,
+            atype,
+            box,
+            charge_spin,
+            do_atomic_virial,
+            shared=self._usable(captured),
         )
 
         out = dict(short_range)
