@@ -226,6 +226,26 @@ class TestConfiguration:
         with pytest.raises(ValueError, match="method must be one of"):
             build_long_range_energy({"method": "nonsense"})
 
+    def test_schema_defaults_are_not_mistaken_for_settings(self):
+        """`normalize` fills the whole reciprocal block in before the model is
+        built, so an isolated config arrives carrying periodic keys nobody
+        wrote. Refusing those would make the method unusable from a config
+        file -- which is exactly what happened the first time."""
+        from deepmd_lr.lr.term import DEFAULT_SPLINE_ORDER  # noqa: PLC0415
+
+        term = IsolatedLongRangeEnergy(
+            method="isolated",
+            alpha=0.4,
+            mesh_spacing=None,
+            mesh_dimensions=None,
+            spline_order=DEFAULT_SPLINE_ORDER,
+            k_cutoff=None,
+            accuracy=1e-6,
+            slab_correction=False,
+            pbc=None,
+        )
+        assert term.alpha == 0.4
+
     def test_periodic_only_settings_are_refused(self):
         """Silently ignoring a mesh setting would be indistinguishable from
         applying it."""
@@ -235,7 +255,7 @@ class TestConfiguration:
             {"mesh_dimensions": [8, 8, 8]},
             {"k_cutoff": 1.0},
         ):
-            with pytest.raises(TypeError, match="unexpected parameters"):
+            with pytest.raises(ValueError, match="do not apply to"):
                 IsolatedLongRangeEnergy(alpha=0.4, **bad)
 
     def test_rejects_nonpositive_alpha(self):

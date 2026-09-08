@@ -287,9 +287,10 @@ class TestThreeBranchInterfaceBulkMolecule:
                         "pbc": [True, True, True],
                     }
                 ),
-                # No long_range: the isolated term does not exist yet, and a
-                # short-range head is already correct on box=None frames.
-                "molecule": branch(),
+                # Same alpha as the periodic branches -- that is what makes
+                # the remainder left to the shared backbone the same shape in
+                # every branch.
+                "molecule": branch({"method": "isolated", "alpha": 0.4}),
             },
         }
         keys = list(model["model_dict"])
@@ -326,7 +327,16 @@ class TestThreeBranchInterfaceBulkMolecule:
         models = self.build()
         assert models["interface"].long_range_energy.slab_correction is True
         assert models["bulk"].long_range_energy.slab_correction is False
-        assert models["molecule"].has_long_range is False
+        assert models["molecule"].long_range_energy.needs_cell is False
+        assert models["interface"].long_range_energy.needs_cell is True
+
+    def test_every_branch_splits_coulomb_at_the_same_alpha(self):
+        """The shared backbone learns the erfc(alpha r)/r remainder. If the
+        branches split at different alphas it would be asked for two different
+        functions at once."""
+        models = self.build()
+        alphas = {m.long_range_energy.alpha for m in models.values()}
+        assert alphas == {0.4}
 
     def test_all_three_share_one_backbone(self):
         models = self.build()
@@ -348,6 +358,42 @@ class TestThreeBranchInterfaceBulkMolecule:
             out = models[name](coord, atype, box=box, **kwargs)
             assert torch.isfinite(out["energy"]).all(), name
             assert torch.isfinite(out["force"]).all(), name
+            assert torch.isfinite(out["energy_long_range"]).all(), name
+            # The pieces must still add up in every boundary condition.
+            assert float(out["energy"]) == pytest.approx(
+                float(out["energy_short_range"]) + float(out["energy_long_range"]),
+                rel=1e-10,
+            ), name
+
+    def test_a_molecule_step_updates_the_shared_backbone(self):
+        """The point of the whole arrangement: gradients from one dataset
+        reach the descriptor the other branches use."""
+        models = self.build()
+        coord, atype, _cell = frame(n_mol=3)
+        anion = torch.tensor([[-1.0, 1.0]], dtype=coord.dtype, device=coord.device)
+
+        weight = next(
+            iter(
+                models["interface"].atomic_model.descriptor.type_embedding.parameters()
+            )
+        )
+        before = weight.clone()
+        models["molecule"](coord, atype, box=None, charge_spin=anion)[
+            "energy"
+        ].sum().backward()
+        assert weight.grad is not None
+        assert float(weight.grad.abs().sum()) > 0.0
+
+        torch.optim.SGD([weight], lr=1e-2).step()
+        assert not torch.equal(before, weight)
+
+    def test_a_charged_molecule_keeps_its_total_charge(self):
+        models = self.build()
+        coord, atype, _cell = frame(n_mol=3)
+        for total in (-1.0, 0.0, 2.0):
+            cs = torch.tensor([[total, 1.0]], dtype=coord.dtype, device=coord.device)
+            out = models["molecule"](coord, atype, box=None, charge_spin=cs)
+            assert float(out["charge"].sum()) == pytest.approx(total, abs=1e-10)
 
     def test_periodic_branches_conserve_total_charge(self):
         models = self.build()

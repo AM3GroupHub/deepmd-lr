@@ -523,20 +523,51 @@ class IsolatedLongRangeEnergy(torch.nn.Module):
     #: Selector under ``long_range.reciprocal.method``.
     METHOD = "isolated"
 
-    def __init__(self, alpha: float = DEFAULT_ALPHA, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        alpha: float = DEFAULT_ALPHA,
+        method: str | None = None,
+        mesh_spacing: float | None = None,
+        mesh_dimensions: tuple[int, int, int] | list[int] | None = None,
+        spline_order: int = DEFAULT_SPLINE_ORDER,
+        k_cutoff: float | None = None,
+        accuracy: float = 1e-6,
+        slab_correction: bool = False,
+        pbc: tuple[bool, bool, bool] | list[bool] | None = None,
+        **kwargs: Any,
+    ) -> None:
         super().__init__()
-        # Everything LongRangeEnergy accepts is about evaluating a k-space sum
-        # over periodic images: meshes, spline orders, k-vector cutoffs, the
-        # slab correction, per-axis pbc. None of it means anything here, and a
-        # setting that looks applied but is not is the worst kind of
-        # configuration bug -- so refuse rather than ignore.
-        kwargs.pop("method", None)
+        del method
+        # Every periodic setting is accepted and then checked against its
+        # default rather than simply refused, because `dargs` fills the whole
+        # block in before anything is built -- an isolated config arrives here
+        # carrying `spline_order: 6` and `pbc: None` that nobody wrote. What
+        # must still be caught is a value someone *chose*: a setting that looks
+        # applied but is not is the worst kind of configuration bug. Same
+        # default-as-sentinel test LongRangeEnergy uses for its own
+        # cross-method check.
+        supplied = [
+            name
+            for name, value, unset in (
+                ("mesh_spacing", mesh_spacing, None),
+                ("mesh_dimensions", mesh_dimensions, None),
+                ("spline_order", spline_order, DEFAULT_SPLINE_ORDER),
+                ("k_cutoff", k_cutoff, None),
+                ("accuracy", accuracy, 1e-6),
+                ("slab_correction", slab_correction, False),
+                ("pbc", pbc, None),
+            )
+            if value != unset
+        ]
         if kwargs:
-            raise TypeError(
-                f"unexpected parameters for the isolated long-range term: "
-                f"{sorted(kwargs)}. It takes only `alpha`. Meshes, k-vector "
-                "cutoffs, `slab_correction` and `pbc` all describe a sum over "
-                "periodic images, which an isolated system does not have."
+            supplied += sorted(kwargs)
+        if supplied:
+            raise ValueError(
+                f"{sorted(supplied)} do not apply to method='isolated', which "
+                "takes only `alpha`. Meshes, k-vector cutoffs, "
+                "`slab_correction` and `pbc` all describe a sum over periodic "
+                "images; an isolated system has none, so these would be "
+                "silently ignored."
             )
         if alpha is None or alpha <= 0:
             raise ValueError(f"alpha must be positive, got {alpha}")
