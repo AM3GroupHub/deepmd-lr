@@ -275,6 +275,58 @@ class TestConservation:
             "cell-blind neighbour builder reached the charge graph"
         )
 
+    def test_shared_backbone_matches_recomputing_it(self):
+        """The charge head reads the energy head's features; same answer.
+
+        DeePMD-kit detaches `edge_vec` into its own leaf before the backbone
+        runs, so the shared features carry no dependence on our coordinate
+        leaf or strain. The charge response therefore comes from
+        `dE/d(edge_vec)` via `edge_force_virial` instead. This asserts the two
+        routes agree -- if they ever diverge, the reformulation is wrong, and
+        it would be wrong silently.
+        """
+        model = build()
+        coord, atype, cell = frame(n_mol=64, box=24.0)
+        shared = model(coord, atype, box=cell)
+
+        original = type(model)._long_range
+
+        def without_sharing(self, *args, **kwargs):
+            kwargs["shared"] = None
+            return original(self, *args, **kwargs)
+
+        type(model)._long_range = without_sharing
+        try:
+            recomputed = model(coord, atype, box=cell)
+        finally:
+            type(model)._long_range = original
+
+        for key, tol in (("force", 2e-4), ("virial", 5e-3), ("charge", 1e-5)):
+            a = shared[key].detach()
+            b = recomputed[key].detach()
+            worst = float((a - b).abs().max())
+            assert worst < tol, f"{key}: max|diff| = {worst:.3e}"
+        assert abs(float(shared["energy"]) - float(recomputed["energy"])) < 1e-3
+
+    def test_backbone_runs_once_per_forward(self):
+        """The point of the sharing: one descriptor pass, not two."""
+        model = build()
+        coord, atype, cell = frame(n_mol=32, box=18.0)
+        descriptor = model.atomic_model.descriptor
+        original = descriptor.call_graph
+        calls = []
+
+        def counted(*args, **kwargs):
+            calls.append(1)
+            return original(*args, **kwargs)
+
+        descriptor.call_graph = counted
+        try:
+            model(coord, atype, box=cell)
+        finally:
+            descriptor.call_graph = original
+        assert len(calls) == 1, f"backbone ran {len(calls)} times, expected 1"
+
     def test_virial_is_symmetric(self):
         """A rotation-invariant energy has a symmetric virial."""
         model = build()

@@ -54,6 +54,9 @@ import torch
 from deepmd.dpmodel.model.model_factory import (
     get_model_components,
 )
+from deepmd.dpmodel.utils.neighbor_graph.derivatives import (
+    edge_force_virial,
+)
 from deepmd.pt_expt.descriptor import (
     BaseDescriptor,
 )
@@ -298,6 +301,32 @@ class LongRangeEnergyModel(EnergyModel):
         )
         return project_to_total_charge(raw, total, mask=mask)
 
+    def _charges_from_features(
+        self,
+        features: torch.Tensor,
+        rot_mat: torch.Tensor | None,
+        atype: torch.Tensor,
+        charge_spin: torch.Tensor | None,
+        mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Charges from an already-computed descriptor output.
+
+        The charge head is a per-atom MLP over the same features the energy
+        head reads, so once the backbone has run there is nothing to repeat.
+        """
+        nf, nloc = atype.shape[0], atype.shape[1]
+        atype_flat = atype.reshape(-1)
+        raw = self.charge_fitting.call_graph(features, atype_flat, gr=rot_mat)[
+            "charge"
+        ]
+        raw = raw.reshape(nf, nloc)
+        total = (
+            charge_spin[:, 0].to(raw.dtype)
+            if charge_spin is not None
+            else torch.zeros(nf, dtype=raw.dtype, device=raw.device)
+        )
+        return project_to_total_charge(raw, total, mask=mask)
+
     def _long_range(
         self,
         coord: torch.Tensor,
@@ -305,6 +334,7 @@ class LongRangeEnergyModel(EnergyModel):
         box: torch.Tensor,
         charge_spin: torch.Tensor | None,
         do_atomic_virial: bool,
+        shared: dict | None = None,
     ) -> dict[str, torch.Tensor]:
         """Long-range energy with its own force and virial.
 
@@ -343,33 +373,73 @@ class LongRangeEnergyModel(EnergyModel):
         strained_box = torch.bmm(base_box, strain.transpose(-1, -2))
 
         mask = self.atomic_model.make_atom_mask(atype)
-        # The charge graph is built from the UNstrained geometry and the strain
-        # is applied to its edge vectors inside -- `_predict_charges` explains
-        # why that is both exact and what makes the O(N) neighbour builder
-        # usable here. `leaf_coord` (not `base_coord`) so d(charge)/d(coord)
-        # still reaches the force.
-        charge = self._predict_charges(
-            leaf_coord, atype, base_box, charge_spin, mask, strain=strain
-        )
-        atom_energy = self.long_range_energy(
-            strained_coord, charge, strained_box, mask=mask
-        )
-        energy = atom_energy.sum()
-
         create_graph = self.training
-        grad_coord, grad_eps = torch.autograd.grad(
-            energy,
-            [leaf_coord, eps],
-            create_graph=create_graph,
-        )
+
+        if shared is not None:
+            # SHARED BACKBONE. The energy head already ran the descriptor; its
+            # output is reused here rather than recomputed, which is the same
+            # 144-dim feature per atom feeding a second per-atom MLP.
+            #
+            # DeePMD-kit detaches `edge_vec` into its own leaf before the
+            # backbone runs, so those features carry no dependence on our
+            # coordinate leaf or strain -- only on that leaf. The charge
+            # response is therefore taken with respect to `edge_vec` and
+            # converted by DeePMD-kit's own `edge_force_virial`, exactly as it
+            # converts the short-range energy's edge gradient. Its backward
+            # sets `retain_graph=True`, which is what leaves the captured
+            # graph traversable here.
+            charge = self._charges_from_features(
+                shared["features"], shared["rot_mat"], atype, charge_spin, mask
+            )
+            atom_energy = self.long_range_energy(
+                strained_coord, charge, strained_box, mask=mask
+            )
+            energy = atom_energy.sum()
+            edge_vec = shared["edge_vec"]
+            grad_coord, grad_eps, g_e = torch.autograd.grad(
+                energy,
+                [leaf_coord, eps, edge_vec],
+                create_graph=create_graph,
+                retain_graph=True,
+            )
+            # `leaf_coord`/`eps` now carry ONLY the reciprocal sum's explicit
+            # geometry dependence; the charge response arrives through the
+            # edges. Summing the two is the same total as before.
+            response_force, _atom_virial, response_virial = edge_force_virial(
+                g_e,
+                edge_vec,
+                shared["edge_index"],
+                shared["edge_mask"],
+                shared["n_node"],
+            )
+            force = -grad_coord + response_force.reshape(nf, nloc, 3)
+            virial = (-grad_eps).reshape(nf, 9) + response_virial.reshape(nf, 9)
+        else:
+            # Fallback: run the backbone again on our own strained graph. Used
+            # when the energy path did not route through the graph lower, so
+            # nothing was captured.
+            charge = self._predict_charges(
+                leaf_coord, atype, base_box, charge_spin, mask, strain=strain
+            )
+            atom_energy = self.long_range_energy(
+                strained_coord, charge, strained_box, mask=mask
+            )
+            energy = atom_energy.sum()
+            grad_coord, grad_eps = torch.autograd.grad(
+                energy,
+                [leaf_coord, eps],
+                create_graph=create_graph,
+            )
+            force = -grad_coord
+            virial = (-grad_eps).reshape(nf, 9)
 
         out = {
             "atom_energy": atom_energy,
             "energy": atom_energy.sum(dim=1),
-            "force": -grad_coord,
+            "force": force,
             # DeePMD-kit reports the virial flattened to (nf, 9), matching
             # `energy_derv_c_redu`; match that rather than the natural (nf, 3, 3).
-            "virial": (-grad_eps).reshape(nf, 9),
+            "virial": virial,
             "charge": charge,
         }
         if do_atomic_virial:
@@ -395,16 +465,55 @@ class LongRangeEnergyModel(EnergyModel):
         **kwargs: Any,
     ) -> dict[str, torch.Tensor]:
         """Short-range DPA4C energy plus the long-range electrostatic term."""
-        short_range = super().forward(
-            coord,
-            atype,
-            box=box,
-            fparam=fparam,
-            aparam=aparam,
-            do_atomic_virial=do_atomic_virial,
-            charge_spin=charge_spin,
-            **kwargs,
-        )
+        # Capture the backbone output on its way through the energy path, so
+        # the charge head can read the same features instead of re-running the
+        # descriptor. Measured at 6520 atoms, the second pass was 18% of the
+        # forward. `descriptor.call_graph` is hooked rather than
+        # `forward_common_lower_graph` overridden, because the leaf we need is
+        # created inside that method and only reaches us as `graph.edge_vec`.
+        shared: dict | None = None
+        descriptor = self.atomic_model.descriptor
+        unhooked = descriptor.call_graph
+        if self.has_long_range and box is not None:
+            captured: dict = {}
+
+            def capture(graph, atype_flat, *args, **kwargs):
+                out = unhooked(graph, atype_flat, *args, **kwargs)
+                # Only the FIRST call is the energy head's. Anything later is
+                # the fallback path re-running the backbone, which must not
+                # overwrite what we captured.
+                if not captured:
+                    captured.update(
+                        features=out[0],
+                        rot_mat=out[1],
+                        edge_vec=graph.edge_vec,
+                        edge_index=graph.edge_index,
+                        edge_mask=graph.edge_mask,
+                        n_node=graph.n_node,
+                    )
+                return out
+
+            descriptor.call_graph = capture
+
+        try:
+            short_range = super().forward(
+                coord,
+                atype,
+                box=box,
+                fparam=fparam,
+                aparam=aparam,
+                do_atomic_virial=do_atomic_virial,
+                charge_spin=charge_spin,
+                **kwargs,
+            )
+        finally:
+            descriptor.call_graph = unhooked
+        if self.has_long_range and box is not None and captured:
+            # A captured `edge_vec` that carries no gradient means the energy
+            # path did not route through the graph lower; fall back rather
+            # than differentiate through a detached tensor.
+            if captured["edge_vec"].requires_grad:
+                shared = captured
         if not self.has_long_range:
             return short_range
         if box is None:
@@ -414,7 +523,7 @@ class LongRangeEnergyModel(EnergyModel):
             )
 
         long_range = self._long_range(
-            coord, atype, box, charge_spin, do_atomic_virial
+            coord, atype, box, charge_spin, do_atomic_virial, shared=shared
         )
 
         out = dict(short_range)
