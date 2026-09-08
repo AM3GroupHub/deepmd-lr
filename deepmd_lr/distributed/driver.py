@@ -35,7 +35,9 @@ from deepmd_lr.distributed.partition import (
     partition_system,
 )
 from deepmd_lr.fitting.charge import (
+    charge_mask,
     project_to_total_charge,
+    resolve_charge_spin,
 )
 from deepmd_lr.neighbors import (
     build_neighbor_graph_fast,
@@ -71,7 +73,7 @@ def device_replicas(model, devices) -> dict:
     return replicas
 
 
-def partition_charges(model, graph, node_type, n_owned: int):
+def partition_charges(model, graph, node_type, n_owned: int, charge_spin=None):
     """Raw (unprojected) charges for one partition's owned atoms.
 
     Runs the shared descriptor and the charge head on the subgraph, mirroring
@@ -84,7 +86,7 @@ def partition_charges(model, graph, node_type, n_owned: int):
     """
     descriptor = model.atomic_model.descriptor
     charge_spin_kwargs = (
-        {"charge_spin": None} if model.atomic_model.supports_charge_spin else {}
+        {"charge_spin": charge_spin} if model.atomic_model.supports_charge_spin else {}
     )
     features, rot_mat = descriptor.call_graph(
         graph,
@@ -161,6 +163,7 @@ def evaluate_partitioned(
     partitions: list[Partition] | None = None,
     replicas: dict | None = None,
     compute_virial: bool = False,
+    charge_spin: torch.Tensor | tuple[float, float] | None = None,
 ) -> dict[str, Any]:
     """Run ``model`` over spatial partitions and assemble the global result.
 
@@ -172,6 +175,9 @@ def evaluate_partitioned(
         Reuse a previously built partitioning instead of rebuilding. Valid as
         long as its halo still covers every neighbour -- see the skin logic in
         :class:`~deepmd_lr.distributed.evaluator.DistributedEvaluator`.
+    charge_spin
+        Global (total charge, spin multiplicity), shared by every partition.
+        If omitted, use the model's configured default condition.
 
     Returns
     -------
@@ -215,6 +221,9 @@ def evaluate_partitioned(
     virial = np.zeros((3, 3)) if compute_virial else None
     for part, device in zip(parts, devices, strict=True):
         local = replicas[torch.device(device)]
+        condition = resolve_charge_spin(
+            local, charge_spin, 1, torch.empty((), dtype=dtype, device=device)
+        )
         # One strain leaf per partition. They cannot be shared -- a leaf
         # lives on one device -- but the virial is a sum of contributions,
         # so per-device leaves and summed gradients are equivalent.
@@ -241,12 +250,13 @@ def evaluate_partitioned(
             graph.edge_index,
             graph.edge_vec,
             graph.edge_mask,
+            charge_spin=condition,
         )
         # Charges come from the SAME graph, and the tensor is kept live so the
         # charge-response force can backpropagate through it later instead of
         # rebuilding the neighbour search and re-running the descriptor.
         raw = (
-            partition_charges(local, graph, node_type, part.n_owned)
+            partition_charges(local, graph, node_type, part.n_owned, condition)
             if long_range
             else None
         )
@@ -300,9 +310,13 @@ def evaluate_partitioned(
             gather,
             dtype,
             compute_virial=compute_virial,
+            atype=atype,
+            charge_spin=charge_spin,
         )
     )
     result["energy"] = result["energy_short_range"] + result["energy_long_range"]
+    result["atom_energy_short_range"] = result["atom_energy"]
+    result["atom_energy"] = result["atom_energy"] + result["atom_energy_long_range"]
     result["force"] = result["force"] + result["force_long_range"]
 
     response_force, response_virial = _charge_response_force(
@@ -342,9 +356,8 @@ def _charge_response_force(
     head, on its own device -- no autograd graph spans devices and no
     communication is needed beyond the halo already present.
 
-    The cotangent passes through the global projection first. With
-    ``q_i = q~_i + (Q - sum_k q~_k) / N``, the chain rule gives
-    ``dE/dq~_j = dE/dq_j - mean(dE/dq)``: a single mean subtraction.
+    The incoming cotangent already passed through the global projection in
+    ``_long_range_global``, including its exclusion mask. Do not project twice.
 
     The charges arrive already computed, still attached to the graph that
     produced them, so this is only the backward pass. Rebuilding the neighbour
@@ -352,7 +365,8 @@ def _charge_response_force(
     was a third descriptor evaluation per partition for no additional
     information.
     """
-    cotangent = dE_dq - dE_dq.mean()
+    # dE_dq already differentiates through the global, possibly masked projection.
+    cotangent = dE_dq
     force = np.zeros((n_atoms, 3))
     virial = np.zeros((3, 3)) if compute_virial else None
 
@@ -379,7 +393,8 @@ def _charge_response_force(
 
 
 def _long_range_global(
-    model, coord, cell, raw_charge, device, dtype, compute_virial: bool = False
+    model, coord, cell, raw_charge, device, dtype, compute_virial: bool = False,
+    *, atype, charge_spin=None,
 ) -> dict:
     """The global half: project the charges, then evaluate the reciprocal sum.
 
@@ -412,7 +427,10 @@ def _long_range_global(
     else:
         coord_in, cell_in = coord_t, cell_t
 
-    charge = project_to_total_charge(charge_t, 0.0)
+    condition = resolve_charge_spin(model, charge_spin, 1, coord_t)
+    total_charge = 0.0 if condition is None else condition[:, 0]
+    types = torch.as_tensor(atype, dtype=torch.int64, device=device).reshape(1, -1)
+    charge = project_to_total_charge(charge_t, total_charge, mask=charge_mask(model, types))
     atom_energy = model.long_range_energy(coord_in, charge, cell_in)
     total = atom_energy.sum()
     targets = [coord_t, charge_t] if eps is None else [coord_t, charge_t, eps]

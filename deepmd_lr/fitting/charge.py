@@ -26,6 +26,7 @@ from typing import (
 )
 
 import array_api_compat
+import torch
 from deepmd.dpmodel.array_api import (
     Array,
 )
@@ -45,6 +46,33 @@ from deepmd.pt_expt.fitting.base_fitting import (
 #: Name of the per-atom variable this head produces, and the key it is
 #: registered and serialized under.
 CHARGE_VAR_NAME = "charge"
+
+
+def resolve_charge_spin(
+    model: Any,
+    charge_spin: Any,
+    nf: int,
+    ref: torch.Tensor,
+) -> torch.Tensor | None:
+    """Resolve explicit/default frame conditions on the caller's device."""
+    if charge_spin is None:
+        charge_spin = model.get_default_chg_spin()
+    if charge_spin is None:
+        return None
+    condition = torch.as_tensor(charge_spin, dtype=ref.dtype, device=ref.device)
+    if condition.numel() not in (2, 2 * nf):
+        raise ValueError(
+            "charge_spin must hold one [charge, multiplicity] pair per frame"
+        )
+    return condition.reshape(-1, 2).expand(nf, 2)
+
+
+def charge_mask(model: Any, atype: torch.Tensor) -> torch.Tensor:
+    """Atoms eligible to carry charge, including fitting-type exclusions."""
+    mask = model.atomic_model.make_atom_mask(atype).bool()
+    for atom_type in model.charge_fitting.exclude_types:
+        mask = mask & (atype != atom_type)
+    return mask
 
 
 def project_to_total_charge(

@@ -95,6 +95,9 @@ class DistributedEvaluator:
         :attr:`stress` (eV/angstrom^3, ASE sign convention) after each call.
         Off by default because it costs an extra strain leaf per partition
         and a second backward through the charge head.
+    charge_spin
+        Fixed (total charge, spin multiplicity) for this system. If omitted,
+        use the model's configured default condition.
 
     Notes
     -----
@@ -114,6 +117,7 @@ class DistributedEvaluator:
         skin: float = 1.0,
         repartition_every: int | None = None,
         compute_virial: bool = False,
+        charge_spin: torch.Tensor | tuple[float, float] | None = None,
     ) -> None:
         if not devices:
             raise ValueError("DistributedEvaluator needs at least one device")
@@ -125,6 +129,7 @@ class DistributedEvaluator:
         self.skin = float(skin)
         self.repartition_every = repartition_every
         self.compute_virial = bool(compute_virial)
+        self.charge_spin = charge_spin
         self.home = next(model.parameters()).device
         self.atype = np.asarray(atype, dtype=np.int64).reshape(-1)
         self.cell = np.asarray(cell, dtype=np.float64).reshape(3, 3)
@@ -235,6 +240,7 @@ class DistributedEvaluator:
             partitions=self._partitions,
             replicas=self._replicas,
             compute_virial=self.compute_virial,
+            charge_spin=self.charge_spin,
         )
         self.results = out
         self.virial = out.get("virial")

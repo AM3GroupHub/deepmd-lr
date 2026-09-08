@@ -72,7 +72,9 @@ from deepmd.pt_expt.model.model import (
 )
 
 from deepmd_lr.fitting.charge import (
+    charge_mask,
     project_to_total_charge,
+    resolve_charge_spin,
 )
 from deepmd_lr.lr.term import (
     LongRangeTerm,
@@ -447,7 +449,7 @@ class LongRangeEnergyModel(EnergyModel):
             None if base_box is None else torch.bmm(base_box, strain.transpose(-1, -2))
         )
 
-        mask = self.atomic_model.make_atom_mask(atype)
+        mask = charge_mask(self, atype)
         create_graph = self.training
 
         if shared is not None:
@@ -543,6 +545,8 @@ class LongRangeEnergyModel(EnergyModel):
         # The backbone runs once, inside `super().forward()`, and the charge
         # head reads its output -- the second descriptor pass this replaces
         # was 18% of the forward at 6520 atoms.
+        if self.has_long_range:
+            charge_spin = resolve_charge_spin(self, charge_spin, atype.shape[0], coord)
         with self._capturing_backbone() as captured:
             short_range = super().forward(
                 coord,
