@@ -100,12 +100,40 @@ class TestCalculatorMatchesTheModel:
 
 
 class TestCalculatorGuards:
-    def test_rejects_non_periodic_atoms(self):
+    def test_rejects_non_periodic_atoms_for_a_periodic_term(self):
+        """A reciprocal sum has nothing to sum over without a cell."""
         atoms = water_atoms()
         atoms.pbc = False
         atoms.calc = LongRangeCalculator(build())
-        with pytest.raises(ValueError, match="fully periodic cell"):
+        with pytest.raises(ValueError, match="sums over periodic images"):
             atoms.get_potential_energy()
+
+    def test_accepts_non_periodic_atoms_for_a_short_range_model(self):
+        """The guard used to fire regardless of whether there was a
+        long-range term at all, which refused a perfectly ordinary
+        short-range model on a molecule."""
+        atoms = water_atoms()
+        atoms.pbc = False
+        atoms.calc = LongRangeCalculator(build(long_range=False))
+        assert np.isfinite(atoms.get_potential_energy())
+        assert np.isfinite(atoms.get_forces()).all()
+
+    def test_accepts_non_periodic_atoms_for_the_isolated_term(self):
+        from .test_isolated_term import isolated_model  # noqa: PLC0415
+
+        atoms = water_atoms()
+        atoms.pbc = False
+        atoms.calc = LongRangeCalculator(isolated_model())
+        assert np.isfinite(atoms.get_potential_energy())
+        assert np.isfinite(atoms.get_forces()).all()
+
+    def test_accepts_a_slab_with_one_open_axis(self):
+        """pbc=[True, True, False] is exactly the configuration
+        `slab_correction` exists for; the guard used to reject it."""
+        atoms = water_atoms()
+        atoms.pbc = [True, True, False]
+        atoms.calc = LongRangeCalculator(build())
+        assert np.isfinite(atoms.get_potential_energy())
 
     def test_rejects_unknown_elements(self):
         atoms = water_atoms()

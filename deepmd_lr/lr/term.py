@@ -24,6 +24,12 @@ like ``erfc(alpha r)/r`` and is already inside the descriptor's cutoff, so the
 short-range model represents it directly -- adding it here would ask the
 network to learn to subtract something it can already describe.
 
+For a system with no cell there is no reciprocal space, but there is still the
+same split: see :class:`IsolatedLongRangeEnergy`, which sums the smooth half
+directly. It is not an approximation of this class but its infinite-volume
+limit, which is what lets one descriptor serve periodic and isolated data at
+once. Choose between them with :func:`build_long_range_energy`.
+
 **The self term stays subtracted.** The bare k-space sum counts each Gaussian
 interacting with itself -- an artifact of replacing point charges with clouds,
 not a physical interaction -- so the Ewald decomposition removes it. Both
@@ -287,6 +293,9 @@ class LongRangeEnergy(torch.nn.Module):
         self.k_cutoff = None if k_cutoff is None else float(k_cutoff)
         self.accuracy = float(accuracy)
 
+    #: This term is only defined under periodic boundary conditions.
+    needs_cell = True
+
     def extra_repr(self) -> str:
         if self.method == "pme":
             return (
@@ -445,4 +454,192 @@ class LongRangeEnergy(torch.nn.Module):
 
         energy = energy * ELECTROSTATIC_CONVERSION
         return energy.reshape(nf, nloc, 1)
+
+
+class IsolatedLongRangeEnergy(torch.nn.Module):
+    r"""The same long-range energy, for a system with no cell.
+
+    Ewald splits Coulomb at :math:`\alpha` into a screened part the network
+    learns and a smooth part this package supplies:
+
+    .. math::
+        \sum_{i<j} \frac{q_i q_j}{r_{ij}}
+          = \underbrace{\sum_{i<j}
+                \frac{q_i q_j \operatorname{erfc}(\alpha r_{ij})}{r_{ij}}
+            }_{\text{short-ranged; the descriptor covers this}}
+          + \underbrace{\sum_{i<j}
+                \frac{q_i q_j \operatorname{erf}(\alpha r_{ij})}{r_{ij}}
+            }_{\text{this class}}
+
+    Under periodicity that second sum is what :class:`LongRangeEnergy`
+    evaluates in reciprocal space. Without a cell it can be summed directly,
+    and doing so is not merely the analogous choice -- it is the *same
+    quantity*. Put a cluster in a cube of side ``L`` and ``recip - self``
+    converges onto this sum as :math:`1/L^3`; measured differences were
+    ``-6.6e-03``, ``-8.3e-04`` and ``-1.0e-04`` eV at ``L = 80, 160, 320``
+    angstrom, pinned by ``tests/test_isolated_term.py``.
+
+    That equality is the whole point. A shared descriptor trained on periodic
+    and isolated frames together sees a remainder of the same
+    ``erfc(alpha r)/r`` shape in both, so it is never asked to do two
+    different jobs -- which is exactly what a damped-shifted-force or
+    hard-truncated Coulomb term would demand.
+
+    Three things follow, and each removes a decision:
+
+    * **No self term.** ``erf(alpha r)/r`` tends to ``2 alpha / sqrt(pi)`` as
+      ``r -> 0``, and the Ewald self term is precisely that times
+      ``0.5 * sum_i q_i^2``. Summing ``j != i`` already excludes it, so this
+      returns the same ``recip - self`` content its periodic twin does.
+    * **Charged systems need nothing extra.** Without periodic images there is
+      no conditionally convergent sum and no neutralising background, so an
+      ion is just an ion.
+    * **No cutoff.** ``erf(alpha r)/r`` decays as ``1/r``. Truncating a
+      long-ranged interaction is the error this whole package exists to avoid,
+      so every pair is summed.
+
+    Evaluated densely rather than through nvalchemiops. Its ``ewald_real_space``
+    could give the same number as ``alpha=0`` minus ``alpha``, but only via a
+    dummy cell, all-zero shifts, an all-pairs neighbour list and a ragged
+    relayout -- ``nvalchemiops`` batches by concatenation while DeePMD-kit
+    hands us a padded ``(nf, nloc)`` frame. Its ``dsf_coulomb`` has no position
+    autograd and ``coulomb_energy`` raises under ``create_graph``, so neither
+    survives force-loss training. The dense form takes DeePMD-kit's layout as
+    it comes, is exact, and is twice differentiable. It costs ``O(N^2)``
+    memory -- 8 MiB at 1024 atoms in float64 -- which is the one reason to
+    revisit it, and only for molecules far larger than these.
+
+    Parameters
+    ----------
+    alpha
+        Ewald splitting parameter in inverse angstrom. **Must match the value
+        used by the periodic branches**; it defines where the split falls, and
+        one shared backbone cannot serve two different splits.
+    """
+
+    #: No cell required -- this is the whole reason the class exists.
+    needs_cell = False
+
+    #: Selector under ``long_range.reciprocal.method``.
+    METHOD = "isolated"
+
+    def __init__(self, alpha: float = DEFAULT_ALPHA, **kwargs: Any) -> None:
+        super().__init__()
+        # Everything LongRangeEnergy accepts is about evaluating a k-space sum
+        # over periodic images: meshes, spline orders, k-vector cutoffs, the
+        # slab correction, per-axis pbc. None of it means anything here, and a
+        # setting that looks applied but is not is the worst kind of
+        # configuration bug -- so refuse rather than ignore.
+        kwargs.pop("method", None)
+        if kwargs:
+            raise TypeError(
+                f"unexpected parameters for the isolated long-range term: "
+                f"{sorted(kwargs)}. It takes only `alpha`. Meshes, k-vector "
+                "cutoffs, `slab_correction` and `pbc` all describe a sum over "
+                "periodic images, which an isolated system does not have."
+            )
+        if alpha is None or alpha <= 0:
+            raise ValueError(f"alpha must be positive, got {alpha}")
+        self.alpha = float(alpha)
+        self.method = self.METHOD
+
+    def extra_repr(self) -> str:
+        return f"method='{self.METHOD}', alpha={self.alpha}"
+
+    def serialize(self) -> dict[str, Any]:
+        return {"alpha": self.alpha, "method": self.METHOD}
+
+    @classmethod
+    def deserialize(cls, data: dict[str, Any]) -> "IsolatedLongRangeEnergy":
+        return cls(**data)
+
+    def forward(
+        self,
+        coord: torch.Tensor,
+        charge: torch.Tensor,
+        box: torch.Tensor | None = None,
+        mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Per-atom long-range electrostatic energy, in eV.
+
+        Parameters
+        ----------
+        coord
+            Coordinates in angstrom, shape ``(nf, nloc, 3)``.
+        charge
+            Per-atom charges in elementary-charge units, shape ``(nf, nloc)``,
+            already satisfying the total-charge constraint.
+        box
+            Ignored. Accepted so this is interchangeable with
+            :class:`LongRangeEnergy`; a cell, if one is passed, simply plays
+            no part in an open-boundary sum.
+        mask
+            Optional ``(nf, nloc)`` mask of real atoms. Padding atoms are given
+            zero charge, which removes them exactly -- every term is bilinear
+            in the charges.
+
+        Returns
+        -------
+        torch.Tensor
+            Per-atom energy in eV, shape ``(nf, nloc, 1)``.
+        """
+        del box
+        if coord.ndim != 3 or coord.shape[-1] != 3:
+            raise ValueError(
+                f"coord must have shape (nf, nloc, 3), got {coord.shape}"
+            )
+        if charge.shape != coord.shape[:2]:
+            raise ValueError(
+                f"charge must have shape (nf, nloc) = {coord.shape[:2]}, "
+                f"got {charge.shape}"
+            )
+
+        nf, nloc = coord.shape[0], coord.shape[1]
+        q = charge if mask is None else charge * mask.to(charge.dtype)
+
+        delta = coord.unsqueeze(2) - coord.unsqueeze(1)      # (nf, nloc, nloc, 3)
+        r2 = (delta * delta).sum(-1)
+        diagonal = torch.eye(nloc, dtype=torch.bool, device=coord.device)
+        # sqrt(0) has an infinite derivative, so the diagonal is replaced
+        # before the square root rather than after -- masking the result would
+        # still push a NaN through the backward pass.
+        r = torch.sqrt(torch.where(diagonal, torch.ones_like(r2), r2))
+        kernel = torch.where(
+            diagonal, torch.zeros_like(r), torch.erf(self.alpha * r) / r
+        )
+
+        # Halved because the double sum counts every pair twice; splitting it
+        # symmetrically is what makes this a per-atom energy in the same sense
+        # as the periodic term's energy_reduction="atom".
+        energy = 0.5 * q * (kernel * q.unsqueeze(1)).sum(-1)
+        energy = energy * ELECTROSTATIC_CONVERSION
+        return energy.reshape(nf, nloc, 1)
+
+
+#: Either long-range term. They are interchangeable at every call site: same
+#: ``forward(coord, charge, box, mask)``, same ``(nf, nloc, 1)`` result, same
+#: ``serialize``/``deserialize`` shape. What differs is ``needs_cell``.
+LongRangeTerm = LongRangeEnergy | IsolatedLongRangeEnergy
+
+
+#: Every way of evaluating the long-range sum, by ``method``.
+TERM_CLASSES: dict[str, type[torch.nn.Module]] = {
+    "pme": LongRangeEnergy,
+    "ewald": LongRangeEnergy,
+    IsolatedLongRangeEnergy.METHOD: IsolatedLongRangeEnergy,
+}
+
+
+def build_long_range_energy(settings: dict[str, Any]) -> torch.nn.Module:
+    """Construct the long-range term named by ``settings["method"]``.
+
+    The single place that maps a config or a checkpoint onto a term class, so
+    the model and its deserializer cannot drift apart on which one to build.
+    """
+    method = settings.get("method", "pme")
+    if method not in TERM_CLASSES:
+        raise ValueError(
+            f"method must be one of {tuple(TERM_CLASSES)}, got {method!r}"
+        )
+    return TERM_CLASSES[method](**settings)
 

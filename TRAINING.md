@@ -763,11 +763,21 @@ empty `nopbc` file in its directory and DeePMD-kit's loader will hand the model
 no special handling. In a multi-task config (§3c) that is how an
 isolated-molecule branch joins a slab and a bulk branch immediately.
 
-Adding a long-range term for such a branch needs one new energy term; nothing
-above it changes, since the charge head, the total-charge projection and the
-force handling never touch a cell.
+To add long-range electrostatics to such a branch, set the method to
+`isolated`:
 
-**What that term has to be is fixed, not a choice.** The periodic path splits
+```jsonc
+"long_range": {
+  "charge_net": { "neuron": [64, 64], "precision": "float32" },
+  "reciprocal": { "method": "isolated", "alpha": 0.4 }
+}
+```
+
+`alpha` must match whatever the periodic branches use. Nothing else applies —
+meshes, k-vector cutoffs, `slab_correction` and `pbc` all describe a sum over
+periodic images, and passing one is an error rather than a silent no-op.
+
+**What that term computes is fixed, not a choice.** The periodic path splits
 Coulomb at the screening parameter α:
 
 ```
@@ -797,12 +807,26 @@ Three consequences worth knowing:
   background is needed, so an ion is just an ion.
 - **No cutoff.** `erf(αr)/r` decays as `1/r`; truncating it would be wrong.
 
-An earlier version of this section suggested building on `nvalchemiops`'s
-`coulomb` or `dsf`. Both turn out to be unusable: `dsf_coulomb` is a
-shifted-force potential with a charge-dependent self term and no position
-autograd, and `coulomb_energy` raises under `create_graph=True`, so neither
-survives force-loss training. A direct dense evaluation of the expression above
-is exact, twice differentiable, and costs ~1 ms at 1000 atoms.
+It is summed densely rather than through `nvalchemiops`. An earlier version of
+this section suggested building on that library's `coulomb` or `dsf`; both turn
+out to be unusable. `dsf_coulomb` is a shifted-force potential with a
+charge-dependent self term and no position autograd, and `coulomb_energy`
+raises under `create_graph=True` — so neither survives force-loss training,
+which differentiates the force a second time. The dense form is exact, twice
+differentiable, and costs about 1 ms at 1000 atoms.
+
+The one limit worth knowing is memory: the pair tensor is `O(N²)`, or 8 MiB at
+1000 atoms in float64. Fine for molecules, and the reason this is not the
+method for a periodic cell even in principle.
+
+Two other things behave differently without a cell, both deliberately:
+
+- **The virial is still computed**, and is still meaningful — it is the pair
+  sum `Σ rᵢⱼ ⊗ fᵢⱼ`, which needs no periodicity. DeePMD-kit's own energy model
+  returns one for a `box=None` frame, so this term matches it rather than
+  leaving the total inconsistent with the short-range part.
+- **Stress is not reported.** Force per unit area needs a volume to divide by,
+  and there is none. `LongRangeCalculator` simply omits it.
 
 ---
 

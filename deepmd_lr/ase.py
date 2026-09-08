@@ -164,11 +164,22 @@ class LongRangeCalculator(Calculator):
         super().calculate(atoms, properties or ["energy"], system_changes)
         atoms = self.atoms
 
-        if not atoms.pbc.all():
+        # Only a term that actually sums over periodic images needs a cell.
+        # This check used to reject every non-periodic frame unconditionally,
+        # which was wrong twice over: a short-range model has no such
+        # requirement at all, and a slab configured as pbc=[T, T, F] is
+        # exactly what `slab_correction` exists to handle.
+        periodic = bool(atoms.pbc.any())
+        needs_cell = (
+            self.model.has_long_range and self.model.long_range_energy.needs_cell
+        )
+        if needs_cell and not periodic:
             raise ValueError(
-                "the long-range term needs a fully periodic cell, but this "
-                f"Atoms object has pbc={atoms.pbc}. Ewald summation is only "
-                "defined under 3D periodic boundary conditions."
+                "this model's long-range term uses method "
+                f"'{self.model.long_range_energy.method}', which sums over "
+                f"periodic images, but the Atoms object has pbc={atoms.pbc} "
+                "and so no cell to repeat. For an isolated molecule build the "
+                "model with `long_range.reciprocal.method: 'isolated'`."
             )
 
         coord = torch.tensor(
@@ -176,9 +187,16 @@ class LongRangeCalculator(Calculator):
             dtype=torch.float64,
             device=self.device,
         ).unsqueeze(0)
-        cell = torch.tensor(
-            np.asarray(atoms.get_cell()), dtype=torch.float64, device=self.device
-        ).unsqueeze(0)
+        # A non-periodic Atoms carries a zero cell, which is not a cell --
+        # passing it would trip the degenerate-box check. Hand the model None,
+        # which is the representation DeePMD-kit itself uses for `nopbc` data.
+        cell = (
+            torch.tensor(
+                np.asarray(atoms.get_cell()), dtype=torch.float64, device=self.device
+            ).unsqueeze(0)
+            if periodic
+            else None
+        )
         atype = self._atom_types(atoms).unsqueeze(0)
 
         out = self.model(coord, atype, box=cell, charge_spin=self.charge_spin)
@@ -193,7 +211,10 @@ class LongRangeCalculator(Calculator):
             .numpy()
         )
 
-        if "virial" in out:
+        # Stress is force per area, so it needs a volume to divide by. The
+        # virial itself is still meaningful without a cell -- it is the pair
+        # sum -- but there is nothing to normalize it against.
+        if "virial" in out and periodic:
             virial = out["virial"].reshape(3, 3).detach().cpu().numpy()
             # ASE wants stress = -virial / volume, in Voigt order.
             stress = -virial / atoms.get_volume()

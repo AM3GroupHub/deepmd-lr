@@ -197,11 +197,18 @@ def _long_range_args() -> Argument:
                 str,
                 optional=True,
                 default="pme",
-                doc="How to evaluate the reciprocal sum: 'pme' (mesh + FFT, "
-                "O(N log N)) or 'ewald' (explicit k-vector sum, exact but "
-                "much slower -- 114 ms vs 3 ms at 2048 atoms). Both compute "
-                "the same quantity; use 'ewald' to check a 'pme' setting, "
-                "not for production.",
+                doc="How to evaluate the long-range sum. Under periodic "
+                "boundary conditions: 'pme' (mesh + FFT, O(N log N)) or "
+                "'ewald' (explicit k-vector sum, exact but much slower -- "
+                "114 ms vs 3 ms at 2048 atoms); both compute the same "
+                "quantity, so use 'ewald' to check a 'pme' setting, not for "
+                "production. For a system with no cell: 'isolated', which "
+                "sums q_i q_j erf(alpha r) / r directly over every pair. That "
+                "is the same quantity again -- the periodic result converges "
+                "onto it as the cell grows -- so a shared descriptor sees the "
+                "same erfc(alpha r) / r remainder either way. 'isolated' "
+                "takes only `alpha`; every other setting here describes a sum "
+                "over periodic images and is refused.",
             ),
             Argument(
                 "alpha",

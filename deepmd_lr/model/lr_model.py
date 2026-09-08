@@ -75,7 +75,8 @@ from deepmd_lr.fitting.charge import (
     project_to_total_charge,
 )
 from deepmd_lr.lr.term import (
-    LongRangeEnergy,
+    LongRangeTerm,
+    build_long_range_energy,
 )
 from deepmd_lr.neighbors import (
     build_neighbor_graph_fast,
@@ -131,7 +132,7 @@ class LongRangeEnergyModel(EnergyModel):
         self,
         *args: Any,
         charge_fitting: Any = None,
-        long_range_energy: LongRangeEnergy | None = None,
+        long_range_energy: LongRangeTerm | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -197,7 +198,7 @@ class LongRangeEnergyModel(EnergyModel):
     @classmethod
     def _build_long_range(
         cls, data: dict, descriptor: Any
-    ) -> tuple[Any, LongRangeEnergy | None]:
+    ) -> tuple[Any, LongRangeTerm | None]:
         """Build the charge head and the reciprocal term from ``long_range``.
 
         Returns ``(None, None)`` when the block is absent, which leaves this
@@ -221,8 +222,8 @@ class LongRangeEnergyModel(EnergyModel):
         # block configures the reciprocal sum however it is evaluated, so
         # naming it `pme` was wrong the moment `method: "ewald"` existed.
         settings = block.get(RECIPROCAL_KEY, block.get(_LEGACY_RECIPROCAL_KEY, {}))
-        long_range_energy = LongRangeEnergy(
-            **_strip_comments(copy.deepcopy(settings))
+        long_range_energy = build_long_range_energy(
+            _strip_comments(copy.deepcopy(settings))
         )
         return charge_fitting, long_range_energy
 
@@ -426,7 +427,7 @@ class LongRangeEnergyModel(EnergyModel):
         # parameters through the charge head, so `create_graph` keeps the
         # force differentiable with respect to them.
         base_coord = coord.detach().reshape(nf, nloc, 3)
-        base_box = box.detach().reshape(nf, 3, 3)
+        base_box = None if box is None else box.detach().reshape(nf, 3, 3)
         eps = torch.zeros(
             (nf, 3, 3), dtype=dtype, device=device, requires_grad=True
         )
@@ -436,7 +437,15 @@ class LongRangeEnergyModel(EnergyModel):
         leaf_coord = base_coord.clone().requires_grad_(True)
         # Row vectors: r' = r (I + eps)^T, and the cell rows transform alike.
         strained_coord = torch.bmm(leaf_coord, strain.transpose(-1, -2))
-        strained_box = torch.bmm(base_box, strain.transpose(-1, -2))
+        # With no cell there is nothing to strain but the coordinates, and
+        # that is not a degenerate case: straining positions alone gives the
+        # pair virial `sum_ij r_ij (x) f_ij`, which is exactly what
+        # DeePMD-kit's own energy model already returns for a `box=None`
+        # frame. Skipping the virial here would leave our total disagreeing
+        # with the short-range part it is added to.
+        strained_box = (
+            None if base_box is None else torch.bmm(base_box, strain.transpose(-1, -2))
+        )
 
         mask = self.atomic_model.make_atom_mask(atype)
         create_graph = self.training
@@ -547,10 +556,13 @@ class LongRangeEnergyModel(EnergyModel):
             )
         if not self.has_long_range:
             return short_range
-        if box is None:
+        if box is None and self.long_range_energy.needs_cell:
             raise ValueError(
-                "The 'dp_lr' model has a long-range term configured, which "
-                "requires a periodic cell, but box is None."
+                "The 'dp_lr' model has a long-range term configured with "
+                f"method '{self.long_range_energy.method}', which requires a "
+                "periodic cell, but box is None. For an isolated system set "
+                "`long_range.reciprocal.method` to 'isolated', which sums the "
+                "same erf-damped interaction directly with no cell."
             )
 
         long_range = self._long_range(
@@ -679,5 +691,5 @@ class LongRangeEnergyModel(EnergyModel):
             # Accept the old key so checkpoints written before the rename
             # still load.
             settings = block.get(RECIPROCAL_KEY, block.get(_LEGACY_RECIPROCAL_KEY))
-            model.long_range_energy = LongRangeEnergy.deserialize(settings)
+            model.long_range_energy = build_long_range_energy(settings)
         return model
