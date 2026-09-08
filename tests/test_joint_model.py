@@ -348,6 +348,54 @@ class TestTraining:
             for g in grads
         )
 
+    def test_force_loss_parameter_gradient_matches_finite_difference(self):
+        """The deepest link in the chain, and the only one checked by value.
+
+        Training minimises a force loss, so it needs ``dL/dtheta`` where
+        ``L`` already contains a derivative -- a second-order path through
+        the long-range branch, enabled by ``create_graph=self.training``. The
+        neighbouring tests assert that gradient is merely nonzero and finite,
+        which a sign error or a dropped term would satisfy. This one compares
+        it to a central difference in the parameter itself.
+        """
+        model = build()
+        model.train()
+        coord, atype, cell = frame()
+
+        def force_loss() -> torch.Tensor:
+            return (model(coord, atype, box=cell)["force"] ** 2).sum()
+
+        model.zero_grad(set_to_none=True)
+        force_loss().backward()
+        # By name rather than by attribute walk: `_module_networks` is a
+        # ModuleDict with string keys, and the widths depend on the config.
+        weight = dict(model.charge_fitting.named_parameters())[
+            "nets._module_networks.0.layers.0.w"
+        ]
+        analytic = weight.grad.detach().clone()
+        assert analytic.abs().sum() > 0, "no gradient reached the charge head"
+
+        # A few entries rather than every one: each costs two forwards, and a
+        # systematic error shows up in any of them.
+        rows, cols = weight.shape
+        picks = [(0, 0), (rows // 3, cols // 2), (rows - 1, cols - 1)]
+        h = 1e-6
+        for row, col in picks:
+            with torch.no_grad():
+                weight[row, col] += h
+            plus = float(force_loss().detach())
+            with torch.no_grad():
+                weight[row, col] -= 2 * h
+            minus = float(force_loss().detach())
+            with torch.no_grad():
+                weight[row, col] += h
+            numeric = (plus - minus) / (2 * h)
+            got = float(analytic[row, col])
+            scale = max(abs(numeric), abs(got), 1e-8)
+            assert abs(got - numeric) / scale < 1e-4, (
+                f"w[{row},{col}]: analytic {got:.6e} vs numeric {numeric:.6e}"
+            )
+
     def test_force_loss_reaches_the_charge_head(self):
         """The joint scheme trains charges through the force too, which needs
         the long-range force to stay differentiable in the parameters."""
