@@ -132,7 +132,13 @@ class TestCalculatorGuards:
         `slab_correction` exists for; the guard used to reject it."""
         atoms = water_atoms()
         atoms.pbc = [True, True, False]
-        atoms.calc = LongRangeCalculator(build())
+        from deepmd_lr.lr.term import LongRangeEnergy
+
+        model = build()
+        settings = model.long_range_energy.serialize()
+        settings.update(slab_correction=True, pbc=[True, True, False])
+        model.long_range_energy = LongRangeEnergy(**settings)
+        atoms.calc = LongRangeCalculator(model)
         assert np.isfinite(atoms.get_potential_energy())
 
     def test_rejects_unknown_elements(self):

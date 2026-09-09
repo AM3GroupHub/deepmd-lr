@@ -631,13 +631,20 @@ class IsolatedLongRangeEnergy(torch.nn.Module):
         delta = coord.unsqueeze(2) - coord.unsqueeze(1)      # (nf, nloc, nloc, 3)
         r2 = (delta * delta).sum(-1)
         diagonal = torch.eye(nloc, dtype=torch.bool, device=coord.device)
-        # sqrt(0) has an infinite derivative, so the diagonal is replaced
-        # before the square root rather than after -- masking the result would
-        # still push a NaN through the backward pass.
-        r = torch.sqrt(torch.where(diagonal, torch.ones_like(r2), r2))
-        kernel = torch.where(
-            diagonal, torch.zeros_like(r), torch.erf(self.alpha * r) / r
+        active = ~diagonal
+        if mask is not None:
+            valid = mask.bool()
+            active = active & valid.unsqueeze(2) & valid.unsqueeze(1)
+        # The series in r^2 preserves finite first and second derivatives at
+        # coincidence. Keep the inactive analytic branch away from sqrt(0).
+        x2 = self.alpha**2 * torch.where(active, r2, torch.zeros_like(r2))
+        small = x2 < 1e-4
+        safe_r = torch.sqrt(torch.where(small, torch.ones_like(r2), r2))
+        series = (2 * self.alpha / math.sqrt(math.pi)) * (
+            1 - x2 / 3 + x2**2 / 10 - x2**3 / 42
         )
+        kernel = torch.where(small, series, torch.erf(self.alpha * safe_r) / safe_r)
+        kernel = torch.where(active, kernel, torch.zeros_like(kernel))
 
         # Halved because the double sum counts every pair twice; splitting it
         # symmetrically is what makes this a per-atom energy in the same sense
@@ -673,4 +680,3 @@ def build_long_range_energy(settings: dict[str, Any]) -> torch.nn.Module:
             f"method must be one of {tuple(TERM_CLASSES)}, got {method!r}"
         )
     return TERM_CLASSES[method](**settings)
-

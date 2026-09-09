@@ -36,20 +36,44 @@ __all__ = ["LongRangeCalculator", "load_model", "select_neighbor_graph_method"]
 _STATE_PREFIX = "model.Default."
 
 
-def load_model(checkpoint: str, device: str | torch.device = DEVICE) -> Any:
+def load_model(
+    checkpoint: str, device: str | torch.device = DEVICE, *, head: str | None = None
+) -> Any:
     """Rebuild a trained model from a training checkpoint.
 
     Reads the architecture from the checkpoint's own ``model_params`` rather
     than asking the caller to supply the input file again, so a checkpoint is
     self-describing.
+    Multi-head checkpoints require ``head`` (branch name or unique alias).
     """
     state = torch.load(checkpoint, map_location="cpu", weights_only=False)
     params = state["model"]["_extra_state"]["model_params"]
+    prefix = _STATE_PREFIX
+    if "model_dict" in params:
+        branches = params["model_dict"]
+        if head is None:
+            raise ValueError(f"Select a checkpoint head from {list(branches)}")
+        matches = [
+            name
+            for name, branch in branches.items()
+            if head == name or head in branch.get("model_branch_alias", [])
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                f"Unknown or ambiguous head {head!r}; available: {list(branches)}"
+            )
+        name = matches[0]
+        params = branches[name]
+        prefix = f"model.{name}."
+    elif head not in (None, "Default"):
+        raise ValueError(
+            f"Single-head checkpoint has only head 'Default', got {head!r}"
+        )
     model = get_model(params)
     weights = {
-        key[len(_STATE_PREFIX) :]: value
+        key[len(prefix) :]: value
         for key, value in state["model"].items()
-        if key.startswith(_STATE_PREFIX)
+        if key.startswith(prefix)
     }
     missing, unexpected = model.load_state_dict(weights, strict=False)
     if missing or unexpected:
@@ -102,6 +126,9 @@ class LongRangeCalculator(Calculator):
     charge_spin
         Optional fixed (total_charge, spin_multiplicity) condition for the
         trajectory. Defaults to the model's neutral/default state.
+    head
+        Required branch name or unique alias for a multi-head checkpoint.
+        Omit when passing an already constructed model.
 
     Examples
     --------
@@ -123,12 +150,15 @@ class LongRangeCalculator(Calculator):
         model: str | Any,
         device: str | torch.device = DEVICE,
         charge_spin: tuple[float, float] | list[float] | torch.Tensor | None = None,
+        head: str | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self.device = device
+        if head is not None and not isinstance(model, str):
+            raise ValueError("head selects a checkpoint branch; pass a checkpoint path")
         self.model = (
-            load_model(model, device)
+            load_model(model, device, head=head)
             if isinstance(model, str)
             else model.to(device).eval()
         )
@@ -180,6 +210,19 @@ class LongRangeCalculator(Calculator):
                 f"periodic images, but the Atoms object has pbc={atoms.pbc} "
                 "and so no cell to repeat. For an isolated molecule build the "
                 "model with `long_range.reciprocal.method: 'isolated'`."
+            )
+
+        if self.model.has_long_range:
+            term = self.model.long_range_energy
+            expected_pbc = term.pbc if term.needs_cell else (False, False, False)
+            if not np.array_equal(atoms.pbc, expected_pbc):
+                raise ValueError(
+                    f"Atoms pbc={atoms.pbc.tolist()} does not match the "
+                    f"selected long-range branch pbc={list(expected_pbc)}"
+                )
+        elif periodic and not atoms.pbc.all():
+            raise ValueError(
+                "Partial pbc is unsupported by the short-range graph interface"
             )
 
         coord = torch.tensor(

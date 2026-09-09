@@ -521,8 +521,19 @@ Downstream commands need to be told which head to use:
 ```bash
 dp --pt-expt train input.json
 dp --pt-expt show  model.ckpt.pt model-branch     # list the heads
-dp --pt-expt freeze -c . --head interface         # --head is REQUIRED here
 ```
+
+Long-range branches cannot currently be frozen: the export path lacks the
+cell/global electrostatic sum and is explicitly blocked. For MD, select the
+branch from the training checkpoint through the eager ASE calculator:
+
+```python
+from deepmd_lr.ase import LongRangeCalculator
+atoms.calc = LongRangeCalculator("model.ckpt.pt", head="interface")
+```
+
+`head` is required for multi-head checkpoints; branch aliases are accepted.
+The ASE periodic axes must match that branch's boundary configuration.
 
 Not available in multi-task mode: `zero_stage`, `validating.full_validation`,
 `lora`, and `change-bias`.
