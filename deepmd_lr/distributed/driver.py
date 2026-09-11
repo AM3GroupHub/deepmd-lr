@@ -430,7 +430,9 @@ def _long_range_global(
     condition = resolve_charge_spin(model, charge_spin, 1, coord_t)
     total_charge = 0.0 if condition is None else condition[:, 0]
     types = torch.as_tensor(atype, dtype=torch.int64, device=device).reshape(1, -1)
-    charge = project_to_total_charge(charge_t, total_charge, mask=charge_mask(model, types))
+    charge = project_to_total_charge(
+        charge_t, total_charge, mask=charge_mask(model, types)
+    )
     atom_energy = model.long_range_energy(coord_in, charge, cell_in)
     total = atom_energy.sum()
     targets = [coord_t, charge_t] if eps is None else [coord_t, charge_t, eps]

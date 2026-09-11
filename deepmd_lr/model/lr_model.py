@@ -71,6 +71,9 @@ from deepmd.pt_expt.model.model import (
     BaseModel,
 )
 
+from deepmd_lr.born import (
+    born_charges,
+)
 from deepmd_lr.fitting.charge import (
     charge_mask,
     project_to_total_charge,
@@ -142,6 +145,11 @@ class LongRangeEnergyModel(EnergyModel):
         # `state_dict()`, and are picked up by the optimizer.
         self.charge_fitting = charge_fitting
         self.long_range_energy = long_range_energy
+        #: Also return Born effective charge tensors from `forward`. Off by
+        #: default because it costs an extra backward pass per call, and only
+        #: a field simulation needs them. Set it on the model, not in the
+        #: config -- a field is a property of the simulation, not the model.
+        self.compute_born = False
 
     @property
     def has_long_range(self) -> bool:
@@ -377,7 +385,9 @@ class LongRangeEnergyModel(EnergyModel):
         atype: torch.Tensor,
         charge_spin: torch.Tensor | None,
         mask: torch.Tensor | None,
-    ) -> torch.Tensor:
+        *,
+        return_raw: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Charges from an already-computed descriptor output.
 
         The charge head is a per-atom MLP over the same features the energy
@@ -394,7 +404,12 @@ class LongRangeEnergyModel(EnergyModel):
             if charge_spin is not None
             else torch.zeros(nf, dtype=raw.dtype, device=raw.device)
         )
-        return project_to_total_charge(raw, total, mask=mask)
+        projected = project_to_total_charge(raw, total, mask=mask)
+        # The Born tensor differentiates the RAW charges, not these. The
+        # projection subtracts a global mean, which couples every atom to every
+        # other one and would put unbounded distant terms into a quantity that
+        # must be local -- see `deepmd_lr/born.py`.
+        return (projected, raw) if return_raw else projected
 
     def _long_range(
         self,
@@ -451,6 +466,7 @@ class LongRangeEnergyModel(EnergyModel):
 
         mask = charge_mask(self, atype)
         create_graph = self.training
+        born = None
 
         if shared is not None:
             # SHARED BACKBONE. The energy head already ran the descriptor; its
@@ -465,8 +481,13 @@ class LongRangeEnergyModel(EnergyModel):
             # converts the short-range energy's edge gradient. Its backward
             # sets `retain_graph=True`, which is what leaves the captured
             # graph traversable here.
-            charge = self._charges_from_features(
-                shared["features"], shared["rot_mat"], atype, charge_spin, mask
+            charge, raw_charge = self._charges_from_features(
+                shared["features"],
+                shared["rot_mat"],
+                atype,
+                charge_spin,
+                mask,
+                return_raw=True,
             )
             atom_energy = self.long_range_energy(
                 strained_coord, charge, strained_box, mask=mask
@@ -491,10 +512,36 @@ class LongRangeEnergyModel(EnergyModel):
             )
             force = -grad_coord + response_force.reshape(nf, nloc, 3)
             virial = (-grad_eps).reshape(nf, 9) + response_virial.reshape(nf, 9)
+            if self.compute_born:
+                # A second, cheaper VJP over the same tape the energy gradient
+                # above left alive with `retain_graph=True`. One pass covers
+                # every edge because the descriptor is one-hop.
+                born = born_charges(
+                    charge,
+                    raw_charge.reshape(-1),
+                    edge_vec,
+                    shared["edge_index"],
+                    shared["edge_mask"],
+                    create_graph=create_graph,
+                )
         else:
             # Fallback: run the backbone again on our own strained graph. Used
             # when the energy path did not route through the graph lower, so
             # nothing was captured.
+            if self.compute_born:
+                # The fallback rebuilds its own graph, so there is no captured
+                # `edge_vec` to differentiate and no cheap route to Z. This
+                # path is taken when the energy never went through the graph
+                # lower -- notably under DP_CUDA_INFER >= 2, where a fused
+                # kernel bypasses `descriptor.call_graph` entirely. Refuse
+                # rather than return a tensor that is quietly absent or wrong.
+                raise NotImplementedError(
+                    "Born effective charges need the shared backbone capture, "
+                    "but this forward took the fallback path, so no edge graph "
+                    "was captured. The usual cause is DP_CUDA_INFER >= 2 "
+                    "selecting a fused energy/force kernel; unset it (or set "
+                    "it below 2) for field simulations."
+                )
             charge = self._predict_charges(
                 leaf_coord, atype, base_box, charge_spin, mask, strain=strain
             )
@@ -519,6 +566,8 @@ class LongRangeEnergyModel(EnergyModel):
             "virial": virial,
             "charge": charge,
         }
+        if born is not None:
+            out["born_charge"] = born
         if do_atomic_virial:
             # A per-atom decomposition of a mesh-based reciprocal sum is not
             # well defined -- the k-space energy is inherently collective --
@@ -588,6 +637,8 @@ class LongRangeEnergyModel(EnergyModel):
         # Diagnostics: the pieces a user needs to see whether the long-range
         # term is doing anything, without re-running the model.
         out["charge"] = long_range["charge"]
+        if "born_charge" in long_range:
+            out["born_charge"] = long_range["born_charge"]
         out["energy_long_range"] = long_range["energy"]
         out["energy_short_range"] = short_range["energy"]
         return out

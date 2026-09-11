@@ -151,10 +151,23 @@ class LongRangeCalculator(Calculator):
         device: str | torch.device = DEVICE,
         charge_spin: tuple[float, float] | list[float] | torch.Tensor | None = None,
         head: str | None = None,
+        efield: Any = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self.device = device
+        # A uniform external field in V/angstrom, or None. The force it adds is
+        # `F_i = Z_i E` with Z the Born effective charge tensor. That is a
+        # response, NOT the gradient of a `-M.E` energy: under periodic
+        # boundaries M is not even defined, and for an isolated system the two
+        # differ by a centroid-dependent term (see `deepmd_lr/born.py`). So the
+        # energy reported here is left untouched, and a constant-field NVE run
+        # will not conserve `E - M.E`. That is by construction, not a bug.
+        self.efield = (
+            None
+            if efield is None
+            else np.asarray(efield, dtype=np.float64).reshape(3)
+        )
         if head is not None and not isinstance(model, str):
             raise ValueError("head selects a checkpoint branch; pass a checkpoint path")
         self.model = (
@@ -162,6 +175,14 @@ class LongRangeCalculator(Calculator):
             if isinstance(model, str)
             else model.to(device).eval()
         )
+        if self.efield is not None:
+            if not self.model.has_long_range:
+                raise ValueError(
+                    "an external field needs Born effective charges, which "
+                    "need the charge head -- this model has no `long_range` "
+                    "block, so it predicts no charges."
+                )
+            self.model.compute_born = True
         self.type_map = list(self.model.get_type_map())
         self.charge_spin = None
         if charge_spin is not None:
@@ -247,17 +268,30 @@ class LongRangeCalculator(Calculator):
         energy = float(out["energy"].reshape(-1)[0].detach())
         self.results["energy"] = energy
         self.results["free_energy"] = energy
-        self.results["forces"] = (
+        forces = (
             (out["forces"] if "forces" in out else out["force"])[0]
             .detach()
             .cpu()
             .numpy()
         )
+        if self.efield is not None:
+            born = out["born_charge"][0].detach().cpu().numpy()
+            # F_ia = Z_iab E_b. Sums to Q.E over the cell, because the Born
+            # tensors sum to Q.I -- so a neutral system feels no net force and
+            # does not drift.
+            forces = forces + np.einsum("iab,b->ia", born, self.efield)
+            self.results["born_charge"] = born
+        self.results["forces"] = forces
 
         # Stress is force per area, so it needs a volume to divide by. The
         # virial itself is still meaningful without a cell -- it is the pair
         # sum -- but there is nothing to normalize it against.
-        if "virial" in out and periodic:
+        if "virial" in out and periodic and self.efield is not None:
+            # The field's own contribution to the stress is a separate
+            # derivation and is not attempted here. Reporting the field-free
+            # stress under a field would be quietly wrong, so report none.
+            pass
+        elif "virial" in out and periodic:
             virial = out["virial"].reshape(3, 3).detach().cpu().numpy()
             # ASE wants stress = -virial / volume, in Voigt order.
             stress = -virial / atoms.get_volume()
