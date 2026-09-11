@@ -90,6 +90,12 @@ class DistributedEvaluator:
     repartition_every
         Force a rebuild every N calls regardless. ``None`` uses the skin
         criterion alone, which is exact rather than merely usually right.
+    compute_born
+        Also assemble Born effective charge tensors, available afterwards as
+        ``results["born_charge"]`` with shape ``(natoms, 3, 3)``. The global
+        total-charge projection is no obstacle: it enters only the
+        ``q_i delta`` term, which arrives already projected, while the
+        derivative half uses the raw charges and is strictly local.
     compute_virial
         Also assemble the virial, exposed as :attr:`virial` (eV) and
         :attr:`stress` (eV/angstrom^3, ASE sign convention) after each call.
@@ -117,6 +123,7 @@ class DistributedEvaluator:
         skin: float = 1.0,
         repartition_every: int | None = None,
         compute_virial: bool = False,
+        compute_born: bool = False,
         charge_spin: torch.Tensor | tuple[float, float] | None = None,
     ) -> None:
         if not devices:
@@ -129,6 +136,10 @@ class DistributedEvaluator:
         self.skin = float(skin)
         self.repartition_every = repartition_every
         self.compute_virial = bool(compute_virial)
+        #: Also assemble Born effective charge tensors, exposed as
+        #: ``results['born_charge']`` ``(natoms, 3, 3)``. Costs one extra
+        #: backward pass per partition; needed for MD in a field.
+        self.compute_born = bool(compute_born)
         self.charge_spin = charge_spin
         self.home = next(model.parameters()).device
         self.atype = np.asarray(atype, dtype=np.int64).reshape(-1)
@@ -240,6 +251,7 @@ class DistributedEvaluator:
             partitions=self._partitions,
             replicas=self._replicas,
             compute_virial=self.compute_virial,
+            compute_born=self.compute_born,
             charge_spin=self.charge_spin,
         )
         self.results = out

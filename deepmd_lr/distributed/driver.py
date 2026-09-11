@@ -29,6 +29,9 @@ from typing import (
 
 import numpy as np
 import torch
+from deepmd.dpmodel.utils.neighbor_graph import (
+    segment_sum,
+)
 
 from deepmd_lr.distributed.partition import (
     Partition,
@@ -164,6 +167,7 @@ def evaluate_partitioned(
     replicas: dict | None = None,
     compute_virial: bool = False,
     charge_spin: torch.Tensor | tuple[float, float] | None = None,
+    compute_born: bool = False,
 ) -> dict[str, Any]:
     """Run ``model`` over spatial partitions and assemble the global result.
 
@@ -260,12 +264,12 @@ def evaluate_partitioned(
             if long_range
             else None
         )
-        launched.append((part, device, out, raw, node_coord, eps))
+        launched.append((part, device, out, raw, node_coord, eps, graph))
 
     # ---- gather phase -------------------------------------------------------
     # Now synchronise. Every device has been given its work, so the transfers
     # below wait on kernels that have been running concurrently.
-    for part, _device, out, raw, _node_coord, _eps in launched:
+    for part, _device, out, raw, _node_coord, _eps, _graph in launched:
         ids = part.global_ids()
         if compute_virial:
             # Each edge survives in exactly one partition, so the per-partition
@@ -319,6 +323,13 @@ def evaluate_partitioned(
     result["atom_energy"] = result["atom_energy"] + result["atom_energy_long_range"]
     result["force"] = result["force"] + result["force_long_range"]
 
+    if compute_born:
+        # Before `_charge_response_force`, which backpropagates through the
+        # same `raw` tensors without retaining the graph.
+        result["born_charge"] = _born_charges_partitioned(
+            launched, len(coord), result["charge"]
+        )
+
     response_force, response_virial = _charge_response_force(
         launched, len(coord), result["dE_dq"], compute_virial=compute_virial
     )
@@ -332,6 +343,68 @@ def evaluate_partitioned(
         )
         result["virial_charge_response"] = response_virial
     return result
+
+
+def _born_charges_partitioned(launched, n_atoms: int, charge) -> np.ndarray:
+    r"""Born effective charge tensors, assembled across partitions.
+
+    The global total-charge projection is not an obstacle here, for the same
+    reason it is not one for the energy: it touches only the
+    :math:`q_i\delta_{\alpha\beta}` term, and that arrives already projected
+    from ``_long_range_global``. The derivative half uses the **raw** charges,
+    which are strictly local -- DPA4C is one-hop, so an atom's raw charge sees
+    only edges where it is the centre -- and therefore partitions exactly.
+
+    Each partition contributes both halves of the pair sum for every edge it
+    owns::
+
+        + 1/2 (r_e (x) g_e)  ->  dst(e)     always owned
+        - 1/2 (r_e (x) g_e)  ->  src(e)     owned OR a ghost
+
+    A directed edge survives in exactly one partition, the one owning its
+    destination (``partition_graph`` masks the rest), so summing these over
+    partitions reproduces the serial tensor with no double counting. The src
+    half may land on a ghost, whose contribution belongs to whichever partition
+    owns it -- that is what the scatter-add onto ``global_ids`` does, exactly
+    as ghost forces are returned to their owners.
+
+    Note the asymmetry this resolves: an owned atom's *destination* edges all
+    live here, but its *source* edges point at neighbours that may be ghosts,
+    and those edges live in the neighbour's partition. Neither partition sees
+    all of atom i's terms alone; the scatter-add is what completes the sum.
+    """
+    born = np.zeros((n_atoms, 3, 3))
+    contributions = []
+    # Launch every backward before transferring anything, for the same reason
+    # the forward pass is staged.
+    for part, _device, _out, raw, _node_coord, _eps, graph in launched:
+        # One VJP per partition. `raw` already holds owned atoms only, and
+        # every kept edge has an owned destination, so this is exactly
+        # d raw_{dst(e)} / d edge_vec_e for the edges this partition owns.
+        (g,) = torch.autograd.grad(raw.sum(), graph.edge_vec, retain_graph=True)
+        # Defensive: `partition_graph` masked ghost-destination edges before
+        # the descriptor ran, so those gradients are already identically zero.
+        g = g * graph.edge_mask[:, None].to(g.dtype)
+        outer = graph.edge_vec.detach()[:, :, None] * g[:, None, :]
+        src = graph.edge_index[0].to(torch.int64)
+        dst = graph.edge_index[1].to(torch.int64)
+        node = 0.5 * (
+            segment_sum(outer, dst, part.n_node)
+            - segment_sum(outer, src, part.n_node)
+        )
+        contributions.append((part, node))
+
+    for part, node in contributions:
+        np.add.at(
+            born,
+            part.global_ids(),
+            node.reshape(part.n_node, 3, 3).detach().cpu().numpy(),
+        )
+    # The delta term, from the globally projected charges. Adding it here
+    # rather than per partition is what makes the acoustic sum rule come out
+    # as the system's actual total charge.
+    born += np.asarray(charge).reshape(-1, 1, 1) * np.eye(3)[None]
+    return born
 
 
 def _charge_response_force(
@@ -373,7 +446,7 @@ def _charge_response_force(
     # Launch every backward first, then transfer, for the same reason the
     # forward pass is staged: a `.cpu()` between them serialises the devices.
     gradients = []
-    for part, _device, _out, raw, node_coord, eps in launched:
+    for part, _device, _out, raw, node_coord, eps, _graph in launched:
         weights = torch.tensor(
             cotangent[part.owned], dtype=raw.dtype, device=raw.device
         )

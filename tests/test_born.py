@@ -303,3 +303,121 @@ class TestAtScale:
         q = out["charge"].detach().sum()
         assert (z[0].sum(0) - q * eye).abs().max() < 1e-8
         assert (z - z.transpose(-1, -2)).abs().max() > 1e-3
+
+
+class TestDistributed:
+    """Born charges assembled across spatial partitions.
+
+    The interesting part is an asymmetry. `partition_graph` keeps only edges
+    whose *destination* is owned, which is exactly right for the energy and the
+    forces. But `Z_i` also sums over edges where atom i is the **source**, and
+    those point at neighbours that may be ghosts -- so they live in the
+    neighbour's partition, not in i's. No partition sees all of an atom's terms
+    on its own; the scatter-add onto global ids is what completes the sum, the
+    same way ghost forces are returned to their owners.
+
+    Partition-count invariance is therefore the test that matters: a wrong
+    ownership rule shows up as a mismatch between 1, 2 and 4 partitions while
+    every local property still looks fine.
+    """
+
+    @staticmethod
+    def _setup(n_mol=8):
+        from deepmd.pt_expt.model.get_model import get_model  # noqa: PLC0415
+
+        cfg = {
+            "type": "dp_lr",
+            "type_map": ["O", "H"],
+            "descriptor": copy.deepcopy(DESCRIPTOR),
+            "fitting_net": copy.deepcopy(FITTING),
+            "long_range": copy.deepcopy(LONG_RANGE),
+        }
+        model = get_model(cfg)
+        model.eval()
+        coord, atype, cell = frame(n_mol=n_mol)
+        return (
+            model,
+            coord[0].cpu().numpy(),
+            atype[0].cpu().numpy(),
+            cell[0].cpu().numpy(),
+            coord,
+            atype,
+            cell,
+        )
+
+    def test_matches_the_serial_tensor_at_every_partition_count(self):
+        from deepmd_lr.distributed import evaluate_partitioned  # noqa: PLC0415
+
+        model, c, a, cl, coord, atype, cell = self._setup()
+        model.compute_born = True
+        serial = model(coord, atype, box=cell)["born_charge"][0].cpu().numpy()
+
+        for n_part in (1, 2, 4):
+            out = evaluate_partitioned(
+                model,
+                c,
+                a,
+                cl,
+                n_partitions=n_part,
+                devices=[DEVICE] * n_part,
+                compute_born=True,
+            )
+            got = out["born_charge"]
+            assert got.shape == (len(c), 3, 3)
+            assert np.abs(got - serial).max() < 1e-10, (
+                f"{n_part} partitions disagree with the serial tensor by "
+                f"{np.abs(got - serial).max():.3e}"
+            )
+
+    def test_off_by_default(self):
+        from deepmd_lr.distributed import evaluate_partitioned  # noqa: PLC0415
+
+        model, c, a, cl, *_ = self._setup()
+        out = evaluate_partitioned(
+            model, c, a, cl, n_partitions=2, devices=[DEVICE] * 2
+        )
+        assert "born_charge" not in out
+
+    def test_exposed_on_the_evaluator(self):
+        from deepmd_lr.distributed import DistributedEvaluator  # noqa: PLC0415
+
+        model, c, a, cl, *_ = self._setup()
+        ev = DistributedEvaluator(
+            model, a, cl, devices=[DEVICE, DEVICE], compute_born=True
+        )
+        ev(torch.tensor(c, dtype=DT, device=DEVICE))
+        z = ev.results["born_charge"]
+        assert z.shape == (len(c), 3, 3)
+        q = ev.results["charge"].sum()
+        assert np.abs(z.sum(0) - q * np.eye(3)).max() < 1e-10
+
+    def test_charge_response_force_still_works_afterwards(self):
+        """Born takes its VJP over the same tape the response force needs.
+
+        It runs first with `retain_graph=True`; if that were dropped, the
+        response force would die with a freed-graph error rather than a wrong
+        number -- but it would die only when Born was enabled, which is easy
+        to miss.
+        """
+        from deepmd_lr.distributed import evaluate_partitioned  # noqa: PLC0415
+
+        model, c, a, cl, *_ = self._setup()
+        plain = evaluate_partitioned(
+            model, c, a, cl, n_partitions=2, devices=[DEVICE] * 2
+        )
+        withz = evaluate_partitioned(
+            model,
+            c,
+            a,
+            cl,
+            n_partitions=2,
+            devices=[DEVICE] * 2,
+            compute_born=True,
+        )
+        assert (
+            np.abs(
+                withz["force_charge_response"] - plain["force_charge_response"]
+            ).max()
+            < 1e-12
+        )
+        assert np.abs(withz["force"] - plain["force"]).max() < 1e-12
