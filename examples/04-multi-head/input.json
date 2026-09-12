@@ -1,0 +1,325 @@
+{
+  "_comment": [
+    "MULTI-HEAD: examples 01, 02 and 03 trained as ONE model.",
+    "",
+    "    bulk        64 H2O, 3D-periodic     RPBE-D3          192 atoms",
+    "    molecules   4 species, no cell      OMol25 DFT       8-32 atoms",
+    "    slab        Li/LiFSI, 2D-periodic   UMA MLIP         468 atoms",
+    "",
+    "Three things forbid one head here. The boundary treatment differs",
+    "(slab correction on / off / no cell at all), the labels come from three",
+    "different levels of theory, and the energy zeros are unrelated. What",
+    "they CAN share is the descriptor: local geometry is local geometry.",
+    "",
+    "Run step 1 of each of the three examples first -- this file reads their",
+    "data/ folders and writes nothing of its own."
+  ],
+  "model": {
+    "_comment": [
+      "shared_dict holds the things more than one branch points at, by name.",
+      "A branch writes \"descriptor\": \"backbone\" instead of a dict, and every",
+      "branch that does gets THE SAME MODULE OBJECT -- not a copy. One set of",
+      "weights, updated by whichever branch the step was drawn from.",
+      "",
+      "Only type_map, descriptor and fitting_net can be shared. long_range is",
+      "per-branch by construction, which is what lets the boundary treatment",
+      "differ."
+    ],
+    "shared_dict": {
+      "_comment_type_map_all": [
+        "ONE type_map for the whole model -- multi-task asserts it. It is the",
+        "UNION over all three examples: H,O from bulk; C,Cl,H,N,O,P,S,Si from",
+        "the molecules; C,F,H,Li,N,O,S from the slab. Each system keeps its",
+        "own local type_map.raw and DeePMD-kit remaps into this list, so no",
+        "dataset has to be renumbered."
+      ],
+      "type_map_all": [
+        "C",
+        "Cl",
+        "F",
+        "H",
+        "Li",
+        "N",
+        "O",
+        "P",
+        "S",
+        "Si"
+      ],
+      "_comment_backbone": [
+        "The shared DPA4C. rcut 6.0 must stay below half of the SMALLEST cell",
+        "in any branch -- bulk water at 12.429 A gives 6.21 A, so 6.0 fits,",
+        "but only just. A branch with a smaller cell would force rcut down",
+        "for every branch, because there is only one descriptor.",
+        "",
+        "add_chg_spin_ebd is part of DPA4C's structural signature, so it must",
+        "be TRUE IN EVERY BRANCH or sharing is refused -- one module cannot",
+        "have two shapes. Here it is written once, which makes that automatic.",
+        "default_chg_spin is the fallback for the two branches whose data",
+        "carries no charge_spin.npy; it is deliberately NOT in the signature."
+      ],
+      "backbone": {
+        "type": "dpa4c",
+        "rcut": 6.0,
+        "channels": 32,
+        "lmax": 2,
+        "basis_type": "bessel",
+        "n_radial": 16,
+        "radial_modes": 4,
+        "precision": "float32",
+        "seed": 1,
+        "add_chg_spin_ebd": true,
+        "default_chg_spin": [
+          0,
+          1
+        ]
+      }
+    },
+    "model_dict": {
+      "bulk": {
+        "_comment": "Example 01 verbatim, minus the parts now shared.",
+        "type": "dp_lr",
+        "type_map": "type_map_all",
+        "descriptor": "backbone",
+        "_comment_data_stat_nbatch": "Frames per system used for the output-bias statistics. The default 10 builds a dense neighbour matrix over 10 frames at once -- at 468 atoms that is tens of GiB. It is a MODEL key, per branch, not a training one.",
+        "data_stat_nbatch": 1,
+        "fitting_net": {
+          "neuron": [
+            128,
+            128,
+            128
+          ],
+          "resnet_dt": false,
+          "activation_function": "silu",
+          "precision": "float32",
+          "seed": 1
+        },
+        "long_range": {
+          "charge_net": {
+            "neuron": [
+              64,
+              64
+            ],
+            "activation_function": "silu",
+            "precision": "float32",
+            "seed": 1
+          },
+          "reciprocal": {
+            "alpha": 0.4,
+            "mesh_dimensions": [
+              10,
+              10,
+              10
+            ],
+            "spline_order": 6,
+            "slab_correction": false,
+            "pbc": [
+              true,
+              true,
+              true
+            ]
+          }
+        }
+      },
+      "molecules": {
+        "_comment": [
+          "No cell: the reciprocal sum becomes the direct pair sum. Same",
+          "alpha as the other two -- see the README."
+        ],
+        "type": "dp_lr",
+        "type_map": "type_map_all",
+        "descriptor": "backbone",
+        "_comment_data_stat_nbatch": "Frames per system used for the output-bias statistics. The default 10 builds a dense neighbour matrix over 10 frames at once -- at 468 atoms that is tens of GiB. It is a MODEL key, per branch, not a training one.",
+        "data_stat_nbatch": 1,
+        "fitting_net": {
+          "neuron": [
+            128,
+            128,
+            128
+          ],
+          "resnet_dt": false,
+          "activation_function": "silu",
+          "precision": "float32",
+          "seed": 1
+        },
+        "long_range": {
+          "charge_net": {
+            "neuron": [
+              64,
+              64
+            ],
+            "activation_function": "silu",
+            "precision": "float32",
+            "seed": 1
+          },
+          "reciprocal": {
+            "method": "isolated",
+            "alpha": 0.4
+          }
+        }
+      },
+      "slab": {
+        "_comment": "Yeh-Berkowitz on, z open, mesh from the PADDED cell.",
+        "type": "dp_lr",
+        "type_map": "type_map_all",
+        "descriptor": "backbone",
+        "_comment_data_stat_nbatch": "Frames per system used for the output-bias statistics. The default 10 builds a dense neighbour matrix over 10 frames at once -- at 468 atoms that is tens of GiB. It is a MODEL key, per branch, not a training one.",
+        "data_stat_nbatch": 1,
+        "fitting_net": {
+          "neuron": [
+            128,
+            128,
+            128
+          ],
+          "resnet_dt": false,
+          "activation_function": "silu",
+          "precision": "float32",
+          "seed": 1
+        },
+        "long_range": {
+          "charge_net": {
+            "neuron": [
+              64,
+              64
+            ],
+            "activation_function": "silu",
+            "precision": "float32",
+            "seed": 1
+          },
+          "reciprocal": {
+            "alpha": 0.4,
+            "mesh_dimensions": [
+              12,
+              12,
+              42
+            ],
+            "spline_order": 6,
+            "slab_correction": true,
+            "pbc": [
+              true,
+              true,
+              false
+            ]
+          }
+        }
+      }
+    }
+  },
+  "learning_rate": {
+    "type": "exp",
+    "start_lr": 0.001,
+    "stop_lr": 1e-05
+  },
+  "loss_dict": {
+    "_comment": [
+      "One loss per branch, keyed by branch name. None of the three has",
+      "virial labels, so every prefactor stays 0 -- but a branch that DID",
+      "have them could switch them on here without touching the others."
+    ],
+    "bulk": {
+      "type": "ener",
+      "start_pref_e": 1,
+      "limit_pref_e": 1,
+      "start_pref_f": 1000,
+      "limit_pref_f": 1,
+      "start_pref_v": 0,
+      "limit_pref_v": 0
+    },
+    "molecules": {
+      "type": "ener",
+      "start_pref_e": 1,
+      "limit_pref_e": 1,
+      "start_pref_f": 1000,
+      "limit_pref_f": 1,
+      "start_pref_v": 0,
+      "limit_pref_v": 0
+    },
+    "slab": {
+      "type": "ener",
+      "start_pref_e": 1,
+      "limit_pref_e": 1,
+      "start_pref_f": 1000,
+      "limit_pref_f": 1,
+      "start_pref_v": 0,
+      "limit_pref_v": 0
+    }
+  },
+  "training": {
+    "_comment": [
+      "model_prob is the probability a given STEP is drawn from that branch.",
+      "It is not a data-size weight: the slab has 30 training frames against",
+      "the bulk's 543, so equal weights would revisit each slab frame ~18x",
+      "more often. 0.2 already flatters it -- see the README."
+    ],
+    "model_prob": {
+      "bulk": 0.4,
+      "molecules": 0.4,
+      "slab": 0.2
+    },
+    "data_dict": {
+      "bulk": {
+        "training_data": {
+          "systems": [
+            "../01-bulk/data/train"
+          ],
+          "batch_size": 4
+        },
+        "validation_data": {
+          "systems": [
+            "../01-bulk/data/valid"
+          ],
+          "batch_size": 4,
+          "numb_btch": 5
+        }
+      },
+      "molecules": {
+        "training_data": {
+          "systems": [
+            "../02-molecules/data/C11H20N1/train",
+            "../02-molecules/data/C1H1O4S2/train",
+            "../02-molecules/data/C2Cl1H5Si1/train",
+            "../02-molecules/data/C4H8N1O5P1S1/train"
+          ],
+          "batch_size": 8,
+          "auto_prob": "prob_sys_size"
+        },
+        "validation_data": {
+          "systems": [
+            "../02-molecules/data/C11H20N1/valid",
+            "../02-molecules/data/C1H1O4S2/valid",
+            "../02-molecules/data/C2Cl1H5Si1/valid",
+            "../02-molecules/data/C4H8N1O5P1S1/valid"
+          ],
+          "batch_size": 8,
+          "numb_btch": 5
+        }
+      },
+      "slab": {
+        "training_data": {
+          "systems": [
+            "../03-slab/data/train"
+          ],
+          "batch_size": 1
+        },
+        "validation_data": {
+          "systems": [
+            "../03-slab/data/valid"
+          ],
+          "batch_size": 1,
+          "numb_btch": 4
+        }
+      }
+    },
+    "_comment_gradient_max_norm": [
+      "NOT OPTIONAL HERE. Branches push the shared backbone with wildly",
+      "different gradient norms -- measured at init: bulk 5.0e9,",
+      "molecules 1.9e6, slab 4.8e5. Without clipping the bulk branch",
+      "simply overwrites what the others learn. See the README."
+    ],
+    "gradient_max_norm": 5.0,
+    "numb_steps": 200000,
+    "save_freq": 2000,
+    "disp_file": "lcurve.out",
+    "disp_freq": 200,
+    "seed": 1
+  }
+}
