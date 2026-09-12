@@ -93,3 +93,61 @@ class TestConsistencyCheck:
         b.symbols = ["He"] + list(b.symbols[1:])
         with pytest.raises(SystemExit, match="differs at atom 0"):
             x2d.check_consistent([a, b])
+
+
+def molecule(symbols, charge=0, spin=1, seed=0):
+    """A non-periodic molecule with a charge/spin header, in a given order."""
+    rng = np.random.default_rng(seed)
+    a = Atoms(symbols, pbc=False)
+    n = len(a)
+    a.set_positions(rng.uniform(0, 4, (n, 3)))
+    a.info.update(charge=charge, spin=spin)
+    a.calc = SinglePointCalculator(a, energy=-10.0 * n, forces=rng.normal(0, 1, (n, 3)))
+    return a
+
+
+class TestGroupByComposition:
+    """A mixed file has to become one system per composition, because a
+    DeePMD system carries a single `type.raw`."""
+
+    def test_splits_on_composition(self):
+        frames = [molecule("H2O"), molecule("CH4"), molecule("OH2", seed=1)]
+        buckets = x2d.group_by_composition(frames)
+        assert [x2d.formula(k) for k in buckets] == ["H2O1", "C1H4"]
+
+    def test_atom_order_does_not_make_a_second_system(self):
+        """OMol25 stores one composition in more than one order. Keying on the
+        sorted symbols folds those together rather than writing two systems
+        for one molecule."""
+        buckets = x2d.group_by_composition([molecule("H2O"), molecule("OHH")])
+        assert len(buckets) == 1
+        assert sum(len(v) for v in buckets.values()) == 2
+
+    def test_mixed_order_inside_one_bucket_is_still_refused(self):
+        """Folding the orders together is not the same as fixing them: one
+        `type.raw` describes a whole system, so the frames must be sorted
+        before conversion. The refusal is what says so."""
+        (group,) = x2d.group_by_composition([molecule("H2O"), molecule("OHH")]).values()
+        with pytest.raises(SystemExit, match="differs at atom 0"):
+            x2d.check_consistent(group)
+        x2d.check_consistent([_sorted(a) for a in group])
+
+    def test_charge_and_spin_do_not_split(self):
+        """They vary per frame and ride in charge_spin.npy -- the same
+        molecule in two charge states is still one system."""
+        frames = [molecule("H2O", charge=0, spin=1), molecule("H2O", charge=-1, spin=2)]
+        assert len(x2d.group_by_composition(frames)) == 1
+
+    def test_each_bucket_passes_the_consistency_check(self):
+        frames = [molecule("H2O"), molecule("CH4"), molecule("OHH")]
+        for group in x2d.group_by_composition(frames).values():
+            x2d.check_consistent([_sorted(a) for a in group])
+
+    def test_formula_is_a_stable_directory_name(self):
+        assert x2d.formula(x2d.composition_key(molecule("OHH"))) == "H2O1"
+        assert x2d.formula(x2d.composition_key(molecule("H2O"))) == "H2O1"
+
+
+def _sorted(atoms):
+    order = np.argsort(atoms.get_atomic_numbers(), kind="stable")
+    return atoms[order]

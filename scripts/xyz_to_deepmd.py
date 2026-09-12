@@ -33,6 +33,7 @@ what lets systems with different element subsets share one model.
 """
 
 import argparse
+import collections
 import pathlib
 import sys
 
@@ -51,6 +52,32 @@ def load_frames(path, fmt=None, index=":"):
     return frames
 
 
+def composition_key(atoms):
+    """Sorted symbol tuple — a frame's DeePMD system identity."""
+    return tuple(sorted(atoms.get_chemical_symbols()))
+
+
+def formula(key):
+    """A readable directory name for a composition, e.g. ``C1H1O4S2``."""
+    counts = collections.Counter(key)
+    return "".join(f"{el}{counts[el]}" for el in sorted(counts))
+
+
+def group_by_composition(frames):
+    """Split a mixed trajectory into one bucket per composition.
+
+    Keyed on the *sorted* symbols, so the same molecule written with its atoms
+    in a different order lands in one bucket rather than two. Charge and spin
+    are deliberately NOT part of the key: they vary per frame and are carried
+    in ``charge_spin.npy``, so the same molecule in two charge states is still
+    one system.
+    """
+    buckets = collections.OrderedDict()
+    for atoms in frames:
+        buckets.setdefault(composition_key(atoms), []).append(atoms)
+    return buckets
+
+
 def check_consistent(frames):
     """Require identical atoms, in identical order, in every frame.
 
@@ -64,12 +91,12 @@ def check_consistent(frames):
         if symbols != reference:
             if len(symbols) != len(reference):
                 detail = (
-                    f"{len(reference)} atoms in frame 0, "
-                    f"{len(symbols)} in frame {i}"
+                    f"{len(reference)} atoms in frame 0, {len(symbols)} in frame {i}"
                 )
             else:
                 bad = next(
-                    j for j, (a, b) in enumerate(zip(reference, symbols, strict=True))
+                    j
+                    for j, (a, b) in enumerate(zip(reference, symbols, strict=True))
                     if a != b
                 )
                 detail = (
@@ -270,6 +297,13 @@ def main() -> None:
     )
     ap.add_argument("--seed", type=int, default=0, help="split shuffle seed")
     ap.add_argument(
+        "--split-by-composition",
+        action="store_true",
+        help="the input mixes species: write one system per composition, into "
+        "<out>/<formula>/. A DeePMD system is one fixed composition and atom "
+        "count, so a mixed file must be split before it can be used.",
+    )
+    ap.add_argument(
         "--no-split",
         action="store_true",
         help="write one system at <out> rather than <out>/train and <out>/valid",
@@ -277,6 +311,24 @@ def main() -> None:
     args = ap.parse_args()
 
     frames = load_frames(args.input, args.format, args.index)
+
+    if args.split_by_composition:
+        buckets = group_by_composition(frames)
+        print(
+            f"{args.input} -> {args.out}\n  {len(frames)} frames -> "
+            f"{len(buckets)} system(s)",
+            file=sys.stderr,
+        )
+        for key, group in buckets.items():
+            name = formula(key)
+            convert_one(group, pathlib.Path(args.out) / name, args, label=name)
+        return
+
+    convert_one(frames, pathlib.Path(args.out), args, label=None)
+
+
+def convert_one(frames, out, args, label=None):
+    """Convert one already-grouped set of frames into a DeePMD system."""
     symbols = check_consistent(frames)
     if args.vacuum is not None:
         frames = pad_vacuum(frames, args.vacuum)
@@ -286,8 +338,6 @@ def main() -> None:
     type_map = sorted(set(symbols))
     atype = np.array([type_map.index(s) for s in symbols], dtype=np.int64)
     arrays = (coord, energy, force, box, charge_spin)
-    out = pathlib.Path(args.out)
-
     if args.no_split or args.valid_fraction <= 0 or len(frames) < 2:
         write_system(out, np.arange(len(frames)), arrays, atype, type_map, periodic)
         splits = {str(out): len(frames)}
@@ -303,7 +353,10 @@ def main() -> None:
         }
 
     labels = [n for n, v in (("energy", energy), ("force", force)) if v is not None]
-    print(f"{args.input} -> {out}", file=sys.stderr)
+    if label is None:
+        print(f"{args.input} -> {out}", file=sys.stderr)
+    else:
+        print(f"  {label}", file=sys.stderr)
     print(f"  {len(frames)} frames x {len(symbols)} atoms", file=sys.stderr)
     print(f"  type_map {type_map}", file=sys.stderr)
     if args.vacuum is not None:
