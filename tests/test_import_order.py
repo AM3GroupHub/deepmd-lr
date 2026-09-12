@@ -9,7 +9,7 @@ itself, ``import deepmd_lr.distributed`` failed with
     ImportError: cannot import name 'CHARGE_VAR_NAME' from partially
     initialized module 'deepmd_lr.fitting.charge'
 
-which is exactly the snippet TRAINING.md tells people to write. Import order
+which is exactly the snippet the README tells people to write. Import order
 can only be tested in a fresh process, hence the subprocess.
 """
 
@@ -45,7 +45,7 @@ def test_module_imports_first_in_a_clean_interpreter(module):
 
 
 def test_the_documented_snippet_works_standalone():
-    """The first line of TRAINING.md 10, on its own."""
+    """The first line of the README's partitioned-MD snippet, on its own."""
     result = subprocess.run(
         [
             sys.executable,

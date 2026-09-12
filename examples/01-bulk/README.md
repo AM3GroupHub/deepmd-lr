@@ -153,7 +153,8 @@ dp --pt-expt train input.json
 Measured here: **0.16 s/batch**, so the configured 200,000 steps is about
 **9 hours** on one GPU.
 
-To warm-start from a pretrained DPA4C instead, see `TRAINING.md` — note that
+To warm-start from a pretrained DPA4C instead, see the repository README —
+note that
 `--finetune` refits the energy bias to your data at startup, which is a
 separate decision from training itself.
 
@@ -171,7 +172,7 @@ step  rmse_val  rmse_trn  rmse_e_val  rmse_e_trn  rmse_f_val  rmse_f_trn  lr
 - **Watch the charges.** The long-range term is only as meaningful as the
   charges feeding it. If `mean|q|` collapses toward zero, the model has learned
   to switch the term off rather than use it, and you have paid for it without
-  benefit. §5 of `TRAINING.md` covers how to check.
+  benefit. "What to watch" in the repository README covers how to check.
 
 ## Is the long-range term earning its place?
 

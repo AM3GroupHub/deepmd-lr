@@ -127,7 +127,8 @@ DEFAULT_SPLINE_ORDER = 6
 #: Default Ewald splitting parameter, in inverse angstrom. Chosen so that
 #: erfc(alpha * 6 A) = 7e-4 for a 6 A descriptor cutoff -- i.e. the part left
 #: to the network dies inside its own reach. A modelling choice, not a fitted
-#: parameter, and it must match between training and MD (TRAINING.md, 2).
+#: parameter, and it must match between training and MD (README, "Choosing
+#: alpha and the mesh").
 DEFAULT_ALPHA = 0.4
 
 #: Supported ways of evaluating the reciprocal sum.
