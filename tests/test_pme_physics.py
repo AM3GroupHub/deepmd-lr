@@ -6,7 +6,7 @@ the PME energy is correct in absolute terms, and it is twice differentiable
 
 They also guard the `spline_order` hazard: at order >= 7 nvalchemiops silently
 drops the entire reciprocal-space sum and returns only the self-energy, with
-no error raised. See PLAN.md, Phase 0.
+no error raised.
 """
 
 import itertools
