@@ -55,6 +55,12 @@ experiments/
 *.xyz
 *.traj
 
+# ...except the two example datasets, which are small and deliberate. Each is
+# a few hundred KB to 1.6 MB, and shipping them is what makes those examples
+# runnable rather than merely readable. Everything else stays unvendored.
+!examples/02-molecules/*.xyz
+!examples/03-slab/*.xyz
+
 # Generated example datasets. `type.raw` and `type_map.raw` are not *.npy, so
 # without this an example would ship those two files and nothing else -- the
 # exact fragment the rule above exists to prevent. Step 1 of each example's

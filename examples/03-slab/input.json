@@ -1,0 +1,123 @@
+{
+  "_comment": [
+    "A 2D-periodic slab: Li metal under LiFSI/EC/DMC electrolyte, 468 atoms.",
+    "",
+    "THE LABELS ARE UMA MLIP PREDICTIONS, NOT DFT, and the energy includes a",
+    "harmonic wall above z = 30.285 A in the ORIGINAL cell. This example",
+    "teaches the settings a slab needs; it is not a reference-quality",
+    "workflow and the numbers it reaches mean nothing about accuracy."
+  ],
+  "model": {
+    "type": "dp_lr",
+    "type_map": [
+      "C",
+      "F",
+      "H",
+      "Li",
+      "N",
+      "O",
+      "S"
+    ],
+    "descriptor": {
+      "type": "dpa4c",
+      "rcut": 6.0,
+      "channels": 32,
+      "lmax": 2,
+      "basis_type": "bessel",
+      "n_radial": 16,
+      "radial_modes": 4,
+      "precision": "float32",
+      "seed": 1
+    },
+    "fitting_net": {
+      "neuron": [
+        128,
+        128,
+        128
+      ],
+      "resnet_dt": false,
+      "activation_function": "silu",
+      "precision": "float32",
+      "seed": 1
+    },
+    "long_range": {
+      "charge_net": {
+        "neuron": [
+          64,
+          64
+        ],
+        "activation_function": "silu",
+        "precision": "float32",
+        "seed": 1
+      },
+      "reciprocal": {
+        "_comment": [
+          "The two settings below are a PAIR. `pbc` marks z as the open axis;",
+          "`slab_correction` applies Yeh-Berkowitz, which cancels the",
+          "interaction between the slab and its periodic images across the",
+          "vacuum. slab_correction without exactly one false entry in pbc is",
+          "refused at construction, and a false entry without the correction",
+          "is refused too.",
+          "",
+          "Padding the cell is NOT a substitute. A dipolar interface keeps",
+          "interacting with its images however much vacuum you add, and the",
+          "error barely shrinks. Padding stops the DESCRIPTOR seeing across",
+          "the gap; the correction stops the ELECTROSTATICS doing so.",
+          "",
+          "mesh_dimensions follows the PADDED cell, 14.04 x 14.04 x 52:",
+          "ceil(14.04/1.25) = 12 and ceil(52/1.25) = 42. Using the original",
+          "32.285 would under-resolve the reciprocal sum along z."
+        ],
+        "alpha": 0.4,
+        "mesh_dimensions": [
+          12,
+          12,
+          42
+        ],
+        "spline_order": 6,
+        "slab_correction": true,
+        "pbc": [
+          true,
+          true,
+          false
+        ]
+      }
+    }
+  },
+  "learning_rate": {
+    "type": "exp",
+    "start_lr": 0.001,
+    "stop_lr": 1e-05
+  },
+  "loss": {
+    "_comment": "No virial labels in this trajectory, so its prefactors stay 0.",
+    "type": "ener",
+    "start_pref_e": 1,
+    "limit_pref_e": 1,
+    "start_pref_f": 1000,
+    "limit_pref_f": 1,
+    "start_pref_v": 0,
+    "limit_pref_v": 0
+  },
+  "training": {
+    "_comment": "468 atoms, so one frame per step. 34 frames is far too few for a real model -- see the README.",
+    "training_data": {
+      "systems": [
+        "./data/train"
+      ],
+      "batch_size": 1
+    },
+    "validation_data": {
+      "systems": [
+        "./data/valid"
+      ],
+      "batch_size": 1,
+      "numb_btch": 5
+    },
+    "numb_steps": 100000,
+    "save_freq": 2000,
+    "disp_file": "lcurve.out",
+    "disp_freq": 200,
+    "seed": 1
+  }
+}

@@ -362,3 +362,74 @@ class TestInTheModel:
         coord, atype = molecule()
         got = float(restored.to(DEVICE)(coord, atype, box=None)["energy"])
         assert got == pytest.approx(float(model(coord, atype, box=None)["energy"]))
+
+
+class TestNonPeriodicStatistics:
+    """Training statistics must survive a `nopbc` dataset.
+
+    DeePMD-kit's `make_stat_input` hands back an all-ZERO box for a system
+    marked `nopbc`, not `None`. Everything downstream tests `box is None` --
+    `DescrptDPA4C.compute_input_stats` does so explicitly -- so the test never
+    fires and a singular cell reaches `linalg.inv`, killing training before
+    step 1. The training loop itself is fine; it reads through a different
+    path that does return `None`. Only the statistics pass sees the zeros.
+    """
+
+    def test_zero_box_is_treated_as_no_cell(self):
+        model = isolated_model()
+        coord, atype = molecule()
+        nframes, natoms = 4, coord.shape[1]
+        rng = np.random.default_rng(0)
+        seen = {}
+
+        def sampled():
+            return [
+                {
+                    "coord": rng.uniform(0, 5, (nframes, natoms * 3)),
+                    "atype": np.tile(atype[0].cpu().numpy(), (nframes, 1)),
+                    # the shape and dtype make_stat_input actually produces
+                    "box": np.zeros((nframes, 9)),
+                    "natoms": np.full((nframes, 2 + 2), natoms),
+                }
+            ]
+
+        def capture(_self, func, *args, **kwargs):
+            # patched onto the parent class, so it is called bound -- the
+            # sampled_func arrives as the SECOND argument
+            seen["box"] = func()[0]["box"]
+
+        original = type(model).__mro__[1].compute_or_load_stat
+        try:
+            type(model).__mro__[1].compute_or_load_stat = capture
+            model.compute_or_load_stat(sampled)
+        finally:
+            type(model).__mro__[1].compute_or_load_stat = original
+        assert seen["box"] is None, (
+            "an all-zero box must reach the descriptor as None, or "
+            "compute_input_stats inverts a singular cell"
+        )
+
+    def test_a_real_box_is_left_alone(self):
+        """The sanitising must not eat a legitimate cell."""
+        from .test_joint_model import build  # noqa: PLC0415
+
+        model = build(long_range=True)
+        cell = np.tile(np.eye(3).reshape(-1) * 12.0, (3, 1))
+        seen = {}
+
+        def sampled():
+            return [{"box": cell.copy()}]
+
+        def capture(_self, func, *args, **kwargs):
+            # patched onto the parent class, so it is called bound -- the
+            # sampled_func arrives as the SECOND argument
+            seen["box"] = func()[0]["box"]
+
+        original = type(model).__mro__[1].compute_or_load_stat
+        try:
+            type(model).__mro__[1].compute_or_load_stat = capture
+            model.compute_or_load_stat(sampled)
+        finally:
+            type(model).__mro__[1].compute_or_load_stat = original
+        assert seen["box"] is not None
+        assert np.allclose(seen["box"], cell)

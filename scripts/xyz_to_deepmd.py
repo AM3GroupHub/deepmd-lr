@@ -84,6 +84,59 @@ def check_consistent(frames):
     return reference
 
 
+def pad_vacuum(frames, target, axis=2):
+    """Re-pad the cell along one axis and centre the slab in it.
+
+    A slab's reference labels are computed with that axis non-periodic, so the
+    cell length carries no physics -- but the model is handed a 3D-periodic
+    cell, and there the length matters enormously. If the vacuum gap is
+    narrower than twice the descriptor cutoff, atoms near one face fall inside
+    the cutoff of the next image's opposite face, and the model is asked to
+    reproduce forces from an interaction the labels never contained.
+
+    Padding is only half of it: the slab still interacts with its images
+    *electrostatically* across the vacuum, and for a dipolar interface that
+    error barely shrinks as the gap grows. Cancelling it is what
+    `long_range.reciprocal.slab_correction` is for. Padding and the correction
+    are a pair, not alternatives.
+    """
+    for atoms in frames:
+        # Save the labels first. ASE's SinglePointCalculator invalidates
+        # itself when the geometry changes, so setting positions below would
+        # silently discard the energies and forces and leave a
+        # coordinates-only dataset that trains on nothing.
+        results = dict(getattr(atoms.calc, "results", {})) if atoms.calc else {}
+        cell = np.array(atoms.get_cell())
+        if target <= cell[axis, axis]:
+            raise SystemExit(
+                f"--vacuum {target} is not larger than the existing cell "
+                f"length {cell[axis, axis]:.3f} along axis {axis}; padding "
+                "would compress the cell rather than extend it."
+            )
+        pos = atoms.get_positions()
+        span = pos[:, axis].max() - pos[:, axis].min()
+        if span >= target:
+            raise SystemExit(
+                f"the slab spans {span:.2f} A along axis {axis}, which does "
+                f"not fit in a {target} A cell."
+            )
+        cell[axis, axis] = target
+        atoms.set_cell(cell)
+        # Centre it, so the vacuum is shared between the two faces rather than
+        # sitting entirely above the slab.
+        pos[:, axis] += (target - span) / 2.0 - pos[:, axis].min()
+        atoms.set_positions(pos)
+        if results:
+            # Re-attach. A rigid translation along one axis leaves energies and
+            # forces unchanged, so the saved values are still the right ones.
+            from ase.calculators.singlepoint import (  # noqa: PLC0415
+                SinglePointCalculator,
+            )
+
+            atoms.calc = SinglePointCalculator(atoms, **results)
+    return frames
+
+
 def collect(frames, symbols):
     """Pull coordinates, and whatever labels the frames actually carry.
 
@@ -201,6 +254,15 @@ def main() -> None:
     ap.add_argument("--format", default=None, help="override ASE's format guess")
     ap.add_argument("--index", default=":", help="ASE slice, e.g. '::10' or '-100:'")
     ap.add_argument(
+        "--vacuum",
+        type=float,
+        default=None,
+        metavar="Z",
+        help="re-pad the cell along z to Z angstrom and centre the slab in it. "
+        "For a 2D slab the gap must exceed twice the descriptor cutoff, or the "
+        "model sees across the vacuum into the next periodic image.",
+    )
+    ap.add_argument(
         "--valid-fraction",
         type=float,
         default=0.1,
@@ -216,6 +278,8 @@ def main() -> None:
 
     frames = load_frames(args.input, args.format, args.index)
     symbols = check_consistent(frames)
+    if args.vacuum is not None:
+        frames = pad_vacuum(frames, args.vacuum)
     coord, energy, force, box, periodic = collect(frames, symbols)
     charge_spin = charge_spin_from(frames)
 
@@ -242,6 +306,13 @@ def main() -> None:
     print(f"{args.input} -> {out}", file=sys.stderr)
     print(f"  {len(frames)} frames x {len(symbols)} atoms", file=sys.stderr)
     print(f"  type_map {type_map}", file=sys.stderr)
+    if args.vacuum is not None:
+        span = np.ptp(frames[0].get_positions()[:, 2])
+        print(
+            f"  padded z to {args.vacuum} A; slab spans {span:.2f} A, "
+            f"vacuum gap {args.vacuum - span:.2f} A",
+            file=sys.stderr,
+        )
     print(
         f"  {'periodic' if periodic else 'non-periodic (nopbc)'}"
         f"  labels: {', '.join(labels) if labels else 'none (coordinates only)'}"

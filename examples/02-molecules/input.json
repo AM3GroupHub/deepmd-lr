@@ -1,0 +1,120 @@
+{
+  "_comment": [
+    "An isolated molecular ion: CHO4S2(-1), 383 frames from OMol25.",
+    "Non-periodic, so there is no cell, no mesh and no slab correction --",
+    "and the long-range term is summed directly rather than in reciprocal",
+    "space. The frames carry a net charge AND a varying spin multiplicity,",
+    "which is what charge_spin.npy is for."
+  ],
+  "model": {
+    "type": "dp_lr",
+    "type_map": [
+      "C",
+      "H",
+      "O",
+      "S"
+    ],
+    "descriptor": {
+      "_comment": [
+        "add_chg_spin_ebd is what makes the model READ charge_spin.npy at all.",
+        "It is part of DPA4C's structural signature, so in a multi-head model",
+        "it must be true for EVERY branch or the shared descriptor refuses to",
+        "link -- and turning it on later invalidates existing checkpoints.",
+        "default_chg_spin supplies the neutral-singlet fallback, so frames or",
+        "systems without a charge_spin.npy still run. It is deliberately NOT",
+        "part of the signature."
+      ],
+      "type": "dpa4c",
+      "rcut": 6.0,
+      "channels": 32,
+      "lmax": 2,
+      "basis_type": "bessel",
+      "n_radial": 16,
+      "radial_modes": 4,
+      "precision": "float32",
+      "seed": 1,
+      "add_chg_spin_ebd": true,
+      "default_chg_spin": [
+        0,
+        1
+      ]
+    },
+    "fitting_net": {
+      "neuron": [
+        128,
+        128,
+        128
+      ],
+      "resnet_dt": false,
+      "activation_function": "silu",
+      "precision": "float32",
+      "seed": 1
+    },
+    "long_range": {
+      "charge_net": {
+        "_comment": [
+          "Charges are projected to the frame's total charge, taken from",
+          "column 0 of charge_spin -- so here they sum to -1, not 0."
+        ],
+        "neuron": [
+          64,
+          64
+        ],
+        "activation_function": "silu",
+        "precision": "float32",
+        "seed": 1
+      },
+      "reciprocal": {
+        "_comment": [
+          "method 'isolated' sums q_i q_j erf(alpha r)/r directly over every",
+          "pair. That is the SAME quantity the periodic branches evaluate in",
+          "reciprocal space -- their result converges onto it as the cell",
+          "grows -- so alpha must match whatever the periodic examples use.",
+          "No mesh, no spline order, no pbc, no slab_correction: all of those",
+          "describe a sum over periodic images, and passing one is an error",
+          "rather than a silent no-op.",
+          "No cutoff either -- erf(alpha r)/r decays as 1/r, so truncating it",
+          "would be wrong. Every pair is summed, which is O(N^2) and fine for",
+          "molecules (8 MiB at 1000 atoms)."
+        ],
+        "method": "isolated",
+        "alpha": 0.4
+      }
+    }
+  },
+  "learning_rate": {
+    "type": "exp",
+    "start_lr": 0.001,
+    "stop_lr": 1e-05
+  },
+  "loss": {
+    "_comment": "start/limit_pref_v are 0: there is no cell, so no virial label.",
+    "type": "ener",
+    "start_pref_e": 1,
+    "limit_pref_e": 1,
+    "start_pref_f": 1000,
+    "limit_pref_f": 1,
+    "start_pref_v": 0,
+    "limit_pref_v": 0
+  },
+  "training": {
+    "training_data": {
+      "systems": [
+        "./data/train"
+      ],
+      "batch_size": 8
+    },
+    "validation_data": {
+      "systems": [
+        "./data/valid"
+      ],
+      "batch_size": 8,
+      "numb_btch": 5
+    },
+    "numb_steps": 100000,
+    "save_freq": 2000,
+    "disp_file": "lcurve.out",
+    "disp_freq": 200,
+    "seed": 1
+  }
+}

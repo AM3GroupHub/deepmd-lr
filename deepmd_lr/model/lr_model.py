@@ -688,6 +688,43 @@ class LongRangeEnergyModel(EnergyModel):
             self._refuse_export("The lower (neighbour-list) interface")
         return super().forward_lower(*args, **kwargs)
 
+    def compute_or_load_stat(
+        self, sampled_func: Any, *args: Any, **kwargs: Any
+    ) -> None:
+        """Compute statistics, tolerating a non-periodic training set.
+
+        DeePMD-kit's ``make_stat_input`` returns an all-**zero** box for a
+        system marked ``nopbc`` rather than ``None``
+        (``utils/model_stat.py``; measured as a ``(nframes, 9)`` array of
+        zeros). Every consumer downstream tests ``box is None`` --
+        ``DescrptDPA4C.compute_input_stats`` does, explicitly -- so the test
+        never fires, a singular cell reaches ``normalize_coord``, and training
+        dies in ``linalg.inv`` before the first step:
+
+            linalg.inv: The diagonal element 1 is zero ... input matrix is
+            singular
+
+        The training loop itself is unaffected: it reads through
+        ``DeepmdDataSetForLoader``, which does return ``None``. Only the
+        statistics pass sees the zeros. So normalise them here, where the
+        sample enters this model, rather than patching DeePMD-kit.
+
+        A zero box is never a legitimate cell -- the term itself refuses one
+        as degenerate -- so treating it as "no cell" cannot mask a real
+        problem.
+        """
+        import numpy as np
+
+        def sanitized() -> Any:
+            sampled = sampled_func()
+            for frame in sampled:
+                box = frame.get("box") if hasattr(frame, "get") else None
+                if box is not None and not np.asarray(box).any():
+                    frame["box"] = None
+            return sampled
+
+        return super().compute_or_load_stat(sanitized, *args, **kwargs)
+
     def forward_ragged(self, *args: Any, **kwargs: Any) -> Any:
         """Refuse the flat-node-axis path, which never reaches our forward.
 
