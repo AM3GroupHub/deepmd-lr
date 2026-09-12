@@ -18,7 +18,7 @@ model.ckpt*
 out.json
 input_v2_compat.json
 
-# Data. Datasets are never vendored: examples/README.md says how to rebuild
+# Data. Datasets are never vendored: each example's README says how to rebuild
 # them. Tracking a bare type.raw without its set.000/*.npy just leaves a
 # confusing fragment in a fresh clone.
 *.npy
@@ -43,7 +43,6 @@ warp_cache/
 # checkpoints that live outside the repo. No trailing slash -- `data` and
 # `run` there are usually symlinks to scratch, and a `dir/` pattern matches
 # only real directories.
-examples
 PLAN.md
 
 # Experiment data and run directories. Scoped deliberately: a bare
@@ -55,3 +54,9 @@ experiments/
 # is 3.1 GB; examples/README.md says how to rebuild the dataset from it.
 *.xyz
 *.traj
+
+# Generated example datasets. `type.raw` and `type_map.raw` are not *.npy, so
+# without this an example would ship those two files and nothing else -- the
+# exact fragment the rule above exists to prevent. Step 1 of each example's
+# README regenerates the whole directory in seconds.
+examples/*/data/

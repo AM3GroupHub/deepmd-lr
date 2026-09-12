@@ -1,0 +1,126 @@
+{
+  "_comment": [
+    "Bulk liquid water, 64 H2O in a 12.429 A cubic cell, RPBE-D3 labels.",
+    "A DPA4C short-range model plus an explicit reciprocal-space electrostatic",
+    "term. Every value below that depends on THIS cell is flagged; change the",
+    "system and you must revisit them."
+  ],
+  "model": {
+    "type": "dp_lr",
+    "_comment_type_map": [
+      "The model's GLOBAL element list. Each system's own type_map.raw maps its",
+      "local type.raw indices into this one, so the two need not agree in order",
+      "-- but for a single system it is simplest to keep them identical."
+    ],
+    "type_map": [
+      "H",
+      "O"
+    ],
+    "descriptor": {
+      "_comment": [
+        "rcut must stay below half the cell length (12.429/2 = 6.21 A), or an",
+        "atom sees two images of the same neighbour. 6.0 is inside that, but",
+        "only just -- a smaller cell would need a smaller rcut."
+      ],
+      "type": "dpa4c",
+      "rcut": 6.0,
+      "channels": 32,
+      "lmax": 2,
+      "basis_type": "bessel",
+      "n_radial": 16,
+      "radial_modes": 4,
+      "precision": "float32",
+      "seed": 1
+    },
+    "fitting_net": {
+      "neuron": [
+        128,
+        128,
+        128
+      ],
+      "resnet_dt": false,
+      "activation_function": "silu",
+      "precision": "float32",
+      "seed": 1
+    },
+    "long_range": {
+      "_comment": [
+        "The charge head predicts a per-atom charge from the SAME descriptor",
+        "features the energy head reads, so the backbone runs once. Charges are",
+        "projected to the frame's total charge (0 here), which is what keeps",
+        "the reciprocal sum convergent."
+      ],
+      "charge_net": {
+        "neuron": [
+          64,
+          64
+        ],
+        "activation_function": "silu",
+        "precision": "float32",
+        "seed": 1
+      },
+      "reciprocal": {
+        "_comment": [
+          "alpha 0.4 pairs with rcut 6.0: erfc(0.4*6) = 7e-4, so the part left",
+          "to the network has died inside its own cutoff.",
+          "mesh spacing must beat 1/(2*alpha) = 1.25 A, so ceil(12.429/1.25) = 10.",
+          "Fixed dimensions, NOT mesh_spacing: a spacing-derived mesh is a step",
+          "function of the cell and makes the energy discontinuous under strain.",
+          "3D-periodic bulk, so no slab correction and no open axis."
+        ],
+        "alpha": 0.4,
+        "mesh_dimensions": [
+          10,
+          10,
+          10
+        ],
+        "spline_order": 6,
+        "slab_correction": false,
+        "pbc": [
+          true,
+          true,
+          true
+        ]
+      }
+    }
+  },
+  "learning_rate": {
+    "type": "exp",
+    "start_lr": 0.001,
+    "stop_lr": 1e-05
+  },
+  "loss": {
+    "_comment": [
+      "Forces dominate the objective: there are 3*natoms of them per frame",
+      "against one energy, and they carry the local information the descriptor",
+      "must learn. start_pref_v 0 -- these labels have no virial."
+    ],
+    "type": "ener",
+    "start_pref_e": 1,
+    "limit_pref_e": 1,
+    "start_pref_f": 1000,
+    "limit_pref_f": 1,
+    "start_pref_v": 0,
+    "limit_pref_v": 0
+  },
+  "training": {
+    "training_data": {
+      "systems": [
+        "./data/train"
+      ],
+      "batch_size": 4
+    },
+    "validation_data": {
+      "systems": [
+        "./data/valid"
+      ],
+      "batch_size": 4,
+      "numb_btch": 5
+    },
+    "numb_steps": 200000,
+    "save_freq": 2000,
+    "disp_file": "lcurve.out",
+    "disp_freq": 200,
+    "seed": 1
+  }
+}
