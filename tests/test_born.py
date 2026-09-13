@@ -5,7 +5,7 @@ derivative: for a charge model with a global total-charge constraint the exact
 `dM/dr` carries a centroid-dependent term that is unbounded and undefined under
 periodic boundaries, and this formula deliberately discards it. Measured, the
 two differ by ~50% on a compact molecule and the gap *is* that term. So
-`F = Z E` is a response, not the gradient of `-M.E`, and a field run conserves
+`F = Z.T E` is a response, not the gradient of `-M.E`, and a field run conserves
 no corresponding energy. `test_field_force_is_not_conservative` pins that down
 so nobody later reads the discrepancy as a bug.
 
@@ -190,6 +190,32 @@ class TestSymmetries:
 
 
 class TestField:
+    def test_nonsymmetric_tensor_and_power_identity(self):
+        z = torch.tensor(
+            [[[[0.0, 2.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]]], dtype=torch.float64
+        )
+        e = torch.tensor([1.0, 0.0, 0.0], dtype=z.dtype)
+        force = field_force(z, e)
+        torch.testing.assert_close(force, z.new_tensor([[[0.0, 2.0, 0.0]]]))
+        velocity = z.new_tensor([0.3, -0.7, 0.2])
+        polarization_rate = z[0, 0] @ velocity
+        torch.testing.assert_close(e @ polarization_rate, force[0, 0] @ velocity)
+
+    def test_ase_field_force_uses_polarization_axis(self):
+        from ase import Atoms
+
+        from deepmd_lr.ase import LongRangeCalculator
+
+        model = build(isolated=True)
+        coord, atype = molecule()
+        out = model(coord, atype, box=None)
+        z = out["born_charge"][0].cpu().numpy()
+        e = np.array([0.01, -0.02, 0.05])
+        expected = out["force"][0].detach().cpu().numpy() + e @ z
+        atoms = Atoms(["O", "H", "H"] * 2, positions=coord[0].cpu().numpy())
+        atoms.calc = LongRangeCalculator(model, efield=e)
+        np.testing.assert_allclose(atoms.get_forces(), expected, atol=1e-10)
+
     def test_force_sums_to_total_charge_times_field(self):
         """A neutral system feels no net force, so it cannot drift."""
         model = build(isolated=True)
@@ -202,7 +228,7 @@ class TestField:
         assert torch.allclose(net, expected, atol=1e-12)
 
     def test_field_force_is_not_conservative(self):
-        """`F = Z E` is NOT `-d(-M.E)/dr`, and this records by how much.
+        """`F = Z.T E` is NOT `-d(-M.E)/dr`, and this records by how much.
 
         Not a defect -- `Z` deliberately omits the centroid-dependent part of
         `dM/dr`, which is the only part that is ill defined in a periodic cell.
@@ -217,7 +243,7 @@ class TestField:
         e = np.array([0.0, 0.0, 0.05])
 
         z = pieces(model, coord, atype)[0]["born_charge"][0].cpu().numpy()
-        analytic = np.einsum("iab,b->ia", z, e)
+        analytic = np.einsum("iab,a->ib", z, e)
 
         def minus_m_dot_e(pos):
             c = torch.tensor(pos.reshape(1, -1, 3), dtype=DT, device=DEVICE)

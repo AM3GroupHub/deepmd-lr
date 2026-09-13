@@ -151,7 +151,10 @@ dp --pt-expt train input_baseline.json     # same settings, no long_range
 
 `scripts/xyz_to_deepmd.py` converts a trajectory ASE can read into a DeePMD
 dataset, including the `--split-by-composition` and `--vacuum` cases the
-examples use.
+examples use. Composition splitting also sorts atoms and their per-atom labels
+into a consistent element order. Choose a new or empty output directory:
+the converter refuses to overwrite existing datasets, preventing stale charge
+labels or boundary markers from being mixed into a new conversion.
 
 ## Does it apply to your data?
 
@@ -776,7 +779,7 @@ training, no extra labels:
 ```python
 calc = LongRangeCalculator(model, efield=[0.0, 0.0, 0.05])   # V/angstrom
 atoms.calc = calc
-atoms.get_forces()          # includes F_i = Z_i E
+atoms.get_forces()          # includes F_i = Z_i.T E (polarization axis contracted)
 calc.results["born_charge"] # (natoms, 3, 3)
 ```
 
@@ -790,7 +793,10 @@ following 10.1021/acs.jctc.6c00146.
 
 ### Read this before interpreting a field run
 
-**`F = Z·E` is not the gradient of `−M·E`.** That is not a bug and not an
+The first axis of `Z_iab` is polarization and the second is displacement,
+so the field contraction is `F_ib = sum_a E_a Z_iab`, or `F = Z.T·E`.
+
+**`F = Z.T·E` is not the gradient of `−M·E`.** That is not a bug and not an
 approximation that gets better with a smaller timestep.
 
 For a charge model with a total-charge constraint, the exact dipole derivative

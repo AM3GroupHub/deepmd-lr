@@ -14,8 +14,12 @@ Assumes **every frame holds the same atoms in the same order**, which is the
 ordinary case for one MD or relaxation trajectory, and is what lets the whole
 thing be a single DeePMD system. The assumption is checked rather than
 trusted: a mismatch is a clear error here instead of a confusing shape error
-somewhere inside training. For a file mixing several species, split it first
--- a DeePMD system is one fixed composition and one fixed atom count.
+somewhere inside training. With ``--split-by-composition``, frames are grouped
+and stably sorted by element, including coordinates, forces and atom arrays.
+A DeePMD system is one fixed composition and one fixed atom count.
+
+The output must be absent or empty. Existing datasets are never overwritten,
+so obsolete labels or a stale ``nopbc`` marker cannot survive a rerun.
 
 What is written, under ``<out>/``::
 
@@ -70,12 +74,52 @@ def group_by_composition(frames):
     in a different order lands in one bucket rather than two. Charge and spin
     are deliberately NOT part of the key: they vary per frame and are carried
     in ``charge_spin.npy``, so the same molecule in two charge states is still
-    one system.
+    one system. Sort each frame stably by element, carrying its labels along.
     """
     buckets = collections.OrderedDict()
     for atoms in frames:
-        buckets.setdefault(composition_key(atoms), []).append(atoms)
+        buckets.setdefault(composition_key(atoms), []).append(sort_frame(atoms))
     return buckets
+
+
+def sort_frame(atoms):
+    """Canonical element order without dropping ASE arrays or calculator labels."""
+    from ase.calculators.calculator import PropertyNotImplementedError
+    from ase.calculators.singlepoint import SinglePointCalculator
+
+    results = {}
+    if atoms.calc is not None:
+        # Collect lazy calculators before slicing, which does not retain calc.
+        for name in ("energy", "forces"):
+            try:
+                atoms.calc.get_property(name, atoms)
+            except PropertyNotImplementedError:
+                pass
+        results = dict(atoms.calc.results)
+    order = np.argsort(atoms.get_chemical_symbols(), kind="stable")
+    sorted_atoms = atoms[order]
+    for name in (
+        "forces",
+        "charges",
+        "magmoms",
+        "energies",
+        "stresses",
+        "born_effective_charges",
+    ):
+        if name in results:
+            results[name] = np.asarray(results[name])[order].copy()
+    if results:
+        sorted_atoms.calc = SinglePointCalculator(sorted_atoms, **results)
+    return sorted_atoms
+
+
+def require_empty_output(out):
+    """Never mix new arrays with labels or boundary markers from an old run."""
+    if out.is_symlink() or (out.exists() and (not out.is_dir() or any(out.iterdir()))):
+        raise SystemExit(
+            f"output {out} already exists and is not an empty directory; "
+            "choose a new output directory. Existing datasets are not overwritten."
+        )
 
 
 def check_consistent(frames):
@@ -253,6 +297,7 @@ def charge_spin_from(frames):
 def write_system(out, indices, arrays, atype, type_map, periodic):
     """Write one split (train or valid) as a DeePMD npy system."""
     coord, energy, force, box, charge_spin = arrays
+    require_empty_output(out)
     out.mkdir(parents=True, exist_ok=True)
     (out / "set.000").mkdir(exist_ok=True)
     np.save(out / "set.000/coord.npy", coord[indices])
@@ -310,6 +355,8 @@ def main() -> None:
     )
     args = ap.parse_args()
 
+    require_empty_output(pathlib.Path(args.out))
+
     frames = load_frames(args.input, args.format, args.index)
 
     if args.split_by_composition:
@@ -329,6 +376,7 @@ def main() -> None:
 
 def convert_one(frames, out, args, label=None):
     """Convert one already-grouped set of frames into a DeePMD system."""
+    require_empty_output(out)
     symbols = check_consistent(frames)
     if args.vacuum is not None:
         frames = pad_vacuum(frames, args.vacuum)

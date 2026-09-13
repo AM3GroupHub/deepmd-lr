@@ -36,7 +36,7 @@ translation-invariant content and discards it. On a compact neutral molecule the
 two differ by 1.9e-01 against a :math:`|Z|` scale of 0.38, and that gap *is* the
 discarded term.
 
-The consequence, stated plainly: :math:`F_i = Z_i E` is **not**
+The consequence, stated plainly: :math:`F_i = Z_i^\mathsf{T} E` is **not**
 :math:`-\partial(-M\cdot E)/\partial r_i`. It is the local response, which is the
 only thing well defined in a periodic cell -- but a constant-field NVE run will
 not conserve :math:`E_{\text{tot}} - M\cdot E`, by construction rather than by
@@ -166,7 +166,7 @@ def born_charges(
 
 
 def field_force(born: torch.Tensor, efield: Any) -> torch.Tensor:
-    """Force from a uniform external field, ``F_i = Z_i E``.
+    """Force from a uniform external field, ``F_i = Z_i.T E``.
 
     ``born`` is ``(nf, nloc, 3, 3)`` and ``efield`` a 3-vector in V/A; the
     result is ``(nf, nloc, 3)`` in eV/A.
@@ -176,4 +176,5 @@ def field_force(born: torch.Tensor, efield: Any) -> torch.Tensor:
     contribution to it is deliberately not guessed at.
     """
     e = torch.as_tensor(efield, dtype=born.dtype, device=born.device).reshape(3)
-    return torch.einsum("fiab,b->fia", born, e)
+    # First tensor axis is polarization; second is atomic displacement.
+    return torch.einsum("fiab,a->fib", born, e)
