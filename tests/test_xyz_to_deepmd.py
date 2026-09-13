@@ -9,6 +9,7 @@ files look right, and training runs on nothing.
 
 import importlib.util
 import pathlib
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -123,14 +124,9 @@ class TestGroupByComposition:
         assert len(buckets) == 1
         assert sum(len(v) for v in buckets.values()) == 2
 
-    def test_mixed_order_inside_one_bucket_is_still_refused(self):
-        """Folding the orders together is not the same as fixing them: one
-        `type.raw` describes a whole system, so the frames must be sorted
-        before conversion. The refusal is what says so."""
+    def test_mixed_order_inside_one_bucket_is_canonicalized(self):
         (group,) = x2d.group_by_composition([molecule("H2O"), molecule("OHH")]).values()
-        with pytest.raises(SystemExit, match="differs at atom 0"):
-            x2d.check_consistent(group)
-        x2d.check_consistent([_sorted(a) for a in group])
+        assert x2d.check_consistent(group) == ["H", "H", "O"]
 
     def test_charge_and_spin_do_not_split(self):
         """They vary per frame and ride in charge_spin.npy -- the same
@@ -141,13 +137,99 @@ class TestGroupByComposition:
     def test_each_bucket_passes_the_consistency_check(self):
         frames = [molecule("H2O"), molecule("CH4"), molecule("OHH")]
         for group in x2d.group_by_composition(frames).values():
-            x2d.check_consistent([_sorted(a) for a in group])
+            x2d.check_consistent(group)
 
     def test_formula_is_a_stable_directory_name(self):
         assert x2d.formula(x2d.composition_key(molecule("OHH"))) == "H2O1"
         assert x2d.formula(x2d.composition_key(molecule("H2O"))) == "H2O1"
 
 
-def _sorted(atoms):
-    order = np.argsort(atoms.get_atomic_numbers(), kind="stable")
-    return atoms[order]
+def test_sort_preserves_labels_and_atom_arrays():
+    a = molecule("OHHO", charge=-1, spin=2)
+    a.set_initial_charges([0.1, 0.2, 0.3, 0.4])
+    a.set_tags([10, 20, 30, 40])
+    forces = np.arange(12.0).reshape(4, 3)
+    charges = np.arange(4.0)
+    stress = np.arange(6.0)
+    a.calc = SinglePointCalculator(
+        a, energy=-7.0, forces=forces, charges=charges, stress=stress
+    )
+    order = [1, 2, 0, 3]
+    result = x2d.sort_frame(a)
+    assert result.info == a.info
+    assert result.get_potential_energy() == -7.0
+    np.testing.assert_array_equal(result.positions, a.positions[order])
+    np.testing.assert_array_equal(result.get_forces(), forces[order])
+    np.testing.assert_array_equal(result.get_charges(), charges[order])
+    np.testing.assert_array_equal(result.get_stress(), stress)
+    np.testing.assert_array_equal(result.get_tags(), a.get_tags()[order])
+    np.testing.assert_array_equal(
+        result.get_initial_charges(), a.get_initial_charges()[order]
+    )
+    assert a.get_chemical_symbols() == ["O", "H", "H", "O"]
+    np.testing.assert_array_equal(a.get_forces(), forces)
+
+
+def test_cli_mixed_order_conversion_and_safe_rerun(tmp_path, monkeypatch):
+    frames = [molecule("OH2", charge=-1, spin=2), molecule("HOH", seed=1)]
+    monkeypatch.setattr(x2d, "load_frames", lambda *args: frames)
+    out = tmp_path / "data"
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "xyz_to_deepmd",
+            "unused.xyz",
+            "-o",
+            str(out),
+            "--split-by-composition",
+            "--no-split",
+        ],
+    )
+    x2d.main()
+    system = out / "H2O1"
+    assert (system / "type.raw").read_text().split() == ["0", "0", "1"]
+    saved_forces = np.load(system / "set.000/force.npy")
+    for i, atoms in enumerate(frames):
+        order = np.argsort(atoms.get_chemical_symbols(), kind="stable")
+        np.testing.assert_array_equal(
+            saved_forces[i], atoms.get_forces()[order].reshape(-1)
+        )
+    np.testing.assert_array_equal(
+        np.load(system / "set.000/charge_spin.npy"), [[-1.0, 2.0], [0.0, 1.0]]
+    )
+    before = {p.relative_to(out): p.read_bytes() for p in out.rglob("*") if p.is_file()}
+    with pytest.raises(SystemExit, match="not an empty directory"):
+        x2d.main()
+    assert before == {
+        p.relative_to(out): p.read_bytes() for p in out.rglob("*") if p.is_file()
+    }
+
+
+def test_writer_refuses_stale_boundary_and_charge_files(tmp_path):
+    coord = np.zeros((1, 3))
+    charged = (coord, np.zeros(1), coord, None, np.array([[1.0, 2.0]]))
+    x2d.write_system(tmp_path, np.array([0]), charged, [0], ["H"], False)
+    before = {
+        p.relative_to(tmp_path): p.read_bytes()
+        for p in tmp_path.rglob("*")
+        if p.is_file()
+    }
+    neutral_periodic = (coord, None, None, np.eye(3).reshape(1, 9), None)
+    with pytest.raises(SystemExit, match="not an empty directory"):
+        x2d.write_system(tmp_path, np.array([0]), neutral_periodic, [0], ["H"], True)
+    assert before == {
+        p.relative_to(tmp_path): p.read_bytes()
+        for p in tmp_path.rglob("*")
+        if p.is_file()
+    }
+
+
+def test_split_collision_refused_before_writing(tmp_path):
+    (tmp_path / "train").mkdir()
+    (tmp_path / "train/type.raw").write_text("0\n")
+    args = SimpleNamespace(
+        vacuum=None, no_split=False, valid_fraction=0.5, seed=0, input="x"
+    )
+    with pytest.raises(SystemExit, match="not an empty directory"):
+        x2d.convert_one([molecule("H2O"), molecule("H2O")], tmp_path, args)
+    assert not (tmp_path / "valid").exists()

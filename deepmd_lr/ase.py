@@ -157,7 +157,7 @@ class LongRangeCalculator(Calculator):
         super().__init__(**kwargs)
         self.device = device
         # A uniform external field in V/angstrom, or None. The force it adds is
-        # `F_i = Z_i E` with Z the Born effective charge tensor. That is a
+        # `F_i = Z_i.T E` with Z the Born effective charge tensor. That is a
         # response, NOT the gradient of a `-M.E` energy: under periodic
         # boundaries M is not even defined, and for an isolated system the two
         # differ by a centroid-dependent term (see `deepmd_lr/born.py`). So the
@@ -276,10 +276,10 @@ class LongRangeCalculator(Calculator):
         )
         if self.efield is not None:
             born = out["born_charge"][0].detach().cpu().numpy()
-            # F_ia = Z_iab E_b. Sums to Q.E over the cell, because the Born
+            # F_ib = E_a Z_iab. Sums to Q.E over the cell, because the Born
             # tensors sum to Q.I -- so a neutral system feels no net force and
             # does not drift.
-            forces = forces + np.einsum("iab,b->ia", born, self.efield)
+            forces = forces + np.einsum("iab,a->ib", born, self.efield)
             self.results["born_charge"] = born
         self.results["forces"] = forces
 
