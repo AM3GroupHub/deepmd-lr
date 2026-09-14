@@ -42,6 +42,9 @@ from typing import (
 import numpy as np
 import torch
 
+from deepmd_lr.born import (
+    field_force,
+)
 from deepmd_lr.distributed.driver import (
     device_replicas,
     evaluate_partitioned,
@@ -101,6 +104,17 @@ class DistributedEvaluator:
         :attr:`stress` (eV/angstrom^3, ASE sign convention) after each call.
         Off by default because it costs an extra strain leaf per partition
         and a second backward through the charge head.
+    efield
+        Uniform external field in V/angstrom, or ``None``. Adds the response
+        force ``F_ib = E_a Z_iab`` to every returned force and implies
+        ``compute_born``. The reported energy is left untouched: this force
+        is NOT the gradient of a ``-M.E`` energy -- under periodic boundaries
+        ``M`` is not even defined -- so a constant-field NVE run will not
+        conserve ``E - M.E``, by construction rather than by error. Use a
+        thermostat and read structure and response, not a conserved quantity.
+        Rejected together with ``compute_virial``, because the field's
+        contribution to the stress is a separate derivation and returning the
+        field-free value would be quietly wrong.
     charge_spin
         Fixed (total charge, spin multiplicity) for this system. If omitted,
         use the model's configured default condition.
@@ -124,6 +138,7 @@ class DistributedEvaluator:
         repartition_every: int | None = None,
         compute_virial: bool = False,
         compute_born: bool = False,
+        efield: Any = None,
         charge_spin: torch.Tensor | tuple[float, float] | None = None,
     ) -> None:
         if not devices:
@@ -140,6 +155,28 @@ class DistributedEvaluator:
         #: ``results['born_charge']`` ``(natoms, 3, 3)``. Costs one extra
         #: backward pass per partition; needed for MD in a field.
         self.compute_born = bool(compute_born)
+        #: Uniform external field in V/angstrom, or None. See the class
+        #: docstring: the force it adds is a local response, not the gradient
+        #: of a field energy.
+        self.efield = (
+            None if efield is None else np.asarray(efield, dtype=np.float64).reshape(3)
+        )
+        if self.efield is not None:
+            if not getattr(model, "has_long_range", False):
+                raise ValueError(
+                    "an external field needs Born effective charges, which "
+                    "need the charge head -- this model has no `long_range` "
+                    "block, so it predicts no charges."
+                )
+            if self.compute_virial:
+                raise ValueError(
+                    "compute_virial and efield cannot be combined: the "
+                    "field's contribution to the stress is a separate "
+                    "derivation, and reporting the field-free virial under a "
+                    "field would be quietly wrong."
+                )
+            # The field force is built from Z, so Z has to be assembled.
+            self.compute_born = True
         self.charge_spin = charge_spin
         self.home = next(model.parameters()).device
         self.atype = np.asarray(atype, dtype=np.int64).reshape(-1)
@@ -259,4 +296,16 @@ class DistributedEvaluator:
         self.forces.copy_(
             torch.as_tensor(out["force"], dtype=torch.float64, device=self.home)
         )
+        if self.efield is not None:
+            # Through `field_force` rather than an einsum written out again:
+            # which index of Z contracts with E is a convention that has been
+            # wrong here before, and one definition cannot drift from another.
+            born = torch.as_tensor(
+                out["born_charge"], dtype=torch.float64, device=self.home
+            )
+            response = field_force(born[None], self.efield)[0]
+            self.forces += response
+            # Kept separately so a caller can watch the field term without
+            # re-deriving it, and so `out["force"]` stays the field-free force.
+            self.results["field_force"] = response.cpu().numpy()
         return float(out["energy"]), self.forces
