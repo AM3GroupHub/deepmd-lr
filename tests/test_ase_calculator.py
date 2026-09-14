@@ -207,3 +207,56 @@ class TestEnergyConservation:
         assert drifts[1] < drifts[0], (
             f"drift did not shrink with the timestep: {drifts}"
         )
+
+
+class TestPlainEnergyModel:
+    """A model trained without `type: dp_lr` at all.
+
+    This is not the same as a `dp_lr` model with no `long_range` block: that
+    one still carries `has_long_range = False`. Delete the `type` key and
+    DeePMD-kit builds a plain `EnergyModel`, which has no such attribute --
+    and that is exactly what the README's baseline-twin recipe produces
+    ("delete `type: dp_lr` and the `long_range` block, change nothing else").
+
+    The calculator used to read `model.has_long_range` unguarded and died with
+    `AttributeError` on it, so the documented way to build a baseline could
+    not be loaded back. The distributed driver had always used `getattr`.
+    """
+
+    @staticmethod
+    def _standard_model():
+        import copy  # noqa: PLC0415
+
+        from deepmd.pt_expt.model.get_model import get_model  # noqa: PLC0415
+
+        from .test_joint_model import DESCRIPTOR, FITTING  # noqa: PLC0415
+
+        model = get_model(
+            {
+                "type_map": ["O", "H"],
+                "descriptor": copy.deepcopy(DESCRIPTOR),
+                "fitting_net": copy.deepcopy(FITTING),
+            }
+        )
+        assert not hasattr(model, "has_long_range"), (
+            "fixture no longer reproduces the case: this model does carry the "
+            "attribute, so it cannot regress the AttributeError"
+        )
+        return model.to(DEVICE).eval()
+
+    def test_runs_a_model_that_has_no_long_range_attribute(self):
+        atoms = water_atoms()
+        atoms.calc = LongRangeCalculator(self._standard_model())
+        assert np.isfinite(atoms.get_potential_energy())
+        assert np.isfinite(atoms.get_forces()).all()
+
+    def test_reports_no_long_range_energy(self):
+        atoms = water_atoms()
+        atoms.calc = LongRangeCalculator(self._standard_model())
+        atoms.get_potential_energy()
+        assert "energy_long_range" not in atoms.calc.results
+        assert "charges" not in atoms.calc.results
+
+    def test_a_field_is_refused_rather_than_crashing(self):
+        with pytest.raises(ValueError, match="no `long_range`"):
+            LongRangeCalculator(self._standard_model(), efield=[0.0, 0.0, 0.1])

@@ -175,8 +175,14 @@ class LongRangeCalculator(Calculator):
             if isinstance(model, str)
             else model.to(device).eval()
         )
+        # A model trained WITHOUT `type: dp_lr` -- the baseline twin the
+        # README asks for -- is a plain EnergyModel and simply has no
+        # `has_long_range` attribute. The distributed driver already reads it
+        # defensively; the calculator used not to, so loading a baseline into
+        # it raised AttributeError instead of just running short-range.
+        self._has_long_range = bool(getattr(self.model, "has_long_range", False))
         if self.efield is not None:
-            if not self.model.has_long_range:
+            if not self._has_long_range:
                 raise ValueError(
                     "an external field needs Born effective charges, which "
                     "need the charge head -- this model has no `long_range` "
@@ -222,7 +228,7 @@ class LongRangeCalculator(Calculator):
         # exactly what `slab_correction` exists to handle.
         periodic = bool(atoms.pbc.any())
         needs_cell = (
-            self.model.has_long_range and self.model.long_range_energy.needs_cell
+            self._has_long_range and self.model.long_range_energy.needs_cell
         )
         if needs_cell and not periodic:
             raise ValueError(
@@ -233,7 +239,7 @@ class LongRangeCalculator(Calculator):
                 "model with `long_range.reciprocal.method: 'isolated'`."
             )
 
-        if self.model.has_long_range:
+        if self._has_long_range:
             term = self.model.long_range_energy
             expected_pbc = term.pbc if term.needs_cell else (False, False, False)
             if not np.array_equal(atoms.pbc, expected_pbc):
