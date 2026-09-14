@@ -845,13 +845,30 @@ tensor, so unset that variable for field simulations. And `Z` is only as
 meaningful as the charge head — if `mean|q|` has collapsed toward zero during
 training, the Born tensor and the whole field response are meaningless.
 
-It is available on the distributed evaluator too:
+It is available on the distributed evaluator too, either as the tensor alone
+or as a field to run under:
 
 ```python
 ev = DistributedEvaluator(model, atype, cell, devices=[...], compute_born=True)
 ev(positions)
 ev.results["born_charge"]          # (natoms, 3, 3)
+
+# or: run under a uniform field, in V/angstrom
+ev = DistributedEvaluator(model, atype, cell, devices=[...], efield=[0, 0, 0.05])
+energy, forces = ev(positions)     # forces include F_ib = E_a Z_iab
+ev.results["field_force"]          # the field term alone, (natoms, 3)
 ```
+
+`efield` implies `compute_born`, and the returned `forces` carry the response
+term while `results["force"]` stays the field-free force. Two deliberate
+refusals: a model with no `long_range` block has no charges to build `Z` from,
+and `compute_virial` cannot be combined with a field, because the field's
+contribution to the stress is a separate derivation and reporting the
+field-free virial under a field would be quietly wrong.
+
+Verified against the serial path at 1, 2 and 4 partitions, and the net field
+force comes out as `Q·E` to 1e-15 — zero for a neutral cell, so nothing
+drifts.
 
 The global projection is no obstacle there. It only enters the `q_i delta`
 term, which is already projected by the time the partitions are assembled,

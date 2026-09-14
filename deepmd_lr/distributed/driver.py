@@ -514,7 +514,7 @@ def _long_range_global(
 
     return {
         "charge": charge.reshape(-1).detach().cpu().numpy(),
-        "energy_long_range": float(total),
+        "energy_long_range": float(total.detach()),
         "atom_energy_long_range": atom_energy.reshape(-1).detach().cpu().numpy(),
         "force_long_range": -grad_coord.reshape(n_atoms, 3).detach().cpu().numpy(),
         "dE_dq": grad_charge.reshape(-1).detach().cpu().numpy(),

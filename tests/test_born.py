@@ -447,3 +447,101 @@ class TestDistributed:
             < 1e-12
         )
         assert np.abs(withz["force"] - plain["force"]).max() < 1e-12
+
+
+class TestDistributedField:
+    """A uniform external field on the partitioned path.
+
+    The field force is built from ``Z``, and ``Z`` is the quantity that needs
+    a scatter-add across partitions (see :class:`TestDistributed`). So the
+    thing worth asserting is that the *force* -- not just the tensor -- comes
+    out partition-invariant and equal to the serial answer.
+    """
+
+    _setup = staticmethod(TestDistributed._setup)
+    FIELD = [0.03, -0.02, 0.05]
+
+    def _evaluator(self, **kwargs):
+        from deepmd_lr.distributed import DistributedEvaluator  # noqa: PLC0415
+
+        model, c, a, cl, *_ = self._setup()
+        return DistributedEvaluator(model, a, cl, **kwargs), c, model
+
+    def test_matches_the_serial_field_force(self):
+        from deepmd_lr.distributed import DistributedEvaluator  # noqa: PLC0415
+
+        model, c, a, cl, coord, atype, cell = self._setup()
+        model.compute_born = True
+        out = model(coord, atype, box=cell)
+        serial = (
+            out["force"][0] + field_force(out["born_charge"], self.FIELD)[0]
+        ).detach().cpu().numpy()
+
+        for n_part in (1, 2, 4):
+            ev = DistributedEvaluator(
+                model, a, cl, devices=[DEVICE] * n_part, efield=self.FIELD
+            )
+            _, forces = ev(torch.tensor(c, dtype=DT, device=DEVICE))
+            got = forces.detach().cpu().numpy()
+            assert np.abs(got - serial).max() < 1e-10, (
+                f"{n_part} partitions disagree with the serial field force by "
+                f"{np.abs(got - serial).max():.3e}"
+            )
+
+    def test_net_force_is_total_charge_times_field(self):
+        """`sum_i Z_i = Q I` identically, so a neutral cell feels no net force
+        and cannot drift. This is the field analogue of the sum rule."""
+        ev, c, _ = self._evaluator(devices=[DEVICE] * 2, efield=self.FIELD)
+        _, forces = ev(torch.tensor(c, dtype=DT, device=DEVICE))
+        q = float(ev.results["charge"].sum())
+        expected = q * np.asarray(self.FIELD)
+        net = ev.results["field_force"].sum(axis=0)
+        assert np.abs(net - expected).max() < 1e-9
+
+    def test_zero_field_leaves_the_forces_alone(self):
+        """A zero field must be exactly a no-op, not merely small -- otherwise
+        the field path is adding noise to every trajectory that enables it."""
+        from deepmd_lr.distributed import DistributedEvaluator  # noqa: PLC0415
+
+        model, c, a, cl, *_ = self._setup()
+        pos = torch.tensor(c, dtype=DT, device=DEVICE)
+        plain = DistributedEvaluator(model, a, cl, devices=[DEVICE] * 2)
+        zero = DistributedEvaluator(
+            model, a, cl, devices=[DEVICE] * 2, efield=[0.0, 0.0, 0.0]
+        )
+        _, f0 = plain(pos)
+        base = f0.detach().cpu().numpy().copy()
+        _, f1 = zero(pos)
+        assert np.abs(f1.detach().cpu().numpy() - base).max() < 1e-12
+
+    def test_field_implies_born(self):
+        ev, _, _ = self._evaluator(devices=[DEVICE], efield=self.FIELD)
+        assert ev.compute_born is True
+
+    def test_field_without_a_charge_head_is_refused(self):
+        from deepmd.pt_expt.model.get_model import get_model  # noqa: PLC0415
+
+        from deepmd_lr.distributed import DistributedEvaluator  # noqa: PLC0415
+
+        model, c, a, cl, *_ = self._setup()
+        short = get_model(
+            {
+                "type": "dp_lr",
+                "type_map": ["O", "H"],
+                "descriptor": copy.deepcopy(DESCRIPTOR),
+                "fitting_net": copy.deepcopy(FITTING),
+            }
+        )
+        with pytest.raises(ValueError, match="no `long_range` block"):
+            DistributedEvaluator(short, a, cl, devices=[DEVICE], efield=self.FIELD)
+
+    def test_virial_and_field_are_refused_together(self):
+        """The field's contribution to the stress is a separate derivation, so
+        the field-free virial would be quietly wrong rather than absent."""
+        from deepmd_lr.distributed import DistributedEvaluator  # noqa: PLC0415
+
+        model, c, a, cl, *_ = self._setup()
+        with pytest.raises(ValueError, match="cannot be combined"):
+            DistributedEvaluator(
+                model, a, cl, devices=[DEVICE], efield=self.FIELD, compute_virial=True
+            )
