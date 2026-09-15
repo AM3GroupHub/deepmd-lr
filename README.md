@@ -915,7 +915,7 @@ mutate (positions, velocities, masses, forces, cell, timestep, each a warp
 array bound once) and reports the thermodynamics, which nvalchemiops does not
 do at all. It takes `temperature` in kelvin and builds the `k_B T` array
 itself, so nothing downstream has a reason to write that conversion.
-`examples/05-md_nvalchemi` has a loop per ensemble.
+`examples/06-md_nvalchemi` has a loop per ensemble.
 
 ```python
 from deepmd_lr.nvalchemi import Thermo, build_evaluator, read_structure

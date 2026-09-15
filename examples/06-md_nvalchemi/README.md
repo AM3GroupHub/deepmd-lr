@@ -1,4 +1,4 @@
-# 5 — MD with nvalchemiops
+# 6 — MD with nvalchemiops
 
 nvalchemiops ships integrator **kernels** and no driver, so the loop belongs to
 you. That is the point of these six scripts: each is a complete, runnable loop
