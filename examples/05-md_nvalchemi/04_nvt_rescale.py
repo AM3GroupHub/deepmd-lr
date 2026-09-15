@@ -10,7 +10,7 @@ needs.
 `velocity_rescale` takes the scale factor, not a temperature, so the policy is
 yours -- here, rescale only when the drift exceeds a tolerance.
 
-    python 04_nvt_rescale.py --model ../../experiments/water_joint/model.ckpt.pt
+    python 04_nvt_rescale.py --model ../../path/to/model.ckpt.pt
 """
 
 import argparse
@@ -23,9 +23,9 @@ from common import (
     Thermo,
     build_evaluator,
     maxwell_boltzmann,
+    read_structure,
     scalar,
     vec,
-    water_box,
 )
 from nvalchemiops.dynamics.integrators import (
     velocity_rescale,
@@ -42,10 +42,13 @@ def main():
     ap.add_argument("--temperature", type=float, default=300.0, help="K")
     ap.add_argument("--tolerance", type=float, default=10.0,
                     help="K; rescale only when |T - target| exceeds this")
-    ap.add_argument("--n-side", type=int, default=6)
+    ap.add_argument("--structure", default="water_192.xyz",
+                    help="anything ase.io.read understands; needs a cell")
+    ap.add_argument("--index", type=int, default=-1,
+                    help="frame to take from a multi-frame file")
     a = ap.parse_args()
 
-    pos, symbols, cell = water_box(a.n_side)
+    pos, symbols, cell = read_structure(a.structure, a.index)
     ev, masses = build_evaluator(a.model, symbols, cell)
     dev = str(ev.home)
     n = len(pos)

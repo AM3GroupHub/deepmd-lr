@@ -15,7 +15,7 @@ Start from a lattice like the one below and the first few hundred fs are
 equilibration, not sampling -- the artificial structure dumps potential energy
 into heat faster than a weak thermostat removes it.
 
-    python 02_nvt_langevin.py --model ../../experiments/water_joint/model.ckpt.pt
+    python 02_nvt_langevin.py --model ../../path/to/model.ckpt.pt
 """
 
 import argparse
@@ -29,9 +29,9 @@ from common import (
     build_evaluator,
     kt,
     maxwell_boltzmann,
+    read_structure,
     scalar,
     vec,
-    water_box,
 )
 from nvalchemiops.dynamics.integrators import (
     langevin_baoab_finalize,
@@ -47,11 +47,14 @@ def main():
     ap.add_argument("--temperature", type=float, default=300.0, help="K")
     ap.add_argument("--friction", type=float, default=0.1,
                     help="inverse ASE time units")
-    ap.add_argument("--n-side", type=int, default=6)
+    ap.add_argument("--structure", default="water_192.xyz",
+                    help="anything ase.io.read understands; needs a cell")
+    ap.add_argument("--index", type=int, default=-1,
+                    help="frame to take from a multi-frame file")
     ap.add_argument("--seed", type=int, default=1)
     a = ap.parse_args()
 
-    pos, symbols, cell = water_box(a.n_side)
+    pos, symbols, cell = read_structure(a.structure, a.index)
     ev, masses = build_evaluator(a.model, symbols, cell)
     dev = str(ev.home)
     n = len(pos)

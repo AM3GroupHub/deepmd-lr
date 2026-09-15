@@ -5,7 +5,7 @@ thermostat the total energy is conserved, so its drift is a direct test that
 the forces really are the gradient of the reported energy. A force that is not
 leaves a drift floor no timestep reduction removes.
 
-    python 01_nve.py --model ../../experiments/water_joint/model.ckpt.pt
+    python 01_nve.py --model ../../path/to/model.ckpt.pt
 """
 
 import argparse
@@ -13,7 +13,15 @@ import argparse
 import torch
 import warp as wp
 from ase.units import fs
-from common import Reporter, Thermo, build_evaluator, maxwell_boltzmann, scalar, vec
+from common import (
+    Reporter,
+    Thermo,
+    build_evaluator,
+    maxwell_boltzmann,
+    read_structure,
+    scalar,
+    vec,
+)
 from nvalchemiops.dynamics.integrators import (
     velocity_verlet_position_update,
     velocity_verlet_velocity_finalize,
@@ -26,11 +34,13 @@ def main():
     ap.add_argument("--steps", type=int, default=500)
     ap.add_argument("--dt", type=float, default=0.5, help="fs")
     ap.add_argument("--temperature", type=float, default=300.0, help="K, initial")
-    ap.add_argument("--n-side", type=int, default=6)
+    ap.add_argument("--structure", default="water_192.xyz",
+                    help="anything ase.io.read understands; needs a cell")
+    ap.add_argument("--index", type=int, default=-1,
+                    help="frame to take from a multi-frame file")
     a = ap.parse_args()
 
-    from common import water_box
-    pos, symbols, cell = water_box(a.n_side)
+    pos, symbols, cell = read_structure(a.structure, a.index)
     ev, masses = build_evaluator(a.model, symbols, cell)
     dev = str(ev.home)
     n = len(pos)

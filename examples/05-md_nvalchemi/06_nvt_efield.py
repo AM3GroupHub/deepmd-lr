@@ -18,7 +18,7 @@ Two things to understand before reading a trajectory from this:
 
 The net force is `Q.E`, exactly zero for a neutral cell, so nothing drifts.
 
-    python 06_nvt_efield.py --model ../../experiments/water_joint/model.ckpt.pt \
+    python 06_nvt_efield.py --model ../../path/to/model.ckpt.pt \
         --efield 0.5
 """
 
@@ -34,9 +34,9 @@ from common import (
     build_evaluator,
     kt,
     maxwell_boltzmann,
+    read_structure,
     scalar,
     vec,
-    water_box,
 )
 from nvalchemiops.dynamics.integrators import (
     langevin_baoab_finalize,
@@ -51,7 +51,7 @@ def alignment(x, symbols, cell) -> float:
     field run is actually for.
     """
     p = x.detach().cpu().numpy()
-    L = np.diag(cell)
+    L = np.diag(np.asarray(cell))   # orthorhombic minimum image
     sym = np.array(symbols)
     oxy = np.where(sym == "O")[0]
     hyd = np.where(sym == "H")[0]
@@ -76,11 +76,14 @@ def main():
                     help="V/angstrom, along x")
     ap.add_argument("--friction", type=float, default=0.5,
                     help="raise this with the field; see the module docstring")
-    ap.add_argument("--n-side", type=int, default=6)
+    ap.add_argument("--structure", default="water_192.xyz",
+                    help="anything ase.io.read understands; needs a cell")
+    ap.add_argument("--index", type=int, default=-1,
+                    help="frame to take from a multi-frame file")
     ap.add_argument("--seed", type=int, default=1)
     a = ap.parse_args()
 
-    pos, symbols, cell = water_box(a.n_side)
+    pos, symbols, cell = read_structure(a.structure, a.index)
     ev, masses = build_evaluator(a.model, symbols, cell,
                                  efield=[a.efield, 0.0, 0.0])
     dev = str(ev.home)

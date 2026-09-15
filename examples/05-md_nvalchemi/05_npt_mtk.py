@@ -17,7 +17,7 @@ That is cheap -- it re-runs `partition_system`, not the per-device model
 copies. Rebuilding the whole evaluator each step would deepcopy the model and
 is what you want to avoid.
 
-    python 05_npt_mtk.py --model ../../experiments/water_joint/model.ckpt.pt
+    python 05_npt_mtk.py --model ../../path/to/model.ckpt.pt
 """
 
 import argparse
@@ -32,9 +32,9 @@ from common import (
     build_evaluator,
     kt,
     maxwell_boltzmann,
+    read_structure,
     scalar,
     vec,
-    water_box,
 )
 from nvalchemiops.dynamics.integrators import (
     compute_pressure_tensor,
@@ -59,10 +59,13 @@ def main():
     ap.add_argument("--chain-length", type=int, default=3)
     ap.add_argument("--repartition-every", type=int, default=1,
                     help="steps between repartitions as the cell moves")
-    ap.add_argument("--n-side", type=int, default=6)
+    ap.add_argument("--structure", default="water_192.xyz",
+                    help="anything ase.io.read understands; needs a cell")
+    ap.add_argument("--index", type=int, default=-1,
+                    help="frame to take from a multi-frame file")
     a = ap.parse_args()
 
-    pos, symbols, cell = water_box(a.n_side)
+    pos, symbols, cell = read_structure(a.structure, a.index)
     # compute_virial is not optional here: no virial, no pressure, no barostat.
     ev, masses = build_evaluator(a.model, symbols, cell, compute_virial=True)
     dev = str(ev.home)

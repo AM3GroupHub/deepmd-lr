@@ -11,6 +11,7 @@ factors appear in the loops.
 
 from __future__ import annotations
 
+import ase.io
 import numpy as np
 import torch
 import warp as wp
@@ -27,7 +28,7 @@ from deepmd_lr.distributed import DistributedEvaluator
 
 __all__ = [
     "Reporter", "Thermo", "build_evaluator", "kt", "maxwell_boltzmann",
-    "scalar", "vec", "water_box",
+    "read_structure", "scalar", "vec",
 ]
 
 
@@ -86,18 +87,30 @@ class Thermo:
 
 # --- system -----------------------------------------------------------------
 
-def water_box(n_side: int = 8, spacing: float = 3.1, seed: int = 0):
-    """A jittered lattice of water molecules: positions, symbols, cell."""
-    rng = np.random.default_rng(seed)
-    L = n_side * spacing
-    pos, sym = [], []
-    for i in range(n_side):
-        for j in range(n_side):
-            for k in range(n_side):
-                o = (np.array([i, j, k]) + 0.5) * spacing + rng.uniform(-0.3, 0.3, 3)
-                pos += [o, o + [0.96, 0.0, 0.0], o + [-0.24, 0.93, 0.0]]
-                sym += ["O", "H", "H"]
-    return np.array(pos) % L, sym, np.eye(3) * L
+def read_structure(path, index: int = -1):
+    """Read a starting structure with ASE: positions, symbols, cell.
+
+    Anything `ase.io.read` understands works -- extxyz, POSCAR, CIF, an ASE
+    trajectory. For a multi-frame file `index` picks the frame; the default
+    takes the last, which is usually the most equilibrated one.
+
+    A cell is required. These are periodic simulations, and a structure with
+    no cell would silently be treated as a molecule in vacuum by the
+    descriptor and rejected outright by the reciprocal-space term.
+    """
+    atoms = ase.io.read(str(path), index=index)
+    if isinstance(atoms, list):                      # a slice was passed
+        atoms = atoms[-1]
+    cell = np.asarray(atoms.get_cell())
+    if abs(np.linalg.det(cell)) < 1e-8:
+        raise ValueError(
+            f"{path} has no cell (volume {abs(np.linalg.det(cell)):.2e} A^3). "
+            "These examples run periodic MD, so the structure needs one -- "
+            "set it in the file, or add a vacuum-padded cell for a slab."
+        )
+    if not atoms.pbc.all():
+        atoms.pbc = True                             # a cell implies periodicity
+    return atoms.get_positions(), atoms.get_chemical_symbols(), cell
 
 
 def build_evaluator(model_path, symbols, cell, devices=None, **kwargs):

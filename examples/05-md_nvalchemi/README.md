@@ -15,8 +15,21 @@ then works against it:
 python 01_nve.py --model ../../path/to/model.ckpt.pt
 ```
 
-Each builds its own jittered water lattice, so no data files are needed. Pass
-`--n-side` to change the size (6 → 648 atoms, 8 → 1536).
+The starting structure defaults to `water_192.xyz`, shipped here — one
+equilibrated frame of 64 H₂O in a 12.429 Å cell, taken from example 01's
+validation set, so it matches the model that example trains.
+
+Any structure `ase.io.read` understands works instead:
+
+```bash
+python 02_nvt_langevin.py --model ... --structure my_system.cif
+python 02_nvt_langevin.py --model ... --structure traj.xyz --index 250
+```
+
+`--index` picks the frame from a multi-frame file and defaults to the last,
+usually the most equilibrated. **A cell is required** — these are periodic
+simulations, and a structure without one is refused rather than quietly
+treated as a molecule in vacuum.
 
 ## The scripts
 
@@ -161,9 +174,10 @@ Worth it above a few thousand atoms per card and not below — see the
 
 ## What these runs are not
 
-Each script starts from a jittered lattice, so the first few hundred fs are
-equilibration rather than sampling: the artificial structure dumps potential
-energy into heat faster than a weak thermostat removes it. The defaults are
-sized to finish in a minute or two, not to converge anything. Start production
-runs from an equilibrated structure and expect the barostat in `05` to need
-many times `tau_P` before the volume settles.
+The defaults are sized to finish in a minute or two, not to converge anything.
+`water_192.xyz` is equilibrated for the example-01 model, so the temperature
+settles quickly — but start from *your* equilibrated structure for anything
+real, and expect the barostat in `05` to need many times `tau_P` before the
+volume stops moving. A structure that is not equilibrated for the model you
+are using will dump potential energy into heat faster than a weak thermostat
+removes it, which looks like a thermostat problem and is not one.

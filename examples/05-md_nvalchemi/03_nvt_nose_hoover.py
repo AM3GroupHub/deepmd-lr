@@ -15,7 +15,7 @@ Three API details that are not guessable from the signatures:
     to every call and the kernels take care of their own factors.
   * the chain update is called once at EACH END of the step, not once per step.
 
-    python 03_nvt_nose_hoover.py --model ../../experiments/water_joint/model.ckpt.pt
+    python 03_nvt_nose_hoover.py --model ../../path/to/model.ckpt.pt
 """
 
 import argparse
@@ -30,9 +30,9 @@ from common import (
     build_evaluator,
     kt,
     maxwell_boltzmann,
+    read_structure,
     scalar,
     vec,
-    water_box,
 )
 from nvalchemiops.dynamics.integrators import (
     nhc_compute_chain_energy,
@@ -54,10 +54,13 @@ def main():
     ap.add_argument("--chain-length", type=int, default=3)
     ap.add_argument("--nloops", type=int, default=3,
                     help="Yoshida-Suzuki sub-steps")
-    ap.add_argument("--n-side", type=int, default=6)
+    ap.add_argument("--structure", default="water_192.xyz",
+                    help="anything ase.io.read understands; needs a cell")
+    ap.add_argument("--index", type=int, default=-1,
+                    help="frame to take from a multi-frame file")
     a = ap.parse_args()
 
-    pos, symbols, cell = water_box(a.n_side)
+    pos, symbols, cell = read_structure(a.structure, a.index)
     ev, masses = build_evaluator(a.model, symbols, cell)
     dev = str(ev.home)
     n = len(pos)
