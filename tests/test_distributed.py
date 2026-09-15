@@ -593,3 +593,93 @@ class TestDistributedEvaluator:
             wp.synchronize()
         drift = abs(energy + kinetic() - start) / driver.n_atoms * 1000
         assert drift < 1.0, f"drift {drift:.4f} meV/atom over 20 steps"
+
+
+class TestBackboneCapture:
+    """The charge head reuses the energy head's descriptor pass.
+
+    `partition_charges` used to run the backbone a second time per partition,
+    which measured 18-19% of the long-range step. The capture removes it. Two
+    things have to hold: it must actually be taken, and it must not change any
+    number -- the features come from a different autograd leaf, so the
+    charge-response force and the Born tensor both had to be retargeted.
+    """
+
+    @staticmethod
+    def _system(n_mol=8):
+        from .test_joint_model import build, frame  # noqa: PLC0415
+
+        model = build()
+        coord, atype, cell = frame(n_mol=n_mol)
+        return (model, coord[0].cpu().numpy(), atype[0].cpu().numpy(),
+                cell[0].cpu().numpy())
+
+    @staticmethod
+    def _run(model, c, a, cl, devices, *, force_fallback=False, **kw):
+        import deepmd_lr.distributed.driver as DRV  # noqa: PLC0415
+        from deepmd_lr.distributed import DistributedEvaluator  # noqa: PLC0415
+
+        original = DRV._usable_capture
+        if force_fallback:
+            DRV._usable_capture = lambda captured: False
+        try:
+            ev = DistributedEvaluator(model, a, cl, devices=devices, **kw)
+            energy, forces = ev(c)
+            return (float(energy), forces.detach().cpu().numpy().copy(),
+                    ev.results["charge"].copy(), ev.results, ev)
+        finally:
+            DRV._usable_capture = original
+
+    def test_capture_is_taken_on_every_partition(self):
+        import deepmd_lr.distributed.driver as DRV  # noqa: PLC0415
+
+        model, c, a, cl = self._system()
+        calls = {"n": 0}
+        original = DRV.partition_charges
+
+        def counting(*args, **kwargs):
+            calls["n"] += 1
+            return original(*args, **kwargs)
+
+        DRV.partition_charges = counting
+        try:
+            self._run(model, c, a, cl, [DEVICE] * 4)
+        finally:
+            DRV.partition_charges = original
+        assert calls["n"] == 0, (
+            f"{calls['n']} partitions fell back to a second descriptor pass"
+        )
+
+    @pytest.mark.parametrize("n_part", [1, 2, 4])
+    def test_identical_to_recomputing_the_backbone(self, n_part):
+        model, c, a, cl = self._system()
+        e_cap, f_cap, q_cap, _, _ = self._run(model, c, a, cl, [DEVICE] * n_part)
+        e_ref, f_ref, q_ref, _, _ = self._run(
+            model, c, a, cl, [DEVICE] * n_part, force_fallback=True
+        )
+        assert abs(e_cap - e_ref) < 1e-10
+        assert np.abs(f_cap - f_ref).max() < 1e-10
+        assert np.abs(q_cap - q_ref).max() < 1e-10
+
+    def test_born_is_identical_too(self):
+        """Born differentiates `raw` w.r.t. the edge vectors, so it had to be
+        retargeted onto the captured leaf."""
+        model, c, a, cl = self._system()
+        _, _, _, cap, _ = self._run(model, c, a, cl, [DEVICE] * 2, compute_born=True)
+        _, _, _, ref, _ = self._run(
+            model, c, a, cl, [DEVICE] * 2, compute_born=True, force_fallback=True
+        )
+        assert np.abs(cap["born_charge"] - ref["born_charge"]).max() < 1e-10
+
+    def test_virial_is_identical_too(self):
+        """The strain reaches `eps` only through the partition's own
+        `edge_vec`, which is why the response force chains through it rather
+        than scattering the captured gradient by hand."""
+        model, c, a, cl = self._system()
+        _, _, _, _, ev_cap = self._run(
+            model, c, a, cl, [DEVICE] * 2, compute_virial=True
+        )
+        _, _, _, _, ev_ref = self._run(
+            model, c, a, cl, [DEVICE] * 2, compute_virial=True, force_fallback=True
+        )
+        assert np.abs(ev_cap.virial - ev_ref.virial).max() < 1e-10
