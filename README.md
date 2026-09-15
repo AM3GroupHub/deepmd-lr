@@ -19,7 +19,8 @@ says so.
 - [Choosing `alpha` and the mesh](#choosing-alpha-and-the-mesh) ·
   [`pme` or `ewald`](#pme-or-ewald)
 - [Non-periodic systems](#non-periodic-systems) ·
-  [Multi-head training](#several-levels-of-theory-multi-head-training)
+  [Multi-head training](#several-levels-of-theory-multi-head-training) ·
+  [Mixed boundaries (`same_as`)](#one-theory-two-boundaries-same_as)
 - [Dataset layout](#dataset-layout) ·
   [Training schedule](#the-training-schedule) ·
   [What to watch](#what-to-watch) · [Validating](#validating-a-trained-model)
@@ -148,6 +149,8 @@ dp --pt-expt train input_baseline.json     # same settings, no long_range
 | [02](examples/02-molecules) | four molecules, no cell | `nopbc`, `charge_spin.npy`, `method: "isolated"`, one system per composition |
 | [03](examples/03-slab) | Li/LiFSI interface, 2D-periodic | vacuum padding, `slab_correction` + `pbc` |
 | [04](examples/04-multi-head) | all three at once | `shared_dict`/`model_dict`, and the gradient clipping it needs |
+| [05](examples/05-pseudo-head) | bulk + slab, one weight set | `same_as`, and setting the long-range type at load |
+| [06](examples/06-md_nvalchemi) | MD with nvalchemiops | NVE, NVT, NPT and a field, one runnable loop each |
 
 `scripts/xyz_to_deepmd.py` converts a trajectory ASE can read into a DeePMD
 dataset, including the `--split-by-composition` and `--vacuum` cases the
@@ -372,7 +375,9 @@ tensors, so one optimizer step updates the backbone for all of them.
 `long_range.charge_net` is **not** shareable, so every branch gets its own
 charge head. That is the right default when the branches are different levels
 of theory — the charges genuinely differ — but it does mean the branches are
-only tied through the backbone.
+only tied through the backbone. When the branches are the *same* theory and
+differ only in boundary condition, see [`same_as`](#one-theory-two-boundaries-same_as)
+below, which ties everything instead.
 
 DPA4C supports `shared_level: 0` only (share everything). It also checks that
 the structural parameters match *exactly* — `rcut`, `channels`, `lmax`,
@@ -477,6 +482,87 @@ model trained on that dataset alone. Sharing should be roughly
 neutral-to-better per branch; if one branch is clearly worse, reweight with
 `model_prob` or train it separately — `shared_level` cannot be relaxed for
 DPA4C.
+
+## One theory, two boundaries: `same_as`
+
+Worked example: [`examples/05-pseudo-head`](examples/05-pseudo-head).
+
+Multi-head above answers "different levels of theory". A different question:
+your dataset is **one** level of theory, but contains both periodic bulk cells
+and 2D-periodic slabs. Separate heads would be wrong — they would each fit
+their own energy zero and each see half the data.
+
+They do not have to be separate, because **the long-range term holds no
+trainable weights**. Every parameter lives in the descriptor, the energy head
+and the charge head; the reciprocal sum has none. So one set of weights serves
+both boundary conditions, and only the sum over periodic images differs.
+
+`same_as` declares a branch to be another branch with a different long-range
+term:
+
+```json
+"model_dict": {
+  "bulk": { "type": "dp_lr", "type_map": "type_map_all",
+            "descriptor": {...}, "fitting_net": {...},
+            "long_range": { "charge_net": {...},
+                            "reciprocal": {"alpha": 0.4,
+                                           "slab_correction": false,
+                                           "pbc": [true, true, true]} } },
+
+  "slab": { "same_as": "bulk",
+            "long_range": { "reciprocal": {"alpha": 0.4,
+                                           "slab_correction": true,
+                                           "pbc": [true, true, false]} } }
+}
+```
+
+Unlike `shared_dict`, which ties a named list of components, this ties
+*everything* parameter-bearing: descriptor, energy head, charge head, and the
+per-type energy offsets — the same Python objects, so one gradient and one
+update per step whichever branch it was drawn from. Those offsets are fitted
+once over both datasets **pooled**, which is what stops any gap between them
+being absorbed as a spurious surface energy.
+
+The two mechanisms compose: `shared_dict` for genuinely different heads,
+`same_as` for heads that are the same model. A multi-task config still needs
+exactly one shared `type_map` reference, so the `shared_dict` stays even here.
+
+**Do you need it?** The correction a slab branch adds is Yeh–Berkowitz,
+`2π M_z²/V`, which is *identically zero* for a non-polar slab. If your slabs
+carry no dipole across the vacuum, one ordinary 3D branch already serves both.
+It earns its keep for polar slabs — an electrode under electrolyte, an
+asymmetric interface — where the correction is large and decays only as `1/L_z`.
+
+A `same_as` branch may set only `long_range`, `model_branch_alias` and `info`.
+Anything else is refused rather than ignored, because it would be built and
+then discarded when the modules are aliased — training would converge to a
+model nobody asked for. So are a differing `alpha` (the shared descriptor
+learned one split), an overridden `charge_net` (it holds weights, so it must be
+the same object), `dim_case_embd > 0` (it gives each branch an index in one
+shared buffer), and a `same_as` chain.
+
+> Remove `stat_file` when you add or change `same_as`: the offsets are restored
+> from it when present, bypassing the pooled fit.
+
+### Setting the long-range type at load
+
+The same fact — no weights in the term — makes the boundary treatment a
+property of the *simulation* rather than of the checkpoint:
+
+```python
+from deepmd_lr.ase import LongRangeCalculator, load_model
+
+model = load_model("model.ckpt.pt", head="slab")
+model.set_long_range({"alpha": 0.4, "mesh_dimensions": [10, 10, 10],
+                      "slab_correction": False, "pbc": [True, True, True]})
+```
+
+`long_range=` is also a keyword on `load_model`, `LongRangeCalculator` and
+`build_evaluator`, so a swap needs no extra line. It **replaces** the reciprocal
+block rather than merging into it — merging cannot work, since
+`method: "isolated"` refuses every periodic parameter. `alpha` is inherited from
+the checkpoint and a different one raises: it is where Coulomb is split, and the
+network learned the remainder of *that* split.
 
 ## Dataset layout
 

@@ -23,7 +23,12 @@
       "",
       "Only type_map, descriptor and fitting_net can be shared. long_range is",
       "per-branch by construction, which is what lets the boundary treatment",
-      "differ."
+      "differ.",
+      "",
+      "That is right HERE, where the three branches are three levels of theory",
+      "with unrelated energy zeros. When branches share a theory and differ",
+      "ONLY in boundary condition, `same_as` ties everything instead -- see",
+      "examples/05-pseudo-head."
     ],
     "shared_dict": {
       "_comment_type_map_all": [

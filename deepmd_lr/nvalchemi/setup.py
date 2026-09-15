@@ -41,19 +41,29 @@ def read_structure(path: Any, index: int = -1) -> Any:
 
 
 def build_evaluator(model: Any, atoms: Any, devices: Any = None,
-                    head: str | None = None, **kwargs: Any) -> DistributedEvaluator:
+                    head: str | None = None, long_range: dict | None = None,
+                    **kwargs: Any) -> DistributedEvaluator:
     """Load a ``dp_lr`` checkpoint and wrap it for this structure.
 
     One device is the normal case; pass several to partition across GPUs.
     ``kwargs`` forwards to :class:`DistributedEvaluator` -- ``compute_virial``
     for NPT, ``efield`` for a field run, and so on.
 
+    ``long_range`` replaces the reciprocal-space settings the checkpoint was
+    trained with, which is how one set of weights runs a bulk cell and a slab:
+    the term holds no parameters, so the choice belongs to the simulation.
+
     Masses are deliberately not returned: the evaluator already derives them
     from the model's own ``type_map``, and a second table built from the
     file's symbols would be a second source of truth that agrees only by
     coincidence.
     """
-    loaded = load_model(str(model), head=head) if isinstance(model, str) else model
+    if isinstance(model, str):
+        loaded = load_model(str(model), head=head, long_range=long_range)
+    else:
+        loaded = model
+        if long_range is not None:
+            loaded.set_long_range(long_range)
     type_map = list(loaded.get_type_map())
     atype = np.array(
         [type_map.index(s) for s in atoms.get_chemical_symbols()], dtype=np.int64

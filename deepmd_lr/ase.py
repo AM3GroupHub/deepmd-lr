@@ -37,7 +37,11 @@ _STATE_PREFIX = "model.Default."
 
 
 def load_model(
-    checkpoint: str, device: str | torch.device = DEVICE, *, head: str | None = None
+    checkpoint: str,
+    device: str | torch.device = DEVICE,
+    *,
+    head: str | None = None,
+    long_range: dict | None = None,
 ) -> Any:
     """Rebuild a trained model from a training checkpoint.
 
@@ -45,6 +49,12 @@ def load_model(
     than asking the caller to supply the input file again, so a checkpoint is
     self-describing.
     Multi-head checkpoints require ``head`` (branch name or unique alias).
+
+    ``long_range`` overrides the reciprocal-space settings the model was
+    trained with -- see
+    :meth:`~deepmd_lr.model.lr_model.LongRangeEnergyModel.set_long_range`. The
+    long-range term holds no weights, so this changes how the electrostatics
+    are summed without touching a single trained parameter.
     """
     state = torch.load(checkpoint, map_location="cpu", weights_only=False)
     params = state["model"]["_extra_state"]["model_params"]
@@ -82,6 +92,8 @@ def load_model(
             f"{len(missing)} missing (e.g. {missing[:3]}) and "
             f"{len(unexpected)} unexpected (e.g. {unexpected[:3]})"
         )
+    if long_range is not None:
+        model.set_long_range(long_range)
     model = model.to(device).eval()
     select_neighbor_graph_method(model)
     return model
@@ -129,6 +141,12 @@ class LongRangeCalculator(Calculator):
     head
         Required branch name or unique alias for a multi-head checkpoint.
         Omit when passing an already constructed model.
+    long_range
+        Optional replacement for the reciprocal-space settings, e.g.
+        ``{"method": "pme", "slab_correction": True, "pbc": [True, True,
+        False]}``. The long-range term carries no weights, so the boundary
+        treatment is a property of the simulation rather than of the
+        checkpoint.
 
     Examples
     --------
@@ -152,6 +170,7 @@ class LongRangeCalculator(Calculator):
         charge_spin: tuple[float, float] | list[float] | torch.Tensor | None = None,
         head: str | None = None,
         efield: Any = None,
+        long_range: dict | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -171,10 +190,12 @@ class LongRangeCalculator(Calculator):
         if head is not None and not isinstance(model, str):
             raise ValueError("head selects a checkpoint branch; pass a checkpoint path")
         self.model = (
-            load_model(model, device, head=head)
+            load_model(model, device, head=head, long_range=long_range)
             if isinstance(model, str)
             else model.to(device).eval()
         )
+        if long_range is not None and not isinstance(model, str):
+            self.model.set_long_range(long_range)
         # A model trained WITHOUT `type: dp_lr` -- the baseline twin the
         # README asks for -- is a plain EnergyModel and simply has no
         # `has_long_range` attribute. The distributed driver already reads it

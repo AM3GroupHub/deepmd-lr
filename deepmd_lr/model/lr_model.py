@@ -150,6 +150,31 @@ class LongRangeEnergyModel(EnergyModel):
         #: a field simulation needs them. Set it on the model, not in the
         #: config -- a field is a property of the simulation, not the model.
         self.compute_born = False
+        #: True on the non-base members of a `same_as` group, whose
+        #: `atomic_model` is the base's very object. A plain bool, not a
+        #: module: see `deepmd_lr.same_as`.
+        self._same_as_link = False
+
+    def change_out_bias(
+        self, merged: Any, bias_adjust_mode: str = "change-by-statistic"
+    ) -> None:
+        """Refit the per-type energy offsets, once per `same_as` group.
+
+        Every member of such a group shares one ``atomic_model``, so
+        ``out_bias`` is one tensor -- but DeePMD-kit loops over branch keys and
+        would apply the same delta to it once per branch. ``"change-by-statistic"``
+        *adds*, so with two branches the offsets would land at twice the
+        correction. The base branch owns the update; the links stand down.
+
+        The delta itself is identical for every member regardless of which
+        reciprocal method they use, because the regression subtracts the
+        **atomic** model's prediction -- short-range only, since the long-range
+        term lives one level above it. That is what makes fitting the offsets
+        over the group's pooled frames well defined.
+        """
+        if self._same_as_link:
+            return
+        super().change_out_bias(merged, bias_adjust_mode=bias_adjust_mode)
 
     @property
     def has_long_range(self) -> bool:
@@ -162,6 +187,60 @@ class LongRangeEnergyModel(EnergyModel):
         return (
             self.charge_fitting is not None and self.long_range_energy is not None
         )
+
+    def set_long_range(self, settings: dict[str, Any]) -> None:
+        """Swap the long-range term for one built from ``settings``.
+
+        Neither :class:`~deepmd_lr.lr.term.LongRangeEnergy` nor
+        :class:`~deepmd_lr.lr.term.IsolatedLongRangeEnergy` contributes a
+        single ``state_dict`` entry -- every weight lives in the descriptor,
+        the fitting net and the charge head. So how the reciprocal sum is
+        evaluated is not a property of the *checkpoint* at all, and a model
+        trained on slabs can be asked for bulk energies, or for isolated ones,
+        by rebinding this one attribute. That is what makes the mixed-boundary
+        training of `same_as` useful at inference time.
+
+        ``settings`` **replaces** the reciprocal block rather than merging into
+        it. Merging cannot work: ``IsolatedLongRangeEnergy`` accepts every
+        periodic parameter and then refuses any that was actually set, so
+        folding a ``pme`` block into ``method: "isolated"`` raises. Replacement
+        is the one shape that is correct for all three methods, and it leaves
+        no merge semantics to get subtly wrong.
+
+        ``alpha`` is the exception, and is inherited rather than replaced. It
+        is where the Ewald split falls, and the descriptor was trained to
+        supply exactly the ``erfc(alpha r)/r`` remainder left at *that* split
+        -- so it defines the model as surely as the weights do. Passing a
+        different one is refused rather than silently honoured.
+        """
+        if not self.has_long_range:
+            raise ValueError(
+                "this model has no `long_range` block, so there is no "
+                "long-range term to set. Train with `type: dp_lr` and a "
+                "`long_range` section to get one."
+            )
+        current = self.long_range_energy.serialize()
+        settings = {"alpha": current["alpha"], **settings}
+        if float(settings["alpha"]) != float(current["alpha"]):
+            raise ValueError(
+                f"alpha is fixed at {current['alpha']} by training and cannot "
+                f"be changed here, got {settings['alpha']}. It sets where "
+                "Coulomb is split, and the network learned the short-ranged "
+                "remainder of *that* split; moving it silently invalidates "
+                "every weight in the model."
+            )
+        self.long_range_energy = build_long_range_energy(settings)
+        # Keep the recorded config in step, so a model that is re-serialised
+        # after a swap describes the term it actually has rather than the one
+        # it was trained with.
+        script = getattr(self, "model_def_script", None)
+        if script:
+            recorded = json.loads(script)
+            block = recorded.get(LONG_RANGE_KEY)
+            if block is not None:
+                block.pop(_LEGACY_RECIPROCAL_KEY, None)
+                block[RECIPROCAL_KEY] = self.long_range_energy.serialize()
+                self.model_def_script = json.dumps(recorded)
 
     @classmethod
     def get_model(cls, model_params: dict) -> "LongRangeEnergyModel":

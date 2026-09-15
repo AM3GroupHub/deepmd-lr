@@ -28,6 +28,9 @@ from deepmd_lr.model.lr_model import (
     MODEL_TYPE,
     RECIPROCAL_KEY,
 )
+from deepmd_lr.same_as import (
+    SAME_AS_KEY,
+)
 
 
 @model_args_plugin.register(MODEL_TYPE)
@@ -86,6 +89,24 @@ def dp_lr_model_args() -> Argument:
                     "Store arbitrary key-value pairs with model- or "
                     "branch-specific information. Used in both single- and "
                     "multi-task models."
+                ),
+            ),
+            Argument(
+                SAME_AS_KEY,
+                str,
+                optional=True,
+                default=None,
+                doc=(
+                    "Name of another branch in `model_dict` that this branch "
+                    "is a copy of. The two share every trainable parameter -- "
+                    "descriptor, fitting net, charge head and per-type energy "
+                    "offsets are the same objects -- and differ only in "
+                    "`long_range.reciprocal`. This is how one set of weights "
+                    "is trained on a dataset mixing bulk and slab systems: "
+                    "the long-range term holds no weights, so only the sum "
+                    "over periodic images has to differ. Such a branch may "
+                    "set only `long_range`, `model_branch_alias` and `info`; "
+                    "everything else is inherited."
                 ),
             ),
             _long_range_args(),

@@ -1,0 +1,242 @@
+{
+  "_comment": [
+    "PSEUDO-HEAD: bulk and slab as ONE model, not two.",
+    "",
+    "A dataset that mixes 3D-periodic bulk with 2D-periodic slabs cannot be a",
+    "single ordinary head, because `slab_correction` and `pbc` are fixed when",
+    "the model is built. But the long-range term holds NO TRAINABLE WEIGHTS --",
+    "every parameter lives in the descriptor, the energy head and the charge",
+    "head. So one set of weights genuinely serves both; only the sum over",
+    "periodic images has to differ.",
+    "",
+    "`same_as` says exactly that. The `slab` branch below IS the `bulk` model",
+    "-- the same Python objects, one gradient and one update per step, one set",
+    "of per-type energy offsets fitted over both datasets pooled -- carrying a",
+    "different long-range term.",
+    "",
+    "CONTRAST WITH EXAMPLE 04. There the three branches came from three levels",
+    "of theory with unrelated energy zeros, so they had to be separate heads",
+    "sharing only a descriptor. Here there is ONE level of theory and one",
+    "system; only the boundary differs. Using `same_as` across different theory",
+    "would be wrong, and using separate heads here would waste half the data on",
+    "each.",
+    "",
+    "THIS FILE SHIPS NO DATA. Point `data_dict` at your own bulk and slab",
+    "subsets -- see the README for what they must have in common."
+  ],
+  "model": {
+    "_comment": [
+      "shared_dict exists here for one reason: DeePMD-kit asserts that a",
+      "multi-task model has exactly one SHARED type_map reference. Even a config",
+      "whose branches are copies of each other has to name it there.",
+      "",
+      "Nothing else needs a shared_dict entry. `same_as` shares by being the",
+      "same model, so there is no list of component names to keep in sync -- and",
+      "nothing to forget when the model grows a new part."
+    ],
+    "shared_dict": {
+      "type_map_all": [
+        "H",
+        "O"
+      ]
+    },
+    "model_dict": {
+      "bulk": {
+        "_comment": [
+          "The branch that defines the model. Everything here -- descriptor,",
+          "fitting net, charge head, type map -- is what BOTH branches run."
+        ],
+        "type": "dp_lr",
+        "type_map": "type_map_all",
+        "descriptor": {
+          "_comment": [
+            "rcut must stay below half of the SMALLEST cell in either branch. A",
+            "padded slab is tall but usually narrow: check its x/y, not its z."
+          ],
+          "type": "dpa4c",
+          "rcut": 6.0,
+          "channels": 32,
+          "lmax": 2,
+          "basis_type": "bessel",
+          "n_radial": 16,
+          "radial_modes": 4,
+          "precision": "float32",
+          "seed": 1
+        },
+        "fitting_net": {
+          "_comment": [
+            "No dim_case_embd. A case embedding gives each branch its own index in",
+            "one buffer, which is precisely the claim `same_as` denies -- so it is",
+            "refused rather than silently collapsed."
+          ],
+          "neuron": [
+            128,
+            128,
+            128
+          ],
+          "resnet_dt": false,
+          "activation_function": "silu",
+          "precision": "float32",
+          "seed": 1
+        },
+        "long_range": {
+          "charge_net": {
+            "neuron": [
+              64,
+              64
+            ],
+            "activation_function": "silu",
+            "precision": "float32",
+            "seed": 1
+          },
+          "reciprocal": {
+            "_comment": [
+              "3D-periodic: no slab correction, no open axis.",
+              "mesh spacing must beat 1/(2*alpha) = 1.25 A; size it for THIS cell."
+            ],
+            "alpha": 0.4,
+            "mesh_dimensions": [
+              10,
+              10,
+              10
+            ],
+            "spline_order": 6,
+            "slab_correction": false,
+            "pbc": [
+              true,
+              true,
+              true
+            ]
+          }
+        }
+      },
+      "slab": {
+        "_comment": [
+          "The whole pseudo-head. It may set ONLY `long_range`, plus the optional",
+          "`model_branch_alias` and `info`. Writing a descriptor or a fitting_net",
+          "here is refused, not ignored: it would be built and then discarded when",
+          "the modules are aliased, and training would converge to a model nobody",
+          "asked for.",
+          "",
+          "`charge_net` is inherited and cannot be overridden -- it holds weights, so",
+          "it must be the same object, not an equal copy."
+        ],
+        "same_as": "bulk",
+        "long_range": {
+          "reciprocal": {
+            "_comment": [
+              "alpha MUST match the bulk branch. It is where Coulomb is split,",
+              "and the one shared descriptor can only learn the erfc(alpha r)/r",
+              "remainder of a single split. A mismatch is refused.",
+              "",
+              "The mesh is sized for the PADDED cell, so its z is much larger.",
+              "pbc marks z open; slab_correction adds Yeh-Berkowitz, 2 pi Mz^2/V.",
+              "",
+              "Note that correction is IDENTICALLY ZERO for a non-polar slab. If",
+              "yours carries no dipole across the vacuum, you do not need this",
+              "file at all -- one ordinary 3D branch already serves both."
+            ],
+            "alpha": 0.4,
+            "mesh_dimensions": [
+              10,
+              10,
+              42
+            ],
+            "spline_order": 6,
+            "slab_correction": true,
+            "pbc": [
+              true,
+              true,
+              false
+            ]
+          }
+        }
+      }
+    }
+  },
+  "learning_rate": {
+    "type": "exp",
+    "start_lr": 0.001,
+    "stop_lr": 1e-05
+  },
+  "loss_dict": {
+    "_comment": [
+      "One loss per branch. Same theory, same weights -- so unless one subset",
+      "has virial labels and the other does not, these should be identical."
+    ],
+    "bulk": {
+      "type": "ener",
+      "start_pref_e": 1,
+      "limit_pref_e": 1,
+      "start_pref_f": 1000,
+      "limit_pref_f": 1,
+      "start_pref_v": 0,
+      "limit_pref_v": 0
+    },
+    "slab": {
+      "type": "ener",
+      "start_pref_e": 1,
+      "limit_pref_e": 1,
+      "start_pref_f": 1000,
+      "limit_pref_f": 1,
+      "start_pref_v": 0,
+      "limit_pref_v": 0
+    }
+  },
+  "training": {
+    "_comment": [
+      "model_prob is the chance a STEP is drawn from that branch, not a data-size",
+      "weight. Slab frames are usually far scarcer and far more expensive than",
+      "bulk ones; weight by how much you want each boundary represented in the",
+      "gradient, then check both rmse_f columns in lcurve.out actually fall."
+    ],
+    "model_prob": {
+      "bulk": 0.6,
+      "slab": 0.4
+    },
+    "data_dict": {
+      "bulk": {
+        "training_data": {
+          "systems": [
+            "./data/bulk/train"
+          ],
+          "batch_size": 4
+        },
+        "validation_data": {
+          "systems": [
+            "./data/bulk/valid"
+          ],
+          "batch_size": 4,
+          "numb_btch": 5
+        }
+      },
+      "slab": {
+        "training_data": {
+          "systems": [
+            "./data/slab/train"
+          ],
+          "batch_size": 1
+        },
+        "validation_data": {
+          "systems": [
+            "./data/slab/valid"
+          ],
+          "batch_size": 1,
+          "numb_btch": 5
+        }
+      }
+    },
+    "numb_steps": 200000,
+    "seed": 1,
+    "disp_file": "lcurve.out",
+    "disp_freq": 200,
+    "save_freq": 2000,
+    "gradient_max_norm": 5.0,
+    "_comment_clip": [
+      "Kept from example 04. The branches share a backbone here too, and a",
+      "near-degenerate descriptor coordinate can amplify one branch's gradient",
+      "enormously -- clipping is what stops a single step from wrecking weights",
+      "the other branch depends on."
+    ]
+  }
+}

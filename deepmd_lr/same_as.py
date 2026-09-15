@@ -1,0 +1,388 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
+"""``same_as``: several branches that are one model with different boundaries.
+
+The problem
+-----------
+A dataset that mixes bulk and slab systems cannot be trained as one model
+today, because the long-range term is welded in: ``slab_correction`` and
+``pbc`` are fixed at construction, so a model that handles a slab cannot
+handle a bulk frame.
+
+It does not have to be. **The long-range term holds no trainable weights** --
+neither :class:`~deepmd_lr.lr.term.LongRangeEnergy` nor
+:class:`~deepmd_lr.lr.term.IsolatedLongRangeEnergy` contributes a single
+``state_dict`` entry. One set of weights genuinely serves every boundary
+condition; only the sum over periodic images differs.
+
+So a branch can declare itself a copy of another, writing only what differs::
+
+    "model_dict": {
+      "bulk": { "type_map": "tm", "descriptor": {...}, "fitting_net": {...},
+                "long_range": {"charge_net": {...},
+                               "reciprocal": {"method": "pme", "alpha": 0.4}} },
+      "slab": { "same_as": "bulk",
+                "long_range": {"reciprocal": {"method": "pme", "alpha": 0.4,
+                                              "slab_correction": true,
+                                              "pbc": [true, true, false]}} }
+    }
+
+The invariant
+-------------
+    A ``same_as`` branch is the base branch's config **verbatim** except
+    ``long_range.reciprocal``, and at runtime it *is* the base model with a
+    different ``long_range_energy`` bolted on. There is exactly **one**
+    ``atomic_model`` and **one** ``charge_fitting`` per group.
+
+Everything here follows from that. Note in particular what it makes free:
+because there is literally one ``atomic_model`` object, the per-type energy
+offsets (``bias_atom_e``, ``out_bias``, ``out_std``) are one tensor, so
+"identical offsets across the group" is not something to arrange. What *is*
+left to arrange is that the single fit of those offsets sees the **union** of
+the group's frames, and that the post-training delta is applied once.
+
+Why not per-frame dispatch
+--------------------------
+The alternative was deciding the boundary treatment per frame. The physics
+side of that is nearly free -- ``pbc`` reaches exactly one call in
+``lr/term.py`` (``compute_slab_correction``), the reciprocal kernels never see
+it, and that kernel already takes per-system ``(B, 3)`` ``pbc`` and returns
+exactly zero for a non-slab frame with no host sync. What blocks it is the
+data layer: DeePMD-kit has no per-frame boundary channel (``nopbc`` is a
+per-*system* file read once at load), and registering one means patching the
+batch splitter itself. This keeps the plugin out of the data path.
+
+One caveat worth stating: the Yeh-Berkowitz correction is ``2 pi M_z^2 / V``,
+which is identically zero for a **non-polar** slab. If your slabs carry no
+dipole across the vacuum, one ordinary 3D branch already serves both and none
+of this is needed. It earns its keep for polar slabs -- a dipolar interface,
+an electrode under electrolyte -- where the correction is large and decays
+only as ``1/L_z``.
+
+How it is installed
+-------------------
+Three upstream symbols are wrapped, none edited, all from :mod:`deepmd_lr.register`
+which already runs on every ``deepmd.pt_expt`` import. Each wrapper is a
+straight pass-through when no ``same_as`` branch is present, so an ordinary
+run is byte-unchanged.
+"""
+
+from __future__ import annotations
+
+import copy
+from typing import Any
+
+__all__ = ["SAME_AS_KEY", "expand_same_as", "groups", "install", "pool"]
+
+#: The branch key that names the branch this one copies.
+SAME_AS_KEY = "same_as"
+
+#: What a ``same_as`` branch may write for itself. Everything else is
+#: inherited, and writing it would be discarded by the aliasing below -- so it
+#: is refused rather than silently ignored.
+_BRANCH_ALLOWED = frozenset({SAME_AS_KEY, "long_range", "model_branch_alias", "info"})
+
+#: What such a branch may write inside ``long_range``. `charge_net` is
+#: excluded deliberately: it is a parameter-bearing module and must be the
+#: same object across the group.
+_LONG_RANGE_ALLOWED = frozenset({"reciprocal", "pme"})
+
+
+def _real_keys(block: dict[str, Any]) -> set[str]:
+    """Keys that configure something, ignoring ``_comment`` annotations."""
+    return {key for key in block if not key.startswith("_")}
+
+
+def groups(model_dict: dict[str, Any]) -> dict[str, list[str]]:
+    """Map each base branch to its pseudo-head group, base first.
+
+    Branches with no ``same_as`` pointing at them do not appear at all, which
+    is what makes every hook below a no-op for an ordinary config.
+    """
+    found: dict[str, list[str]] = {}
+    for key, branch in model_dict.items():
+        if not isinstance(branch, dict):
+            continue
+        base = branch.get(SAME_AS_KEY)
+        if base:
+            found.setdefault(base, [base]).append(key)
+    return found
+
+
+def _alpha(block: dict[str, Any]) -> float:
+    """The Ewald splitting parameter a ``long_range`` block asks for."""
+    from deepmd_lr.lr.term import DEFAULT_ALPHA
+
+    settings = block.get("reciprocal", block.get("pme", {})) or {}
+    return float(settings.get("alpha", DEFAULT_ALPHA))
+
+
+def expand_same_as(model_config: dict[str, Any]) -> dict[str, Any]:
+    """Expand every ``same_as`` branch into a full config, in place.
+
+    Runs *after* DeePMD-kit's own ``preprocess_shared_params``, so the base it
+    copies has already had its ``shared_dict`` string references resolved. The
+    pseudo branch therefore never appears in ``shared_links`` -- which keeps
+    ``merge_env_stat`` from folding one branch's descriptor statistics into
+    the base twice, and keeps the ``shared_level > 0`` compile scan seeing only
+    genuine links. Nothing is lost: the aliasing in :func:`_alias_groups`
+    subsumes whatever sharing would have been recorded.
+    """
+    model_dict = model_config.get("model_dict")
+    if not isinstance(model_dict, dict):
+        return model_config
+
+    pending = {
+        key: branch
+        for key, branch in model_dict.items()
+        if isinstance(branch, dict) and branch.get(SAME_AS_KEY)
+    }
+    for key, branch in pending.items():
+        base_key = branch[SAME_AS_KEY]
+        base = _validated_base(model_dict, key, base_key, branch)
+
+        merged = copy.deepcopy(base)
+        # Branch-local metadata is never inherited. `model_branch_alias` must
+        # not be, because DeePMD-kit asserts aliases are unique across
+        # branches and `ase.load_model` resolves a head through them; `info`
+        # must not be, because an inherited "theory: RPBE" on the slab head
+        # would simply be a lie.
+        merged.pop("model_branch_alias", None)
+        merged.pop("info", None)
+        merged[SAME_AS_KEY] = base_key
+
+        long_range = copy.deepcopy(base.get("long_range") or {})
+        # Drop BOTH spellings before applying the branch's own, or an
+        # inherited `reciprocal` would survive alongside a branch-written
+        # legacy `pme` and the alias resolution would see two.
+        long_range.pop("reciprocal", None)
+        long_range.pop("pme", None)
+        long_range.update(branch.get("long_range") or {})
+        merged["long_range"] = long_range
+
+        for carried in ("model_branch_alias", "info"):
+            if carried in branch:
+                merged[carried] = copy.deepcopy(branch[carried])
+
+        model_dict[key] = merged
+    return model_config
+
+
+def _validated_base(
+    model_dict: dict[str, Any],
+    key: str,
+    base_key: str,
+    branch: dict[str, Any],
+) -> dict[str, Any]:
+    """Resolve ``base_key`` and refuse every way the group could diverge.
+
+    These checks are the whole safety story. A key that slipped through would
+    build a *different* model whose weights the aliasing then throws away --
+    training would run, converge, and be quietly meaningless.
+    """
+    if base_key == key:
+        raise ValueError(f"branch {key!r}: `{SAME_AS_KEY}` cannot point at itself")
+    if base_key not in model_dict:
+        raise ValueError(
+            f"branch {key!r}: `{SAME_AS_KEY}` names {base_key!r}, which is not "
+            f"a branch. Available: {sorted(model_dict)}"
+        )
+    base = model_dict[base_key]
+    if not isinstance(base, dict):
+        raise ValueError(f"branch {key!r}: {base_key!r} is not a model config")
+    if base.get(SAME_AS_KEY):
+        raise ValueError(
+            f"branch {key!r}: {base_key!r} is itself a `{SAME_AS_KEY}` branch. "
+            "Point every member of a group at the one branch that defines it "
+            "-- a chain would make it ambiguous which model is the original."
+        )
+    if base.get("type") != "dp_lr":
+        raise ValueError(
+            f"branch {key!r}: {base_key!r} has type {base.get('type')!r}, but "
+            f"`{SAME_AS_KEY}` exists to vary the long-range term and only "
+            "`dp_lr` has one."
+        )
+    if not base.get("long_range"):
+        raise ValueError(
+            f"branch {key!r}: {base_key!r} has no `long_range` block, so there "
+            "is nothing for this branch to differ in."
+        )
+
+    extra = _real_keys(branch) - _BRANCH_ALLOWED
+    if extra:
+        raise ValueError(
+            f"branch {key!r} declares `{SAME_AS_KEY}: {base_key}` but also sets "
+            f"{sorted(extra)}. A pseudo-head IS the base model -- those keys "
+            "would be built and then discarded when the modules are aliased. "
+            f"Set them on {base_key!r}, or drop `{SAME_AS_KEY}` and write the "
+            "branch out in full."
+        )
+
+    own_long_range = branch.get("long_range") or {}
+    extra = _real_keys(own_long_range) - _LONG_RANGE_ALLOWED
+    if extra:
+        detail = (
+            " `charge_net` holds trainable weights and must be the same module "
+            "object across the group, so it is inherited, never overridden."
+            if "charge_net" in extra
+            else ""
+        )
+        raise ValueError(
+            f"branch {key!r}: only {sorted(_LONG_RANGE_ALLOWED)} may be set "
+            f"under `long_range` in a `{SAME_AS_KEY}` branch, got "
+            f"{sorted(extra)}.{detail}"
+        )
+
+    base_alpha, branch_alpha = _alpha(base["long_range"]), _alpha(own_long_range)
+    if own_long_range and base_alpha != branch_alpha:
+        raise ValueError(
+            f"branch {key!r}: alpha is {branch_alpha} but {base_key!r} uses "
+            f"{base_alpha}. alpha is where Coulomb is split, and the one "
+            "shared descriptor can only learn the `erfc(alpha r)/r` remainder "
+            "of a single split."
+        )
+
+    if (base.get("fitting_net") or {}).get("dim_case_embd", 0):
+        raise ValueError(
+            f"branch {key!r}: `{SAME_AS_KEY}` is incompatible with "
+            "`fitting_net.dim_case_embd > 0`. A case embedding gives each "
+            "branch a different index in one `case_embd` buffer, which the "
+            "shared fitting net collapses to a single value -- the branches "
+            "would silently share an index. Drop the case embedding: these "
+            "branches are one model, which is what a case embedding exists to "
+            "deny."
+        )
+    return base
+
+
+# --------------------------------------------------------------------------
+# The three hooks.
+#
+# Order matters and is not free to change:
+#
+#   preprocess_config        upstream preprocess_shared_params, then expansion
+#   normalize_config         the `dp_lr` schema accepts `same_as`
+#   Trainer.__init__
+#     _POOLED filled from training_data
+#     get_model per branch                two independent models
+#     compute_or_load_stat                pooled samples  <- hook 3
+#     share_params x3                     upstream merge, then OUR ALIASING
+#     DDP wrap, optimizer                 see one deduped parameter set
+#   train loop                            one gradient, one update per step
+#   change_model_out_bias_by_task         base applies the delta once
+# --------------------------------------------------------------------------
+
+#: ``id(DeepmdDataSystem)`` -> the data systems of its group, base first. The
+#: values hold strong references, so an id here cannot be recycled onto a
+#: different object.
+_POOLED: dict[int, list[Any]] = {}
+
+
+def pool(data: Any, nbatches: int, sample: Any, **kwargs: Any) -> list:
+    """Sample a data system, or its whole group when it belongs to one.
+
+    Concatenating the per-system sample lists is indistinguishable from having
+    listed every system under one branch: ``compute_output_stats`` indexes that
+    list per system and feeds all of them into one global regression. So this
+    is the exact union least-squares, with per-frame weighting for free --
+    unlike averaging the per-branch biases, which is a different estimator and
+    plainly wrong for the delta fit, a regression on residuals.
+
+    A system that is in no group falls straight through, which is what makes
+    an ordinary run byte-unchanged.
+    """
+    group = _POOLED.get(id(data))
+    if group is None:
+        return sample(data, nbatches, **kwargs)
+    return [s for system in group for s in sample(system, nbatches, **kwargs)]
+
+
+def _alias_groups(wrapper: Any) -> None:
+    """Make every member of a group the same model but for its long-range term.
+
+    Two rebindings, not a per-submodule loop, and both choices are forced:
+
+    * ``BaseAtomicModel._store_out_stat`` ends by *binding a fresh array over*
+      ``out_bias`` rather than copying into it -- DeePMD-kit says as much where
+      it lists them as per-task buffers. So aliasing the buffers individually
+      is undone by the first ``change_out_bias``. Aliasing the object that
+      owns them is the only durable form.
+    * ``InvarFitting.share_params`` deliberately excludes ``bias_atom_e``, so
+      reusing it would leave each branch its own energy zero -- the opposite
+      of one model.
+    """
+    model_dict = (getattr(wrapper, "model_params", None) or {}).get("model_dict")
+    if not isinstance(model_dict, dict):
+        return
+    for base_key, members in groups(model_dict).items():
+        base = wrapper.model[base_key]
+        for key in members[1:]:
+            link = wrapper.model[key]
+            link.atomic_model = base.atomic_model
+            link.charge_fitting = base.charge_fitting
+            # A plain bool: assigning a Module here would register a submodule
+            # and recurse into the state dict.
+            link._same_as_link = True
+
+
+def install() -> None:
+    """Wrap the three upstream symbols. Idempotent."""
+    from deepmd.pt_expt.train import training as _training
+    from deepmd.pt_expt.train import wrapper as _wrapper
+    from deepmd.pt_expt.utils import multi_task as _multi_task
+
+    if getattr(_multi_task.preprocess_shared_params, "_deepmd_lr_patched", False):
+        return
+
+    _orig_preprocess = _multi_task.preprocess_shared_params
+
+    def preprocess_shared_params(model_config: dict[str, Any]) -> tuple:
+        model_config, shared_links = _orig_preprocess(model_config)
+        expand_same_as(model_config)
+        return model_config, shared_links
+
+    preprocess_shared_params._deepmd_lr_patched = True
+    preprocess_shared_params.__doc__ = _orig_preprocess.__doc__
+    _multi_task.preprocess_shared_params = preprocess_shared_params
+
+    _orig_share = _wrapper.ModelWrapper.share_params
+
+    def share_params(self: Any, *args: Any, **kwargs: Any) -> None:
+        _orig_share(self, *args, **kwargs)
+        _alias_groups(self)
+
+    share_params.__doc__ = _orig_share.__doc__
+    _wrapper.ModelWrapper.share_params = share_params
+
+    # `make_stat_input` is imported into training.py's namespace and called
+    # through the module global, so this is the name that takes effect. The
+    # sampler closures are built and consumed inside `Trainer.__init__` with
+    # no seam between them, which is why the pooling has to happen here rather
+    # than at a call site.
+    _orig_stat_input = _training.make_stat_input
+
+    def make_stat_input(data: Any, nbatches: int, **kwargs: Any) -> list:
+        return pool(data, nbatches, _orig_stat_input, **kwargs)
+
+    make_stat_input.__doc__ = _orig_stat_input.__doc__
+    _training.make_stat_input = make_stat_input
+
+    _orig_init = _training.Trainer.__init__
+
+    def __init__(
+        self: Any, config: Any, training_data: Any, *args: Any, **kwargs: Any
+    ) -> None:
+        _POOLED.clear()
+        model_dict = (config.get("model") or {}).get("model_dict")
+        if isinstance(model_dict, dict) and isinstance(training_data, dict):
+            for members in groups(model_dict).values():
+                # Base first: `compute_output_stats` filters the keys it was
+                # asked for against `sampled[0].keys()`.
+                systems = [
+                    training_data[key] for key in members if key in training_data
+                ]
+                for system in systems:
+                    _POOLED[id(system)] = systems
+        _orig_init(self, config, training_data, *args, **kwargs)
+
+    __init__.__doc__ = _orig_init.__doc__
+    _training.Trainer.__init__ = __init__
