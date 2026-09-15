@@ -123,6 +123,9 @@ class Thermo:
         self.columns = tuple(columns)
         self.every = int(every)
         self.rows: list[tuple] = []
+        #: Column order of `rows`, fixed by the first `log` call --
+        #: built-ins followed by whatever extras that call passed.
+        self.row_names: tuple[str, ...] = ()
 
         # --- state this object owns -------------------------------------
         # Allocated here, so contiguous by construction. That matters: warp's
@@ -164,12 +167,15 @@ class Thermo:
         # --- scratch, allocated once ------------------------------------
         self._ke_w = self.zeros(1)
         self._temp_w = self.zeros(1)
-        self._volume_w = self.scalar(evaluator.volume)
+        #: Volume as a device array, for kernels that take one.
+        self.volume_w = self.scalar(evaluator.volume)
         self._momentum = self.zeros(1, dtype=wp.vec3d)
         self._total_mass = self.zeros(1)
         self._com = self.zeros(1, dtype=wp.vec3d)
-        self._virial_w = None       # vec9d, built lazily -- see update_pressure
-        self._press_w = None
+        #: Pressure tensor as a device array (vec9d), built on first use
+        #: by `update_pressure` -- see the lazy import there.
+        self.press_w = None
+        self._virial_w = None
         self._kin_w = None
 
         self.energy = float("nan")
@@ -232,7 +238,7 @@ class Thermo:
         if cell is not None:
             self.cell.assign(np.asarray(cell, dtype=np.float64).reshape(1, 3, 3))
         self.evaluator.set_cell(self.cell.numpy()[0])
-        self._volume_w.fill_(self.evaluator.volume)
+        self.volume_w.fill_(self.evaluator.volume)
 
     # --- measurements ------------------------------------------------------
 
@@ -283,7 +289,7 @@ class Thermo:
         before feeding one, in the direction where an error is silent.
         """
         self.update_pressure()
-        p = self._press_w.numpy()[0]
+        p = self.press_w.numpy()[0]
         return float(p[0] + p[4] + p[8]) / 3.0
 
     def update_pressure(self) -> None:
@@ -306,16 +312,16 @@ class Thermo:
                 "no virial available; build the evaluator with "
                 "compute_virial=True and call evaluate() first."
             )
-        if self._press_w is None:
+        if self.press_w is None:
             self._virial_w = wp.zeros(1, dtype=vec9d, device=self.device)
-            self._press_w = wp.zeros(1, dtype=vec9d, device=self.device)
+            self.press_w = wp.zeros(1, dtype=vec9d, device=self.device)
             self._kin_w = wp.zeros((1, 9), dtype=wp.float64, device=self.device)
         self._virial_w.assign(
             np.asarray(self.evaluator.virial, dtype=np.float64).reshape(1, 9)
         )
         compute_pressure_tensor(
             self.velocities, self.masses, self._virial_w, self.cell,
-            self._kin_w, self._press_w, self._volume_w,
+            self._kin_w, self.press_w, self.volume_w,
         )
 
     def update_kinetic_energy(self) -> None:
@@ -403,6 +409,13 @@ class Thermo:
         rarely as the analysis allows.
         """
         names = (*self.columns, *extra)
+        if not self.row_names:
+            self.row_names = names
+        elif names != self.row_names:
+            raise ValueError(
+                f"log() called with columns {names}, but the first call fixed "
+                f"{self.row_names}. The rows are a table; keep them aligned."
+            )
         if not self._header_written:
             def _head(n: str) -> str:
                 unit = BUILTIN_COLUMNS.get(n)
@@ -432,16 +445,20 @@ class Thermo:
     def drift(self, column: str = "etot", per_atom: bool = True) -> float:
         """Least-squares drift in a logged column, in meV/atom/ps.
 
+        Works on anything logged, including a keyword extra -- a Nose-Hoover
+        invariant is exactly the quantity worth fitting, and it is the
+        caller's to compute.
+
         The reason this is here rather than in a caller: the unit chain --
         eV and fs in, meV per atom per ps out -- is easy to get wrong, and it
         is the headline number of an NVE conservation check.
         """
-        if column not in self.columns:
-            raise KeyError(f"{column!r} is not a logged column: {self.columns}")
-        i = self.columns.index(column)
-        j = self.columns.index("time") if "time" in self.columns else None
-        if j is None:
+        names = self.row_names or self.columns
+        if column not in names:
+            raise KeyError(f"{column!r} is not a logged column: {names}")
+        if "time" not in names:
             raise KeyError("drift needs a 'time' column")
+        i, j = names.index(column), names.index("time")
         t = np.array([r[j] for r in self.rows]) / 1000.0        # ps
         y = np.array([r[i] for r in self.rows]) * 1000.0        # meV
         if per_atom:

@@ -42,16 +42,32 @@ treated as a molecule in vacuum.
 | [`05_npt_mtk.py`](05_npt_mtk.py) | NPT | MTK, isotropic | equilibrating density; needs the virial |
 | [`06_nvt_efield.py`](06_nvt_efield.py) | NVT | Langevin | response to an external electric field |
 
-`common.py` holds the shared setup: warp interop, units, the water box, the
-evaluator, and a small reporter.
+There is no `common.py`: the shared setup now lives in the package itself, so
+these scripts demonstrate the API you would actually use rather than a helper
+file sitting beside them.
 
-It uses nvalchemiops' own utilities rather than reimplementing them —
-`initialize_velocities` for the Maxwell–Boltzmann draw (centre-of-mass motion
-removed on the GPU, verified to 1e-14) and `compute_kinetic_energy` /
-`compute_temperature` for the reporting. Note `compute_temperature` returns
-`k_B T` in energy units like everything else there, and already divides by
-`3N − 3` rather than `3N` — it assumes the COM motion was removed, which
-`initialize_velocities` does. Both conventions were checked against the
+```python
+from deepmd_lr.nvalchemi import Thermo, build_evaluator, read_structure
+
+atoms = read_structure("water_192.xyz")
+ev = build_evaluator("model.ckpt.pt", atoms)
+th = Thermo(ev, atoms.get_positions(), timestep=0.5, temperature=300.0)
+```
+
+`Thermo` **owns the state** the integrator kernels mutate — `th.positions`,
+`th.velocities`, `th.forces`, `th.masses`, `th.cell`, `th.dt` are warp arrays,
+bound once — and reports the thermodynamics, which nvalchemiops does not do at
+all. It deliberately does *not* own the ensemble: thermostat chains and
+barostat masses stay in these scripts, which is what lets one class serve all
+six.
+
+Under the hood it calls nvalchemiops' own utilities rather than reimplementing
+them — `initialize_velocities` for the Maxwell–Boltzmann draw (COM motion
+removed on the GPU, verified to 1e-14), `compute_kinetic_energy` /
+`compute_temperature` for the measurements, `compute_pressure_tensor` for the
+pressure. `compute_temperature` returns `k_B T` in energy units and already
+divides by `3N − 3` rather than `3N`, assuming the COM motion was removed,
+which `initialize_velocities` does. Both conventions were checked against the
 kernel's output rather than assumed.
 
 ## Units, and the one that bites
@@ -63,8 +79,14 @@ consistent — no conversion factors appear in any loop.
 dynamics entry point takes it that way, which is the *opposite* of the heavy
 `nvalchemi-toolkit`, whose thermostats took kelvin. Pass kelvin where `kT` is
 expected and you thermostat to ~11,600× the temperature you meant; pass `kT`
-where kelvin is expected and you get a system at rest. `common.kt(300.0)` does
-the conversion.
+where kelvin is expected and you get a system at rest.
+
+The defence is structural rather than a helper function: `Thermo` takes
+`temperature` in **kelvin** and builds `th.kT` itself, so no script has any
+reason to write the conversion. Hand a kernel `th.kT` and it is right by
+construction. `th.temperature` reads back in kelvin — a different name, a
+different type, a different role, so the two cannot be swapped at a call
+site.
 
 Time is the other one. One ASE time unit is **10.181 fs**, and `friction` is in
 *inverse* ASE time units, so the relaxation time is `1/friction` of those:
@@ -88,7 +110,8 @@ Found by running into them:
   every call and each kernel applies its own convention.
 - **The tensor kernels want a flat `vec9` layout**, and `kinetic_tensors` is
   2-D `(B, 9)`. Only `cells` is `mat33`. `vec9d` comes from nvalchemiops, not
-  from warp — `wp.vec9d` does not exist.
+  from warp — `wp.vec9d` does not exist. `Thermo.update_pressure` owns this
+  mess so no script has to.
 
 The NHC chain update is also called once at **each end** of the step, not once
 per step.
@@ -117,16 +140,20 @@ conservation check**, which is why `01` exists.
 ## NPT moves the cell, and the evaluator has to be told
 
 `DistributedEvaluator` takes the cell at construction, because the spatial
-partitioning is built against it. NPT moves the cell every step, so `05` pushes
-it back in and invalidates the partitioning:
+partitioning is built against it. NPT moves the cell every step, so `05` hands
+it back after the barostat has run:
 
 ```python
-ev.cell = new_cell
-ev._partitions = None      # force a repartition against it
+npt_cell_update(th.cell, cell_v, th.dt)
+th.set_cell()              # device cell -> evaluator, repartition, new volume
 ```
 
-That re-runs `partition_system` only. **Do not rebuild the evaluator** — that
-deepcopies the model onto every device.
+This is **correctness, not caching**. The Verlet criterion that decides when to
+rebuild watches *atom displacement only* and cannot see the cell move, so a
+stale halo puts ghost images at the wrong offsets and the forces are quietly
+wrong with nothing raising. `set_cell` therefore invalidates unconditionally.
+It re-runs `partition_system` only — **do not rebuild the evaluator**, which
+would deepcopy the model onto every device.
 
 NPT also needs `compute_virial=True`, since the barostat is driven by the
 pressure tensor. That costs essentially nothing: DeePMD-kit's lower graph

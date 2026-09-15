@@ -910,6 +910,22 @@ the serial tensor to 5e-16 at 1, 2 and 4 partitions.
 `DistributedEvaluator` evaluates the model over spatial partitions — one per
 GPU:
 
+`Thermo` is the other half an MD loop needs — it owns the state those kernels
+mutate (positions, velocities, masses, forces, cell, timestep, each a warp
+array bound once) and reports the thermodynamics, which nvalchemiops does not
+do at all. It takes `temperature` in kelvin and builds the `k_B T` array
+itself, so nothing downstream has a reason to write that conversion.
+`examples/05-md_nvalchemi` has a loop per ensemble.
+
+```python
+from deepmd_lr.nvalchemi import Thermo, build_evaluator, read_structure
+
+atoms = read_structure("start.xyz")
+ev = build_evaluator("model.ckpt.pt", atoms, compute_virial=True)
+th = Thermo(ev, atoms.get_positions(), timestep=0.5, temperature=300.0,
+            columns=("step", "time", "temp", "press", "vol"))
+```
+
 ```python
 from deepmd_lr.nvalchemi import DistributedEvaluator
 

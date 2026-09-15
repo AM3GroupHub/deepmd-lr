@@ -26,6 +26,10 @@ from deepmd_lr.nvalchemi.partition import (
     Partition,
     partition_system,
 )
+from deepmd_lr.nvalchemi.setup import (
+    build_evaluator,
+    read_structure,
+)
 from deepmd_lr.nvalchemi.thermo import (
     Thermo,
 )
@@ -35,8 +39,10 @@ __all__ = [
     "Thermo",
     "Partition",
     "atomic_masses",
+    "build_evaluator",
     "device_replicas",
     "evaluate_partitioned",
     "partition_graph",
     "partition_system",
+    "read_structure",
 ]

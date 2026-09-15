@@ -181,7 +181,27 @@ class TestSetupAndLog:
         row = th.log(0)
         assert set(row) == set(th.columns)
         assert len(th.rows) == 1
-        assert th.log(1, custom=2.5)["custom"] == 2.5
+
+    def test_extras_are_first_class(self):
+        """A caller-computed quantity -- a Nose-Hoover invariant, a field
+        alignment -- is logged, returned, and fittable by `drift`."""
+        ev, pos = setup()
+        th = Thermo(ev, pos, temperature=300.0, every=10**9)
+        th.evaluate()
+        assert th.log(0, custom=2.5)["custom"] == 2.5
+        assert th.log(1, custom=3.5)["custom"] == 3.5
+        assert "custom" in th.row_names
+        assert th.drift("custom") != 0.0
+
+    def test_changing_the_column_set_midway_is_refused(self):
+        """The rows are a table. Silently ragged rows would corrupt every
+        `drift` and any analysis downstream of `th.rows`."""
+        ev, pos = setup()
+        th = Thermo(ev, pos, temperature=300.0, every=10**9)
+        th.evaluate()
+        th.log(0, custom=1.0)
+        with pytest.raises(ValueError, match="first call fixed"):
+            th.log(1)
 
     def test_drift_is_mev_per_atom_per_ps(self):
         ev, pos = setup()

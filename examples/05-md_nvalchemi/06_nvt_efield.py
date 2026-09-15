@@ -25,34 +25,23 @@ The net force is `Q.E`, exactly zero for a neutral cell, so nothing drifts.
 import argparse
 
 import numpy as np
-import torch
-import warp as wp
-from ase.units import fs
-from common import (
-    Reporter,
-    Thermo,
-    build_evaluator,
-    kt,
-    maxwell_boltzmann,
-    read_structure,
-    scalar,
-    vec,
-)
 from nvalchemiops.dynamics.integrators import (
     langevin_baoab_finalize,
     langevin_baoab_half_step,
 )
 
+from deepmd_lr.nvalchemi import Thermo, build_evaluator, read_structure
 
-def alignment(x, symbols, cell) -> float:
+
+def alignment(atoms) -> float:
     """Mean projection of each molecule's HOH bisector on +x.
 
     0 for an isotropic liquid, 1 for perfect alignment -- the observable a
-    field run is actually for.
+    field run is for. Minimum image assumes an orthorhombic cell.
     """
-    p = x.detach().cpu().numpy()
-    L = np.diag(np.asarray(cell))   # orthorhombic minimum image
-    sym = np.array(symbols)
+    p = atoms.get_positions()
+    L = np.diag(np.asarray(atoms.get_cell()))
+    sym = np.array(atoms.get_chemical_symbols())
     oxy = np.where(sym == "O")[0]
     hyd = np.where(sym == "H")[0]
     d = p[hyd][:, None, :] - p[oxy][None, :, :]
@@ -72,52 +61,39 @@ def main():
     ap.add_argument("--steps", type=int, default=1000)
     ap.add_argument("--dt", type=float, default=0.5, help="fs")
     ap.add_argument("--temperature", type=float, default=300.0, help="K")
-    ap.add_argument("--efield", type=float, default=0.5,
-                    help="V/angstrom, along x")
+    ap.add_argument("--efield", type=float, default=0.5, help="V/angstrom, along x")
     ap.add_argument("--friction", type=float, default=0.5,
                     help="raise this with the field; see the module docstring")
-    ap.add_argument("--structure", default="water_192.xyz",
-                    help="anything ase.io.read understands; needs a cell")
-    ap.add_argument("--index", type=int, default=-1,
-                    help="frame to take from a multi-frame file")
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--structure", default="water_192.xyz")
+    ap.add_argument("--index", type=int, default=-1)
     a = ap.parse_args()
 
-    pos, symbols, cell = read_structure(a.structure, a.index)
-    ev, masses = build_evaluator(a.model, symbols, cell,
-                                 efield=[a.efield, 0.0, 0.0])
-    dev = str(ev.home)
-    n = len(pos)
+    atoms = read_structure(a.structure, a.index)
+    ev = build_evaluator(a.model, atoms, efield=[a.efield, 0.0, 0.0])
+    th = Thermo(
+        ev, atoms.get_positions(), timestep=a.dt, temperature=a.temperature,
+        columns=("step", "time", "temp", "epot"),
+        every=max(a.steps // 10, 1),
+    )
+    friction = th.scalar(a.friction)
 
-    x = torch.tensor(pos, dtype=torch.float64, device=dev)
-    v = maxwell_boltzmann(masses, a.temperature, device=dev)
-    m = torch.tensor(masses, dtype=torch.float64, device=dev)
-
-    wx, wv, wm = vec(x), vec(v), wp.from_torch(m)
-    thermo = Thermo(n, dev)
-    wdt = scalar(a.dt * fs, dev)
-    wkT = scalar(kt(a.temperature), dev)
-    wfric = scalar(a.friction, dev)
-
-    energy, f = ev(x)
-    wf = vec(f)
-
-    print(f"NVT + field  {n} atoms  E_x {a.efield} V/A  T {a.temperature} K  "
-          f"friction {a.friction}")
-    log = Reporter("T_K", "E_pot", "cos_x", "maxZ", every=max(a.steps // 10, 1))
+    th.evaluate()
+    print(f"NVT + field  {th.n_atoms} atoms  E_x {a.efield} V/A  "
+          f"T {a.temperature} K  friction {a.friction}")
     for step in range(a.steps + 1):
         Z = ev.results["born_charge"]
-        log(step, step * a.dt, T_K=thermo.kelvin(wv, wm), E_pot=energy,
-            cos_x=alignment(x, symbols, cell), maxZ=float(np.abs(Z).max()))
+        th.log(step, cos_x=alignment(th.atoms()), maxZ=float(np.abs(Z).max()))
         if step == a.steps:
             break
-        langevin_baoab_half_step(wx, wv, wf, wm, wdt, wkT, wfric, a.seed + step)
-        energy, f = ev(x)
-        wf = vec(f)
-        langevin_baoab_finalize(wv, wf, wm, wdt)
+        langevin_baoab_half_step(th.positions, th.velocities, th.forces,
+                                 th.masses, th.dt, th.kT, friction,
+                                 a.seed + step)
+        th.evaluate()
+        langevin_baoab_finalize(th.velocities, th.forces, th.masses, th.dt)
 
-    half = len(log.rows) // 2
-    rows = log.rows[half:]
+    half = len(th.rows) // 2
+    rows = th.rows[half:]
     print(f"\n  second half: <cos_x> {sum(r[4] for r in rows)/len(rows):+.4f}, "
           f"T {sum(r[2] for r in rows)/len(rows):.1f} K")
     net = np.abs(ev.results["field_force"].sum(axis=0)).max()

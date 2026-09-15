@@ -21,19 +21,8 @@ Three API details that are not guessable from the signatures:
 import argparse
 
 import numpy as np
-import torch
 import warp as wp
 from ase.units import fs
-from common import (
-    Reporter,
-    Thermo,
-    build_evaluator,
-    kt,
-    maxwell_boltzmann,
-    read_structure,
-    scalar,
-    vec,
-)
 from nvalchemiops.dynamics.integrators import (
     nhc_compute_chain_energy,
     nhc_compute_masses,
@@ -41,6 +30,8 @@ from nvalchemiops.dynamics.integrators import (
     nhc_thermostat_chain_update,
     nhc_velocity_half_step,
 )
+
+from deepmd_lr.nvalchemi import Thermo, build_evaluator, read_structure
 
 
 def main():
@@ -54,89 +45,75 @@ def main():
     ap.add_argument("--chain-length", type=int, default=3)
     ap.add_argument("--nloops", type=int, default=3,
                     help="Yoshida-Suzuki sub-steps")
-    ap.add_argument("--structure", default="water_192.xyz",
-                    help="anything ase.io.read understands; needs a cell")
-    ap.add_argument("--index", type=int, default=-1,
-                    help="frame to take from a multi-frame file")
+    ap.add_argument("--structure", default="water_192.xyz")
+    ap.add_argument("--index", type=int, default=-1)
     a = ap.parse_args()
 
-    pos, symbols, cell = read_structure(a.structure, a.index)
-    ev, masses = build_evaluator(a.model, symbols, cell)
-    dev = str(ev.home)
-    n = len(pos)
+    atoms = read_structure(a.structure, a.index)
+    ev = build_evaluator(a.model, atoms)
+    th = Thermo(
+        ev, atoms.get_positions(), timestep=a.dt, temperature=a.temperature,
+        columns=("step", "time", "temp", "epot", "ekin"),
+        every=max(a.steps // 10, 1),
+    )
 
-    x = torch.tensor(pos, dtype=torch.float64, device=dev)
-    v = maxwell_boltzmann(masses, a.temperature, device=dev)
-    m = torch.tensor(masses, dtype=torch.float64, device=dev)
-    ndof = 3 * n - 3
-
-    wx, wv, wm = vec(x), vec(v), wp.from_torch(m)
-    thermo = Thermo(n, dev)
-    wdt = scalar(a.dt * fs, dev)
-    wkT = scalar(kt(a.temperature), dev)
-
-    # The dtype split: int32 to build the masses, float64 to propagate.
-    ndof_i32 = wp.array(np.array([ndof]), dtype=wp.int32, device=dev)
-    ndof_f64 = scalar(float(ndof), dev)
+    # The dtype split: int32 to build the chain masses, float64 to propagate.
+    # It is a Warp launch error, not a cast, so both forms are needed.
+    ndof = 3 * th.n_atoms - 3
+    ndof_i32 = wp.array(np.array([ndof]), dtype=wp.int32, device=th.device)
+    ndof_f64 = th.scalar(float(ndof))
 
     L = a.chain_length
-    eta = wp.zeros(L, dtype=wp.float64, device=dev)
-    eta_dot = wp.zeros(L, dtype=wp.float64, device=dev)
-    eta_mass = wp.zeros(L, dtype=wp.float64, device=dev)
-    nhc_compute_masses(ndof_i32, wkT, scalar(a.tau * fs, dev), L, eta_mass)
+    eta = th.zeros(L)
+    eta_dot = th.zeros(L)
+    eta_mass = th.zeros(L)
+    nhc_compute_masses(ndof_i32, th.kT, th.scalar(a.tau * fs), L, eta_mass)
 
     # Scratch the chain update needs; total_scale must start at one.
-    ke2 = wp.zeros(1, dtype=wp.float64, device=dev)
-    total_scale = scalar(1.0, dev)
-    step_scale = wp.zeros(1, dtype=wp.float64, device=dev)
-    dt_chain = wp.zeros(1, dtype=wp.float64, device=dev)
-    ke_chain = wp.zeros(1, dtype=wp.float64, device=dev)
-    pe_chain = wp.zeros(1, dtype=wp.float64, device=dev)
+    ke2 = th.zeros(1)
+    total_scale = th.scalar(1.0)
+    step_scale = th.zeros(1)
+    dt_chain = th.zeros(1)
+    ke_chain = th.zeros(1)
+    pe_chain = th.zeros(1)
 
     def chain():
         total_scale.fill_(1.0)
         nhc_thermostat_chain_update(
-            wv, wm, eta, eta_dot, eta_mass, wkT, wdt, ndof_f64, ke2,
-            total_scale, step_scale, dt_chain, nloops=a.nloops,
+            th.velocities, th.masses, eta, eta_dot, eta_mass, th.kT, th.dt,
+            ndof_f64, ke2, total_scale, step_scale, dt_chain, nloops=a.nloops,
         )
 
-    def invariant(e_pot: float, e_kin: float) -> float:
+    def invariant():
         """The MTK conserved quantity: physical energy plus the chain's own.
 
         The physical total is NOT conserved -- the thermostat moves it on
         purpose. This is what to watch instead.
         """
-        nhc_compute_chain_energy(eta, eta_dot, eta_mass, wkT, ndof_f64,
+        nhc_compute_chain_energy(eta, eta_dot, eta_mass, th.kT, ndof_f64,
                                  ke_chain, pe_chain)
-        return e_pot + e_kin + float(ke_chain.numpy()[0]) + float(pe_chain.numpy()[0])
+        return (th.total_energy + float(ke_chain.numpy()[0])
+                + float(pe_chain.numpy()[0]))
 
-    energy, f = ev(x)
-    wf = vec(f)
-
-    print(f"Nose-Hoover chain  {n} atoms  dt {a.dt} fs  T {a.temperature} K  "
-          f"tau {a.tau} fs  chain {L}  nloops {a.nloops}")
-    log = Reporter("T_K", "E_pot", "E_kin", "invariant",
-                   every=max(a.steps // 10, 1))
+    th.evaluate()
+    print(f"Nose-Hoover chain  {th.n_atoms} atoms  dt {a.dt} fs  "
+          f"T {a.temperature} K  tau {a.tau} fs  chain {L}  nloops {a.nloops}")
     for step in range(a.steps + 1):
-        ke = thermo.kinetic_energy(wv, wm)
-        log(step, step * a.dt, T_K=thermo.kelvin(wv, wm), E_pot=energy,
-            E_kin=ke, invariant=invariant(energy, ke))
+        th.log(step, invariant=invariant())
         if step == a.steps:
             break
-        chain()                                   # first half of the step
-        nhc_velocity_half_step(wv, wf, wm, wdt)   # applies its own 1/2
-        nhc_position_update(wx, wv, wdt)          # full dt, no internal 1/2
-        energy, f = ev(x)
-        wf = vec(f)
-        nhc_velocity_half_step(wv, wf, wm, wdt)
-        chain()                                   # second half
+        chain()                                              # first half
+        nhc_velocity_half_step(th.velocities, th.forces, th.masses, th.dt)
+        nhc_position_update(th.positions, th.velocities, th.dt)
+        th.evaluate()
+        nhc_velocity_half_step(th.velocities, th.forces, th.masses, th.dt)
+        chain()                                              # second half
 
-    half = len(log.rows) // 2
-    mean_T = sum(r[2] for r in log.rows[half:]) / max(len(log.rows) - half, 1)
-    print(f"\n  mean T over the second half: {mean_T:.1f} K "
-          f"(target {a.temperature})")
-    print(f"  invariant drift {log.drift('invariant', per_atom=n):+.4f} "
-          f"meV/atom/ps")
+    half = len(th.rows) // 2
+    rows = th.rows[half:]
+    print(f"\n  mean T over the second half: "
+          f"{sum(r[2] for r in rows)/len(rows):.1f} K (target {a.temperature})")
+    print(f"  invariant drift {th.drift('invariant'):+.4f} meV/atom/ps")
     print("  Watch the invariant, not E_pot+E_kin. Note it drifts a few")
     print("  meV/atom/ps at strong coupling INDEPENDENTLY of dt -- so that")
     print("  drift is not integration error. Weak coupling is the safe regime,")

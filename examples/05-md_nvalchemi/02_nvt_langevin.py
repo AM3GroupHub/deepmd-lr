@@ -20,23 +20,12 @@ into heat faster than a weak thermostat removes it.
 
 import argparse
 
-import torch
-import warp as wp
-from ase.units import fs
-from common import (
-    Reporter,
-    Thermo,
-    build_evaluator,
-    kt,
-    maxwell_boltzmann,
-    read_structure,
-    scalar,
-    vec,
-)
 from nvalchemiops.dynamics.integrators import (
     langevin_baoab_finalize,
     langevin_baoab_half_step,
 )
+
+from deepmd_lr.nvalchemi import Thermo, build_evaluator, read_structure
 
 
 def main():
@@ -46,54 +35,40 @@ def main():
     ap.add_argument("--dt", type=float, default=0.5, help="fs")
     ap.add_argument("--temperature", type=float, default=300.0, help="K")
     ap.add_argument("--friction", type=float, default=0.1,
-                    help="inverse ASE time units")
-    ap.add_argument("--structure", default="water_192.xyz",
-                    help="anything ase.io.read understands; needs a cell")
-    ap.add_argument("--index", type=int, default=-1,
-                    help="frame to take from a multi-frame file")
+                    help="inverse ASE time units; 1/friction is the relaxation time")
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--structure", default="water_192.xyz")
+    ap.add_argument("--index", type=int, default=-1)
     a = ap.parse_args()
 
-    pos, symbols, cell = read_structure(a.structure, a.index)
-    ev, masses = build_evaluator(a.model, symbols, cell)
-    dev = str(ev.home)
-    n = len(pos)
+    atoms = read_structure(a.structure, a.index)
+    ev = build_evaluator(a.model, atoms)
+    th = Thermo(
+        ev, atoms.get_positions(), timestep=a.dt, temperature=a.temperature,
+        columns=("step", "time", "temp", "epot", "ekin"),
+        every=max(a.steps // 10, 1),
+    )
+    friction = th.scalar(a.friction)
 
-    x = torch.tensor(pos, dtype=torch.float64, device=dev)
-    v = maxwell_boltzmann(masses, a.temperature, device=dev)
-    m = torch.tensor(masses, dtype=torch.float64, device=dev)
-
-    wx, wv, wm = vec(x), vec(v), wp.from_torch(m)
-    thermo = Thermo(n, dev)
-    wdt = scalar(a.dt * fs, dev)
-    # k_B T in eV, NOT kelvin. See common.kt.
-    wkT = scalar(kt(a.temperature), dev)
-    wfric = scalar(a.friction, dev)
-
-    energy, f = ev(x)
-    wf = vec(f)
-
-    print(f"Langevin (BAOAB)  {n} atoms  dt {a.dt} fs  T {a.temperature} K  "
-          f"friction {a.friction}")
-    log = Reporter("T_K", "E_pot", "E_kin", every=max(a.steps // 10, 1))
+    print(f"Langevin (BAOAB)  {th.n_atoms} atoms  dt {a.dt} fs  "
+          f"T {a.temperature} K  friction {a.friction}")
+    th.evaluate()
     for step in range(a.steps + 1):
-        ke = thermo.kinetic_energy(wv, wm)
-        log(step, step * a.dt, T_K=thermo.kelvin(wv, wm), E_pot=energy, E_kin=ke)
+        th.log(step)
         if step == a.steps:
             break
         # B-A-O-A: half-kick, half-drift, thermostat, half-drift -- one kernel.
         # The seed advances per step so the noise is not repeated.
-        langevin_baoab_half_step(wx, wv, wf, wm, wdt, wkT, wfric,
+        langevin_baoab_half_step(th.positions, th.velocities, th.forces,
+                                 th.masses, th.dt, th.kT, friction,
                                  a.seed + step)
-        energy, f = ev(x)
-        wf = vec(f)
+        th.evaluate()
         # The final B: half-kick with the new forces.
-        langevin_baoab_finalize(wv, wf, wm, wdt)
-
-    half = len(log.rows) // 2
-    mean_T = sum(r[2] for r in log.rows[half:]) / max(len(log.rows) - half, 1)
-    print(f"\n  mean T over the second half: {mean_T:.1f} K "
-          f"(target {a.temperature})")
+        langevin_baoab_finalize(th.velocities, th.forces, th.masses, th.dt)
+    half = len(th.rows) // 2
+    rows = th.rows[half:]
+    print(f"\n  mean T over the second half: "
+          f"{sum(r[2] for r in rows)/len(rows):.1f} K (target {a.temperature})")
     print("  There is no conserved quantity here -- the thermostat exchanges")
     print("  energy with a bath on purpose. Judge it by the temperature.")
 
