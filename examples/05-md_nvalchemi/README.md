@@ -199,6 +199,36 @@ ev, masses = build_evaluator(model, symbols, cell,
 Worth it above a few thousand atoms per card and not below — see the
 [main README](../../README.md#limits) for the measured scaling.
 
+## Throughput
+
+Every script ends with a throughput line:
+
+```
+  192 atoms, dt 0.5 fs: 32.7 ms/step -> 1.320 ns/day
+```
+
+`ns/day` scales with the timestep, so it is a statement about *this run's* `dt`
+and not about the model alone — at 1 fs the same model doubles it.
+
+The first logged interval is excluded, because it carries kernel compilation:
+~1 s against a ~30 ms step here. Fitting through that point is not enough — a
+least-squares slope over all points still lands 2× high — so it is dropped
+outright, as the benchmarks in `experiments/` do.
+
+It measures the loop as it actually ran, `log` included. Logging every step
+means a device synchronisation every step, and any analysis you pass as a
+keyword runs every step too. Measured on this machine, 192 atoms at 0.5 fs:
+
+| | ms/step | ns/day |
+|---|---:|---:|
+| NVE, NVT (all three thermostats) | 32.7–33.8 | ~1.29 |
+| NPT | 38.3 | 1.13 |
+| NVT + field | 44.9 | 0.96 |
+
+NPT pays for repartitioning every step as the cell moves; the field pays for
+the extra backward pass Born charges need. Both match the costs measured in
+the main README's benchmarks.
+
 ## What these runs are not
 
 The defaults are sized to finish in a minute or two, not to converge anything.

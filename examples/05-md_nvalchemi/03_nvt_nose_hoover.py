@@ -111,7 +111,8 @@ def main():
 
     half = len(th.rows) // 2
     rows = th.rows[half:]
-    print(f"\n  mean T over the second half: "
+    print(f"\n  {th.performance()}")
+    print(f"  mean T over the second half: "
           f"{sum(r[2] for r in rows)/len(rows):.1f} K (target {a.temperature})")
     print(f"  invariant drift {th.drift('invariant'):+.4f} meV/atom/ps")
     print("  Watch the invariant, not E_pot+E_kin. Note it drifts a few")

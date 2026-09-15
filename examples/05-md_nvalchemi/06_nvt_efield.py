@@ -33,23 +33,21 @@ from nvalchemiops.dynamics.integrators import (
 from deepmd_lr.nvalchemi import Thermo, build_evaluator, read_structure
 
 
-def alignment(atoms) -> float:
+def alignment(p, oxy, hyd, L) -> float:
     """Mean projection of each molecule's HOH bisector on +x.
 
     0 for an isotropic liquid, 1 for perfect alignment -- the observable a
     field run is for. Minimum image assumes an orthorhombic cell.
+
+    Takes raw positions rather than an ASE `Atoms`, and sums with `add.at`
+    rather than a per-molecule loop: this runs every step, and built the
+    long way it cost more than the MD it was measuring.
     """
-    p = atoms.get_positions()
-    L = np.diag(np.asarray(atoms.get_cell()))
-    sym = np.array(atoms.get_chemical_symbols())
-    oxy = np.where(sym == "O")[0]
-    hyd = np.where(sym == "H")[0]
     d = p[hyd][:, None, :] - p[oxy][None, :, :]
     d -= np.round(d / L) * L
     own = np.argmin((d**2).sum(-1), axis=1)
     mu = np.zeros((len(oxy), 3))
-    for k in range(len(oxy)):
-        mu[k] = d[own == k, k].sum(axis=0)
+    np.add.at(mu, own, d[np.arange(len(hyd)), own])
     n = np.linalg.norm(mu, axis=1)
     n[n == 0] = 1.0
     return float((mu[:, 0] / n).mean())
@@ -77,13 +75,18 @@ def main():
         every=max(a.steps // 10, 1),
     )
     friction = th.scalar(a.friction)
+    sym = np.array(atoms.get_chemical_symbols())
+    oxy, hyd = np.where(sym == "O")[0], np.where(sym == "H")[0]
+    lengths = np.diag(np.asarray(atoms.get_cell()))
 
     th.evaluate()
     print(f"NVT + field  {th.n_atoms} atoms  E_x {a.efield} V/A  "
           f"T {a.temperature} K  friction {a.friction}")
     for step in range(a.steps + 1):
         Z = ev.results["born_charge"]
-        th.log(step, cos_x=alignment(th.atoms()), maxZ=float(np.abs(Z).max()))
+        th.log(step,
+               cos_x=alignment(th.positions.numpy(), oxy, hyd, lengths),
+               maxZ=float(np.abs(Z).max()))
         if step == a.steps:
             break
         langevin_baoab_half_step(th.positions, th.velocities, th.forces,
@@ -94,7 +97,8 @@ def main():
 
     half = len(th.rows) // 2
     rows = th.rows[half:]
-    print(f"\n  second half: <cos_x> {sum(r[4] for r in rows)/len(rows):+.4f}, "
+    print(f"\n  {th.performance()}")
+    print(f"  second half: <cos_x> {sum(r[4] for r in rows)/len(rows):+.4f}, "
           f"T {sum(r[2] for r in rows)/len(rows):.1f} K")
     net = np.abs(ev.results["field_force"].sum(axis=0)).max()
     print(f"  net field force {net:.2e} eV/A  (zero for a neutral cell)")

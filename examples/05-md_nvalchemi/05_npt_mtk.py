@@ -111,7 +111,8 @@ def main():
 
     half = len(th.rows) // 2
     rows = th.rows[half:]
-    print(f"\n  second half: T {sum(r[2] for r in rows)/len(rows):.1f} K, "
+    print(f"\n  {th.performance()}")
+    print(f"  second half: T {sum(r[2] for r in rows)/len(rows):.1f} K, "
           f"P {sum(r[3] for r in rows)/len(rows):+.4f} GPa, "
           f"V {sum(r[4] for r in rows)/len(rows):.1f} A^3")
     print("  A barostat equilibrates on tau_P, much longer than a demo run --")

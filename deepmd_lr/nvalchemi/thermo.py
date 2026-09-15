@@ -27,6 +27,7 @@ they are what a human types or reads:
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import numpy as np
@@ -126,6 +127,8 @@ class Thermo:
         #: Column order of `rows`, fixed by the first `log` call --
         #: built-ins followed by whatever extras that call passed.
         self.row_names: tuple[str, ...] = ()
+        #: (step, wall clock) at each `log`, for the throughput properties.
+        self._clock: list[tuple[int, float]] = []
 
         # --- state this object owns -------------------------------------
         # Allocated here, so contiguous by construction. That matters: warp's
@@ -338,6 +341,58 @@ class Thermo:
         """Kinetic energy as a device array, for kernels that take one."""
         return self._ke_w
 
+    # --- throughput --------------------------------------------------------
+
+    @property
+    def seconds_per_step(self) -> float:
+        """Wall-clock seconds per MD step, over the logged history.
+
+        The first logged interval is **dropped** when there is more than one,
+        because it carries kernel compilation -- on this machine that is
+        ~1 s against a ~30 ms step, and a least-squares fit over all points
+        still comes out 2x high (measured). Excluding it is what the
+        benchmarks in `experiments/` do, and it is the only thing that
+        actually recovers the steady-state rate. The remaining points are then
+        fitted by least squares.
+
+        This measures the loop as it actually ran, `log` included. Logging
+        every step means a device synchronisation every step, and that cost is
+        real and counted here; a production run logging every 100th step is
+        faster than this number suggests.
+        """
+        clock = self._clock[1:] if len(self._clock) > 2 else self._clock
+        if len(clock) < 2:
+            return float("nan")
+        steps = np.array([c[0] for c in clock], dtype=float)
+        wall = np.array([c[1] for c in clock], dtype=float)
+        if steps.max() == steps.min():
+            return float("nan")
+        return float(np.polyfit(steps, wall, 1)[0])
+
+    @property
+    def ms_per_step(self) -> float:
+        """Wall-clock milliseconds per MD step."""
+        return self.seconds_per_step * 1000.0
+
+    @property
+    def ns_per_day(self) -> float:
+        """Simulated nanoseconds per day of wall clock.
+
+        Scales with the timestep, so it is a statement about this run's `dt`
+        and not about the model alone.
+        """
+        seconds = self.seconds_per_step
+        if not np.isfinite(seconds) or seconds <= 0:
+            return float("nan")
+        return self.timestep * 1e-6 * 86400.0 / seconds
+
+    def performance(self) -> str:
+        """One line of throughput, for the end of a run."""
+        return (
+            f"{self.n_atoms} atoms, dt {self.timestep} fs: "
+            f"{self.ms_per_step:.1f} ms/step -> {self.ns_per_day:.3f} ns/day"
+        )
+
     # --- setup -------------------------------------------------------------
 
     def maxwell_boltzmann(self, temperature: float | None = None,
@@ -425,6 +480,7 @@ class Thermo:
             self._emit(head)
             self._header_written = True
 
+        self._clock.append((step, time.perf_counter()))
         row = {n: self._value(n, step) for n in self.columns}
         row.update(extra)
         self.rows.append(tuple(row.values()))

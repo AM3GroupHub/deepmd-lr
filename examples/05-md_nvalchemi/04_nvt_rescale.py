@@ -65,7 +65,8 @@ def main():
                                           th.masses, th.dt)
     half = len(th.rows) // 2
     rows = th.rows[half:]
-    print(f"\n  mean T over the second half: "
+    print(f"\n  {th.performance()}")
+    print(f"  mean T over the second half: "
           f"{sum(r[2] for r in rows)/len(rows):.1f} K   ({rescales} rescalings)")
     print("  Use this to equilibrate, then switch to Langevin or Nose-Hoover")
     print("  before collecting anything you intend to report.")

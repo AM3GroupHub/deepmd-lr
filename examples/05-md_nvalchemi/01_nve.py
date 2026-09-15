@@ -54,7 +54,8 @@ def main():
             th.velocities, th.forces, th.masses, th.dt
         )
 
-    print(f"\n  total-energy drift {th.drift('etot'):+.4f} meV/atom/ps")
+    print(f"\n  {th.performance()}")
+    print(f"  total-energy drift {th.drift('etot'):+.4f} meV/atom/ps")
     print("  Halve dt and this should fall roughly 4x (it is O(dt^2)).")
     print("  A floor that does not move means the forces are not the exact")
     print("  gradient of the energy -- which no thermostat will hide.")

@@ -229,3 +229,60 @@ class TestSetupAndLog:
 def _shift(x: wp.array(dtype=wp.vec3d)):
     i = wp.tid()
     x[i] = x[i] + wp.vec3d(0.1, 0.1, 0.1)
+
+
+class TestThroughput:
+    """ns/day is a unit chain with four factors; only the chain is testable
+    deterministically, so that is what these pin."""
+
+    def test_ns_per_day_follows_from_seconds_per_step(self):
+        ev, pos = setup()
+        th = Thermo(ev, pos, temperature=300.0, timestep=0.5, every=10**9)
+        th.evaluate()
+        # a synthetic clock: exactly 10 ms per step
+        th._clock = [(i, i * 0.010) for i in range(11)]
+        assert th.seconds_per_step == pytest.approx(0.010, rel=1e-9)
+        assert th.ms_per_step == pytest.approx(10.0, rel=1e-9)
+        # 0.5 fs per step at 100 steps/s -> 0.5e-6 ns * 86400 / 0.010
+        assert th.ns_per_day == pytest.approx(0.5e-6 * 86400 / 0.010, rel=1e-9)
+
+    def test_ns_per_day_scales_with_the_timestep(self):
+        """It is a statement about this run's dt, not about the model alone."""
+        ev, pos = setup()
+        rates = []
+        for dt in (0.5, 1.0):
+            th = Thermo(ev, pos, temperature=300.0, timestep=dt, every=10**9)
+            th._clock = [(i, i * 0.010) for i in range(11)]
+            rates.append(th.ns_per_day)
+        assert rates[1] == pytest.approx(2 * rates[0], rel=1e-9)
+
+    def test_the_warm_up_interval_is_excluded(self):
+        """The first logged interval carries kernel compilation -- ~1 s
+        against a 30 ms step here. Fitting through it is not enough: measured,
+        a least-squares slope over all points still lands 2x high. It has to
+        be dropped."""
+        ev, pos = setup()
+        th = Thermo(ev, pos, temperature=300.0, timestep=0.5, every=10**9)
+        clock = [(0, 0.0)] + [(i, 1.0 + i * 0.010) for i in range(1, 21)]
+        th._clock = clock
+        naive = (clock[-1][1] - clock[0][1]) / clock[-1][0]
+        assert naive > 0.05                        # a plain average is skewed
+        fitted_through = float(
+            np.polyfit([c[0] for c in clock], [c[1] for c in clock], 1)[0]
+        )
+        assert fitted_through > 0.02               # and so is a fit through it
+        assert th.seconds_per_step == pytest.approx(0.010, rel=1e-9)
+
+    def test_undefined_before_two_logged_points(self):
+        ev, pos = setup()
+        th = Thermo(ev, pos, temperature=300.0)
+        assert np.isnan(th.seconds_per_step)
+        assert np.isnan(th.ns_per_day)
+
+    def test_performance_line_mentions_both_rates(self):
+        ev, pos = setup()
+        th = Thermo(ev, pos, temperature=300.0, timestep=0.5)
+        th._clock = [(i, i * 0.010) for i in range(11)]
+        line = th.performance()
+        assert "ms/step" in line and "ns/day" in line
+        assert str(th.n_atoms) in line

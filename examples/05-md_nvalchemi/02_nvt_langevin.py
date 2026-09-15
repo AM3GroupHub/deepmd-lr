@@ -67,7 +67,8 @@ def main():
         langevin_baoab_finalize(th.velocities, th.forces, th.masses, th.dt)
     half = len(th.rows) // 2
     rows = th.rows[half:]
-    print(f"\n  mean T over the second half: "
+    print(f"\n  {th.performance()}")
+    print(f"  mean T over the second half: "
           f"{sum(r[2] for r in rows)/len(rows):.1f} K (target {a.temperature})")
     print("  There is no conserved quantity here -- the thermostat exchanges")
     print("  energy with a bath on purpose. Judge it by the temperature.")
