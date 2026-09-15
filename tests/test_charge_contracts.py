@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import torch
 
-from deepmd_lr.distributed import DistributedEvaluator, evaluate_partitioned
+from deepmd_lr.nvalchemi import DistributedEvaluator, evaluate_partitioned
 
 from .test_joint_model import DESCRIPTOR, FITTING, LONG_RANGE, frame, get_model
 

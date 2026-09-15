@@ -24,7 +24,7 @@ from nvalchemiops.dynamics.utils import (
 )
 
 from deepmd_lr.ase import load_model
-from deepmd_lr.distributed import DistributedEvaluator
+from deepmd_lr.nvalchemi import DistributedEvaluator
 
 __all__ = [
     "Reporter", "Thermo", "build_evaluator", "kt", "maxwell_boltzmann",

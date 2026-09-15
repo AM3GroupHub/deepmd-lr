@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""Spatial partitioning with a ghost halo, for distributed evaluation.
+"""Spatial partitioning with a ghost halo, for partitioned evaluation.
 
 Follows DistMLIP's design -- one process, several devices, an owned/halo split
 per partition -- rather than its code: DistMLIP's partitioner is a C extension

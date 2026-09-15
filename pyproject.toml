@@ -13,7 +13,7 @@ dependencies = [
     "deepmd-kit==3.2.0",
     "nvalchemi-toolkit-ops>=0.4.1",
     "torch>=2.11.0",
-    # `deepmd_lr.ase` is built on ASE's Calculator, and the distributed
+    # `deepmd_lr.ase` is built on ASE's Calculator, and the partitioned
     # evaluator reads its mass table. Undeclared until a fresh HOPPER env
     # imported cleanly right up to the point of using either.
     "ase",

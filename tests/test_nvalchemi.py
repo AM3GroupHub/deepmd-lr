@@ -16,7 +16,7 @@ import torch
 from ase import units as ase_units
 from deepmd.pt_expt.utils.env import DEVICE
 
-from deepmd_lr.distributed import (
+from deepmd_lr.nvalchemi import (
     DistributedEvaluator,
     evaluate_partitioned,
     partition_graph,
@@ -616,8 +616,8 @@ class TestBackboneCapture:
 
     @staticmethod
     def _run(model, c, a, cl, devices, *, force_fallback=False, **kw):
-        import deepmd_lr.distributed.driver as DRV  # noqa: PLC0415
-        from deepmd_lr.distributed import DistributedEvaluator  # noqa: PLC0415
+        import deepmd_lr.nvalchemi.driver as DRV  # noqa: PLC0415
+        from deepmd_lr.nvalchemi import DistributedEvaluator  # noqa: PLC0415
 
         original = DRV._usable_capture
         if force_fallback:
@@ -631,7 +631,7 @@ class TestBackboneCapture:
             DRV._usable_capture = original
 
     def test_capture_is_taken_on_every_partition(self):
-        import deepmd_lr.distributed.driver as DRV  # noqa: PLC0415
+        import deepmd_lr.nvalchemi.driver as DRV  # noqa: PLC0415
 
         model, c, a, cl = self._system()
         calls = {"n": 0}

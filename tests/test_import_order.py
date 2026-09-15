@@ -4,7 +4,7 @@
 DeePMD-kit fires our entry point from inside ``deepmd.pt_expt.__init__``, so
 whichever of our modules first touches that backend gets re-entered by the
 registration it triggers. Before ``deepmd_lr/__init__`` imported the backend
-itself, ``import deepmd_lr.distributed`` failed with
+itself, ``import deepmd_lr.nvalchemi`` failed with
 
     ImportError: cannot import name 'CHARGE_VAR_NAME' from partially
     initialized module 'deepmd_lr.fitting.charge'
@@ -20,7 +20,7 @@ import pytest
 
 FIRST_IMPORTS = [
     "deepmd_lr",
-    "deepmd_lr.distributed",
+    "deepmd_lr.nvalchemi",
     "deepmd_lr.argcheck",
     "deepmd_lr.neighbors",
     "deepmd_lr.fitting.charge",
@@ -50,7 +50,7 @@ def test_the_documented_snippet_works_standalone():
         [
             sys.executable,
             "-c",
-            "from deepmd_lr.distributed import DistributedEvaluator; "
+            "from deepmd_lr.nvalchemi import DistributedEvaluator; "
             "print(DistributedEvaluator.__name__)",
         ],
         capture_output=True,

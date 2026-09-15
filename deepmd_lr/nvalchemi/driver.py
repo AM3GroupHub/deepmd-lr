@@ -34,10 +34,6 @@ from deepmd.dpmodel.utils.neighbor_graph import (
     segment_sum,
 )
 
-from deepmd_lr.distributed.partition import (
-    Partition,
-    partition_system,
-)
 from deepmd_lr.fitting.charge import (
     charge_mask,
     project_to_total_charge,
@@ -45,6 +41,10 @@ from deepmd_lr.fitting.charge import (
 )
 from deepmd_lr.neighbors import (
     build_neighbor_graph_fast,
+)
+from deepmd_lr.nvalchemi.partition import (
+    Partition,
+    partition_system,
 )
 
 __all__ = [
@@ -239,7 +239,7 @@ def evaluate_partitioned(
     partitions
         Reuse a previously built partitioning instead of rebuilding. Valid as
         long as its halo still covers every neighbour -- see the skin logic in
-        :class:`~deepmd_lr.distributed.evaluator.DistributedEvaluator`.
+        :class:`~deepmd_lr.nvalchemi.evaluator.DistributedEvaluator`.
     charge_spin
         Global (total charge, spin multiplicity), shared by every partition.
         If omitted, use the model's configured default condition.

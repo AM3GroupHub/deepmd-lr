@@ -719,7 +719,7 @@ drift.
 
 The charge head reads the same descriptor features the energy head produced,
 so the backbone runs **once** — the serial path via `_capturing_backbone`, the
-partitioned path via the equivalent capture in `distributed/driver.py`. Both
+partitioned path via the equivalent capture in `nvalchemi/driver.py`. Both
 keep the old second pass as a fallback for when the capture cannot carry the
 gradient.
 
@@ -870,7 +870,7 @@ tensor, so unset that variable for field simulations. And `Z` is only as
 meaningful as the charge head — if `mean|q|` has collapsed toward zero during
 training, the Born tensor and the whole field response are meaningless.
 
-It is available on the distributed evaluator too, either as the tensor alone
+It is available on the partitioned evaluator too, either as the tensor alone
 or as a field to run under:
 
 ```python
@@ -911,7 +911,7 @@ the serial tensor to 5e-16 at 1, 2 and 4 partitions.
 GPU:
 
 ```python
-from deepmd_lr.distributed import DistributedEvaluator
+from deepmd_lr.nvalchemi import DistributedEvaluator
 
 evaluator = DistributedEvaluator(
     model, atype, cell,
@@ -1140,7 +1140,7 @@ the atom count clears the threshold for its boundary condition.
 | no cell (`box=None`) | `CELL_LIST_MIN_ATOMS_FREE = 1024` | 1024 atoms and up |
 
 Partitions are the second case: the halo already carries the images, so the
-distributed driver builds its graph with `box=None`.
+partitioned driver builds its graph with `box=None`.
 
 The thresholds come from measurement, median of 7 after warm-up on one GB10
 (ms):
@@ -1206,7 +1206,7 @@ physics to capture; and the charge head recovering the true charge magnitudes
   electrostatic energy the intended formula, and are the reported derivatives
   actually derivatives of it?
 - `experiments/hopper_bench/RESULTS.md` — MD throughput in ns/day across the
-  ASE, nvalchemiops and distributed paths.
+  ASE, nvalchemiops and partitioned paths.
 
 ## Status
 

@@ -6,10 +6,10 @@ Registration itself lives in :mod:`deepmd_lr.register`, which DeePMD-kit's
 
 Importing ``deepmd.pt_expt`` here looks redundant -- the entry point would
 fire on its own the moment any submodule touched the backend -- but the
-order matters. Without it, ``import deepmd_lr.distributed`` as the first
+order matters. Without it, ``import deepmd_lr.nvalchemi`` as the first
 DeePMD-kit import went:
 
-    deepmd_lr.distributed -> driver -> fitting.charge
+    deepmd_lr.nvalchemi -> driver -> fitting.charge
       -> deepmd.pt_expt (mid-module)
         -> load_entry_point -> deepmd_lr.register -> argcheck
           -> fitting.charge   <- still executing, CHARGE_VAR_NAME unbound

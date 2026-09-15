@@ -45,11 +45,11 @@ import torch
 from deepmd_lr.born import (
     field_force,
 )
-from deepmd_lr.distributed.driver import (
+from deepmd_lr.nvalchemi.driver import (
     device_replicas,
     evaluate_partitioned,
 )
-from deepmd_lr.distributed.partition import (
+from deepmd_lr.nvalchemi.partition import (
     partition_system,
 )
 
