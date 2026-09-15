@@ -717,11 +717,36 @@ drift.
 
 ## Cost
 
-The joint model runs the descriptor twice — the short-range path consumes and
-discards its own descriptor output, and the charge head needs it again.
-Measured at **~3× per training step** on small systems (24 atoms: 15 → 45 ms;
-96 atoms: 14 → 46 ms). Those sizes are launch-overhead dominated, so expect
-the ratio to improve with system size.
+The charge head reads the same descriptor features the energy head produced,
+so the backbone runs **once** — the serial path via `_capturing_backbone`, the
+partitioned path via the equivalent capture in `distributed/driver.py`. Both
+keep the old second pass as a fallback for when the capture cannot carry the
+gradient.
+
+Measured against an identically configured short-range twin (same descriptor,
+same fitting net, `long_range` deleted):
+
+| | short-range | long-range | ratio |
+|---|---:|---:|---:|
+| training, 192-atom water | 0.0431 s/batch | 0.0967 s/batch | **2.24×** |
+| MD, 6,000 atoms | 34.6 ms/step | 55.5 ms/step | **1.60×** |
+| MD, 65,856 atoms | 256.7 ms/step | 403.8 ms/step | **1.57×** |
+
+Training pays more than MD because the force loss differentiates a second time,
+and that double backward goes through the charge head too.
+
+**The reciprocal sum is not what costs.** Timed on its own it is 1.5 ms — 2.3%
+of a 6,000-atom step and **0.3%** of a 65,856-atom one — and it barely grows
+with the system, because the FFT cost follows the mesh rather than the atom
+count. Refining the mesh is therefore close to free; see
+[Choosing `alpha` and the mesh](#choosing-alpha-and-the-mesh). What remains of
+the long-range overhead is the charge head and the charge-response backward,
+which is work rather than duplication.
+
+An external field adds a further backward for `Z`: **+25–30%** on the step, and
+no extra memory, since it reuses the captured features. Memory for the
+long-range model is ~0.65 MiB/atom (42.6 GiB at 65,856 atoms), with or without
+a field.
 
 ## Running MD
 
@@ -991,6 +1016,11 @@ survive spatial decomposition — splitting it gave 2.0% error on 2 ranks and
 36.5% on 8. That is affordable because it is under 10% of the step and the
 round trip is ~230 KB. Only the descriptor is worth splitting.
 
+Most of that 73 ms is the gather and the charge projection, not the FFT: the
+PME evaluation timed on its own is **1.5 ms**, and it stays there as the system
+grows (2.3% of a 6,000-atom step, 0.3% of a 65,856-atom one) because its cost
+follows the mesh rather than the atom count.
+
 The charge-response force, `-Σⱼ (dE/dqⱼ) ∂qⱼ/∂rᵢ`, stays partitioned: `∂qⱼ/∂rᵢ`
 is nonzero only within `rcut`, so although the *energy* is long-ranged its
 *charge derivative* is short-ranged.
@@ -1025,20 +1055,30 @@ asserting exactly that.
   serial virial — itself finite-difference checked — to ~6e-15, symmetric, and
   identical at 1, 2, 4 and 8 partitions.
 
-- **Multi-GPU is correct but not yet faster.** Verified on 2 × A40: results are
-  identical across `cuda:0`, `cuda:0`×2 and `cuda:0`+`cuda:1` (ΔE = 0 at 768
-  and 2592 atoms, 9.1e-13 at 6144). But the measured speedup from a second GPU
-  is **0.92–1.03×** — i.e. none.
+- **Multi-GPU pays above a few thousand atoms per card, and not below.**
+  Results are identical either way — verified on 2 × A40 (ΔE = 0 at 768 and
+  2592 atoms, 9.1e-13 at 6144) and on 3 × RTX PRO 6000 Blackwell, where Born
+  charges match the single-GPU answer to ~1e-15 at 1, 2 and 3 real devices and
+  stay flat from 81 to 5184 atoms.
 
-  The reason is measured, not guessed: with the partition loop staged so that
-  all devices are launched before any host transfer, the step is still ~100%
-  CPU-bound — at 768 atoms there is 0 ms of GPU work outstanding when the
-  launch loop returns, and 2.4 ms (8%) at 2592. The ~11 ms per partition is
-  eager-PyTorch dispatch in the descriptor and charge head, not GPU compute, so
-  a second device has nothing to overlap with. Adding GPUs will not help until
-  that per-partition CPU cost comes down — through a compiled descriptor, CUDA
-  graphs, or per-device launch threads. Partitioning also *multiplies* that
-  fixed cost, so fewer, larger partitions are cheaper than many small ones.
+  Speed depends entirely on size, because the parallelism is real but the fixed
+  per-partition cost is Python. Measured on RTX PRO 6000:
+
+  | system | 1 GPU | 2 GPUs | speedup |
+  |---|---:|---:|---:|
+  | 12,000 atoms | 121.7 ms | 78.6 ms | 1.55× |
+  | 131,712 atoms (weak scaling vs 65,856 on one) | 403.8 ms | 421.5 ms | 96% efficiency |
+
+  Below that it is worthless and can be negative: an older 2 × A40 measurement
+  at ≤ 6,144 atoms gave **0.92–1.03×**, i.e. none. The reason is measured, not
+  guessed. Put every partition on one device, so total GPU work is constant and
+  only the number of launch iterations changes, and the wall time still grows —
+  49 → 184 ms going from 1 to 8 partitions — while the GPU work outstanding
+  when the call returns is 0.04 ms at every count. The ~11 ms per partition is
+  eager-PyTorch dispatch, not GPU compute. At 6,000 atoms per card that is most
+  of the step; at 65,856 it is ~2% of it, which is why efficiency climbs from
+  81% to 96% across that range. Partitioning multiplies that fixed cost, so
+  fewer, larger partitions stay cheaper than many small ones.
 
 - **The short-range path needs `neighbor_graph_method` set for inference.**
   DeePMD-kit resolves it once at *training* startup (default `auto`, which is
