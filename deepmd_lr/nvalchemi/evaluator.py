@@ -218,6 +218,21 @@ class DistributedEvaluator:
         """Standard masses for this system, in amu."""
         return atomic_masses(self.model, self.atype)
 
+    def set_cell(self, cell: Any) -> None:
+        """Replace the cell and invalidate the partitioning.
+
+        A barostat moves the cell every step, and the partitioning was built
+        against the old one. Invalidation here is **correctness, not caching**:
+        :meth:`_needs_rebuild` watches atom displacement only and cannot see a
+        cell change, so nothing else would ever notice. A stale halo puts ghost
+        images at the wrong offsets and the forces are quietly wrong -- there
+        is no natural backstop for that, which is why this is unconditional
+        rather than left to the caller's judgement.
+        """
+        self.cell = np.asarray(cell, dtype=np.float64).reshape(3, 3)
+        self._partitions = None
+        self._reference_positions = None
+
     def _needs_rebuild(self, positions: torch.Tensor) -> bool:
         """Standard Verlet criterion on the cached halo.
 
@@ -293,6 +308,12 @@ class DistributedEvaluator:
         )
         self.results = out
         self.virial = out.get("virial")
+        # INVARIANT: this writes INTO the preallocated buffer and never
+        # rebinds `self.forces`, so a warp view taken once stays live for the
+        # life of the object -- which is what lets `Thermo` bind it a single
+        # time instead of rewrapping every step. Turning either this or the
+        # `+=` below into an assignment would silently freeze the forces every
+        # MD driver sees. `tests/test_nvalchemi.py` pins the pointer.
         self.forces.copy_(
             torch.as_tensor(out["force"], dtype=torch.float64, device=self.home)
         )
