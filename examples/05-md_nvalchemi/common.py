@@ -16,12 +16,17 @@ import torch
 import warp as wp
 from ase.data import atomic_masses, atomic_numbers
 from ase.units import fs, kB
+from nvalchemiops.dynamics.utils import (
+    compute_kinetic_energy,
+    compute_temperature,
+    initialize_velocities,
+)
 
 from deepmd_lr.ase import load_model
 from deepmd_lr.distributed import DistributedEvaluator
 
 __all__ = [
-    "Reporter", "build_evaluator", "kelvin", "kt", "maxwell_boltzmann",
+    "Reporter", "Thermo", "build_evaluator", "kt", "maxwell_boltzmann",
     "scalar", "vec", "water_box",
 ]
 
@@ -52,10 +57,31 @@ def kt(temperature_K: float) -> float:
     return kB * temperature_K
 
 
-def kelvin(velocities: torch.Tensor, masses: torch.Tensor, ndof: int) -> float:
-    """Instantaneous temperature in kelvin, from the kinetic energy."""
-    ke2 = float((masses[:, None] * velocities**2).sum())
-    return ke2 / (ndof * kB)
+class Thermo:
+    """Kinetic energy and temperature, through nvalchemiops' own kernels.
+
+    `compute_temperature` returns `k_B T` in energy units, like everything
+    else in that library, and it already divides by `3N - 3` rather than `3N`
+    -- i.e. it assumes the centre-of-mass motion was removed, which
+    `initialize_velocities` does. Verified against both conventions rather
+    than assumed.
+    """
+
+    def __init__(self, natoms: int, device: str):
+        self._ke = wp.zeros(1, dtype=wp.float64, device=device)
+        self._T = wp.zeros(1, dtype=wp.float64, device=device)
+        self._n = wp.array(np.array([natoms]), dtype=wp.int32, device=device)
+
+    def kinetic_energy(self, wv: wp.array, wm: wp.array) -> float:
+        """Total kinetic energy in eV."""
+        compute_kinetic_energy(wv, wm, self._ke)
+        return float(self._ke.numpy()[0])
+
+    def kelvin(self, wv: wp.array, wm: wp.array) -> float:
+        """Instantaneous temperature in kelvin."""
+        compute_kinetic_energy(wv, wm, self._ke)
+        compute_temperature(self._ke, self._T, self._n)
+        return float(self._T.numpy()[0]) / kB
 
 
 # --- system -----------------------------------------------------------------
@@ -94,12 +120,26 @@ def build_evaluator(model_path, symbols, cell, devices=None, **kwargs):
 
 def maxwell_boltzmann(masses: np.ndarray, temperature_K: float, seed: int = 0,
                       device: str = "cuda") -> torch.Tensor:
-    """Velocities from a Maxwell-Boltzmann distribution, drift removed."""
-    rng = np.random.default_rng(seed)
-    sigma = np.sqrt(kt(temperature_K) / masses)[:, None]
-    v = rng.normal(0.0, 1.0, (len(masses), 3)) * sigma
-    v -= (masses[:, None] * v).sum(0) / masses.sum()      # zero total momentum
-    return torch.tensor(v, dtype=torch.float64, device=device)
+    """Maxwell-Boltzmann velocities, centre-of-mass motion removed.
+
+    Straight through `nvalchemiops.dynamics.utils.initialize_velocities`, so
+    the draw happens on the GPU and the result never touches the host. The
+    three scratch arrays are its COM-removal workspace, zeroed internally.
+
+    Returns the torch tensor backing the warp view, because the integrator
+    kernels want a warp array while the reporting wants something indexable.
+    """
+    v = torch.zeros((len(masses), 3), dtype=torch.float64, device=device)
+    wm = wp.array(np.asarray(masses, dtype=np.float64), dtype=wp.float64,
+                  device=device)
+    momentum = wp.zeros(1, dtype=wp.vec3d, device=device)
+    total_mass = wp.zeros(1, dtype=wp.float64, device=device)
+    com = wp.zeros(1, dtype=wp.vec3d, device=device)
+    initialize_velocities(
+        vec(v), wm, scalar(kt(temperature_K), device),
+        momentum, total_mass, com, random_seed=seed, remove_com=True,
+    )
+    return v
 
 
 # --- reporting --------------------------------------------------------------

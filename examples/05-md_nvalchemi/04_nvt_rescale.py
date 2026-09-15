@@ -20,8 +20,8 @@ import warp as wp
 from ase.units import fs
 from common import (
     Reporter,
+    Thermo,
     build_evaluator,
-    kelvin,
     maxwell_boltzmann,
     scalar,
     vec,
@@ -53,9 +53,9 @@ def main():
     x = torch.tensor(pos, dtype=torch.float64, device=dev)
     v = maxwell_boltzmann(masses, a.temperature, device=dev)
     m = torch.tensor(masses, dtype=torch.float64, device=dev)
-    ndof = 3 * n - 3
 
     wx, wv, wm = vec(x), vec(v), wp.from_torch(m)
+    thermo = Thermo(n, dev)
     wdt = scalar(a.dt * fs, dev)
     wscale = scalar(1.0, dev)
 
@@ -67,7 +67,7 @@ def main():
     log = Reporter("T_K", "E_pot", "rescaled", every=max(a.steps // 10, 1))
     rescales = 0
     for step in range(a.steps + 1):
-        T = kelvin(v, m, ndof)
+        T = thermo.kelvin(wv, wm)
         log(step, step * a.dt, T_K=T, E_pot=energy, rescaled=rescales)
         if step == a.steps:
             break

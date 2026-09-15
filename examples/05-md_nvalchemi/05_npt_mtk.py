@@ -28,8 +28,8 @@ import warp as wp
 from ase.units import GPa, fs
 from common import (
     Reporter,
+    Thermo,
     build_evaluator,
-    kelvin,
     kt,
     maxwell_boltzmann,
     scalar,
@@ -74,6 +74,7 @@ def main():
     ndof = 3 * n - 3
 
     wx, wv, wm = vec(x), vec(v), wp.from_torch(m)
+    thermo = Thermo(n, dev)
     wdt = scalar(a.dt * fs, dev)
     wkT = scalar(kt(a.temperature), dev)
     # eV/A^3 is the model's pressure unit; ase.units.GPa converts into it.
@@ -116,11 +117,11 @@ def main():
           f"P {a.pressure} GPa  tau_T {a.tau_t} fs  tau_P {a.tau_p} fs")
     log = Reporter("T_K", "P_GPa", "volume", "E_pot", every=max(a.steps // 10, 1))
     for step in range(a.steps + 1):
-        ke = 0.5 * float((m[:, None] * v**2).sum())
+        ke = thermo.kinetic_energy(wv, wm)
         ke_w.fill_(ke)
         p = press_w.numpy()[0]
         p_iso = float(p[0] + p[4] + p[8]) / 3.0
-        log(step, step * a.dt, T_K=kelvin(v, m, ndof), P_GPa=p_iso / GPa,
+        log(step, step * a.dt, T_K=thermo.kelvin(wv, wm), P_GPa=p_iso / GPa,
             volume=ev.volume, E_pot=energy)
         if step == a.steps:
             break
@@ -145,7 +146,7 @@ def main():
         wf = vec(f)
 
         # Second half, in reverse order.
-        ke_w.fill_(0.5 * float((m[:, None] * v**2).sum()))
+        ke_w.fill_(thermo.kinetic_energy(wv, wm))
         npt_velocity_half_step(wv, wm, wf, cell_v, volumes=vols,
                                eta_dots=eta_dot, num_atoms=natoms_i, dt=wdt)
         npt_barostat_half_step(cell_v, press_w, wP, vols, cell_mass, ke_w,

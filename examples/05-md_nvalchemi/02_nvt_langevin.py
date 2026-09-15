@@ -25,8 +25,8 @@ import warp as wp
 from ase.units import fs
 from common import (
     Reporter,
+    Thermo,
     build_evaluator,
-    kelvin,
     kt,
     maxwell_boltzmann,
     scalar,
@@ -59,9 +59,9 @@ def main():
     x = torch.tensor(pos, dtype=torch.float64, device=dev)
     v = maxwell_boltzmann(masses, a.temperature, device=dev)
     m = torch.tensor(masses, dtype=torch.float64, device=dev)
-    ndof = 3 * n - 3
 
     wx, wv, wm = vec(x), vec(v), wp.from_torch(m)
+    thermo = Thermo(n, dev)
     wdt = scalar(a.dt * fs, dev)
     # k_B T in eV, NOT kelvin. See common.kt.
     wkT = scalar(kt(a.temperature), dev)
@@ -74,8 +74,8 @@ def main():
           f"friction {a.friction}")
     log = Reporter("T_K", "E_pot", "E_kin", every=max(a.steps // 10, 1))
     for step in range(a.steps + 1):
-        ke = 0.5 * float((m[:, None] * v**2).sum())
-        log(step, step * a.dt, T_K=kelvin(v, m, ndof), E_pot=energy, E_kin=ke)
+        ke = thermo.kinetic_energy(wv, wm)
+        log(step, step * a.dt, T_K=thermo.kelvin(wv, wm), E_pot=energy, E_kin=ke)
         if step == a.steps:
             break
         # B-A-O-A: half-kick, half-drift, thermostat, half-drift -- one kernel.

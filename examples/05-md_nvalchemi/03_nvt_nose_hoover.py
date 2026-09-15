@@ -26,8 +26,8 @@ import warp as wp
 from ase.units import fs
 from common import (
     Reporter,
+    Thermo,
     build_evaluator,
-    kelvin,
     kt,
     maxwell_boltzmann,
     scalar,
@@ -68,6 +68,7 @@ def main():
     ndof = 3 * n - 3
 
     wx, wv, wm = vec(x), vec(v), wp.from_torch(m)
+    thermo = Thermo(n, dev)
     wdt = scalar(a.dt * fs, dev)
     wkT = scalar(kt(a.temperature), dev)
 
@@ -114,8 +115,8 @@ def main():
     log = Reporter("T_K", "E_pot", "E_kin", "invariant",
                    every=max(a.steps // 10, 1))
     for step in range(a.steps + 1):
-        ke = 0.5 * float((m[:, None] * v**2).sum())
-        log(step, step * a.dt, T_K=kelvin(v, m, ndof), E_pot=energy,
+        ke = thermo.kinetic_energy(wv, wm)
+        log(step, step * a.dt, T_K=thermo.kelvin(wv, wm), E_pot=energy,
             E_kin=ke, invariant=invariant(energy, ke))
         if step == a.steps:
             break

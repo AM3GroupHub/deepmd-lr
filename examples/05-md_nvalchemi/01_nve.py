@@ -13,7 +13,7 @@ import argparse
 import torch
 import warp as wp
 from ase.units import fs
-from common import Reporter, build_evaluator, kelvin, maxwell_boltzmann, scalar, vec
+from common import Reporter, Thermo, build_evaluator, maxwell_boltzmann, scalar, vec
 from nvalchemiops.dynamics.integrators import (
     velocity_verlet_position_update,
     velocity_verlet_velocity_finalize,
@@ -38,11 +38,11 @@ def main():
     x = torch.tensor(pos, dtype=torch.float64, device=dev)
     v = maxwell_boltzmann(masses, a.temperature, device=dev)
     m = torch.tensor(masses, dtype=torch.float64, device=dev)
-    ndof = 3 * n - 3                      # momentum was removed
 
     # Warp views. These alias the torch tensors, so the kernels update them in
     # place and nothing round-trips through the host.
     wx, wv, wm = vec(x), vec(v), wp.from_torch(m)
+    thermo = Thermo(n, dev)
     wdt = scalar(a.dt * fs, dev)
 
     energy, f = ev(x)
@@ -51,8 +51,8 @@ def main():
     print(f"NVE  {n} atoms  dt {a.dt} fs  {a.steps} steps")
     log = Reporter("T_K", "E_pot", "E_kin", "E_tot", every=max(a.steps // 10, 1))
     for step in range(a.steps + 1):
-        ke = 0.5 * float((m[:, None] * v**2).sum())
-        log(step, step * a.dt, T_K=kelvin(v, m, ndof), E_pot=energy,
+        ke = thermo.kinetic_energy(wv, wm)
+        log(step, step * a.dt, T_K=thermo.kelvin(wv, wm), E_pot=energy,
             E_kin=ke, E_tot=energy + ke)
         if step == a.steps:
             break

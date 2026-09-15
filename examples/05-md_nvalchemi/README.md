@@ -32,6 +32,15 @@ Each builds its own jittered water lattice, so no data files are needed. Pass
 `common.py` holds the shared setup: warp interop, units, the water box, the
 evaluator, and a small reporter.
 
+It uses nvalchemiops' own utilities rather than reimplementing them —
+`initialize_velocities` for the Maxwell–Boltzmann draw (centre-of-mass motion
+removed on the GPU, verified to 1e-14) and `compute_kinetic_energy` /
+`compute_temperature` for the reporting. Note `compute_temperature` returns
+`k_B T` in energy units like everything else there, and already divides by
+`3N − 3` rather than `3N` — it assumes the COM motion was removed, which
+`initialize_velocities` does. Both conventions were checked against the
+kernel's output rather than assumed.
+
 ## Units, and the one that bites
 
 The model works in **angstrom, eV, amu and ASE time units**, which are mutually
