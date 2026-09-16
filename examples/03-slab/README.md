@@ -36,7 +36,7 @@ python ../../scripts/xyz_to_deepmd.py Li_LiFSI_interface.xyz -o data \
 
 ```
 34 frames x 468 atoms
-type_map ['C', 'F', 'H', 'Li', 'N', 'O', 'S']
+type_map: the full periodic table (118 elements); present here: ['C', 'F', 'H', 'Li', 'N', 'O', 'S']
 padded z to 52.0 A; slab spans 30.31 A, vacuum gap 21.69 A
 periodic  labels: energy, force
 data/train  29 frames

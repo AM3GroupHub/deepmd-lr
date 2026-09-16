@@ -41,11 +41,23 @@ python ../../scripts/xyz_to_deepmd.py train-H2O_RPBE-D3.xyz -o data --valid-frac
 
 ```
 604 frames x 192 atoms
-type_map ['H', 'O']
+type_map: the full periodic table (118 elements); present here: ['H', 'O']
 periodic  labels: energy, force
 data/train  544 frames
 data/valid   60 frames
+note: set the model's `type_map` to the same full table, or training stops at 'Elements [...] are not present in the provided `type_map`'. Use --type-map present for a short one.
 ```
+
+The `type_map` is the whole periodic table, not just `['H', 'O']`, and that is
+the default. A per-dataset map makes the same integer mean different elements
+in different directories, so a dataset only ever works with the model it was
+converted for; with the full table hydrogen is type 0 everywhere. The 116
+elements absent from this water get a row in the type embedding and the energy
+bias, never receive a gradient, and cost nothing else.
+
+The one thing it commits you to: `input.json`'s `type_map` must be the same
+full list, because DeePMD-kit refuses an element a dataset has and the model
+does not. Pass `--type-map present` for the old per-dataset behaviour.
 
 Reading goes through `ase.io.read`, so the same command works for `.traj`,
 OUTCAR, CP2K output and anything else ASE knows (`--format` overrides the

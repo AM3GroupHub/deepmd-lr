@@ -8,13 +8,36 @@
   "model": {
     "type": "dp_lr",
     "_comment_type_map": [
-      "The model's GLOBAL element list. Each system's own type_map.raw maps its",
-      "local type.raw indices into this one, so the two need not agree in order",
-      "-- but for a single system it is simplest to keep them identical."
+      "The whole periodic table, in atomic-number order -- what",
+      "scripts/xyz_to_deepmd.py writes by default, so this list and every",
+      "dataset's type_map.raw are the same list and hydrogen is type 0",
+      "everywhere.",
+      "",
+      "Only H and O appear in this data. The other 116 types simply never",
+      "receive a gradient; they cost a row each in the type embedding and the",
+      "energy bias, and nothing else. What they buy is that this model and",
+      "this dataset are not welded to each other: either can meet another",
+      "one later without renumbering anything.",
+      "",
+      "DeePMD-kit refuses any element a system's type_map.raw has and this",
+      "list does not, so shortening this means re-converting with",
+      "--type-map present."
     ],
     "type_map": [
-      "H",
-      "O"
+      "H", "He", "Li", "Be", "B", "C", "N", "O", "F",
+      "Ne", "Na", "Mg", "Al", "Si", "P", "S", "Cl", "Ar",
+      "K", "Ca", "Sc", "Ti", "V", "Cr", "Mn", "Fe", "Co",
+      "Ni", "Cu", "Zn", "Ga", "Ge", "As", "Se", "Br", "Kr",
+      "Rb", "Sr", "Y", "Zr", "Nb", "Mo", "Tc", "Ru", "Rh",
+      "Pd", "Ag", "Cd", "In", "Sn", "Sb", "Te", "I", "Xe",
+      "Cs", "Ba", "La", "Ce", "Pr", "Nd", "Pm", "Sm", "Eu",
+      "Gd", "Tb", "Dy", "Ho", "Er", "Tm", "Yb", "Lu", "Hf",
+      "Ta", "W", "Re", "Os", "Ir", "Pt", "Au", "Hg", "Tl",
+      "Pb", "Bi", "Po", "At", "Rn", "Fr", "Ra", "Ac", "Th",
+      "Pa", "U", "Np", "Pu", "Am", "Cm", "Bk", "Cf", "Es",
+      "Fm", "Md", "No", "Lr", "Rf", "Db", "Sg", "Bh", "Hs",
+      "Mt", "Ds", "Rg", "Cn", "Nh", "Fl", "Mc", "Lv", "Ts",
+      "Og"
     ],
     "descriptor": {
       "_comment": [

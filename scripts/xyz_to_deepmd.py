@@ -23,8 +23,8 @@ so obsolete labels or a stale ``nopbc`` marker cannot survive a rerun.
 
 What is written, under ``<out>/``::
 
-    type.raw           per-atom indices, LOCAL to this system
-    type_map.raw       the elements this system contains, sorted
+    type.raw           per-atom indices into type_map.raw
+    type_map.raw       the full periodic table, unless --type-map present
     nopbc              empty marker, only when the frames are non-periodic
     set.000/coord.npy  (nframes, natoms * 3)
     set.000/energy.npy (nframes,)          when the frames carry energies
@@ -34,6 +34,20 @@ What is written, under ``<out>/``::
 ``type.raw`` indices point into this system's own ``type_map.raw``, not into
 the model's global ``type_map``; DeePMD-kit remaps them at load time. That is
 what lets systems with different element subsets share one model.
+
+**The default type_map is the whole periodic table**, in atomic-number order,
+so a carbon is type 5 in every dataset this script ever writes. A per-dataset
+map -- ``["H", "O"]`` here, ``["C", "H", "O"]`` there -- makes the same integer
+mean different elements in different directories, which is how a dataset ends
+up unusable with a model it was not converted for, and why pretrained DPA
+models carry the full table.
+
+The cost is one coupling worth knowing before you convert: DeePMD-kit refuses
+any element in a system's ``type_map.raw`` that is absent from the model's
+``type_map`` (``deepmd/utils/data.py:107``), so **the model's ``type_map`` must
+be the full table too**. Types with no atoms in the data are harmless -- they
+simply never receive a gradient. Pass ``--type-map present`` for the old
+per-dataset behaviour.
 """
 
 import argparse
@@ -42,6 +56,29 @@ import pathlib
 import sys
 
 import numpy as np
+
+#: Every element, in atomic-number order, which is the type_map a DPA-style
+#: model is expected to carry. Written out rather than taken from
+#: `ase.data.chemical_symbols` so the indices this script emits are fixed by
+#: THIS file: `type.raw` is data on disk, and it must not shift because a
+#: dependency reordered a list. `tests/test_xyz_to_deepmd.py` pins the two
+#: against each other.
+PERIODIC_TABLE = (
+    "H", "He", "Li", "Be", "B", "C", "N", "O", "F",
+    "Ne", "Na", "Mg", "Al", "Si", "P", "S", "Cl", "Ar",
+    "K", "Ca", "Sc", "Ti", "V", "Cr", "Mn", "Fe", "Co",
+    "Ni", "Cu", "Zn", "Ga", "Ge", "As", "Se", "Br", "Kr",
+    "Rb", "Sr", "Y", "Zr", "Nb", "Mo", "Tc", "Ru", "Rh",
+    "Pd", "Ag", "Cd", "In", "Sn", "Sb", "Te", "I", "Xe",
+    "Cs", "Ba", "La", "Ce", "Pr", "Nd", "Pm", "Sm", "Eu",
+    "Gd", "Tb", "Dy", "Ho", "Er", "Tm", "Yb", "Lu", "Hf",
+    "Ta", "W", "Re", "Os", "Ir", "Pt", "Au", "Hg", "Tl",
+    "Pb", "Bi", "Po", "At", "Rn", "Fr", "Ra", "Ac", "Th",
+    "Pa", "U", "Np", "Pu", "Am", "Cm", "Bk", "Cf", "Es",
+    "Fm", "Md", "No", "Lr", "Rf", "Db", "Sg", "Bh", "Hs",
+    "Mt", "Ds", "Rg", "Cn", "Nh", "Fl", "Mc", "Lv", "Ts",
+    "Og",
+)
 
 
 def load_frames(path, fmt=None, index=":"):
@@ -342,6 +379,16 @@ def main() -> None:
     )
     ap.add_argument("--seed", type=int, default=0, help="split shuffle seed")
     ap.add_argument(
+        "--type-map",
+        choices=("full", "present"),
+        default="full",
+        help="'full' (default) writes the whole periodic table, so type.raw "
+        "indices are Z-1 and mean the same thing in every dataset you ever "
+        "convert -- the model's `type_map` must then be the full table too. "
+        "'present' writes only the elements in this file, the old behaviour, "
+        "for a model whose type_map is a short hand-written list.",
+    )
+    ap.add_argument(
         "--split-by-composition",
         action="store_true",
         help="the input mixes species: write one system per composition, into "
@@ -383,8 +430,16 @@ def convert_one(frames, out, args, label=None):
     coord, energy, force, box, periodic = collect(frames, symbols)
     charge_spin = charge_spin_from(frames)
 
-    type_map = sorted(set(symbols))
-    atype = np.array([type_map.index(s) for s in symbols], dtype=np.int64)
+    present = sorted(set(symbols))
+    type_map = list(PERIODIC_TABLE) if args.type_map == "full" else present
+    index = {element: i for i, element in enumerate(type_map)}
+    unknown = [element for element in present if element not in index]
+    if unknown:
+        raise SystemExit(
+            f"{out}: {unknown} are not elements this script knows. "
+            "Pseudo-atoms and ASE's dummy 'X' have no place in a type_map."
+        )
+    atype = np.array([index[s] for s in symbols], dtype=np.int64)
     arrays = (coord, energy, force, box, charge_spin)
     if args.no_split or args.valid_fraction <= 0 or len(frames) < 2:
         write_system(out, np.arange(len(frames)), arrays, atype, type_map, periodic)
@@ -406,7 +461,14 @@ def convert_one(frames, out, args, label=None):
     else:
         print(f"  {label}", file=sys.stderr)
     print(f"  {len(frames)} frames x {len(symbols)} atoms", file=sys.stderr)
-    print(f"  type_map {type_map}", file=sys.stderr)
+    if args.type_map == "full":
+        print(
+            f"  type_map: the full periodic table ({len(type_map)} elements); "
+            f"present here: {present}",
+            file=sys.stderr,
+        )
+    else:
+        print(f"  type_map {type_map}", file=sys.stderr)
     if args.vacuum is not None:
         span = np.ptp(frames[0].get_positions()[:, 2])
         print(
@@ -426,6 +488,13 @@ def convert_one(frames, out, args, label=None):
         print(
             "  note: charge_spin is read only when the descriptor sets "
             "`add_chg_spin_ebd: true`",
+            file=sys.stderr,
+        )
+    if args.type_map == "full":
+        print(
+            "  note: set the model's `type_map` to the same full table, or "
+            "training stops at 'Elements [...] are not present in the "
+            "provided `type_map`'. Use --type-map present for a short one.",
             file=sys.stderr,
         )
 

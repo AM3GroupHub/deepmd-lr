@@ -187,7 +187,9 @@ def test_cli_mixed_order_conversion_and_safe_rerun(tmp_path, monkeypatch):
     )
     x2d.main()
     system = out / "H2O1"
-    assert (system / "type.raw").read_text().split() == ["0", "0", "1"]
+    # Z-1, because the default type_map is the whole periodic table: H is 0
+    # and O is 7 here, and will be 0 and 7 in every dataset this script writes.
+    assert (system / "type.raw").read_text().split() == ["0", "0", "7"]
     saved_forces = np.load(system / "set.000/force.npy")
     for i, atoms in enumerate(frames):
         order = np.argsort(atoms.get_chemical_symbols(), kind="stable")
@@ -233,3 +235,59 @@ def test_split_collision_refused_before_writing(tmp_path):
     with pytest.raises(SystemExit, match="not an empty directory"):
         x2d.convert_one([molecule("H2O"), molecule("H2O")], tmp_path, args)
     assert not (tmp_path / "valid").exists()
+
+
+class TestPeriodicTableDefault:
+    """The default `type_map` is the whole periodic table.
+
+    A per-dataset map makes the same integer mean different elements in
+    different directories, which is how a dataset becomes unusable with any
+    model but the one it was converted for. The cost is a coupling: DeePMD-kit
+    refuses an element that a system's map has and the model's does not
+    (`deepmd/utils/data.py:107`), so the model must carry the full table too.
+    """
+
+    def test_the_table_is_the_elements_in_atomic_number_order(self):
+        """Pinned against ASE rather than derived from it: `type.raw` is data
+        on disk, and its indices must not shift if a dependency reorders a
+        list."""
+        from ase.data import chemical_symbols
+
+        assert list(x2d.PERIODIC_TABLE) == chemical_symbols[1:]
+        assert len(x2d.PERIODIC_TABLE) == 118
+        assert x2d.PERIODIC_TABLE.index("C") == 5  # Z - 1
+
+    def _convert(self, tmp_path, monkeypatch, *flags):
+        frames = [molecule("HOH", seed=1)]
+        monkeypatch.setattr(x2d, "load_frames", lambda *args: frames)
+        out = tmp_path / "data"
+        monkeypatch.setattr(
+            "sys.argv",
+            ["xyz_to_deepmd", "unused.xyz", "-o", str(out), "--no-split", *flags],
+        )
+        x2d.main()
+        return out
+
+    def test_full_is_the_default(self, tmp_path, monkeypatch):
+        out = self._convert(tmp_path, monkeypatch)
+        written = (out / "type_map.raw").read_text().split()
+        assert written == list(x2d.PERIODIC_TABLE)
+        # Atoms keep their file order (H O H), so the indices are Z-1 in
+        # that order -- sorting happens only under --split-by-composition.
+        assert (out / "type.raw").read_text().split() == ["0", "7", "0"]
+
+    def test_present_keeps_the_old_per_dataset_map(self, tmp_path, monkeypatch):
+        out = self._convert(tmp_path, monkeypatch, "--type-map", "present")
+        assert (out / "type_map.raw").read_text().split() == ["H", "O"]
+        assert (out / "type.raw").read_text().split() == ["0", "1", "0"]
+
+    def test_the_two_modes_describe_the_same_atoms(self, tmp_path, monkeypatch):
+        """Different integers, same elements -- the point of the remap."""
+        full = self._convert(tmp_path / "a", monkeypatch)
+        present = self._convert(tmp_path / "b", monkeypatch, "--type-map", "present")
+        named = []
+        for system in (full, present):
+            table = (system / "type_map.raw").read_text().split()
+            named.append([table[int(i)] for i in
+                          (system / "type.raw").read_text().split()])
+        assert named[0] == named[1] == ["H", "O", "H"]
