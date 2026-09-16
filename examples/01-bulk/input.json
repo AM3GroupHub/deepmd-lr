@@ -8,10 +8,11 @@
   "model": {
     "type": "dp_lr",
     "_comment_type_map": [
-      "The whole periodic table, in atomic-number order -- what",
-      "scripts/xyz_to_deepmd.py writes by default, so this list and every",
-      "dataset's type_map.raw are the same list and hydrogen is type 0",
-      "everywhere.",
+      "The whole periodic table, indexed so that a type IS the atomic",
+      "number: hydrogen 1, oxygen 8. Index 0 is ASE's dummy \"X\", never",
+      "assigned to an atom -- the price of indices being the numbers you",
+      "already know. scripts/xyz_to_deepmd.py writes this by default, so",
+      "this list and every dataset's type_map.raw are the same list.",
       "",
       "Only H and O appear in this data. The other 116 types simply never",
       "receive a gradient; they cost a row each in the type embedding and the",
@@ -24,20 +25,20 @@
       "--type-map present."
     ],
     "type_map": [
-      "H", "He", "Li", "Be", "B", "C", "N", "O", "F",
-      "Ne", "Na", "Mg", "Al", "Si", "P", "S", "Cl", "Ar",
-      "K", "Ca", "Sc", "Ti", "V", "Cr", "Mn", "Fe", "Co",
-      "Ni", "Cu", "Zn", "Ga", "Ge", "As", "Se", "Br", "Kr",
-      "Rb", "Sr", "Y", "Zr", "Nb", "Mo", "Tc", "Ru", "Rh",
-      "Pd", "Ag", "Cd", "In", "Sn", "Sb", "Te", "I", "Xe",
-      "Cs", "Ba", "La", "Ce", "Pr", "Nd", "Pm", "Sm", "Eu",
-      "Gd", "Tb", "Dy", "Ho", "Er", "Tm", "Yb", "Lu", "Hf",
-      "Ta", "W", "Re", "Os", "Ir", "Pt", "Au", "Hg", "Tl",
-      "Pb", "Bi", "Po", "At", "Rn", "Fr", "Ra", "Ac", "Th",
-      "Pa", "U", "Np", "Pu", "Am", "Cm", "Bk", "Cf", "Es",
-      "Fm", "Md", "No", "Lr", "Rf", "Db", "Sg", "Bh", "Hs",
-      "Mt", "Ds", "Rg", "Cn", "Nh", "Fl", "Mc", "Lv", "Ts",
-      "Og"
+      "X", "H", "He", "Li", "Be", "B", "C", "N", "O",
+      "F", "Ne", "Na", "Mg", "Al", "Si", "P", "S", "Cl",
+      "Ar", "K", "Ca", "Sc", "Ti", "V", "Cr", "Mn", "Fe",
+      "Co", "Ni", "Cu", "Zn", "Ga", "Ge", "As", "Se", "Br",
+      "Kr", "Rb", "Sr", "Y", "Zr", "Nb", "Mo", "Tc", "Ru",
+      "Rh", "Pd", "Ag", "Cd", "In", "Sn", "Sb", "Te", "I",
+      "Xe", "Cs", "Ba", "La", "Ce", "Pr", "Nd", "Pm", "Sm",
+      "Eu", "Gd", "Tb", "Dy", "Ho", "Er", "Tm", "Yb", "Lu",
+      "Hf", "Ta", "W", "Re", "Os", "Ir", "Pt", "Au", "Hg",
+      "Tl", "Pb", "Bi", "Po", "At", "Rn", "Fr", "Ra", "Ac",
+      "Th", "Pa", "U", "Np", "Pu", "Am", "Cm", "Bk", "Cf",
+      "Es", "Fm", "Md", "No", "Lr", "Rf", "Db", "Sg", "Bh",
+      "Hs", "Mt", "Ds", "Rg", "Cn", "Nh", "Fl", "Mc", "Lv",
+      "Ts", "Og"
     ],
     "descriptor": {
       "_comment": [

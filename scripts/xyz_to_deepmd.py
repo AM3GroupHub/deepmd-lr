@@ -23,7 +23,7 @@ so obsolete labels or a stale ``nopbc`` marker cannot survive a rerun.
 
 What is written, under ``<out>/``::
 
-    type.raw           per-atom indices into type_map.raw
+    type.raw           per-atom indices into type_map.raw = atomic numbers
     type_map.raw       the full periodic table, unless --type-map present
     nopbc              empty marker, only when the frames are non-periodic
     set.000/coord.npy  (nframes, natoms * 3)
@@ -35,12 +35,15 @@ What is written, under ``<out>/``::
 the model's global ``type_map``; DeePMD-kit remaps them at load time. That is
 what lets systems with different element subsets share one model.
 
-**The default type_map is the whole periodic table**, in atomic-number order,
-so a carbon is type 5 in every dataset this script ever writes. A per-dataset
-map -- ``["H", "O"]`` here, ``["C", "H", "O"]`` there -- makes the same integer
-mean different elements in different directories, which is how a dataset ends
-up unusable with a model it was not converted for, and why pretrained DPA
-models carry the full table.
+**The default type_map is the whole periodic table**, arranged so that a type
+index *is* the atomic number: hydrogen 1, carbon 6, oxygen 8. Index 0 is ASE's
+dummy ``"X"``, which no atom is ever assigned -- the price of having the
+indices be the numbers everyone already knows rather than one less.
+
+A per-dataset map -- ``["H", "O"]`` here, ``["C", "H", "O"]`` there -- makes
+the same integer mean different elements in different directories, which is how
+a dataset ends up unusable with a model it was not converted for, and why
+pretrained DPA models carry the full table.
 
 The cost is one coupling worth knowing before you convert: DeePMD-kit refuses
 any element in a system's ``type_map.raw`` that is absent from the model's
@@ -57,27 +60,37 @@ import sys
 
 import numpy as np
 
-#: Every element, in atomic-number order, which is the type_map a DPA-style
-#: model is expected to carry. Written out rather than taken from
-#: `ase.data.chemical_symbols` so the indices this script emits are fixed by
-#: THIS file: `type.raw` is data on disk, and it must not shift because a
-#: dependency reordered a list. `tests/test_xyz_to_deepmd.py` pins the two
-#: against each other.
+#: The type_map a DPA-style model is expected to carry, arranged so that a
+#: type index IS the atomic number: hydrogen is 1, oxygen is 8, oganesson 118.
+#: That costs one slot, index 0, which is why the list opens with ASE's dummy
+#: symbol "X" -- a type no atom is ever assigned. The alternative, starting at
+#: H = 0, makes every index one less than the number physicists actually use,
+#: which is a subtraction waiting to be forgotten.
+#:
+#: "X" specifically, not "NULL" or "PAD": it is the placeholder `ase.data`
+#: itself uses, so anything resolving a type_map entry through ASE -- our own
+#: `atomic_masses` in deepmd_lr/nvalchemi/evaluator.py, for one -- keeps
+#: working rather than raising on a name it has never heard of.
+#:
+#: Written out rather than imported from `ase.data.chemical_symbols` so the
+#: indices this script emits are fixed by THIS file: `type.raw` is data on
+#: disk, and it must not shift because a dependency reordered a list.
+#: `tests/test_xyz_to_deepmd.py` pins the two against each other.
 PERIODIC_TABLE = (
-    "H", "He", "Li", "Be", "B", "C", "N", "O", "F",
-    "Ne", "Na", "Mg", "Al", "Si", "P", "S", "Cl", "Ar",
-    "K", "Ca", "Sc", "Ti", "V", "Cr", "Mn", "Fe", "Co",
-    "Ni", "Cu", "Zn", "Ga", "Ge", "As", "Se", "Br", "Kr",
-    "Rb", "Sr", "Y", "Zr", "Nb", "Mo", "Tc", "Ru", "Rh",
-    "Pd", "Ag", "Cd", "In", "Sn", "Sb", "Te", "I", "Xe",
-    "Cs", "Ba", "La", "Ce", "Pr", "Nd", "Pm", "Sm", "Eu",
-    "Gd", "Tb", "Dy", "Ho", "Er", "Tm", "Yb", "Lu", "Hf",
-    "Ta", "W", "Re", "Os", "Ir", "Pt", "Au", "Hg", "Tl",
-    "Pb", "Bi", "Po", "At", "Rn", "Fr", "Ra", "Ac", "Th",
-    "Pa", "U", "Np", "Pu", "Am", "Cm", "Bk", "Cf", "Es",
-    "Fm", "Md", "No", "Lr", "Rf", "Db", "Sg", "Bh", "Hs",
-    "Mt", "Ds", "Rg", "Cn", "Nh", "Fl", "Mc", "Lv", "Ts",
-    "Og",
+    "X", "H", "He", "Li", "Be", "B", "C", "N", "O",
+    "F", "Ne", "Na", "Mg", "Al", "Si", "P", "S", "Cl",
+    "Ar", "K", "Ca", "Sc", "Ti", "V", "Cr", "Mn", "Fe",
+    "Co", "Ni", "Cu", "Zn", "Ga", "Ge", "As", "Se", "Br",
+    "Kr", "Rb", "Sr", "Y", "Zr", "Nb", "Mo", "Tc", "Ru",
+    "Rh", "Pd", "Ag", "Cd", "In", "Sn", "Sb", "Te", "I",
+    "Xe", "Cs", "Ba", "La", "Ce", "Pr", "Nd", "Pm", "Sm",
+    "Eu", "Gd", "Tb", "Dy", "Ho", "Er", "Tm", "Yb", "Lu",
+    "Hf", "Ta", "W", "Re", "Os", "Ir", "Pt", "Au", "Hg",
+    "Tl", "Pb", "Bi", "Po", "At", "Rn", "Fr", "Ra", "Ac",
+    "Th", "Pa", "U", "Np", "Pu", "Am", "Cm", "Bk", "Cf",
+    "Es", "Fm", "Md", "No", "Lr", "Rf", "Db", "Sg", "Bh",
+    "Hs", "Mt", "Ds", "Rg", "Cn", "Nh", "Fl", "Mc", "Lv",
+    "Ts", "Og",
 )
 
 
@@ -382,9 +395,9 @@ def main() -> None:
         "--type-map",
         choices=("full", "present"),
         default="full",
-        help="'full' (default) writes the whole periodic table, so type.raw "
-        "indices are Z-1 and mean the same thing in every dataset you ever "
-        "convert -- the model's `type_map` must then be the full table too. "
+        help="'full' (default) writes the whole periodic table, so a type "
+        "index IS the atomic number -- H is 1, O is 8 -- in every dataset you "
+        "ever convert. The model's `type_map` must then be the full table too. "
         "'present' writes only the elements in this file, the old behaviour, "
         "for a model whose type_map is a short hand-written list.",
     )
@@ -433,11 +446,12 @@ def convert_one(frames, out, args, label=None):
     present = sorted(set(symbols))
     type_map = list(PERIODIC_TABLE) if args.type_map == "full" else present
     index = {element: i for i, element in enumerate(type_map)}
-    unknown = [element for element in present if element not in index]
+    unknown = [el for el in present if el not in index or el == "X"]
     if unknown:
         raise SystemExit(
-            f"{out}: {unknown} are not elements this script knows. "
-            "Pseudo-atoms and ASE's dummy 'X' have no place in a type_map."
+            f"{out}: {unknown} cannot be given a type. Real elements only -- "
+            "ASE's dummy 'X' holds index 0 so that a type index is the atomic "
+            "number, and no atom may be assigned to it."
         )
     atype = np.array([index[s] for s in symbols], dtype=np.int64)
     arrays = (coord, energy, force, box, charge_spin)
@@ -463,7 +477,7 @@ def convert_one(frames, out, args, label=None):
     print(f"  {len(frames)} frames x {len(symbols)} atoms", file=sys.stderr)
     if args.type_map == "full":
         print(
-            f"  type_map: the full periodic table ({len(type_map)} elements); "
+            f"  type_map: the full periodic table ({len(type_map)} entries); "
             f"present here: {present}",
             file=sys.stderr,
         )
