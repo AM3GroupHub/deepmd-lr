@@ -46,7 +46,7 @@ molecules.xyz -> data
   670 frames -> 4 system(s)
   C2Cl1H5Si1
   180 frames x 9 atoms
-  type_map ['C', 'Cl', 'H', 'Si']
+  type_map: the full periodic table (118 elements); present here: ['C', 'Cl', 'H', 'Si']
   non-periodic (nopbc)  labels: energy, force  +charge_spin
   data/C2Cl1H5Si1/train  162 frames
   data/C2Cl1H5Si1/valid  18 frames

@@ -102,6 +102,11 @@ Select the model type in the input file:
 }
 ```
 
+Both snippets are abbreviated. In particular `type_map` is shown as two
+elements for readability; `scripts/xyz_to_deepmd.py` writes the **whole
+periodic table** into every dataset by default, and the model's `type_map` has
+to be the same list — see [Dataset layout](#the-indices-in-typeraw-are-local-to-that-system).
+
 Add a `long_range` block to switch the electrostatics on:
 
 ```json
@@ -420,9 +425,10 @@ the order branches are listed in.
 
 ### Rules that will bite you
 
-- **One `type_map` for all heads.** DeePMD-kit asserts it. The map is the union
-  of elements across every dataset; per-system `type.raw` indices stay local
-  and are remapped through each system's own `type_map.raw`.
+- **One `type_map` for all heads.** DeePMD-kit asserts it. With the
+  converter's default that is simply the whole periodic table, so there is no
+  union to compute and no element to forget; per-system `type.raw` indices
+  stay local and are remapped through each system's own `type_map.raw`.
 - **`pt_expt` does not inherit top-level defaults into branches.** Unlike the
   `pt` backend, nothing cascades — combined with strict validation, every
   option must be written out in every branch.
@@ -603,6 +609,19 @@ With model `type_map = ["Cl", "H", "Na", "O"]`:
 - An element in a system's `type_map.raw` that the model's `type_map` lacks
   fails loudly: `ValueError: Elements ['Xe'] are not present in the provided
   type_map`.
+
+**The remap above is machinery you can now mostly ignore.**
+`scripts/xyz_to_deepmd.py` writes the full periodic table into `type_map.raw`
+by default, in atomic-number order, so every dataset it produces uses the same
+indices — hydrogen is 0 and carbon is 5 everywhere — and the remap becomes the
+identity. That is what makes a dataset reusable with a model it was not
+converted for, and it is why pretrained DPA models carry the full table.
+
+The trade is the last bullet above, now unmissable rather than rare: the
+model's `type_map` must be the full table too, or every element the data
+declares and the model lacks is reported at load. Elements with no atoms in
+the data are harmless — a row each in the type embedding and the energy bias,
+never a gradient. Pass `--type-map present` to get the old per-dataset map.
 
 ### Several compositions in one training set
 

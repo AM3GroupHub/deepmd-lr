@@ -14,21 +14,29 @@
   "model": {
     "type": "dp_lr",
     "_comment_type_map": [
-      "The GLOBAL element list: the union over every system. Each system's own",
-      "type_map.raw is different (C,Cl,H,Si / C,H,O,S / C,H,N,O,P,S / C,H,N)",
-      "and its type.raw indexes THAT list, not this one. DeePMD-kit remaps at",
-      "load time, which is what lets systems with different element subsets",
-      "share one model without renumbering anything."
+      "The whole periodic table. Four systems of four different compositions",
+      "live under this one model, and with the full table they no longer need",
+      "four different type_map.raw files to be reconciled -- every system",
+      "writes the same list, and carbon is type 5 in all of them.",
+      "",
+      "The remap DeePMD-kit does at load time still happens; it just has",
+      "nothing left to do."
     ],
     "type_map": [
-      "C",
-      "Cl",
-      "H",
-      "N",
-      "O",
-      "P",
-      "S",
-      "Si"
+      "H", "He", "Li", "Be", "B", "C", "N", "O", "F",
+      "Ne", "Na", "Mg", "Al", "Si", "P", "S", "Cl", "Ar",
+      "K", "Ca", "Sc", "Ti", "V", "Cr", "Mn", "Fe", "Co",
+      "Ni", "Cu", "Zn", "Ga", "Ge", "As", "Se", "Br", "Kr",
+      "Rb", "Sr", "Y", "Zr", "Nb", "Mo", "Tc", "Ru", "Rh",
+      "Pd", "Ag", "Cd", "In", "Sn", "Sb", "Te", "I", "Xe",
+      "Cs", "Ba", "La", "Ce", "Pr", "Nd", "Pm", "Sm", "Eu",
+      "Gd", "Tb", "Dy", "Ho", "Er", "Tm", "Yb", "Lu", "Hf",
+      "Ta", "W", "Re", "Os", "Ir", "Pt", "Au", "Hg", "Tl",
+      "Pb", "Bi", "Po", "At", "Rn", "Fr", "Ra", "Ac", "Th",
+      "Pa", "U", "Np", "Pu", "Am", "Cm", "Bk", "Cf", "Es",
+      "Fm", "Md", "No", "Lr", "Rf", "Db", "Sg", "Bh", "Hs",
+      "Mt", "Ds", "Rg", "Cn", "Nh", "Fl", "Mc", "Lv", "Ts",
+      "Og"
     ],
     "descriptor": {
       "_comment": [

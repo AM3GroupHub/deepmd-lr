@@ -32,23 +32,29 @@
     ],
     "shared_dict": {
       "_comment_type_map_all": [
-        "ONE type_map for the whole model -- multi-task asserts it. It is the",
-        "UNION over all three examples: H,O from bulk; C,Cl,H,N,O,P,S,Si from",
-        "the molecules; C,F,H,Li,N,O,S from the slab. Each system keeps its",
-        "own local type_map.raw and DeePMD-kit remaps into this list, so no",
-        "dataset has to be renumbered."
+        "ONE type_map for the whole model -- multi-task asserts it.",
+        "",
+        "It used to have to be the hand-computed UNION over all three",
+        "examples (H,O from bulk; C,Cl,H,N,O,P,S,Si from the molecules;",
+        "C,F,H,Li,N,O,S from the slab), and a missed element failed at load.",
+        "With the full periodic table there is no union to get wrong, and a",
+        "fourth branch can be added without touching this list at all."
       ],
       "type_map_all": [
-        "C",
-        "Cl",
-        "F",
-        "H",
-        "Li",
-        "N",
-        "O",
-        "P",
-        "S",
-        "Si"
+        "H", "He", "Li", "Be", "B", "C", "N", "O", "F",
+        "Ne", "Na", "Mg", "Al", "Si", "P", "S", "Cl", "Ar",
+        "K", "Ca", "Sc", "Ti", "V", "Cr", "Mn", "Fe", "Co",
+        "Ni", "Cu", "Zn", "Ga", "Ge", "As", "Se", "Br", "Kr",
+        "Rb", "Sr", "Y", "Zr", "Nb", "Mo", "Tc", "Ru", "Rh",
+        "Pd", "Ag", "Cd", "In", "Sn", "Sb", "Te", "I", "Xe",
+        "Cs", "Ba", "La", "Ce", "Pr", "Nd", "Pm", "Sm", "Eu",
+        "Gd", "Tb", "Dy", "Ho", "Er", "Tm", "Yb", "Lu", "Hf",
+        "Ta", "W", "Re", "Os", "Ir", "Pt", "Au", "Hg", "Tl",
+        "Pb", "Bi", "Po", "At", "Rn", "Fr", "Ra", "Ac", "Th",
+        "Pa", "U", "Np", "Pu", "Am", "Cm", "Bk", "Cf", "Es",
+        "Fm", "Md", "No", "Lr", "Rf", "Db", "Sg", "Bh", "Hs",
+        "Mt", "Ds", "Rg", "Cn", "Nh", "Fl", "Mc", "Lv", "Ts",
+        "Og"
       ],
       "_comment_backbone": [
         "The shared DPA4C. rcut 6.0 must stay below half of the SMALLEST cell",
