@@ -41,7 +41,7 @@ python ../../scripts/xyz_to_deepmd.py train-H2O_RPBE-D3.xyz -o data --valid-frac
 
 ```
 604 frames x 192 atoms
-type_map: the full periodic table (118 elements); present here: ['H', 'O']
+type_map: the full periodic table (119 entries); present here: ['H', 'O']
 periodic  labels: energy, force
 data/train  544 frames
 data/valid   60 frames
@@ -51,9 +51,14 @@ note: set the model's `type_map` to the same full table, or training stops at 'E
 The `type_map` is the whole periodic table, not just `['H', 'O']`, and that is
 the default. A per-dataset map makes the same integer mean different elements
 in different directories, so a dataset only ever works with the model it was
-converted for; with the full table hydrogen is type 0 everywhere. The 116
-elements absent from this water get a row in the type embedding and the energy
-bias, never receive a gradient, and cost nothing else.
+converted for.
+
+With the full table a **type index is the atomic number** — hydrogen 1, oxygen
+8, everywhere. Index 0 is ASE's dummy `"X"`, which no atom is ever assigned;
+that slot exists so the indices are the numbers you already know rather than
+one less than them. The 116 elements absent from this water get a row in the
+type embedding and the energy bias, never receive a gradient, and cost nothing
+else.
 
 The one thing it commits you to: `input.json`'s `type_map` must be the same
 full list, because DeePMD-kit refuses an element a dataset has and the model

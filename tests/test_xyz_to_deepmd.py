@@ -187,9 +187,9 @@ def test_cli_mixed_order_conversion_and_safe_rerun(tmp_path, monkeypatch):
     )
     x2d.main()
     system = out / "H2O1"
-    # Z-1, because the default type_map is the whole periodic table: H is 0
-    # and O is 7 here, and will be 0 and 7 in every dataset this script writes.
-    assert (system / "type.raw").read_text().split() == ["0", "0", "7"]
+    # The default type_map is the whole periodic table, indexed so that a type
+    # IS the atomic number: H is 1 and O is 8 here, and in every dataset.
+    assert (system / "type.raw").read_text().split() == ["1", "1", "8"]
     saved_forces = np.load(system / "set.000/force.npy")
     for i, atoms in enumerate(frames):
         order = np.argsort(atoms.get_chemical_symbols(), kind="stable")
@@ -247,15 +247,42 @@ class TestPeriodicTableDefault:
     (`deepmd/utils/data.py:107`), so the model must carry the full table too.
     """
 
-    def test_the_table_is_the_elements_in_atomic_number_order(self):
-        """Pinned against ASE rather than derived from it: `type.raw` is data
-        on disk, and its indices must not shift if a dependency reorders a
-        list."""
-        from ase.data import chemical_symbols
+    def test_a_type_index_is_the_atomic_number(self):
+        """The point of the layout. Index 0 is ASE's dummy so that H lands on
+        1 rather than 0 -- otherwise every index is one less than the number
+        anyone actually uses, which is a subtraction waiting to be forgotten.
 
-        assert list(x2d.PERIODIC_TABLE) == chemical_symbols[1:]
-        assert len(x2d.PERIODIC_TABLE) == 118
-        assert x2d.PERIODIC_TABLE.index("C") == 5  # Z - 1
+        Pinned against ASE rather than derived from it: `type.raw` is data on
+        disk, and its indices must not shift if a dependency reorders a list.
+        """
+        from ase.data import atomic_numbers, chemical_symbols
+
+        assert list(x2d.PERIODIC_TABLE) == chemical_symbols
+        assert len(x2d.PERIODIC_TABLE) == 119
+        assert x2d.PERIODIC_TABLE[0] == "X"
+        for element in ("H", "C", "O", "Fe", "Og"):
+            assert x2d.PERIODIC_TABLE.index(element) == atomic_numbers[element]
+
+    def test_the_dummy_slot_resolves_through_ase(self):
+        """"X", not "NULL": deepmd_lr's own `atomic_masses` builds a mass for
+        every type_map entry through `ase.data`, so slot 0 has to be a name ASE
+        knows or MD setup raises on a model it could otherwise run."""
+        from ase.data import atomic_masses, atomic_numbers
+
+        assert atomic_masses[atomic_numbers[x2d.PERIODIC_TABLE[0]]] is not None
+
+    def test_a_dummy_atom_in_the_data_is_refused(self, tmp_path, monkeypatch):
+        """Slot 0 exists to be unused. Now that "X" is in the table, a frame
+        carrying one would otherwise be quietly assigned to it."""
+        from ase import Atoms
+
+        monkeypatch.setattr(x2d, "load_frames", lambda *a: [Atoms("XH")])
+        monkeypatch.setattr(
+            "sys.argv",
+            ["xyz_to_deepmd", "unused.xyz", "-o", str(tmp_path / "d"), "--no-split"],
+        )
+        with pytest.raises(SystemExit, match="cannot be given a type"):
+            x2d.main()
 
     def _convert(self, tmp_path, monkeypatch, *flags):
         frames = [molecule("HOH", seed=1)]
@@ -272,9 +299,10 @@ class TestPeriodicTableDefault:
         out = self._convert(tmp_path, monkeypatch)
         written = (out / "type_map.raw").read_text().split()
         assert written == list(x2d.PERIODIC_TABLE)
-        # Atoms keep their file order (H O H), so the indices are Z-1 in
-        # that order -- sorting happens only under --split-by-composition.
-        assert (out / "type.raw").read_text().split() == ["0", "7", "0"]
+        # Atoms keep their file order (H O H), so the indices are the atomic
+        # numbers in that order -- sorting happens only under
+        # --split-by-composition.
+        assert (out / "type.raw").read_text().split() == ["1", "8", "1"]
 
     def test_present_keeps_the_old_per_dataset_map(self, tmp_path, monkeypatch):
         out = self._convert(tmp_path, monkeypatch, "--type-map", "present")

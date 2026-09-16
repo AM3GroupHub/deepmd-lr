@@ -612,10 +612,12 @@ With model `type_map = ["Cl", "H", "Na", "O"]`:
 
 **The remap above is machinery you can now mostly ignore.**
 `scripts/xyz_to_deepmd.py` writes the full periodic table into `type_map.raw`
-by default, in atomic-number order, so every dataset it produces uses the same
-indices — hydrogen is 0 and carbon is 5 everywhere — and the remap becomes the
-identity. That is what makes a dataset reusable with a model it was not
-converted for, and it is why pretrained DPA models carry the full table.
+by default, arranged so that **a type index is the atomic number** — hydrogen 1,
+carbon 6, oxygen 8 — in every dataset it produces, which makes the remap the
+identity. Index 0 is ASE's dummy `"X"` and is never assigned to an atom; it is
+there so the indices are the numbers everyone already uses rather than one less.
+That is what makes a dataset reusable with a model it was not converted for, and
+it is why pretrained DPA models carry the full table.
 
 The trade is the last bullet above, now unmissable rather than rare: the
 model's `type_map` must be the full table too, or every element the data
