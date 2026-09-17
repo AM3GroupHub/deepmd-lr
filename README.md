@@ -20,6 +20,7 @@ says so.
   [`pme` or `ewald`](#pme-or-ewald)
 - [Non-periodic systems](#non-periodic-systems) ·
   [Multi-head training](#several-levels-of-theory-multi-head-training) ·
+  [EMA](#ema-is-on-by-default) ·
   [Mixed boundaries (`same_as`)](#one-theory-two-boundaries-same_as)
 - [Dataset layout](#dataset-layout) ·
   [Training schedule](#the-training-schedule) ·
@@ -751,6 +752,41 @@ At the default 0.01 the graft is continuous and the head is alive:
 | warm-up ended | — | — | 0.176 eV/Å |
 | grafted init  | 0.0002 eV | 4.1e-03 | 0.168 eV/Å |
 | after stage 3 | 0.0492 eV | 8.7e-02 | 0.175 eV/Å |
+
+### EMA is on by default
+
+`dp_lr` training keeps an exponential moving average of the parameters,
+`ema = 0.999 * ema + 0.001 * param` after every optimizer step, and writes it
+next to the live checkpoint as `model_ema.ckpt-<step>.pt` (pointer
+`model_ema.ckpt.pt`). The plugin sets `"enable_ema": true, "ema_decay": 0.999`
+in `training` whenever the model is `dp_lr` and you have not written
+`enable_ema` yourself — an explicit `false` is respected, and so is your own
+decay. Plain DeePMD-kit runs are untouched.
+
+Why: the default loss schedule weights forces a thousand times more than
+energy at the start and hands the weight to energy as the learning rate
+decays; late in training the force-shaped parameters drift on a small, noisy
+gradient. Averaging the last ~1000 steps (the window is about `1/(1-decay)`)
+gives a production model that does not depend on which step training happened
+to stop at, for the price of one extra parameter copy.
+
+What to know:
+
+- **Deploy the EMA snapshot, restart from the live one.** `model_ema.ckpt.pt`
+  holds averaged parameters plus the live buffers (`out_bias`, `out_std`,
+  descriptor statistics) and carries neither optimizer nor EMA state; the
+  ASE calculator, the partitioned evaluator and `load_model` take it like any
+  checkpoint. `--restart` needs `model.ckpt.pt`.
+- **A new run is a new average.** `--init-model` (Plan B's stage 3, a graft,
+  a fine-tune) drops the previous accumulator and starts averaging from the
+  loaded weights; only `--restart` continues it.
+- **Short runs: turn it off.** After 200 steps the snapshot is still 82 %
+  initial weights. Below a few thousand steps set `"enable_ema": false`, or
+  use a smaller decay (0.99 averages ~100 steps).
+- DeePMD-kit supports EMA only for `zero_stage < 2`; the default is not
+  applied otherwise.
+
+The examples write both keys explicitly so a reader sees what will run.
 
 ## What to watch
 

@@ -239,6 +239,8 @@
       }
     },
     "numb_steps": 200000,
+    "enable_ema": true,
+    "ema_decay": 0.999,
     "seed": 1,
     "disp_file": "lcurve.out",
     "disp_freq": 200,
