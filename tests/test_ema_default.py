@@ -8,6 +8,7 @@ import sys
 from deepmd_lr.ema_default import (
     EMA_DEFAULTS,
     apply_ema_default,
+    apply_to_normalized,
     has_long_range_model,
 )
 
@@ -90,6 +91,48 @@ first = training.Trainer.__init__
 assert getattr(first, "_deepmd_lr_ema_default", False), "not installed"
 ema_default.install()
 assert training.Trainer.__init__ is first, "not idempotent"
+print("ok")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=600
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().endswith("ok")
+
+
+def normalized(config):
+    """What argcheck does to every config: fill in the declared defaults."""
+    out = copy.deepcopy(config)
+    out["training"].setdefault("enable_ema", False)
+    out["training"].setdefault("ema_decay", 0.999)
+    return out
+
+
+def test_normalization_default_is_not_mistaken_for_a_user_choice():
+    # `dp train` normalizes before building the trainer, so by then enable_ema is
+    # already present and False. Deciding from the raw config is the whole point.
+    silent = apply_to_normalized(SINGLE, normalized(SINGLE))
+    assert silent["training"]["enable_ema"] is True
+    assert silent["training"]["ema_decay"] == EMA_DEFAULTS["ema_decay"]
+
+    off = copy.deepcopy(SINGLE)
+    off["training"]["enable_ema"] = False
+    assert apply_to_normalized(off, normalized(off))["training"]["enable_ema"] is False
+
+    on = copy.deepcopy(SINGLE)
+    on["training"].update(enable_ema=True, ema_decay=0.99)
+    assert apply_to_normalized(on, normalized(on))["training"]["ema_decay"] == 0.99
+
+    # a non-dp_lr config is returned exactly as the normalizer produced it
+    assert apply_to_normalized(PLAIN, normalized(PLAIN)) == normalized(PLAIN)
+
+
+def test_entrypoint_normalize_config_is_wrapped_by_the_entry_point():
+    code = """
+import deepmd.pt_expt  # noqa: F401
+from deepmd.dpmodel.train.entrypoint import AbstractTrainEntrypoint
+hook = AbstractTrainEntrypoint.normalize_config
+assert getattr(hook, "_deepmd_lr_ema_default", False)
 print("ok")
 """
     result = subprocess.run(
