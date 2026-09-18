@@ -328,6 +328,8 @@
     ],
     "gradient_max_norm": 5.0,
     "numb_steps": 200000,
+    "enable_ema": true,
+    "ema_decay": 0.999,
     "save_freq": 2000,
     "disp_file": "lcurve.out",
     "disp_freq": 200,

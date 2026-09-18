@@ -18,8 +18,9 @@ input-normalization time -- both strictly after the backend import that
 brings us here.
 """
 
-from deepmd_lr import (  # noqa: F401  registers `dp_lr` / `charge` schema args  # noqa: F401  the `same_as` pseudo-head hooks
+from deepmd_lr import (  # noqa: F401  schema args; `same_as` and EMA hooks
     argcheck,
+    ema_default,
     same_as,
 )
 from deepmd_lr.fitting import (  # noqa: F401  registers the `charge` fitting head
@@ -36,5 +37,8 @@ from deepmd_lr.model import (  # noqa: F401  registers the `dp_lr` model type
 # that merely importing the module -- which `argcheck` does, for one constant
 # -- has no side effect on the backend.
 same_as.install()
+# EMA on by default for `dp_lr` training: wraps `Trainer.__init__` after `same_as`
+# did, so both run and each is a pass-through when it does not apply.
+ema_default.install()
 
-__all__ = ["argcheck", "charge", "lr_model", "same_as"]
+__all__ = ["argcheck", "charge", "ema_default", "lr_model", "same_as"]

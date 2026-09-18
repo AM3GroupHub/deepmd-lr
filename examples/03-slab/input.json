@@ -122,6 +122,8 @@
       "numb_btch": 5
     },
     "numb_steps": 100000,
+    "enable_ema": true,
+    "ema_decay": 0.999,
     "save_freq": 2000,
     "disp_file": "lcurve.out",
     "disp_freq": 200,
