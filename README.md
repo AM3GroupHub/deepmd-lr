@@ -26,7 +26,8 @@ says so.
   [Training schedule](#the-training-schedule) ·
   [What to watch](#what-to-watch) · [Validating](#validating-a-trained-model)
 - [Troubleshooting](#troubleshooting) · [Cost](#cost)
-- [Running MD](#running-md) · [Born charges and external fields](#born-effective-charges-and-md-in-an-external-field) ·
+- [Running MD](#running-md) · [Compressed backbone](#compressed-backbone) ·
+  [Born charges and external fields](#born-effective-charges-and-md-in-an-external-field) ·
   [MD over partitions](#running-md-over-partitions)
 - [Which neighbour list runs](#which-neighbour-list-runs) · [Tests](#tests) · [Results](#results)
 
@@ -73,7 +74,10 @@ and resolves `libmpi.so` through mpich's package metadata. Without it,
 The PyPI `deepmd-kit` aarch64 wheel is a `DP_VARIANT=cpu` build, which is
 fine: training runs in eager PyTorch on the GPU, and the compiled CUDA
 mega-kernels are opt-in through `DP_CUDA_INFER` and inference-only. No source
-build is needed.
+build is needed — unless you want the
+[compressed backbone](#compressed-backbone) for MD, whose kernel the wheel
+does not contain; the recipe is under
+[Building the CUDA operators](#building-the-cuda-operators).
 
 Smoke-test before anything else — the riskiest part is warp compiling for
 sm_121, and if it fails `warp.init()` says so:
@@ -857,14 +861,19 @@ drift.
 | `pme` and `ewald` disagree by more than ~1e-4 | mesh too coarse for this `alpha` | refine the mesh, or lower `alpha` |
 | Energies fine, forces bad | `alpha`/mesh mismatch | check the mesh resolves `1/(2·alpha)` |
 | CUDA OOM during statistics | `data_stat_nbatch` default of 10 on large frames | set `data_stat_nbatch: 1` in the model block |
+| `RuntimeError: compression needs the compiled operator ...` | the PyPI wheel has no `dpa4c_graph_compress` kernel | [build the CUDA operators](#building-the-cuda-operators), or drop `compress=` |
+| `RuntimeError: DP_CUDA_INFER=2 on a compressed model` | level 2 bypasses `call_graph` and the shared backbone | `export DP_CUDA_INFER=1` |
+| `RuntimeError: ... needs the destination CSR views` | a hand-built graph reached a compressed model | build it with `with_csr=True`, or `attach_edge_csr` |
+| `ValueError: charge_spin ... differs from the state ... folded into the compressed tables` | the run's condition is not the one compressed with | pass that `charge_spin` to the calculator/evaluator, which folds it in |
+| `NotImplementedError: The graph-lower interface (DeepPot, dp test, ...)` | a long-range checkpoint evaluated through DeepPot/`dp test` | use `LongRangeCalculator` or the nvalchemi evaluator; only they see the cell |
 
 ## Cost
 
 The charge head reads the same descriptor features the energy head produced,
-so the backbone runs **once** — the serial path via `_capturing_backbone`, the
-partitioned path via the equivalent capture in `nvalchemi/driver.py`. Both
-keep the old second pass as a fallback for when the capture cannot carry the
-gradient.
+so the backbone runs **once** — serial and partitioned paths alike, through
+the model's own `_capturing_backbone`. Both keep the old second pass as a
+fallback for when the capture cannot carry the gradient (never for a
+compressed model, which refuses it).
 
 Measured against an identically configured short-range twin (same descriptor,
 same fitting net, `long_range` deleted):
@@ -891,6 +900,54 @@ no extra memory, since it reuses the captured features. Memory for the
 long-range model is ~0.65 MiB/atom (42.6 GiB at 65,856 atoms), with or without
 a field.
 
+### With the compressed backbone
+
+Measured on a GB10 (compute capability 12.1) with the source-built CUDA
+operators — a different machine from the table above, so compare within this
+table only. 6,144-atom water (`water_192.xyz` × 4×4×2), 1,000 NVE steps,
+`Thermo.performance()` with the warm-up interval excluded; the SR twin is
+`experiments/water_sr`, the long-range model `experiments/water_joint`.
+
+| | `DP_CUDA_INFER` | stride | ms/step | ns/day | peak GiB | drift meV/atom/ps |
+|---|---:|---:|---:|---:|---:|---:|
+| short-range | 0 | – | 226.8 | 0.190 | 6.28 | −0.0024 |
+| short-range | 1 | – | 226.2 | 0.191 | 6.25 | −0.0024 |
+| short-range, compressed | 1 | 0.01 | **20.9** | **2.069** | **0.32** | −0.0025 |
+| long-range | 0 | – | 375.6 | 0.115 | 6.44 | +0.0008 |
+| long-range | 1 | – | 373.3 | 0.116 | 6.41 | +0.0008 |
+| long-range, compressed | 1 | 0.01 | **27.2** | **1.590** | **0.34** | +0.0008 |
+| long-range, compressed | 1 | 0.002 | 29.1 | 1.482 | 0.34 | +0.0008 |
+
+Compression is a **13.7×** step-time reduction for the long-range model
+(10.8× for the short-range twin) and a **19×** reduction in peak memory. The
+kernel was entered exactly `steps + 1` times in every compressed row, which
+the benchmark asserts — a row cannot report a compression result through the
+silent fall-through. Level 1 alone, without compression, changes nothing
+measurable (1.01×). The total-energy drift is unchanged by compression, which
+is the cheapest check that the operator's backward is right.
+
+The LR/SR ratio *improves*, from 1.66× to **1.30×**: the long-range overhead
+falls from 147 ms to 6.3 ms because the charge-response backward runs through
+the compressed kernel's fused VJP as well. The reciprocal sum itself is
+unchanged at ~1.5 ms and is now a visible fraction of the step.
+
+**Accuracy**, compressed against uncompressed on 50 frames of the water BEC
+set (192 atoms), both at level 1:
+
+| stride | max ΔE | max ΔF | max Δq | max ΔZ | vs DFT: E / F / Z rmse |
+|---:|---:|---:|---:|---:|---|
+| – | – | – | – | – | 0.278 meV/atom / 0.0309 eV/Å / 0.184 e |
+| 0.01 | 0.0001 meV/atom | 1.1e-5 eV/Å | 4.3e-7 e | 6.4e-7 e | identical to the digits shown |
+| 0.002 | 0.0001 meV/atom | 1.1e-5 eV/Å | 4.8e-7 e | 6.7e-7 e | identical |
+
+The tabulation error is three orders of magnitude below the model's own error
+against DFT, and the finer stride buys nothing, so DeePMD-kit's default 0.01 Å
+is the right one. On the small test frames the gaps are at the fp32 floor
+(~1e-7 in every quantity). Reproduce with `experiments/compress_bench/`.
+
+On the PyPI wheel none of this applies: `compress=True` is refused, so the
+speedup there is exactly none.
+
 ## Running MD
 
 > **Do not `dp freeze` a model with a `long_range` block.** It is refused. The
@@ -900,6 +957,14 @@ a field.
 > **−93.74 eV** where the eager model gives **−55.12** — the entire 38.6 eV
 > long-range contribution gone, with no warning. Freezing a short-range-only
 > model (no `long_range` block) still works.
+>
+> The same refusal now covers every other caller of that graph lower:
+> `DeepPot` and `deepmd.calculator.DP` on a checkpoint, `dp test`, and
+> training with `enable_compile`. Each of them evaluates
+> `forward_common_lower_graph` directly and would report the short-range
+> energy alone. The lower is permitted only inside the model's own backbone
+> capture, which is where the long-range term gets added — `forward` here,
+> and the partitioned driver.
 
 Use the ASE calculator, which drives the model's full `forward` and therefore
 has the cell:
@@ -912,6 +977,110 @@ from deepmd_lr.ase import LongRangeCalculator
 atoms.calc = LongRangeCalculator("run_joint/model.ckpt.pt")
 VelocityVerlet(atoms, timestep=0.5 * units.fs).run(10000)
 ```
+
+### Compressed backbone
+
+The descriptor is where the time goes — at 6,520 atoms it is 883 ms of a step
+against 73 ms for the reciprocal sum — and it is the part DeePMD-kit knows how
+to compress: the radial branch is tabulated into fp32 quintic-Hermite tables,
+the pair, coupling and readout tensors are frozen, and the descriptor
+dispatches to one fused CUDA kernel, `deepmd::dpa4c_graph_compress`. The
+charge head and the reciprocal-space term are untouched.
+
+```python
+atoms.calc = LongRangeCalculator("run_joint/model.ckpt.pt", compress=True)
+ev = build_evaluator("run_joint/model.ckpt.pt", atoms, compress=True)   # nvalchemi MD
+model.enable_compression(table_stride_1=0.01)                           # a model you hold
+```
+
+`compress=True` uses DeePMD-kit's default table stride (0.01 Å); a float is an
+explicit stride. Measured error against the uncompressed model, and the speed,
+are in [Cost](#cost).
+
+**It needs a deepmd-kit built from source.** The PyPI wheel is a CPU-only
+build of the operator library: `torch.ops.deepmd.dpa4c_graph_compress` is not
+in it, and DeePMD-kit's compressed branch then **falls through to the
+uncompressed math without a word** — tables built, nothing faster. So on the
+wheel `compress=True` is refused, naming the operator and the fix:
+
+```
+RuntimeError: compression needs the compiled operator
+`torch.ops.deepmd.dpa4c_graph_compress`, which is not loaded. The PyPI
+deepmd-kit wheel does not ship it: build deepmd-kit 3.2.0 from source with
+DP_VARIANT=cuda and run in that environment. ...
+```
+
+The build recipe that produced the numbers below is in
+[Building the CUDA operators](#building-the-cuda-operators).
+
+Things it commits you to, each refused rather than warned about when violated:
+
+- **`DP_CUDA_INFER` becomes `1`** if unset — the one process-global side
+  effect, because DeePMD-kit re-reads the variable on every call and has no
+  API for it. Level 2 is refused for a long-range model: its fused energy/force
+  kernel bypasses `descriptor.call_graph`, and with it the shared backbone,
+  the charge response and the Born charges. Level 1 also changes the
+  force/virial scatter of every other graph-lowered model in the process,
+  which is why the baselines in Cost are measured at the same level.
+- **The charge state is folded into the tables.** With `add_chg_spin_ebd` the
+  kernel reads the `charge_spin` baked in at compression, not the one passed
+  at forward time — so the calculator and evaluator fold in the run's
+  `charge_spin`, and a forward with a different one is refused.
+- **Inference only.** A compressed DPA4C cannot re-enter training; compress
+  after loading, never before.
+- **Nothing is persisted.** The tables are a deterministic function of the
+  weights, the stride and the charge state and build in well under a second,
+  so they are rebuilt at load. A `state_dict` saved from a compressed model is
+  rejected by `load_model` — save the uncompressed model and pass
+  `compress=True`.
+- **Multi-GPU**: the evaluator compresses once, before making its device
+  replicas, so every replica carries the tables.
+
+Precision: the fp32 DPA4C already casts edge vectors to fp32 before doing any
+math, so compression changes nothing about the precision surface; the only new
+error is the radial tabulation, controlled by the stride.
+
+### Building the CUDA operators
+
+Verified on an aarch64 GB10 (compute capability 12.1) with CUDA 13.0, cmake
+3.28, gcc 13, torch 2.11.0+cu130. The recipe has four non-obvious parts, each
+of which silently produces a kernel-less build if omitted:
+
+```bash
+conda create --clone dpmd -n dpmd-cuda      # keeps torch, nvalchemiops, warp identical
+conda activate dpmd-cuda
+pip install "scikit-build-core>=1" setuptools_scm dependency_groups packaging \
+            ninja hatch-fancy-pypi-readme
+git clone --branch v3.2.0 --depth 1 https://github.com/deepmodeling/deepmd-kit.git
+cd deepmd-kit
+export DP_VARIANT=cuda CUDAToolkit_ROOT=/usr/local/cuda \
+       DP_ENABLE_TENSORFLOW=0 DP_ENABLE_PYTORCH=1 \
+       TORCH_CUDA_ARCH_LIST="12.0" SETUPTOOLS_SCM_PRETEND_VERSION=3.2.0 \
+       SKBUILD_CMAKE_DEFINE="CMAKE_CUDA_ARCHITECTURES=120;DEEPMD_CUDA_PORTABLE_PTX=OFF;CMAKE_DISABLE_FIND_PACKAGE_MPI=ON;CMAKE_CUDA_FLAGS=-gencode arch=compute_120,code=sm_120"
+pip install --no-build-isolation --no-deps -v .
+pip install --no-deps -e /path/to/deepmd-lr
+```
+
+- `--no-build-isolation`: the build locates torch with `find_spec` in the
+  build environment and otherwise falls back to a CPU torch, under which
+  CMake decides there is no CUDA and compiles no kernels.
+- The arch triple: torch's own CMake resets `CMAKE_CUDA_ARCHITECTURES` to
+  `OFF` during `find_package(Torch)`, and DeePMD-kit then defaults to `all`
+  (every architecture, hours) or PTX-only. Defining it suppresses `all`,
+  `DEEPMD_CUDA_PORTABLE_PTX=OFF` suppresses the PTX fallback, and the real
+  architecture goes in through `CMAKE_CUDA_FLAGS`. Use your GPU's `sm_`.
+- MPI off: an env with a pip `mpich` gets auto-linked with an `$ORIGIN`-only
+  rpath, and the operator library then fails to load.
+- `--no-deps` on both installs, or the `deepmd-kit==3.2.0` pin pulls the
+  wheel back over the build.
+
+Check it took, in this order: `strings lib/libdeepmd_op_pt.so | grep -c
+dpa4c_graph_compress` is non-zero; `ldd` shows `libcudart` and no `libmpi`;
+`python -c "import deepmd.pt_expt; from deepmd.kernels.cuda.dpa4c.graph_compress
+import op_available; print(op_available())"` prints `True`; and
+`DEEPMD_LR_REQUIRE_COMPRESS=1 pytest tests/` passes — with that variable the
+kernel tests fail instead of skipping, which is how a build proves itself. The
+build takes about two minutes on 20 cores.
 
 `atoms.calc.results` carries `energy_short_range`, `energy_long_range` and
 `charges` alongside energy/forces/stress, so the split can be watched along a
@@ -1336,6 +1505,14 @@ pytest tests/ -q
   silent-failure mode.
 - `tests/test_plugin_registration.py` — entry-point registration, input-schema
   acceptance, equivalence to the standard model, and serialization round-trip.
+- `tests/test_compress.py` — compressed DPA4C inference. On any install: the
+  `get_geo_compress` seam, every refusal (no kernel, wrong `DP_CUDA_INFER`,
+  fallback paths, unpersisted tables), and the graph-lower guard that keeps
+  `DeepPot`/`dp test` from returning short-range-only energies. With the
+  compiled operator: that the kernel is entered exactly once per forward, and
+  compressed-vs-uncompressed agreement for energy, force, virial, charge and
+  Born tensors, serial and partitioned. `DEEPMD_LR_REQUIRE_COMPRESS=1` turns
+  the kernel skips into failures.
 - `tests/test_charge_head.py` — the total-charge projection (exactness,
   masking, differentiability) and the charge head's physical symmetries
   through a real DPA4C descriptor.

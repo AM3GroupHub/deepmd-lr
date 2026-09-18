@@ -33,6 +33,9 @@ import torch
 from deepmd.dpmodel.utils.neighbor_graph import (
     segment_sum,
 )
+from deepmd.dpmodel.utils.neighbor_graph.csr import (
+    attach_edge_csr,
+)
 
 from deepmd_lr.fitting.charge import (
     charge_mask,
@@ -77,48 +80,6 @@ def device_replicas(model, devices) -> dict:
     return replicas
 
 
-@contextlib.contextmanager
-def _capture_backbone(model):
-    """Record the descriptor output of one partition's energy pass.
-
-    The charge head reads the same features the energy head just produced, so
-    the backbone need only run once per partition -- the saving the serial
-    model already takes via ``LongRangeEnergyModel._capturing_backbone``.
-
-    What has to be recorded alongside the features is the ``edge_vec`` the
-    descriptor actually saw. ``forward_common_lower_graph`` does
-    ``edge_vec.detach().requires_grad_(True)`` (make_model.py:668) to make it
-    the leaf for the energy backward, so the captured features hang off THAT
-    leaf and not off the partition's ``node_coord``. Anything differentiating
-    them has to target the captured leaf; see ``_charge_response_force``.
-
-    Yields a dict that is empty if nothing was captured, in which case the
-    caller falls back to running the backbone again.
-    """
-    descriptor = model.atomic_model.descriptor
-    unhooked = descriptor.call_graph
-    captured: dict = {}
-
-    def capture(graph, atype_flat, *args, **kwargs):
-        out = unhooked(graph, atype_flat, *args, **kwargs)
-        # Only the first call is the energy head's.
-        if not captured:
-            captured.update(
-                features=out[0], rot_mat=out[1], edge_vec=graph.edge_vec
-            )
-        return out
-
-    had_own = "call_graph" in descriptor.__dict__
-    descriptor.call_graph = capture
-    try:
-        yield captured
-    finally:
-        if had_own:
-            descriptor.call_graph = unhooked
-        else:
-            del descriptor.call_graph
-
-
 def _usable_capture(captured) -> bool:
     """Whether the capture can carry the charge response.
 
@@ -149,6 +110,15 @@ def partition_charges(model, graph, node_type, n_owned: int, charge_spin=None):
     handled once the partitions are assembled.
     """
     descriptor = model.atomic_model.descriptor
+    if getattr(descriptor, "compress", False):
+        # Compressed inference is defined only on the captured route: this
+        # second pass would run the uncompressed math on a CSR-less graph
+        # while the model still claims to be compressed.
+        raise RuntimeError(
+            "the fallback charge pass was reached on a compressed model; the "
+            "shared-backbone capture should have been taken. Check "
+            "DP_CUDA_INFER (it must be exactly 1)."
+        )
     charge_spin_kwargs = (
         {"charge_spin": charge_spin} if model.atomic_model.supports_charge_spin else {}
     )
@@ -308,9 +278,22 @@ def evaluate_partitioned(
         n_node = torch.tensor([part.n_node], dtype=torch.int64, device=device)
         n_local = torch.tensor([part.n_owned], dtype=torch.int64, device=device)
 
-        with _capture_backbone(local) if long_range else contextlib.nullcontext(
-            {}
-        ) as captured:
+        if getattr(local.atomic_model.descriptor, "compress", False):
+            # The compressed kernel needs the destination CSR views, attached
+            # AFTER the ownership mask: `build_edge_csr` routes masked edges
+            # into a padding segment using the mask it is shown, so attaching
+            # inside the builder would leave ghost-destination edges in owned
+            # rows. `canonicalize=False` leaves `edge_vec` the very tensor the
+            # search produced, so the charge-response backward below still
+            # reaches `node_coord` through it.
+            graph = attach_edge_csr(graph, part.n_node)
+        # The model's own capture context: it records the backbone output the
+        # charge head reuses, and it is what permits the graph lower -- any
+        # caller outside one would be reporting the short-range energy alone.
+        capture = (
+            local._capturing_backbone() if long_range else contextlib.nullcontext({})
+        )
+        with capture as captured:
             out = local.forward_common_lower_graph(
                 node_type,
                 n_node,
@@ -318,6 +301,11 @@ def evaluate_partitioned(
                 graph.edge_index,
                 graph.edge_vec,
                 graph.edge_mask,
+                destination_order=graph.destination_order,
+                destination_row_ptr=graph.destination_row_ptr,
+                source_order=graph.source_order,
+                source_row_ptr=graph.source_row_ptr,
+                destination_sorted=graph.destination_sorted,
                 charge_spin=condition,
             )
         # Charges come from the SAME descriptor pass the energy head just ran,

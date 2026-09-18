@@ -30,6 +30,10 @@ from ase.calculators.calculator import (
 from deepmd.pt_expt.model.get_model import get_model
 from deepmd.pt_expt.utils.env import DEVICE
 
+from deepmd_lr.compress import (
+    compress_model,
+)
+
 __all__ = ["LongRangeCalculator", "load_model", "select_neighbor_graph_method"]
 
 #: eV/A^3 is what ASE expects for stress; DeePMD-kit reports the virial in eV.
@@ -87,10 +91,19 @@ def load_model(
     }
     missing, unexpected = model.load_state_dict(weights, strict=False)
     if missing or unexpected:
+        hint = ""
+        if any(".compress_" in key for key in unexpected):
+            # Tables from `enable_compression` are a function of the weights
+            # and are rebuilt at load, never restored from a state dict.
+            hint = (
+                " The `compress_*` buffers of a compressed DPA4C are not "
+                "persisted; save the uncompressed model and pass compress=True "
+                "to LongRangeCalculator or the evaluator instead."
+            )
         raise ValueError(
             "checkpoint weights do not match the recorded model config: "
             f"{len(missing)} missing (e.g. {missing[:3]}) and "
-            f"{len(unexpected)} unexpected (e.g. {unexpected[:3]})"
+            f"{len(unexpected)} unexpected (e.g. {unexpected[:3]})." + hint
         )
     if long_range is not None:
         model.set_long_range(long_range)
@@ -147,6 +160,12 @@ class LongRangeCalculator(Calculator):
         False]}``. The long-range term carries no weights, so the boundary
         treatment is a property of the simulation rather than of the
         checkpoint.
+    compress
+        ``True`` to compress the DPA4C backbone for inference at DeePMD-kit's
+        default table stride, or a float stride in angstrom. Needs a
+        deepmd-kit built from source with the CUDA operators -- refused
+        otherwise -- and folds ``charge_spin`` into the tables; see
+        :meth:`~deepmd_lr.model.lr_model.LongRangeEnergyModel.enable_compression`.
 
     Examples
     --------
@@ -171,6 +190,7 @@ class LongRangeCalculator(Calculator):
         head: str | None = None,
         efield: Any = None,
         long_range: dict | None = None,
+        compress: bool | float = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -221,6 +241,9 @@ class LongRangeCalculator(Calculator):
                     "charge_spin must contain (total_charge, spin_multiplicity)"
                 )
             self.charge_spin = condition.reshape(1, 2)
+        # Last: the model is on its device and in eval mode, and the run's
+        # charge state is known -- compression folds it into the tables.
+        compress_model(self.model, compress, charge_spin=self.charge_spin)
 
     def _atom_types(self, atoms: Any) -> torch.Tensor:
         """Map ASE chemical symbols onto the model's type indices."""

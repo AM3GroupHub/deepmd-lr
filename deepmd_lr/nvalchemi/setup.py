@@ -53,6 +53,11 @@ def build_evaluator(model: Any, atoms: Any, devices: Any = None,
     trained with, which is how one set of weights runs a bulk cell and a slab:
     the term holds no parameters, so the choice belongs to the simulation.
 
+    ``compress=True`` (or a float table stride) rides ``kwargs`` into the
+    evaluator and compresses the DPA4C backbone before the device replicas are
+    made. It needs a deepmd-kit built from source with the CUDA operators and
+    is refused otherwise; see ``LongRangeEnergyModel.enable_compression``.
+
     Masses are deliberately not returned: the evaluator already derives them
     from the model's own ``type_map``, and a second table built from the
     file's symbols would be a second source of truth that agrees only by

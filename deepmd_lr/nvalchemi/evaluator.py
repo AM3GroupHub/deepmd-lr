@@ -45,6 +45,9 @@ import torch
 from deepmd_lr.born import (
     field_force,
 )
+from deepmd_lr.compress import (
+    compress_model,
+)
 from deepmd_lr.nvalchemi.driver import (
     device_replicas,
     evaluate_partitioned,
@@ -118,6 +121,12 @@ class DistributedEvaluator:
     charge_spin
         Fixed (total charge, spin multiplicity) for this system. If omitted,
         use the model's configured default condition.
+    compress
+        ``True`` to compress the DPA4C backbone at DeePMD-kit's default table
+        stride, or a float stride in angstrom. Done before the device replicas
+        are made, with ``charge_spin`` folded into the tables. Needs a
+        deepmd-kit built from source with the CUDA operators and is refused
+        otherwise; see ``LongRangeEnergyModel.enable_compression``.
 
     Notes
     -----
@@ -140,6 +149,7 @@ class DistributedEvaluator:
         compute_born: bool = False,
         efield: Any = None,
         charge_spin: torch.Tensor | tuple[float, float] | None = None,
+        compress: bool | float = False,
     ) -> None:
         if not devices:
             raise ValueError("DistributedEvaluator needs at least one device")
@@ -182,6 +192,9 @@ class DistributedEvaluator:
         self.atype = np.asarray(atype, dtype=np.int64).reshape(-1)
         self.cell = np.asarray(cell, dtype=np.float64).reshape(3, 3)
 
+        # Compress BEFORE the replicas are made, so the deep copies carry the
+        # tables; the run's charge state is folded in here, once.
+        compress_model(model, compress, charge_spin=charge_spin)
         # One deepcopy per non-home device, held for the life of the driver
         # rather than rebuilt per call.
         self._replicas = device_replicas(model, self.devices)
