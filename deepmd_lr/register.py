@@ -38,8 +38,8 @@ from deepmd_lr.model import (  # noqa: F401  registers the `dp_lr` model type
 # that merely importing the module -- which `argcheck` does, for one constant
 # -- has no side effect on the backend.
 same_as.install()
-# EMA on by default for `dp_lr` training: wraps `Trainer.__init__` after `same_as`
-# did, so both run and each is a pass-through when it does not apply.
+# Apply EMA defaults before CLI normalization and for direct Trainer callers.
+# Install after `same_as` so the Trainer wrappers compose.
 ema_default.install()
 # A compressed DPA4C must ask for the CSR views its kernel needs; upstream's
 # `get_geo_compress` never does for DPA4C. One boolean, see `compress.py`.
