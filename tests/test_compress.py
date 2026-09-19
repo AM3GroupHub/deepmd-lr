@@ -36,16 +36,17 @@ from deepmd_lr.nvalchemi.evaluator import DistributedEvaluator
 
 from .test_joint_model import DESCRIPTOR, FITTING, LONG_RANGE, build, frame
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="compression is a CUDA-only path"
-)
-
+CUDA = torch.cuda.is_available()
 OP = op_available()
 REQUIRE = os.environ.get("DEEPMD_LR_REQUIRE_COMPRESS") == "1"
+if REQUIRE and not (CUDA and OP):
+    raise pytest.UsageError(
+        "DEEPMD_LR_REQUIRE_COMPRESS=1 requires a usable CUDA device and "
+        f"dpa4c_graph_compress operator (CUDA={CUDA}, operator={OP})"
+    )
 needs_kernel = pytest.mark.skipif(
-    not OP and not REQUIRE, reason="compiled dpa4c_graph_compress op not loaded"
+    not (CUDA and OP), reason="compressed dispatch needs CUDA and its compiled operator"
 )
-wheel_only = pytest.mark.skipif(OP, reason="the compiled op IS loaded here")
 
 
 def cfg32(long_range: bool = True, chg_ebd: bool = False) -> dict:
@@ -131,9 +132,14 @@ class TestSeam:
             build().atomic_model.descriptor.enable_compression(0.0)
 
 
-@wheel_only
 class TestRefusedWithoutTheKernel:
     """Every door into compression names the missing operator and the fix."""
+
+    @pytest.fixture(autouse=True)
+    def missing_kernel(self, monkeypatch):
+        from deepmd_lr.model import lr_model
+
+        monkeypatch.setattr(lr_model, "_kernel_available", lambda: False)
 
     def test_the_model_method(self):
         with pytest.raises(RuntimeError, match="dpa4c_graph_compress"):

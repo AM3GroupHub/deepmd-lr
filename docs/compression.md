@@ -19,7 +19,11 @@ model.enable_compression(table_stride_1=0.01)
 ```
 
 `compress=True` is DeePMD-kit's default 0.01 Å table stride; pass a float for
-another. Compress once per process, after loading. It is inference-only.
+another; a numeric stride must be finite and strictly positive (`0.0` is
+invalid). Only the boolean `False` disables compression. Compress once per
+process, after loading. It is inference-only. Failed compression preserves
+the original descriptor state and leaves `DP_CUDA_INFER` unchanged, so the
+caller can correct the inputs and retry.
 
 **Requirements**
 
@@ -67,5 +71,6 @@ the `==3.2.0` pin pulls the wheel back).
 
 Verify: `python -c "import deepmd.pt_expt; from deepmd.kernels.cuda.dpa4c.graph_compress import op_available; print(op_available())"`
 prints `True`, and `DEEPMD_LR_REQUIRE_COMPRESS=1 pytest tests/` passes — that
-variable makes the kernel tests fail instead of skip.
+variable fails collection if either CUDA or the operator is unavailable.
+Without it, CPU-capable checks still run and only CUDA execution tests skip.
 
