@@ -47,7 +47,9 @@ it matters.
 import contextlib
 import copy
 import json
+import math
 import os
+from numbers import Real
 from typing import (
     Any,
 )
@@ -925,8 +927,8 @@ class LongRangeEnergyModel(EnergyModel):
         * ``DP_CUDA_INFER`` becomes ``1`` if unset -- the one process-global
           side effect here, because DeePMD-kit re-reads the variable on every
           call and offers no API for it; a second switch to remember would be
-          redundant with asking for compression. Level 2 is refused for a
-          model with a long-range term: its fused energy/force kernel bypasses
+          redundant with asking for compression. Level 2 is refused for every
+          model: its fused energy/force kernel bypasses
           ``descriptor.call_graph``, and with it the shared backbone, the
           charge response and the Born charges.
         * The frame condition is **folded into the tables**. With
@@ -938,6 +940,10 @@ class LongRangeEnergyModel(EnergyModel):
         weights, the stride and the charge state, and build in well under a
         second, so they are rebuilt at load rather than saved.
         """
+        if isinstance(table_stride_1, bool) or not isinstance(table_stride_1, Real):
+            raise TypeError("table_stride_1 must be a positive finite number")
+        if not math.isfinite(table_stride_1) or table_stride_1 <= 0:
+            raise ValueError("table_stride_1 must be positive and finite")
         if not _kernel_available():
             raise RuntimeError(_NO_KERNEL)
         if self.training:
@@ -946,32 +952,57 @@ class LongRangeEnergyModel(EnergyModel):
                 "compressed DPA4C cannot re-enter training mode."
             )
         level = cuda_infer_level()
-        if level >= 2 and self.has_long_range:
+        if level >= 2:
             raise RuntimeError(
                 "DP_CUDA_INFER=2 selects the fused energy/force kernel, which "
                 "bypasses `descriptor.call_graph`: the charge head could no "
                 "longer share the backbone and Born charges would be refused. "
                 "Set DP_CUDA_INFER=1, the level compression needs."
             )
-        if level == 0:
-            os.environ["DP_CUDA_INFER"] = "1"
-        super().enable_compression(
-            table_extrapolate, table_stride_1, table_stride_2, check_frequency
-        )
-        if not self.atomic_model.add_chg_spin_ebd:
-            return
-        if charge_spin is None:
-            state = [float(x) for x in self.get_default_chg_spin()]
-        else:
-            condition = torch.as_tensor(charge_spin, dtype=torch.float64).reshape(-1)
+        descriptor = self.atomic_model.descriptor
+        state = None
+        if self.atomic_model.add_chg_spin_ebd:
+            from deepmd.utils.charge_state import validate_charge_state
+
+            condition = torch.as_tensor(
+                self.get_default_chg_spin() if charge_spin is None else charge_spin,
+                dtype=torch.float64,
+            ).reshape(-1)
             if condition.numel() != 2:
                 raise ValueError(
-                    "charge_spin must hold one [charge, multiplicity] pair: the "
-                    "state is a constant of the run, folded into the tables"
+                    "charge_spin must hold one [charge, multiplicity] pair"
                 )
-            state = [float(x) for x in condition.tolist()]
-            self.atomic_model.descriptor.apply_charge_state(state)
-        self._compressed_charge_spin = (state[0], state[1])
+            state = list(validate_charge_state(condition.tolist()))
+
+        # Upstream registers/replaces buffers and sets these attributes. Preserve
+        # the original objects so failed construction also preserves shared refs.
+        buffers = descriptor._buffers.copy()
+        nonpersistent = descriptor._non_persistent_buffers_set.copy()
+        was_compressed = descriptor.compress
+        had_scalars = hasattr(descriptor, "_compression_scalars")
+        scalars = getattr(descriptor, "_compression_scalars", None)
+        try:
+            super().enable_compression(
+                table_extrapolate, table_stride_1, table_stride_2, check_frequency
+            )
+            if state is not None:
+                descriptor.apply_charge_state(state)
+        except BaseException:
+            descriptor._buffers.clear()
+            descriptor._buffers.update(buffers)
+            descriptor._non_persistent_buffers_set.clear()
+            descriptor._non_persistent_buffers_set.update(nonpersistent)
+            descriptor.compress = was_compressed
+            if had_scalars:
+                descriptor._compression_scalars = scalars
+            elif hasattr(descriptor, "_compression_scalars"):
+                del descriptor._compression_scalars
+            raise
+        if state is not None:
+            self._compressed_charge_spin = (state[0], state[1])
+        # Only successful compression changes the process-wide inference level.
+        if level == 0:
+            os.environ["DP_CUDA_INFER"] = "1"
 
     def compute_or_load_stat(
         self, sampled_func: Any, *args: Any, **kwargs: Any

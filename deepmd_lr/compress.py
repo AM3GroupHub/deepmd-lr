@@ -46,6 +46,8 @@ canonical-export check, so the blast radius is that boolean.
 
 from __future__ import annotations
 
+import math
+from numbers import Real
 from typing import (
     Any,
 )
@@ -90,8 +92,15 @@ def compress_model(model: Any, compress: bool | float, charge_spin: Any = None) 
         LongRangeEnergyModel,
     )
 
-    if not compress:
+    if compress is False:
         return model
+    if compress is not True:
+        if isinstance(compress, bool) or not isinstance(compress, Real):
+            raise TypeError(
+                "compress must be a bool or a positive finite numeric stride"
+            )
+        if not math.isfinite(compress) or compress <= 0:
+            raise ValueError("compression stride must be positive and finite")
     if not isinstance(model, LongRangeEnergyModel):
         raise TypeError(
             f"compress= needs a 'dp_lr' model, got {type(model).__name__}. A "
