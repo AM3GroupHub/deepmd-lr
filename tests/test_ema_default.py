@@ -97,3 +97,66 @@ print("ok")
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip().endswith("ok")
+
+
+def test_cli_normalization_and_saved_config(tmp_path):
+    """Use the actual pt_expt CLI normalization and output writer, without training."""
+    import json
+
+    from deepmd.pt_expt.entrypoints.main import PTExptTrainEntrypoint
+
+    from .test_plugin_registration import BASE_MODEL_CONFIG
+
+    entrypoint = PTExptTrainEntrypoint()
+    for model_type in ("dp_lr", "standard"):
+        for override in (
+            {},
+            {"enable_ema": False},
+            {"ema_decay": 0.98},
+            {"enable_ema": True, "ema_decay": 0.97},
+            {"zero_stage": 2},
+        ):
+            for multi in (False, True):
+                model = {"type": model_type, **copy.deepcopy(BASE_MODEL_CONFIG)}
+                data = {"training_data": {"systems": ["./unused"], "batch_size": 1}}
+                raw = {
+                    "model": {"model_dict": {"head": model}} if multi else model,
+                    "learning_rate": {"type": "exp", "start_lr": 1e-3, "stop_lr": 1e-5},
+                    "loss_dict" if multi else "loss": {"head": {"type": "ener"}}
+                    if multi
+                    else {"type": "ener"},
+                    "training": {
+                        "numb_steps": 1,
+                        **override,
+                        **({"data_dict": {"head": data}} if multi else data),
+                    },
+                }
+                original = copy.deepcopy(raw)
+                normalized = entrypoint.normalize_config(raw, multi_task=multi)
+                assert raw == original
+                expected = override.get(
+                    "enable_ema",
+                    model_type == "dp_lr" and override.get("zero_stage", 0) < 2,
+                )
+                assert normalized["training"]["enable_ema"] is expected
+                assert normalized["training"]["ema_decay"] == override.get(
+                    "ema_decay", 0.999
+                )
+                output = tmp_path / "out.json"
+                entrypoint.dump_config(normalized, str(output))
+                assert (
+                    json.loads(output.read_text())["training"] == normalized["training"]
+                )
+                again = entrypoint.normalize_config(normalized, multi_task=multi)
+                assert again["training"] == normalized["training"]
+
+
+def test_normalization_hook_is_idempotent():
+    from deepmd.dpmodel.train.entrypoint import AbstractTrainEntrypoint
+
+    from deepmd_lr.ema_default import install
+
+    hook = AbstractTrainEntrypoint.normalize_config
+    assert getattr(hook, "_deepmd_lr_ema_default", False)
+    install()
+    assert AbstractTrainEntrypoint.normalize_config is hook
