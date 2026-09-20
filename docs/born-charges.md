@@ -19,6 +19,31 @@ Z_iab = q_i d_ab + 1/2 sum_{j!=i} ( r_ji,a dq_i/dr_ji,b  -  r_ij,a dq_j/dr_ij,b 
 
 following 10.1021/acs.jctc.6c00146.
 
+### Electronic screening: `eps_inf`
+
+The model's Coulomb term is `q_i q_j / (4π ε0 r_ij)`. In a medium with
+high-frequency dielectric constant ε∞ the same energy reads
+`q~_i q~_j / (4π ε0 ε∞ r_ij)`, so the physical, screened charges are
+`q~ = sqrt(ε∞) q`, and the Born tensors, derivatives of those charges, scale
+by the same factor. Pass `eps_inf` to get them reported that way:
+
+```python
+calc = LongRangeCalculator(model, efield=[0, 0, 0.05], eps_inf=1.78)   # water
+ev = DistributedEvaluator(model, atype, cell, devices=[...], efield=[0, 0, 0.05], eps_inf=1.78)
+evaluate_partitioned(model, coord, atype, cell, compute_born=True, eps_inf=1.78)
+born_charges(charge, raw, edge_vec, edge_index, edge_mask, eps_inf=1.78)
+```
+
+What scales by `sqrt(eps_inf)`: `results["charges"]`, `results["born_charge"]`,
+and therefore the field force `F = Z~.T E` and anything built from `Z~`, such
+as the IR dipole rate `Ṁ = Σ_i Z~_i v_i`. What does not: the energy, the
+field-free forces, the stress, and the model itself — the tables, checkpoint
+and training are untouched, because this is a change of units on the reported
+charges, not on the interaction that was fitted. The default `1.0` is vacuum
+and reproduces the old numbers exactly. Non-positive or non-finite values are
+refused at construction. A compressed model is unaffected: the scaling is
+applied to the outputs, after the tables.
+
 ### Read this before interpreting a field run
 
 The first axis of `Z_iab` is polarization and the second is displacement,

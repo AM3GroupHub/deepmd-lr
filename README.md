@@ -136,8 +136,9 @@ VelocityVerlet(atoms, timestep=0.5 * units.fs).run(10000)
 
 For MD that never leaves the GPU, and for several GPUs, use the nvalchemiops
 path — `examples/06-md_nvalchemi` has a runnable loop per ensemble
-([partitioned MD](docs/partitioned-md.md)). A field run and Born effective
-charges: [born-charges](docs/born-charges.md).
+([partitioned MD](docs/partitioned-md.md)). A field run, Born effective
+charges, and reporting them screened by a medium's ε∞ (`eps_inf=`):
+[born-charges](docs/born-charges.md).
 
 ### Compress the model
 

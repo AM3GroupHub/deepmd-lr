@@ -79,6 +79,7 @@ from deepmd.pt_expt.model.model import (
 
 from deepmd_lr.born import (
     born_charges,
+    screening_factor,
 )
 from deepmd_lr.fitting.charge import (
     charge_mask,
@@ -177,6 +178,11 @@ class LongRangeEnergyModel(EnergyModel):
         #: a field simulation needs them. Set it on the model, not in the
         #: config -- a field is a property of the simulation, not the model.
         self.compute_born = False
+        #: High-frequency dielectric constant of the medium. Reported charges
+        #: and Born tensors are multiplied by sqrt(eps_inf), the factor that
+        #: turns the model's Coulomb charges into screened ones; the energy
+        #: and forces are untouched. 1.0 is vacuum. See `deepmd_lr.born`.
+        self.eps_inf = 1.0
         #: True on the non-base members of a `same_as` group, whose
         #: `atomic_model` is the base's very object. A plain bool, not a
         #: module: see `deepmd_lr.same_as`.
@@ -657,6 +663,7 @@ class LongRangeEnergyModel(EnergyModel):
                     shared["edge_index"],
                     shared["edge_mask"],
                     create_graph=create_graph,
+                    eps_inf=self.eps_inf,
                 )
         else:
             # Fallback: run the backbone again on our own strained graph. Used
@@ -709,7 +716,10 @@ class LongRangeEnergyModel(EnergyModel):
             # DeePMD-kit reports the virial flattened to (nf, 9), matching
             # `energy_derv_c_redu`; match that rather than the natural (nf, 3, 3).
             "virial": virial,
-            "charge": charge,
+            # Reported as screened charges, q~ = sqrt(eps_inf) q. The energy
+            # above was evaluated with the model's own `charge`, which is what
+            # it was trained with; only the diagnostic output is rescaled.
+            "charge": charge * screening_factor(self.eps_inf),
         }
         if born is not None:
             out["born_charge"] = born

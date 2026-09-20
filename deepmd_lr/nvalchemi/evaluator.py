@@ -44,6 +44,7 @@ import torch
 
 from deepmd_lr.born import (
     field_force,
+    screening_factor,
 )
 from deepmd_lr.compress import (
     compress_model,
@@ -128,6 +129,14 @@ class DistributedEvaluator:
         deepmd-kit built from source with the CUDA operators and is refused
         otherwise; see ``LongRangeEnergyModel.enable_compression``.
 
+    eps_inf
+        High-frequency dielectric constant of the medium, default ``1.0``
+        (vacuum). The reported charges and Born tensors are multiplied by
+        ``sqrt(eps_inf)``: the model's Coulomb energy ``q_i q_j / (4 pi eps_0 r)``
+        is the screened ``q~_i q~_j / (4 pi eps_0 eps_inf r)`` with
+        ``q~ = sqrt(eps_inf) q``. The field force, built from ``Z``, scales with
+        it; energies and field-free forces do not change.
+
     Notes
     -----
     The reciprocal sum is gathered onto one device rather than decomposed,
@@ -150,6 +159,7 @@ class DistributedEvaluator:
         efield: Any = None,
         charge_spin: torch.Tensor | tuple[float, float] | None = None,
         compress: bool | float = False,
+        eps_inf: float = 1.0,
     ) -> None:
         if not devices:
             raise ValueError("DistributedEvaluator needs at least one device")
@@ -188,6 +198,12 @@ class DistributedEvaluator:
             # The field force is built from Z, so Z has to be assembled.
             self.compute_born = True
         self.charge_spin = charge_spin
+        #: High-frequency dielectric constant. ``results['charge']`` and
+        #: ``results['born_charge']`` -- and therefore the field force -- are
+        #: scaled by sqrt(eps_inf); energies and field-free forces are not.
+        #: Validated here so a typo fails at construction, not mid-run.
+        screening_factor(eps_inf)
+        self.eps_inf = float(eps_inf)
         self.home = next(model.parameters()).device
         self.atype = np.asarray(atype, dtype=np.int64).reshape(-1)
         self.cell = np.asarray(cell, dtype=np.float64).reshape(3, 3)
@@ -318,6 +334,7 @@ class DistributedEvaluator:
             compute_virial=self.compute_virial,
             compute_born=self.compute_born,
             charge_spin=self.charge_spin,
+            eps_inf=self.eps_inf,
         )
         self.results = out
         self.virial = out.get("virial")
