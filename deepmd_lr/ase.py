@@ -30,6 +30,10 @@ from ase.calculators.calculator import (
 from deepmd.pt_expt.model.get_model import get_model
 from deepmd.pt_expt.utils.env import DEVICE
 
+from deepmd_lr.born import (
+    screening_factor,
+)
+
 __all__ = ["LongRangeCalculator", "load_model", "select_neighbor_graph_method"]
 
 #: eV/A^3 is what ASE expects for stress; DeePMD-kit reports the virial in eV.
@@ -147,6 +151,13 @@ class LongRangeCalculator(Calculator):
         False]}``. The long-range term carries no weights, so the boundary
         treatment is a property of the simulation rather than of the
         checkpoint.
+    eps_inf
+        High-frequency dielectric constant of the medium, default ``1.0``
+        (vacuum). ``results["charges"]`` and ``results["born_charge"]`` are
+        multiplied by ``sqrt(eps_inf)``, the factor that turns the model's
+        Coulomb charges into the screened ones for which the energy reads
+        ``q~_i q~_j / (4 pi eps_0 eps_inf r)``. A field force built from those
+        tensors scales with it; the energy and field-free forces do not.
 
     Examples
     --------
@@ -171,6 +182,7 @@ class LongRangeCalculator(Calculator):
         head: str | None = None,
         efield: Any = None,
         long_range: dict | None = None,
+        eps_inf: float = 1.0,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -210,6 +222,14 @@ class LongRangeCalculator(Calculator):
                     "block, so it predicts no charges."
                 )
             self.model.compute_born = True
+        # Screened charges: `results["charges"]` and `results["born_charge"]`
+        # -- and so the field force -- carry sqrt(eps_inf); the energy and the
+        # field-free forces do not. Validated now rather than on the first
+        # step. A short-range model reports no charges, so nothing to scale.
+        screening_factor(eps_inf)
+        self.eps_inf = float(eps_inf)
+        if self._has_long_range:
+            self.model.eps_inf = self.eps_inf
         self.type_map = list(self.model.get_type_map())
         self.charge_spin = None
         if charge_spin is not None:
@@ -290,6 +310,11 @@ class LongRangeCalculator(Calculator):
         )
         atype = self._atom_types(atoms).unsqueeze(0)
 
+        if self._has_long_range:
+            # Re-asserted every call: the model object may be shared between
+            # calculators built with different media, and the last one to be
+            # constructed must not win over the one actually computing.
+            self.model.eps_inf = self.eps_inf
         out = self.model(coord, atype, box=cell, charge_spin=self.charge_spin)
 
         energy = float(out["energy"].reshape(-1)[0].detach())

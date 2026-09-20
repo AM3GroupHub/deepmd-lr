@@ -71,6 +71,10 @@ Which is also the reason that sum rule is worthless as a check. It held to
 by 100%. It is a regression guard, not a validation.
 """
 
+import math
+from numbers import (
+    Real,
+)
 from typing import (
     Any,
 )
@@ -80,7 +84,33 @@ from deepmd.dpmodel.utils.neighbor_graph import (
     segment_sum,
 )
 
-__all__ = ["born_charges", "field_force"]
+__all__ = ["born_charges", "field_force", "screening_factor"]
+
+
+def screening_factor(eps_inf: Any) -> float:
+    r"""The factor :math:`\sqrt{\varepsilon_\infty}` from model to screened charges.
+
+    The model's Coulomb term is :math:`q_i q_j / (4\pi\varepsilon_0 r_{ij})`.
+    In a medium with high-frequency dielectric constant
+    :math:`\varepsilon_\infty` the same energy reads
+    :math:`\tilde q_i \tilde q_j / (4\pi\varepsilon_0\varepsilon_\infty r_{ij})`,
+    so the physical (screened) charges are
+    :math:`\tilde q = \sqrt{\varepsilon_\infty}\, q`, and the Born tensors,
+    being derivatives of the same charges, scale by the same factor. The
+    energy and its forces are unchanged: this is a change of units on the
+    reported charges, not on the interaction. ``eps_inf = 1`` is vacuum and
+    leaves everything as it was.
+    """
+    if isinstance(eps_inf, bool) or not isinstance(eps_inf, Real):
+        raise TypeError(f"eps_inf must be a positive finite number, got {eps_inf!r}")
+    value = float(eps_inf)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError(
+            f"eps_inf must be positive and finite, got {eps_inf!r}; the vacuum "
+            "value is 1.0 and a physical high-frequency dielectric constant is "
+            "at least that."
+        )
+    return math.sqrt(value)
 
 
 def born_charges(
@@ -91,6 +121,7 @@ def born_charges(
     edge_mask: torch.Tensor,
     *,
     create_graph: bool = False,
+    eps_inf: float = 1.0,
 ) -> torch.Tensor:
     """Per-atom Born effective charge tensors, shape ``(nf, nloc, 3, 3)``.
 
@@ -115,6 +146,11 @@ def born_charges(
     create_graph
         Keep the graph, for differentiating through ``Z`` itself. Off by
         default: nothing needs it yet and it costs memory.
+    eps_inf
+        High-frequency dielectric constant of the medium. The tensor is
+        multiplied by :math:`\\sqrt{\\varepsilon_\\infty}`, the factor that
+        turns the model's Coulomb charges into screened ones; see
+        :func:`screening_factor`. ``1.0`` (vacuum) changes nothing.
 
     Returns
     -------
@@ -162,6 +198,11 @@ def born_charges(
     eye = torch.eye(3, dtype=charge.dtype, device=charge.device)
     diag = charge.reshape(-1)[:, None, None] * eye[None]
     out = (diag + response.to(charge.dtype)).reshape(nf, nloc, 3, 3)
+    # Both halves are built from the same charges, so the screening factor
+    # multiplies the whole tensor: Z~ = sqrt(eps_inf) Z, as q~ = sqrt(eps_inf) q.
+    factor = screening_factor(eps_inf)
+    if factor != 1.0:
+        out = out * factor
     return out if create_graph else out.detach()
 
 

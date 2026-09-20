@@ -34,6 +34,9 @@ from deepmd.dpmodel.utils.neighbor_graph import (
     segment_sum,
 )
 
+from deepmd_lr.born import (
+    screening_factor,
+)
 from deepmd_lr.fitting.charge import (
     charge_mask,
     project_to_total_charge,
@@ -229,6 +232,7 @@ def evaluate_partitioned(
     compute_virial: bool = False,
     charge_spin: torch.Tensor | tuple[float, float] | None = None,
     compute_born: bool = False,
+    eps_inf: float = 1.0,
 ) -> dict[str, Any]:
     """Run ``model`` over spatial partitions and assemble the global result.
 
@@ -243,6 +247,13 @@ def evaluate_partitioned(
     charge_spin
         Global (total charge, spin multiplicity), shared by every partition.
         If omitted, use the model's configured default condition.
+    eps_inf
+        High-frequency dielectric constant. The returned ``charge`` and
+        ``born_charge`` are multiplied by ``sqrt(eps_inf)`` -- the screened
+        charges ``q~`` for which the Coulomb energy reads
+        ``q~_i q~_j / (4 pi eps_0 eps_inf r)``. Energies and forces are
+        evaluated with the model's own charges and are unchanged. ``1.0`` is
+        vacuum. See :func:`deepmd_lr.born.screening_factor`.
 
     Returns
     -------
@@ -400,8 +411,14 @@ def evaluate_partitioned(
         # Before `_charge_response_force`, which backpropagates through the
         # same `raw` tensors without retaining the graph.
         result["born_charge"] = _born_charges_partitioned(
-            launched, len(coord), result["charge"]
+            launched, len(coord), result["charge"], eps_inf=eps_inf
         )
+    # The energy above used the model's own charges; only the report is
+    # rescaled to screened charges, and after Born so its delta term saw the
+    # unscaled values once and the whole tensor was scaled once.
+    factor = screening_factor(eps_inf)
+    if factor != 1.0:
+        result["charge"] = result["charge"] * factor
 
     response_force, response_virial = _charge_response_force(
         launched, len(coord), result["dE_dq"], compute_virial=compute_virial
@@ -418,7 +435,9 @@ def evaluate_partitioned(
     return result
 
 
-def _born_charges_partitioned(launched, n_atoms: int, charge) -> np.ndarray:
+def _born_charges_partitioned(
+    launched, n_atoms: int, charge, *, eps_inf: float = 1.0
+) -> np.ndarray:
     r"""Born effective charge tensors, assembled across partitions.
 
     The global total-charge projection is not an obstacle here, for the same
@@ -482,7 +501,9 @@ def _born_charges_partitioned(launched, n_atoms: int, charge) -> np.ndarray:
     # rather than per partition is what makes the acoustic sum rule come out
     # as the system's actual total charge.
     born += np.asarray(charge).reshape(-1, 1, 1) * np.eye(3)[None]
-    return born
+    # Screened tensor, Z~ = sqrt(eps_inf) Z -- same factor as the serial
+    # `born_charges`, applied once to the assembled whole.
+    return born * screening_factor(eps_inf)
 
 
 def _charge_response_force(
