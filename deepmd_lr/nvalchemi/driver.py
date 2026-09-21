@@ -326,6 +326,18 @@ def evaluate_partitioned(
     # its own stream, so deferring the transfers is what buys the overlap.
     launched = []
     virial = torch.zeros((3, 3), dtype=dtype, device=home) if compute_virial else None
+    # Distribute the coordinates to every device BEFORE any forward is queued.
+    # A cross-device copy runs on the SOURCE device's current stream, behind
+    # whatever is already enqueued there: issued inside the loop, the copy for
+    # partition 1 would sit behind partition 0's entire forward on the home
+    # device, and device 1 would idle until device 0 finished -- the two
+    # GPUs would run one after the other. Measured on two H200s: 0.7x.
+    coord_on = {}
+    for device in devices:
+        dev = torch.device(device)
+        if dev not in coord_on:
+            with _current_device(dev):
+                coord_on[dev] = coord_t.to(device=dev, dtype=dtype)
     for part, device in zip(parts, devices, strict=True):
         with _current_device(device):
             local = replicas[torch.device(device)]
@@ -346,7 +358,7 @@ def evaluate_partitioned(
             # `requires_grad` only when the charge-response backward will need it.
             graph, node_type, node_coord = partition_graph(
                 part,
-                coord_t,
+                coord_on[torch.device(device)],
                 atype,
                 rcut,
                 device,
