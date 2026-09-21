@@ -192,15 +192,24 @@ def partition_graph(
     Returns ``(graph, node_type_flat, node_coord)``. ``node_coord`` is the
     unstrained leaf, so a backward reaches both it and the strain.
     """
-    node_coord = torch.tensor(
-        part.coordinates(coord)[None, ...],
-        dtype=dtype,
-        device=device,
-        requires_grad=requires_grad,
-    )
-    node_type = torch.tensor(
-        part.types(atype)[None, ...], dtype=torch.int64, device=device
-    )
+    if isinstance(coord, torch.Tensor):
+        # Device path: gather owned + shifted ghosts from the global coordinate
+        # tensor with cached index tensors. No host round trip per partition.
+        v = part.views(device, dtype)
+        c = coord.detach().to(device=device, dtype=dtype)
+        nodes = torch.cat([c[v["owned"]], c[v["ghost"]] + v["shift"]])
+        node_coord = nodes.unsqueeze(0).clone().requires_grad_(requires_grad)
+        node_type = part.types_on(atype, device).unsqueeze(0)
+    else:
+        node_coord = torch.tensor(
+            part.coordinates(coord)[None, ...],
+            dtype=dtype,
+            device=device,
+            requires_grad=requires_grad,
+        )
+        node_type = torch.tensor(
+            part.types(atype)[None, ...], dtype=torch.int64, device=device
+        )
     search_coord = (
         node_coord
         if strain is None
@@ -229,8 +238,15 @@ def evaluate_partitioned(
     charge_spin: torch.Tensor | tuple[float, float] | None = None,
     compute_born: bool = False,
     eps_inf: float = 1.0,
+    as_tensor: bool = False,
 ) -> dict[str, Any]:
     """Run ``model`` over spatial partitions and assemble the global result.
+
+    Everything is assembled on the gather device: per-partition forces,
+    energies and charges are moved device-to-device and scatter-added with
+    ``index_add_`` -- the ghost-force reverse communication of a
+    domain-decomposed code, done as a device primitive rather than a serial
+    host loop. Nothing touches the host until the caller asks for numpy.
 
     Parameters
     ----------
@@ -250,6 +266,11 @@ def evaluate_partitioned(
         ``q~_i q~_j / (4 pi eps_0 eps_inf r)``. Energies and forces are
         evaluated with the model's own charges and are unchanged. ``1.0`` is
         vacuum. See :func:`deepmd_lr.born.screening_factor`.
+    as_tensor
+        Return device tensors on the gather device instead of numpy arrays
+        (scalars as 0-d tensors). The evaluator uses this so the forces never
+        leave the GPU between one step and the next. Default ``False`` keeps
+        the numpy contract for every other caller.
 
     Returns
     -------
@@ -261,8 +282,17 @@ def evaluate_partitioned(
         charge head.
     """
     rcut = float(model.get_rcut())
+    coord_np = (
+        None if isinstance(coord, torch.Tensor) else np.asarray(coord, dtype=np.float64)
+    )
     parts = (
-        partition_system(coord, cell, rcut, n_partitions, pbc)
+        partition_system(
+            coord_np if coord_np is not None else coord.detach().cpu().numpy(),
+            cell,
+            rcut,
+            n_partitions,
+            pbc,
+        )
         if partitions is None
         else partitions
     )
@@ -277,11 +307,16 @@ def evaluate_partitioned(
     if replicas is None:
         replicas = device_replicas(model, devices)
     long_range = getattr(model, "has_long_range", False)
-    n_atoms = len(coord)
-    force = np.zeros((n_atoms, 3))
-    atom_energy = np.zeros(n_atoms)
-    raw_charge = np.zeros(n_atoms)
-    energy = 0.0
+    home = torch.device(gather_device if gather_device is not None else devices[0])
+    coord_t = (
+        coord.detach().to(device=home, dtype=dtype)
+        if isinstance(coord, torch.Tensor)
+        else torch.as_tensor(coord_np, dtype=dtype, device=home)
+    )
+    n_atoms = coord_t.shape[0]
+    force = torch.zeros((n_atoms, 3), dtype=dtype, device=home)
+    atom_energy = torch.zeros(n_atoms, dtype=dtype, device=home)
+    raw_charge = torch.zeros(n_atoms, dtype=dtype, device=home) if long_range else None
 
     # ---- launch phase -------------------------------------------------------
     # Queue every partition's work WITHOUT touching the host. A `.cpu()` here
@@ -290,7 +325,7 @@ def evaluate_partitioned(
     # one after the other. Kernel launches are asynchronous and each device has
     # its own stream, so deferring the transfers is what buys the overlap.
     launched = []
-    virial = np.zeros((3, 3)) if compute_virial else None
+    virial = torch.zeros((3, 3), dtype=dtype, device=home) if compute_virial else None
     for part, device in zip(parts, devices, strict=True):
         with _current_device(device):
             local = replicas[torch.device(device)]
@@ -311,7 +346,7 @@ def evaluate_partitioned(
             # `requires_grad` only when the charge-response backward will need it.
             graph, node_type, node_coord = partition_graph(
                 part,
-                coord,
+                coord_t,
                 atype,
                 rcut,
                 device,
@@ -374,17 +409,20 @@ def evaluate_partitioned(
     # ---- gather phase -------------------------------------------------------
     # Now synchronise. Every device has been given its work, so the transfers
     # below wait on kernels that have been running concurrently.
+    # The transfers are device-to-device onto the gather device and the
+    # scatter-adds are device primitives, so no partition waits for the host
+    # and no GPU idles while a CPU loop runs. `.to()` between devices does not
+    # synchronise the host; it orders on the streams.
     for part, _device, out, raw, _node_coord, _eps, _graph, _cap in launched:
-        ids = part.global_ids()
+        v = part.views(home, dtype)
         if compute_virial:
             # Each edge survives in exactly one partition, so the per-partition
             # virials sum to the global one exactly -- the same ownership
             # argument as the forces.
-            virial += out["energy_derv_c_redu"].reshape(3, 3).detach().cpu().numpy()
+            virial += out["energy_derv_c_redu"].reshape(3, 3).detach().to(home, dtype)
         # Energy: owned atoms only. Each atom is scored by exactly one owner.
-        per_atom = out["energy"].reshape(-1).detach().cpu().numpy()
-        atom_energy[part.owned] += per_atom[: part.n_owned]
-        energy += float(per_atom[: part.n_owned].sum())
+        per_atom = out["energy"].reshape(-1).detach().to(home, dtype)
+        atom_energy.index_add_(0, v["owned"], per_atom[: part.n_owned])
 
         # Force: every node, ghosts included. A ghost carries the reaction to
         # an owned atom's edge, and that belongs to the ghost's owner --
@@ -393,28 +431,30 @@ def evaluate_partitioned(
         # `energy_derv_r` is already the force, not the energy gradient --
         # `_to_public_keys` maps it straight onto the public "force" key with
         # no sign change.
-        node_force = out["energy_derv_r"].reshape(part.n_node, 3)
-        np.add.at(force, ids, node_force.detach().cpu().numpy())
+        node_force = (
+            out["energy_derv_r"].reshape(part.n_node, 3).detach().to(home, dtype)
+        )
+        force.index_add_(0, v["ids"], node_force)
 
         if long_range:
-            raw_charge[part.owned] = raw.detach().cpu().numpy()
+            raw_charge.index_copy_(0, v["owned"], raw.detach().to(home, dtype))
 
+    energy = atom_energy.sum()
     result = {"energy": energy, "force": force, "atom_energy": atom_energy}
     if compute_virial:
-        result["virial"] = virial.copy()
-        result["virial_short_range"] = virial.copy()
+        result["virial"] = virial.clone()
+        result["virial_short_range"] = virial.clone()
     if not long_range:
-        return result
+        return result if as_tensor else _as_numpy(result)
 
-    gather = gather_device if gather_device is not None else devices[0]
     result["energy_short_range"] = energy
     result.update(
         _long_range_global(
-            replicas[torch.device(gather)],
-            coord,
+            replicas[home],
+            coord_t,
             cell,
             raw_charge,
-            gather,
+            home,
             dtype,
             compute_virial=compute_virial,
             atype=atype,
@@ -430,7 +470,7 @@ def evaluate_partitioned(
         # Before `_charge_response_force`, which backpropagates through the
         # same `raw` tensors without retaining the graph.
         result["born_charge"] = _born_charges_partitioned(
-            launched, len(coord), result["charge"], eps_inf=eps_inf
+            launched, n_atoms, result["charge"], home, dtype, eps_inf=eps_inf
         )
     # The energy above used the model's own charges; only the report is
     # rescaled to screened charges, and after Born so its delta term saw the
@@ -440,7 +480,7 @@ def evaluate_partitioned(
         result["charge"] = result["charge"] * factor
 
     response_force, response_virial = _charge_response_force(
-        launched, len(coord), result["dE_dq"], compute_virial=compute_virial
+        launched, n_atoms, result["dE_dq"], home, dtype, compute_virial=compute_virial
     )
     result["force_charge_response"] = response_force
     result["force"] = result["force"] + response_force
@@ -449,12 +489,24 @@ def evaluate_partitioned(
             result["virial"] + result["virial_long_range"] + response_virial
         )
         result["virial_charge_response"] = response_virial
-    return result
+    return result if as_tensor else _as_numpy(result)
+
+
+def _as_numpy(result: dict) -> dict:
+    """The numpy contract: arrays to host, 0-d tensors to Python floats."""
+    out = {}
+    for key, value in result.items():
+        if isinstance(value, torch.Tensor):
+            value = value.detach()
+            out[key] = float(value) if value.ndim == 0 else value.cpu().numpy()
+        else:
+            out[key] = value
+    return out
 
 
 def _born_charges_partitioned(
-    launched, n_atoms: int, charge, *, eps_inf: float = 1.0
-) -> np.ndarray:
+    launched, n_atoms: int, charge, home, dtype, *, eps_inf: float = 1.0
+) -> torch.Tensor:
     r"""Born effective charge tensors, assembled across partitions.
 
     The global total-charge projection is not an obstacle here, for the same
@@ -482,7 +534,7 @@ def _born_charges_partitioned(
     and those edges live in the neighbour's partition. Neither partition sees
     all of atom i's terms alone; the scatter-add is what completes the sum.
     """
-    born = np.zeros((n_atoms, 3, 3))
+    born = torch.zeros((n_atoms, 3, 3), dtype=dtype, device=home)
     contributions = []
     # Launch every backward before transferring anything, for the same reason
     # the forward pass is staged.
@@ -510,23 +562,24 @@ def _born_charges_partitioned(
             contributions.append((part, node))
 
     for part, node in contributions:
-        np.add.at(
-            born,
-            part.global_ids(),
-            node.reshape(part.n_node, 3, 3).detach().cpu().numpy(),
+        born.index_add_(
+            0,
+            part.views(home, dtype)["ids"],
+            node.reshape(part.n_node, 3, 3).detach().to(home, dtype),
         )
     # The delta term, from the globally projected charges. Adding it here
     # rather than per partition is what makes the acoustic sum rule come out
     # as the system's actual total charge.
-    born += np.asarray(charge).reshape(-1, 1, 1) * np.eye(3)[None]
+    eye = torch.eye(3, dtype=dtype, device=home)
+    born = born + charge.reshape(-1, 1, 1).to(home, dtype) * eye
     # Screened tensor, Z~ = sqrt(eps_inf) Z -- same factor as the serial
     # `born_charges`, applied once to the assembled whole.
     return born * screening_factor(eps_inf)
 
 
 def _charge_response_force(
-    launched, n_atoms: int, dE_dq, compute_virial: bool = False
-) -> tuple[np.ndarray, np.ndarray | None]:
+    launched, n_atoms: int, dE_dq, home, dtype, compute_virial: bool = False
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     r"""The force from charges shifting as atoms move.
 
     Because the charges are predicted rather than fixed, the long-range force
@@ -557,16 +610,16 @@ def _charge_response_force(
     """
     # dE_dq already differentiates through the global, possibly masked projection.
     cotangent = dE_dq
-    force = np.zeros((n_atoms, 3))
-    virial = np.zeros((3, 3)) if compute_virial else None
+    force = torch.zeros((n_atoms, 3), dtype=dtype, device=home)
+    virial = torch.zeros((3, 3), dtype=dtype, device=home) if compute_virial else None
 
     # Launch every backward first, then transfer, for the same reason the
     # forward pass is staged: a `.cpu()` between them serialises the devices.
     gradients = []
     for part, _device, _out, raw, node_coord, eps, graph, cap in launched:
         with _current_device(raw.device):
-            weights = torch.tensor(
-                cotangent[part.owned], dtype=raw.dtype, device=raw.device
+            weights = cotangent[part.views(home, dtype)["owned"]].to(
+                device=raw.device, dtype=raw.dtype
             )
             targets = [node_coord] if eps is None else [node_coord, eps]
             if cap is None:
@@ -588,13 +641,13 @@ def _charge_response_force(
             gradients.append((part, grads[0], grads[1] if eps is not None else None))
 
     for part, gradient, grad_eps in gradients:
-        np.add.at(
-            force,
-            part.global_ids(),
-            -gradient.reshape(part.n_node, 3).detach().cpu().numpy(),
+        force.index_add_(
+            0,
+            part.views(home, dtype)["ids"],
+            -gradient.reshape(part.n_node, 3).detach().to(home, dtype),
         )
         if compute_virial:
-            virial -= grad_eps.reshape(3, 3).detach().cpu().numpy()
+            virial -= grad_eps.reshape(3, 3).detach().to(home, dtype)
     return force, virial
 
 
@@ -617,13 +670,25 @@ def _long_range_global(
     short-ranged and is added per partition in Phase C -- taking ``dE/dq`` out
     as a plain value here is what keeps the autograd graph on one device.
     """
-    n_atoms = len(coord)
-    coord_t = torch.tensor(
-        coord[None, ...], dtype=dtype, device=device, requires_grad=True
+    n_atoms = coord.shape[0]
+    coord_t = (
+        torch.as_tensor(coord, dtype=dtype, device=device)
+        .detach()
+        .reshape(1, n_atoms, 3)
+        .clone()
+        .requires_grad_(True)
     )
-    cell_t = torch.tensor(cell.reshape(1, 3, 3), dtype=dtype, device=device)
-    charge_t = torch.tensor(
-        raw_charge[None, ...], dtype=dtype, device=device, requires_grad=True
+    cell_t = torch.as_tensor(
+        cell if isinstance(cell, torch.Tensor) else np.asarray(cell),
+        dtype=dtype,
+        device=device,
+    ).reshape(1, 3, 3)
+    charge_t = (
+        torch.as_tensor(raw_charge, dtype=dtype, device=device)
+        .detach()
+        .reshape(1, n_atoms)
+        .clone()
+        .requires_grad_(True)
     )
 
     eps = None
@@ -654,13 +719,13 @@ def _long_range_global(
     grad_coord, grad_charge = grads[0], grads[1]
 
     return {
-        "charge": charge.reshape(-1).detach().cpu().numpy(),
-        "energy_long_range": float(total.detach()),
-        "atom_energy_long_range": atom_energy.reshape(-1).detach().cpu().numpy(),
-        "force_long_range": -grad_coord.reshape(n_atoms, 3).detach().cpu().numpy(),
-        "dE_dq": grad_charge.reshape(-1).detach().cpu().numpy(),
+        "charge": charge.reshape(-1).detach(),
+        "energy_long_range": total.detach(),
+        "atom_energy_long_range": atom_energy.reshape(-1).detach(),
+        "force_long_range": -grad_coord.reshape(n_atoms, 3).detach(),
+        "dE_dq": grad_charge.reshape(-1).detach(),
         **(
-            {"virial_long_range": -grads[2].reshape(3, 3).detach().cpu().numpy()}
+            {"virial_long_range": -grads[2].reshape(3, 3).detach()}
             if eps is not None
             else {}
         ),
