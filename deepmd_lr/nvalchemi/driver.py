@@ -24,6 +24,7 @@ logic is tested on a single-GPU machine.
 
 import contextlib
 import copy
+from concurrent.futures import ThreadPoolExecutor
 from typing import (
     Any,
 )
@@ -239,6 +240,7 @@ def evaluate_partitioned(
     charge_spin: torch.Tensor | tuple[float, float] | None = None,
     compute_born: bool = False,
     eps_inf: float = 1.0,
+    launch_threads: bool | None = None,
 ) -> dict[str, Any]:
     """Run ``model`` over spatial partitions and assemble the global result.
 
@@ -268,6 +270,13 @@ def evaluate_partitioned(
         ``q~_i q~_j / (4 pi eps_0 eps_inf r)``. Energies and forces are
         evaluated with the model's own charges and are unchanged. ``1.0`` is
         vacuum. See :func:`deepmd_lr.born.screening_factor`.
+    launch_threads
+        Run each device's partitions in its own thread during the launch
+        phase. ``None`` (the default) turns it on exactly when more than one
+        device is in use, where it is measured to recover most of the
+        parallelism the neighbour search's host syncs take away; ``False``
+        forces the single-threaded loop, which is what the comment in the
+        launch phase explains and what a profile should compare against.
 
     Returns
     -------
@@ -322,7 +331,21 @@ def evaluate_partitioned(
     # until this one finished -- which is how two GPUs end up running strictly
     # one after the other. Kernel launches are asynchronous and each device has
     # its own stream, so deferring the transfers is what buys the overlap.
-    launched = []
+    #
+    # That is not enough on its own: the neighbour search underneath
+    # `partition_graph` performs eight blocking device-to-host reads per
+    # partition (`_max_radius_tuple` x3, a device query x2,
+    # `estimate_batch_cell_list_sizes`, `_batch_query_cell_list_op`, and the
+    # capacity check in `nv_search_matrix`), and each one waits for that
+    # partition's queued kernels. Issued from one thread they serialise the
+    # devices whatever the streams do. So each *device* gets its own thread:
+    # `.item()` releases the GIL while it waits, so a thread blocked on cuda:0
+    # does not stop another queueing work on cuda:1. One thread per device and
+    # not per partition, because partitions sharing a device share a model
+    # replica whose capture state is not re-entrant. Measured on 2 A40s at
+    # 98,304 atoms: the launch phase goes from 54.7 to 38.1 ms, parallel gain
+    # 1.31x -> 1.88x of the ideal 2x.
+    launched: list = [None] * len(parts)
     virial = torch.zeros((3, 3), dtype=dtype, device=home) if compute_virial else None
     # Distribute the coordinates to every device BEFORE any forward is queued.
     # A cross-device copy runs on the SOURCE device's current stream, behind
@@ -336,7 +359,8 @@ def evaluate_partitioned(
         if dev not in coord_on:
             with _current_device(dev):
                 coord_on[dev] = coord_t.to(device=dev, dtype=dtype)
-    for part, device in zip(parts, devices, strict=True):
+    def launch_one(index, part, device):
+        """One partition's forward, on its own device."""
         with _current_device(device):
             local = replicas[torch.device(device)]
             condition = resolve_charge_spin(
@@ -412,9 +436,30 @@ def evaluate_partitioned(
                     raw = partition_charges(
                         local, graph, node_type, part.n_owned, condition
                     )
-            launched.append(
-                (part, device, out, raw, node_coord, eps, graph, cap_edge_vec)
+            launched[index] = (
+                part, device, out, raw, node_coord, eps, graph, cap_edge_vec
             )
+
+    def launch_group(group):
+        """Every partition that shares one device, in order, in one thread."""
+        for item in group:
+            launch_one(*item)
+
+    groups: dict = {}
+    for index, (part, device) in enumerate(zip(parts, devices, strict=True)):
+        groups.setdefault(torch.device(device), []).append((index, part, device))
+    # One device means one group, and a thread pool of one is pure overhead.
+    threaded = len(groups) > 1 and (
+        launch_threads is None or bool(launch_threads)
+    )
+    if threaded:
+        with ThreadPoolExecutor(max_workers=len(groups)) as pool:
+            # `result()` re-raises whatever a worker raised, on this thread.
+            for future in [pool.submit(launch_group, g) for g in groups.values()]:
+                future.result()
+    else:
+        for group in groups.values():
+            launch_group(group)
 
     # ---- gather phase -------------------------------------------------------
     # Now synchronise. Every device has been given its work, so the transfers

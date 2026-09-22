@@ -23,6 +23,7 @@ from deepmd_lr.nvalchemi import (
     partition_system,
     to_numpy,
 )
+from deepmd_lr.nvalchemi.partition import default_skin
 
 from .test_joint_model import build, frame
 
@@ -191,6 +192,119 @@ class TestPartitionCountInvariance:
             to_numpy(evaluate_partitioned(
                 model, coord, atype, cell, n_partitions=4, devices=[DEVICE]
             ))
+
+
+class TestSkinDefault:
+    """The skin is a cost knob, and a constant is the wrong setting for it.
+
+    Measured on two A40s at 98,304 atoms: skin 1.0 spent 76 % of every step
+    rebuilding the decomposition and capped the two-GPU speed-up at 1.14x;
+    skin 4.0 ran 3.4x faster and lifted the ceiling to 1.9x. On a couple of
+    thousand atoms the trade reverses. So the default scales with geometry.
+    """
+
+    def test_auto_grows_with_the_cell_and_shrinks_with_partitions(self):
+        small = np.diag([24.86] * 3)
+        large = np.diag([99.43] * 3)
+        assert default_skin(small, 6.0, 1) < default_skin(large, 6.0, 1)
+        assert default_skin(large, 6.0, 4) < default_skin(large, 6.0, 1)
+
+    def test_auto_matches_the_measured_optimum_at_98k_atoms(self):
+        """The 99.43 A box is the 98,304-atom system the profile was run on."""
+        assert default_skin(np.diag([99.43] * 3), 6.0, 1) == pytest.approx(4.3, abs=0.4)
+
+    @pytest.fixture(scope="class")
+    def model(self):
+        m = build(long_range=False)
+        m.eval()
+        return m
+
+    def test_halo_inflation_stays_within_the_tolerance(self):
+        cell = np.diag([99.43] * 3)
+        for parts in (1, 2, 4):
+            skin = default_skin(cell, 6.0, parts, tolerance=0.25)
+            edges = np.array([99.43] * 3)
+            edges[0] /= parts
+            base = edges + 12.0
+            assert float(np.prod((base + 2 * skin) / base)) <= 1.25 + 1e-9
+
+    def test_evaluator_resolves_auto_and_reports_it(self, model, system):
+        from deepmd_lr.nvalchemi import DistributedEvaluator  # noqa: PLC0415
+
+        coord, atype, cell, *_ = system
+        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE])
+        assert ev.skin == pytest.approx(default_skin(cell, float(model.get_rcut()), 1))
+        explicit = DistributedEvaluator(
+            model, atype, cell, devices=[DEVICE], skin=2.5
+        )
+        assert explicit.skin == 2.5
+
+    def test_rejects_an_unknown_string(self, model, system):
+        from deepmd_lr.nvalchemi import DistributedEvaluator  # noqa: PLC0415
+
+        _coord, atype, cell, *_ = system
+        with pytest.raises(ValueError, match="number or 'auto'"):
+            DistributedEvaluator(model, atype, cell, devices=[DEVICE], skin="wide")
+
+
+class TestThreadedLaunch:
+    """Each device queues its own partitions, so one device's host syncs do
+    not stall another's.
+
+    The neighbour search makes eight blocking device-to-host reads per
+    partition; from a single thread they serialise the devices whatever the
+    CUDA streams do. Threading must not change a single number.
+    """
+
+    @pytest.fixture(scope="class")
+    def model(self):
+        m = build(long_range=True)
+        m.eval()
+        return m
+
+    @pytest.mark.parametrize("parts", [2, 4])
+    def test_threaded_equals_sequential(self, system, model, parts):
+        coord, atype, cell, *_ = system
+        devices = [DEVICE] * parts
+        common = {"n_partitions": parts, "devices": devices, "compute_born": True}
+        seq = to_numpy(
+            evaluate_partitioned(
+                model, coord, atype, cell, launch_threads=False, **common
+            )
+        )
+        thr = to_numpy(
+            evaluate_partitioned(
+                model, coord, atype, cell, launch_threads=True, **common
+            )
+        )
+        assert thr["energy"] == pytest.approx(seq["energy"], abs=1e-9)
+        for key in ("force", "charge", "born_charge", "atom_energy"):
+            np.testing.assert_allclose(thr[key], seq[key], atol=1e-10, err_msg=key)
+
+    def test_a_failing_partition_raises_on_the_calling_thread(self, system, model):
+        """An exception in a worker must not be swallowed into a hang."""
+        coord, atype, cell, *_ = system
+        with pytest.raises(RuntimeError, match="partition exploded"):
+            evaluate_partitioned(
+                model,
+                coord,
+                atype,
+                cell,
+                n_partitions=2,
+                devices=[DEVICE] * 2,
+                launch_threads=True,
+                charge_spin=_Exploding(),
+            )
+
+
+class _Exploding:
+    """A charge_spin stand-in that raises inside the launch phase."""
+
+    def __getitem__(self, item):
+        raise RuntimeError("partition exploded")
+
+    def __len__(self):
+        raise RuntimeError("partition exploded")
 
 
 class TestGatherIsOnTheDevice:

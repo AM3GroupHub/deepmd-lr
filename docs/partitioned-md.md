@@ -144,7 +144,39 @@ of 40, with results identical to rebuilding every step. `repartition_every=1`
 forces a rebuild each step; it changes timing, never results — there is a test
 asserting exactly that.
 
-### What the driver returns
+### Two knobs that decide multi-GPU scaling
+
+**`skin` (default `"auto"`).** The decomposition is reused until an atom has
+moved half the skin, then rebuilt on the host by a spatial sort whose cost
+grows with the atom count. Measured on two A40s at 98,304 atoms:
+
+| skin (Å) | ms/step | rebuild | serial fraction | 2-GPU Amdahl ceiling |
+|---|---|---|---|---|
+| 1.0 (the old default) | 347 | every 13 steps | 76 % | 1.14x |
+| 2.0 | 206 | every 40 steps | 54 % | 1.30x |
+| 4.0 | 101 | none in 40 steps | 5 % | 1.90x |
+| 8.0 | 189 | none | 4 % | 1.92x |
+
+A constant is wrong at both ends -- a few thousand atoms rebuild cheaply and
+pay for a thick halo -- so `"auto"` takes the largest skin whose halo costs at
+most 25 % more nodes than a zero-skin halo, from the cell, the cutoff and the
+partition count (`partition.default_skin`). That is 1.4 Å at 1,536 atoms,
+4.3 Å at 98,304 and 5.3 Å at 192,000, and 4.3 Å is where the measurement put
+the optimum. Pass a number to override; `evaluator.skin` reports what was used.
+
+**`launch_threads` (default `None` = on above one device).** The neighbour
+search performs eight blocking device-to-host reads per partition per step
+(three in `_max_radius_tuple`, two device queries, the cell-list size estimate,
+the cell-list query, and the capacity check in `nv_search_matrix`). From one
+thread they serialise the devices whatever the CUDA streams do, because the
+host cannot queue partition k+1 while partition k's search is still running.
+Giving each *device* its own thread fixes it -- `.item()` releases the GIL
+while it waits. One thread per device rather than per partition, because
+partitions sharing a device share a model replica whose capture state is not
+re-entrant. On two A40s the launch phase went from 54.7 to 38.1 ms at 98,304
+atoms, and the parallel gain from 1.31x to 1.88x against an ideal 2x.
+
+## What the driver returns
 
 `evaluate_partitioned` assembles on the gather device and returns **device
 tensors** (scalars as 0-d tensors). There is no host-side assembly path: the

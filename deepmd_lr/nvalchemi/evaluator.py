@@ -54,6 +54,7 @@ from deepmd_lr.nvalchemi.driver import (
     evaluate_partitioned,
 )
 from deepmd_lr.nvalchemi.partition import (
+    default_skin,
     partition_system,
 )
 
@@ -123,8 +124,13 @@ class DistributedEvaluator:
         One device per partition. Repeats are accepted and exercise the
         partitioning arithmetic, but only distinct devices test placement.
     skin
-        Halo padding beyond ``rcut``. The partitioning is reused until an
-        atom has moved far enough to invalidate it.
+        Halo padding beyond ``rcut``. The partitioning is reused until an atom
+        has moved far enough to invalidate it, so this trades ghost work
+        against how often the (host-side, serial) rebuild runs. ``"auto"``,
+        the default, sizes it from the cell, the cutoff and the partition
+        count -- see :func:`~deepmd_lr.nvalchemi.partition.default_skin`, which
+        documents why a constant is the wrong answer at both ends of the size
+        range. The value actually used is :attr:`skin`.
     repartition_every
         Force a rebuild every N calls regardless. ``None`` uses the skin
         criterion alone, which is exact rather than merely usually right.
@@ -153,6 +159,10 @@ class DistributedEvaluator:
     charge_spin
         Fixed (total charge, spin multiplicity) for this system. If omitted,
         use the model's configured default condition.
+    launch_threads
+        Run each device's partitions in its own thread while the forwards are
+        queued. ``None`` (default) means on whenever more than one device is
+        in use; see :func:`~deepmd_lr.nvalchemi.driver.evaluate_partitioned`.
     results_on_device
         Keep :attr:`results` as device tensors. By default they are wrapped so
         that each entry is converted to numpy on first access -- the forces
@@ -187,7 +197,7 @@ class DistributedEvaluator:
         cell: np.ndarray,
         *,
         devices: list[Any],
-        skin: float = 1.0,
+        skin: float | str = "auto",
         repartition_every: int | None = None,
         compute_virial: bool = False,
         compute_born: bool = False,
@@ -196,15 +206,18 @@ class DistributedEvaluator:
         compress: bool | float = False,
         eps_inf: float = 1.0,
         results_on_device: bool = False,
+        launch_threads: bool | None = None,
     ) -> None:
         if not devices:
             raise ValueError("DistributedEvaluator needs at least one device")
-        if skin < 0:
+        if isinstance(skin, str):
+            if skin != "auto":
+                raise ValueError(f"skin must be a number or 'auto', got {skin!r}")
+        elif skin < 0:
             raise ValueError(f"skin must be non-negative, got {skin}")
 
         self.model = model
         self.devices = list(devices)
-        self.skin = float(skin)
         self.repartition_every = repartition_every
         self.compute_virial = bool(compute_virial)
         #: Also assemble Born effective charge tensors, exposed as
@@ -242,9 +255,17 @@ class DistributedEvaluator:
         self.eps_inf = float(eps_inf)
         #: Leave ``results`` as device tensors instead of the lazy numpy view.
         self.results_on_device = bool(results_on_device)
+        #: One thread per device in the launch phase; ``None`` means on
+        #: whenever more than one device is used. See `evaluate_partitioned`.
+        self.launch_threads = launch_threads
         self.home = next(model.parameters()).device
         self.atype = np.asarray(atype, dtype=np.int64).reshape(-1)
         self.cell = np.asarray(cell, dtype=np.float64).reshape(3, 3)
+        self.skin = (
+            default_skin(self.cell, float(model.get_rcut()), len(self.devices))
+            if isinstance(skin, str)
+            else float(skin)
+        )
 
         # Compress BEFORE the replicas are made, so the deep copies carry the
         # tables; the run's charge state is folded in here, once.
@@ -372,6 +393,7 @@ class DistributedEvaluator:
             compute_born=self.compute_born,
             charge_spin=self.charge_spin,
             eps_inf=self.eps_inf,
+            launch_threads=self.launch_threads,
         )
         # Results stay on the device; `_LazyNumpy` hands out numpy on access,
         # so a caller that reads `results["charge"]` pays for that copy and a

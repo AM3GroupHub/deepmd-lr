@@ -144,6 +144,62 @@ def _image_shifts(cell: np.ndarray, pbc, rcut: float) -> np.ndarray:
     return np.array(list(product(*ranges)), dtype=int)
 
 
+def default_skin(
+    cell: np.ndarray,
+    rcut: float,
+    n_partitions: int = 1,
+    tolerance: float = 0.25,
+) -> float:
+    r"""The skin a partitioned run should use when the caller does not pick one.
+
+    The halo is rebuilt whenever an atom has moved more than half the skin, so
+    a larger skin trades ghost work for a rarer rebuild. Which way that trade
+    goes is not a constant: the rebuild is a host-side spatial sort whose cost
+    grows with the atom count, while the *relative* cost of a thicker halo
+    shrinks as the partition gets larger. A fixed default is therefore wrong at
+    both ends -- measured on 2 A40s at 98,304 atoms, the old default of 1 A
+    spent **76 % of every step** rebuilding (3.9 s per rebuild, one every 13
+    steps) and capped the two-GPU speed-up at 1.14x; at 4 A the same step ran
+    3.4x faster and the ceiling rose to 1.9x. On a few thousand atoms the
+    ordering reverses and a thick halo is the waste.
+
+    So the rule scales with the geometry instead: take the largest skin whose
+    halo costs at most ``tolerance`` more nodes than a zero-skin halo would.
+    For a partition with edges :math:`l_i`,
+
+    .. math::
+        \prod_i rac{l_i + 2(r_c + s)}{l_i + 2 r_c} \le 1 + 	ext{tolerance}
+
+    which is monotone in :math:`s` and solved here by bisection. It returns
+    about 1.4 A for 1,536 atoms, 4.3 A for 98,304 and 5.3 A for 192,000 -- and
+    4.3 A is where the 98k measurement put the optimum.
+
+    The estimate treats the cell as orthorhombic and the density as uniform,
+    which is what a default needs to be: cheap and roughly right. Pass an
+    explicit ``skin`` when the system is neither.
+    """
+    lengths = np.linalg.norm(np.asarray(cell, dtype=float).reshape(3, 3), axis=1)
+    # `partition_system` slabs along the longest cell vector, so that edge --
+    # and only that one -- is divided among the partitions.
+    lengths[int(np.argmax(lengths))] /= max(int(n_partitions), 1)
+    base = lengths + 2.0 * rcut
+
+    def inflation(s: float) -> float:
+        return float(np.prod((base + 2.0 * s) / base))
+
+    ceiling = 1.0 + float(tolerance)
+    lo, hi = 0.0, 0.5 * float(lengths.min())
+    if inflation(hi) <= ceiling:
+        return hi
+    for _ in range(40):
+        mid = 0.5 * (lo + hi)
+        if inflation(mid) <= ceiling:
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
 def partition_system(
     coord: np.ndarray,
     cell: np.ndarray,
