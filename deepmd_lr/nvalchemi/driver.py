@@ -274,9 +274,11 @@ def evaluate_partitioned(
         Run each device's partitions in its own thread during the launch
         phase. ``None`` (the default) turns it on exactly when more than one
         device is in use, where it is measured to recover most of the
-        parallelism the neighbour search's host syncs take away; ``False``
+        parallelism the neighbour search's host syncs take away. ``False``
         forces the single-threaded loop, which is what the comment in the
-        launch phase explains and what a profile should compare against.
+        launch phase explains and what a profile should compare against;
+        ``True`` threads even on one device, which buys nothing but is how a
+        single-GPU machine covers this path.
 
     Returns
     -------
@@ -448,9 +450,13 @@ def evaluate_partitioned(
     groups: dict = {}
     for index, (part, device) in enumerate(zip(parts, devices, strict=True)):
         groups.setdefault(torch.device(device), []).append((index, part, device))
-    # One device means one group, and a thread pool of one is pure overhead.
-    threaded = len(groups) > 1 and (
-        launch_threads is None or bool(launch_threads)
+    # Automatic means "when there is more than one device to overlap"; a pool
+    # of one is pure overhead. An explicit `True` threads anyway, even for a
+    # single device: it buys nothing there, but it is what lets a one-GPU
+    # machine exercise this path -- the forwards, the capture and the autograd
+    # graphs all get built off the main thread.
+    threaded = (
+        len(groups) > 1 if launch_threads is None else bool(launch_threads)
     )
     if threaded:
         with ThreadPoolExecutor(max_workers=len(groups)) as pool:

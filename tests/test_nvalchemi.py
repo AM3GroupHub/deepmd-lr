@@ -228,6 +228,40 @@ class TestSkinDefault:
             base = edges + 12.0
             assert float(np.prod((base + 2 * skin) / base)) <= 1.25 + 1e-9
 
+    def test_bracket_grows_for_an_anisotropic_cell(self):
+        """Half the shortest edge is not a bracket, only a guess.
+
+        With edges [100, 100, 1] even a skin of 0.5 stays far inside the
+        tolerance, so a fixed upper bound would return that cap instead of the
+        largest admissible skin.
+        """
+        cell = np.diag([100.0, 100.0, 1.0])
+        skin = default_skin(cell, 6.0, 1)
+        assert skin > 0.5 * 1.0
+        base = np.array([100.0, 100.0, 1.0]) + 12.0
+        assert float(np.prod((base + 2 * skin) / base)) == pytest.approx(1.25, abs=1e-6)
+
+    def test_auto_follows_the_cell_through_set_cell(self, model, system):
+        """A barostat replaces the cell; the rule reads the cell."""
+        from deepmd_lr.nvalchemi import DistributedEvaluator  # noqa: PLC0415
+
+        _coord, atype, cell, *_ = system
+        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE])
+        before = ev.skin
+        ev.set_cell(cell * 2.0)
+        assert ev.skin > before
+        assert ev.skin == pytest.approx(default_skin(cell * 2.0, ev._rcut, 1))
+        ev.set_cell(cell)
+        assert ev.skin == pytest.approx(before)
+
+    def test_an_explicit_skin_is_not_touched_by_set_cell(self, model, system):
+        from deepmd_lr.nvalchemi import DistributedEvaluator  # noqa: PLC0415
+
+        _coord, atype, cell, *_ = system
+        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE], skin=2.5)
+        ev.set_cell(cell * 2.0)
+        assert ev.skin == 2.5
+
     def test_evaluator_resolves_auto_and_reports_it(self, model, system):
         from deepmd_lr.nvalchemi import DistributedEvaluator  # noqa: PLC0415
 
@@ -280,6 +314,42 @@ class TestThreadedLaunch:
         assert thr["energy"] == pytest.approx(seq["energy"], abs=1e-9)
         for key in ("force", "charge", "born_charge", "atom_energy"):
             np.testing.assert_allclose(thr[key], seq[key], atol=1e-10, err_msg=key)
+
+    def test_the_launch_really_runs_off_the_main_thread(self, system, model):
+        """`launch_threads=True` must enter the pool even on one device.
+
+        Without this the suite on a single-GPU machine would exercise the old
+        sequential loop while claiming to pin the threaded one: the automatic
+        rule skips the pool when there is only one device, and every test here
+        passes the same device twice.
+        """
+        import threading  # noqa: PLC0415
+
+        from deepmd_lr.nvalchemi import driver as drv  # noqa: PLC0415
+
+        coord, atype, cell, *_ = system
+        seen: set[str] = set()
+        original = drv.partition_graph
+
+        def record(*args, **kwargs):
+            seen.add(threading.current_thread().name)
+            return original(*args, **kwargs)
+
+        drv.partition_graph = record
+        try:
+            evaluate_partitioned(
+                model, coord, atype, cell, n_partitions=2,
+                devices=[DEVICE] * 2, launch_threads=False,
+            )
+            assert seen == {threading.main_thread().name}, seen
+            seen.clear()
+            evaluate_partitioned(
+                model, coord, atype, cell, n_partitions=2,
+                devices=[DEVICE] * 2, launch_threads=True,
+            )
+            assert seen and threading.main_thread().name not in seen, seen
+        finally:
+            drv.partition_graph = original
 
     def test_a_failing_partition_raises_on_the_calling_thread(self, system, model):
         """An exception in a worker must not be swallowed into a hang."""

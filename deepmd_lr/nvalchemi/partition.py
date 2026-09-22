@@ -168,7 +168,7 @@ def default_skin(
     For a partition with edges :math:`l_i`,
 
     .. math::
-        \prod_i rac{l_i + 2(r_c + s)}{l_i + 2 r_c} \le 1 + 	ext{tolerance}
+        \prod_i \frac{l_i + 2(r_c + s)}{l_i + 2 r_c} \le 1 + \text{tolerance}
 
     which is monotone in :math:`s` and solved here by bisection. It returns
     about 1.4 A for 1,536 atoms, 4.3 A for 98,304 and 5.3 A for 192,000 -- and
@@ -188,9 +188,20 @@ def default_skin(
         return float(np.prod((base + 2.0 * s) / base))
 
     ceiling = 1.0 + float(tolerance)
-    lo, hi = 0.0, 0.5 * float(lengths.min())
-    if inflation(hi) <= ceiling:
-        return hi
+    if ceiling <= 1.0:
+        return 0.0
+    # Bracket first, then bisect. A fixed upper bound is not a bracket: for a
+    # very anisotropic cell -- edges [100, 100, 1], say -- even a skin of half
+    # the shortest edge stays well inside the tolerance, and returning that cap
+    # would hand back an arbitrary number rather than the largest admissible
+    # one. `inflation` grows without bound in ``s``, so doubling terminates.
+    lo, hi = 0.0, max(float(lengths.min()), 1.0)
+    for _ in range(64):
+        if inflation(hi) > ceiling:
+            break
+        lo, hi = hi, 2.0 * hi
+    else:  # pragma: no cover - `inflation` is cubic in s; 2**64 cannot survive
+        raise RuntimeError(f"no skin reaches an inflation of {ceiling}")
     for _ in range(40):
         mid = 0.5 * (lo + hi)
         if inflation(mid) <= ceiling:

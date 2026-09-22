@@ -261,11 +261,14 @@ class DistributedEvaluator:
         self.home = next(model.parameters()).device
         self.atype = np.asarray(atype, dtype=np.int64).reshape(-1)
         self.cell = np.asarray(cell, dtype=np.float64).reshape(3, 3)
-        self.skin = (
-            default_skin(self.cell, float(model.get_rcut()), len(self.devices))
-            if isinstance(skin, str)
-            else float(skin)
-        )
+        #: Whether the caller asked for the geometry rule. Kept because the
+        #: rule reads the cell, and `set_cell` can replace it mid-run: under a
+        #: barostat a contraction would otherwise keep a skin that no longer
+        #: honours the halo bound, and an expansion would keep one too small
+        #: to buy the rebuild reduction it was chosen for.
+        self._skin_is_auto = isinstance(skin, str)
+        self._rcut = float(model.get_rcut())
+        self.skin = self._auto_skin() if self._skin_is_auto else float(skin)
 
         # Compress BEFORE the replicas are made, so the deep copies carry the
         # tables; the run's charge state is folded in here, once.
@@ -306,11 +309,17 @@ class DistributedEvaluator:
         """Standard masses for this system, in amu."""
         return atomic_masses(self.model, self.atype)
 
+    def _auto_skin(self) -> float:
+        """The geometry rule, against the cell this evaluator holds now."""
+        return default_skin(self.cell, self._rcut, len(self.devices))
+
     def set_cell(self, cell: Any) -> None:
         """Replace the cell and invalidate the partitioning.
 
         A barostat moves the cell every step, and the partitioning was built
-        against the old one. Invalidation here is **correctness, not caching**:
+        against the old one. An ``"auto"`` skin is recomputed here too, since
+        the rule is a function of the cell. Invalidation here is
+        **correctness, not caching**:
         :meth:`_needs_rebuild` watches atom displacement only and cannot see a
         cell change, so nothing else would ever notice. A stale halo puts ghost
         images at the wrong offsets and the forces are quietly wrong -- there
@@ -320,6 +329,10 @@ class DistributedEvaluator:
         self.cell = np.asarray(cell, dtype=np.float64).reshape(3, 3)
         self._partitions = None
         self._reference_positions = None
+        # The rule is a function of the cell, so a new cell means a new answer.
+        # An explicitly chosen skin is the caller's and is left alone.
+        if self._skin_is_auto:
+            self.skin = self._auto_skin()
 
     def _needs_rebuild(self, positions: torch.Tensor) -> bool:
         """Standard Verlet criterion on the cached halo.
