@@ -191,25 +191,26 @@ def partition_graph(
 
     Returns ``(graph, node_type_flat, node_coord)``. ``node_coord`` is the
     unstrained leaf, so a backward reaches both it and the strain.
+
+    ``coord`` may be a device tensor or a numpy array; either way the node
+    set is gathered on ``device`` with :meth:`Partition.views`, never
+    concatenated on the host.
     """
-    if isinstance(coord, torch.Tensor):
-        # Device path: gather owned + shifted ghosts from the global coordinate
-        # tensor with cached index tensors. No host round trip per partition.
-        v = part.views(device, dtype)
-        c = coord.detach().to(device=device, dtype=dtype)
-        nodes = torch.cat([c[v["owned"]], c[v["ghost"]] + v["shift"]])
-        node_coord = nodes.unsqueeze(0).clone().requires_grad_(requires_grad)
-        node_type = part.types_on(atype, device).unsqueeze(0)
-    else:
-        node_coord = torch.tensor(
-            part.coordinates(coord)[None, ...],
-            dtype=dtype,
-            device=device,
-            requires_grad=requires_grad,
-        )
-        node_type = torch.tensor(
-            part.types(atype)[None, ...], dtype=torch.int64, device=device
-        )
+    # One gather, on the device: owned nodes plus ghosts shifted into place,
+    # taken from the global coordinate tensor with this partition's cached
+    # index tensors. A numpy argument is uploaded once, here, so there is no
+    # second implementation that assembles nodes on the host.
+    coord_t = (
+        coord
+        if isinstance(coord, torch.Tensor)
+        else torch.as_tensor(np.asarray(coord, dtype=np.float64))
+    )
+    v = part.views(device, dtype)
+    c = coord_t.detach().to(device=device, dtype=dtype)
+    nodes = torch.cat([c[v["owned"]], c[v["ghost"]] + v["shift"]])
+    node_coord = nodes.unsqueeze(0).clone().requires_grad_(requires_grad)
+    node_type = part.types_on(atype, device).unsqueeze(0)
+
     search_coord = (
         node_coord
         if strain is None
@@ -238,15 +239,16 @@ def evaluate_partitioned(
     charge_spin: torch.Tensor | tuple[float, float] | None = None,
     compute_born: bool = False,
     eps_inf: float = 1.0,
-    as_tensor: bool = False,
 ) -> dict[str, Any]:
     """Run ``model`` over spatial partitions and assemble the global result.
 
-    Everything is assembled on the gather device: per-partition forces,
-    energies and charges are moved device-to-device and scatter-added with
-    ``index_add_`` -- the ghost-force reverse communication of a
-    domain-decomposed code, done as a device primitive rather than a serial
-    host loop. Nothing touches the host until the caller asks for numpy.
+    Everything is assembled on the gather device and **returned there**:
+    per-partition forces, energies and charges are moved device-to-device and
+    scatter-added with ``index_add_`` -- the ghost-force reverse communication
+    of a domain-decomposed code, done as a device primitive rather than a
+    serial host loop. There is no host-side assembly path; a caller that wants
+    numpy arrays converts explicitly with :func:`to_numpy`, which makes the
+    download a visible line rather than a hidden default.
 
     Parameters
     ----------
@@ -266,15 +268,11 @@ def evaluate_partitioned(
         ``q~_i q~_j / (4 pi eps_0 eps_inf r)``. Energies and forces are
         evaluated with the model's own charges and are unchanged. ``1.0`` is
         vacuum. See :func:`deepmd_lr.born.screening_factor`.
-    as_tensor
-        Return device tensors on the gather device instead of numpy arrays
-        (scalars as 0-d tensors). The evaluator uses this so the forces never
-        leave the GPU between one step and the next. Default ``False`` keeps
-        the numpy contract for every other caller.
 
     Returns
     -------
     dict
+        Device tensors on the gather device, scalars as 0-d tensors:
         ``energy``, ``force`` ``(N, 3)``, ``atom_energy`` ``(N,)``, and when the
         model carries a long-range term also ``charge`` ``(N,)``,
         ``energy_short_range``, ``energy_long_range``, and ``dE_dq`` ``(N,)``
@@ -457,7 +455,7 @@ def evaluate_partitioned(
         result["virial"] = virial.clone()
         result["virial_short_range"] = virial.clone()
     if not long_range:
-        return result if as_tensor else _as_numpy(result)
+        return result
 
     result["energy_short_range"] = energy
     result.update(
@@ -501,11 +499,17 @@ def evaluate_partitioned(
             result["virial"] + result["virial_long_range"] + response_virial
         )
         result["virial_charge_response"] = response_virial
-    return result if as_tensor else _as_numpy(result)
+    return result
 
 
-def _as_numpy(result: dict) -> dict:
-    """The numpy contract: arrays to host, 0-d tensors to Python floats."""
+def to_numpy(result: dict) -> dict:
+    """Copy a :func:`evaluate_partitioned` result to the host.
+
+    Arrays become numpy, 0-d tensors become Python floats. This is the only
+    download in the pipeline and it is the caller's explicit choice: the
+    driver assembles and returns on the device, so a step that never reads a
+    result on the host never pays for one.
+    """
     out = {}
     for key, value in result.items():
         if isinstance(value, torch.Tensor):

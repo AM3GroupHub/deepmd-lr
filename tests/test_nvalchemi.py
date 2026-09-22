@@ -21,6 +21,7 @@ from deepmd_lr.nvalchemi import (
     evaluate_partitioned,
     partition_graph,
     partition_system,
+    to_numpy,
 )
 
 from .test_joint_model import build, frame
@@ -154,9 +155,9 @@ class TestPartitionCountInvariance:
         d_energy, d_force = self._noise_floor(model, coord_t, atype_t, cell_t)
 
         for n in PARTITION_COUNTS:
-            out = evaluate_partitioned(
+            out = to_numpy(evaluate_partitioned(
                 model, coord, atype, cell, n_partitions=n, devices=[DEVICE] * n
-            )
+            ))
             assert abs(out["energy"] - energy_ref) <= max(d_energy * 10, 1e-9), (
                 f"{n} partitions: energy off by "
                 f"{abs(out['energy'] - energy_ref):.3e}"
@@ -178,18 +179,77 @@ class TestPartitionCountInvariance:
             .cpu()
             .numpy()
         )
-        out = evaluate_partitioned(
+        out = to_numpy(evaluate_partitioned(
             model, coord, atype, cell, n_partitions=4, devices=[DEVICE] * 4
-        )
+        ))
         assert np.abs(out["atom_energy"] - reference).max() < 1e-8
 
     def test_rejects_device_count_mismatch(self, system):
         coord, atype, cell, *_ = system
         model = build(long_range=False)
         with pytest.raises(ValueError, match="one device per partition"):
-            evaluate_partitioned(
+            to_numpy(evaluate_partitioned(
                 model, coord, atype, cell, n_partitions=4, devices=[DEVICE]
-            )
+            ))
+
+
+class TestGatherIsOnTheDevice:
+    """One assembly path, and it ends on the gather device.
+
+    The per-partition results used to be pulled to the host and scatter-added
+    with `np.add.at`, which synchronised every device once per partition per
+    step. Now `index_add_` runs on the gather device and the result is handed
+    back as tensors; the only download is the caller's explicit `to_numpy`.
+    Pinned here because a well-meaning `.cpu()` anywhere in the gather would
+    silently restore the sync while every other test still passed.
+    """
+
+    @pytest.fixture(scope="class")
+    def model(self):
+        m = build(long_range=True)
+        m.eval()
+        return m
+
+    def test_results_are_tensors_on_the_gather_device(self, system, model):
+        coord, atype, cell, *_ = system
+        out = evaluate_partitioned(
+            model, coord, atype, cell, n_partitions=2,
+            devices=[DEVICE] * 2, compute_born=True, compute_virial=False,
+        )
+        expected = torch.device(DEVICE)
+        for key in ("force", "atom_energy", "charge", "born_charge",
+                    "force_long_range", "force_charge_response", "dE_dq"):
+            value = out[key]
+            assert isinstance(value, torch.Tensor), f"{key} is {type(value).__name__}"
+            assert value.device.type == expected.type, f"{key} on {value.device}"
+        assert out["energy"].ndim == 0
+        assert out["force"].shape == (len(coord), 3)
+
+    def test_to_numpy_converts_arrays_and_scalars(self, system, model):
+        coord, atype, cell, *_ = system
+        out = evaluate_partitioned(
+            model, coord, atype, cell, n_partitions=2, devices=[DEVICE] * 2
+        )
+        host = to_numpy(out)
+        assert isinstance(host["force"], np.ndarray)
+        assert isinstance(host["energy"], float)
+        assert host["energy"] == pytest.approx(float(out["energy"]))
+        np.testing.assert_allclose(host["force"], out["force"].cpu().numpy())
+
+    def test_the_gather_never_calls_numpy_scatter(self, system, model, monkeypatch):
+        """`np.add.at` in the gather is the regression this class exists for."""
+        import numpy as real_np
+
+        def refuse(*args, **kwargs):  # noqa: ANN002, ANN003
+            raise AssertionError("the gather scattered on the host")
+
+        monkeypatch.setattr(real_np.add, "at", refuse)
+        coord, atype, cell, *_ = system
+        out = evaluate_partitioned(
+            model, coord, atype, cell, n_partitions=2,
+            devices=[DEVICE] * 2, compute_born=True,
+        )
+        assert torch.isfinite(out["force"]).all()
 
 
 class TestGatheredLongRange:
@@ -215,9 +275,9 @@ class TestGatheredLongRange:
         coord, atype, cell, *_ = system
         model, serial = joint
         reference = serial["charge"].reshape(-1).detach().cpu().numpy()
-        out = evaluate_partitioned(
+        out = to_numpy(evaluate_partitioned(
             model, coord, atype, cell, n_partitions=n, devices=[DEVICE] * n
-        )
+        ))
         assert np.abs(out["charge"] - reference).max() < 1e-12
 
     @pytest.mark.parametrize("n", PARTITION_COUNTS)
@@ -225,9 +285,9 @@ class TestGatheredLongRange:
         """The constraint is global; a per-partition projection would break it."""
         coord, atype, cell, *_ = system
         model, _ = joint
-        out = evaluate_partitioned(
+        out = to_numpy(evaluate_partitioned(
             model, coord, atype, cell, n_partitions=n, devices=[DEVICE] * n
-        )
+        ))
         assert abs(out["charge"].sum()) < 1e-10
 
     @pytest.mark.parametrize("n", PARTITION_COUNTS)
@@ -235,9 +295,9 @@ class TestGatheredLongRange:
         coord, atype, cell, *_ = system
         model, serial = joint
         reference = float(serial["energy_long_range"].reshape(-1)[0])
-        out = evaluate_partitioned(
+        out = to_numpy(evaluate_partitioned(
             model, coord, atype, cell, n_partitions=n, devices=[DEVICE] * n
-        )
+        ))
         assert abs(out["energy_long_range"] - reference) < 1e-10
 
     def test_direct_long_range_force_matches_serial(self, system, joint):
@@ -250,9 +310,9 @@ class TestGatheredLongRange:
         reference = (
             -torch.autograd.grad(energy, positions)[0][0].cpu().numpy()
         )
-        out = evaluate_partitioned(
+        out = to_numpy(evaluate_partitioned(
             model, coord, atype, cell, n_partitions=4, devices=[DEVICE] * 4
-        )
+        ))
         assert np.abs(out["force_long_range"] - reference).max() < 1e-12
 
     def test_charge_gradient_is_available_and_nonzero(self, system, joint):
@@ -260,9 +320,9 @@ class TestGatheredLongRange:
         what keeps the autograd graph on a single device."""
         coord, atype, cell, *_ = system
         model, _ = joint
-        out = evaluate_partitioned(
+        out = to_numpy(evaluate_partitioned(
             model, coord, atype, cell, n_partitions=4, devices=[DEVICE] * 4
-        )
+        ))
         assert out["dE_dq"].shape == (len(coord),)
         assert np.isfinite(out["dE_dq"]).all()
         assert np.abs(out["dE_dq"]).max() > 1e-6
@@ -278,9 +338,9 @@ class TestGatheredLongRange:
         coord, atype, cell, *_ = system
         model, serial = joint
         reference = serial["force"][0].detach().cpu().numpy()
-        out = evaluate_partitioned(
+        out = to_numpy(evaluate_partitioned(
             model, coord, atype, cell, n_partitions=n, devices=[DEVICE] * n
-        )
+        ))
         assert np.abs(out["force"] - reference).max() < 1e-12
 
     def test_charge_response_dominates_the_direct_term(self, system, joint):
@@ -292,9 +352,9 @@ class TestGatheredLongRange:
         """
         coord, atype, cell, *_ = system
         model, _ = joint
-        out = evaluate_partitioned(
+        out = to_numpy(evaluate_partitioned(
             model, coord, atype, cell, n_partitions=4, devices=[DEVICE] * 4
-        )
+        ))
         response = np.sqrt((out["force_charge_response"] ** 2).mean())
         direct = np.sqrt((out["force_long_range"] ** 2).mean())
         assert response > direct
@@ -314,14 +374,14 @@ class TestGatheredLongRange:
         model, _ = joint
 
         def energy(positions):
-            return evaluate_partitioned(
+            return to_numpy(evaluate_partitioned(
                 model, positions, atype, cell,
                 n_partitions=n, devices=[DEVICE] * n,
-            )["energy"]
+            ))["energy"]
 
-        force = evaluate_partitioned(
+        force = to_numpy(evaluate_partitioned(
             model, coord, atype, cell, n_partitions=n, devices=[DEVICE] * n
-        )["force"]
+        ))["force"]
 
         step = 1e-5
         for atom in range(0, len(coord), 11):
@@ -352,15 +412,15 @@ class TestGatheredLongRange:
         model, _ = joint
 
         def energy(positions, box):
-            return evaluate_partitioned(
+            return to_numpy(evaluate_partitioned(
                 model, positions, atype, box,
                 n_partitions=n, devices=[DEVICE] * n,
-            )["energy"]
+            ))["energy"]
 
-        analytic = evaluate_partitioned(
+        analytic = to_numpy(evaluate_partitioned(
             model, coord, atype, cell,
             n_partitions=n, devices=[DEVICE] * n, compute_virial=True,
-        )["virial"]
+        ))["virial"]
 
         step = 1e-5
         numeric = np.zeros((3, 3))

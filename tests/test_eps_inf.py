@@ -184,14 +184,14 @@ class TestPartitioned:
         )
 
     def test_evaluate_partitioned_matches_the_serial_screened_tensor(self):
-        from deepmd_lr.nvalchemi import evaluate_partitioned
+        from deepmd_lr.nvalchemi import evaluate_partitioned, to_numpy
 
         model, c, a, cl, coord, atype, cell = self._setup()
         model.eps_inf = EPS
         serial = model(coord, atype, box=cell)
         model.eps_inf = 1.0
         for n_part in (1, 2, 4):
-            out = evaluate_partitioned(
+            out = to_numpy(evaluate_partitioned(
                 model,
                 c,
                 a,
@@ -200,7 +200,7 @@ class TestPartitioned:
                 devices=[DEVICE] * n_part,
                 compute_born=True,
                 eps_inf=EPS,
-            )
+            ))
             np.testing.assert_allclose(
                 out["born_charge"],
                 serial["born_charge"][0].detach().cpu().numpy(),

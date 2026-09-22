@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import torch
 
-from deepmd_lr.nvalchemi import DistributedEvaluator, evaluate_partitioned
+from deepmd_lr.nvalchemi import DistributedEvaluator, evaluate_partitioned, to_numpy
 
 from .test_joint_model import DESCRIPTOR, FITTING, LONG_RANGE, frame, get_model
 
@@ -54,7 +54,7 @@ def test_partitioned_charge_contracts(excluded, explicit):
     positions = coord[0].cpu().numpy()
     types = atype[0].cpu().numpy()
     box = cell[0].cpu().numpy()
-    result = evaluate_partitioned(
+    result = to_numpy(evaluate_partitioned(
         model,
         positions,
         types,
@@ -63,7 +63,7 @@ def test_partitioned_charge_contracts(excluded, explicit):
         devices=[coord.device] * 2,
         compute_virial=True,
         charge_spin=condition,
-    )
+    ))
     assert result["charge"].sum() == pytest.approx(-1.0 if explicit else 1.0, abs=1e-12)
     if excluded:
         np.testing.assert_array_equal(result["charge"][types == 1], 0.0)

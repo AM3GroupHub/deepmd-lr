@@ -17,6 +17,7 @@ from deepmd_lr.nvalchemi.driver import (
     device_replicas,
     evaluate_partitioned,
     partition_graph,
+    to_numpy,
 )
 from deepmd_lr.nvalchemi.evaluator import (
     DistributedEvaluator,
@@ -44,5 +45,6 @@ __all__ = [
     "evaluate_partitioned",
     "partition_graph",
     "partition_system",
+    "to_numpy",
     "read_structure",
 ]

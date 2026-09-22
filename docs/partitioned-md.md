@@ -144,7 +144,38 @@ of 40, with results identical to rebuilding every step. `repartition_every=1`
 forces a rebuild each step; it changes timing, never results — there is a test
 asserting exactly that.
 
-### Limits
+### What the driver returns
+
+`evaluate_partitioned` assembles on the gather device and returns **device
+tensors** (scalars as 0-d tensors). There is no host-side assembly path: the
+per-partition forces, energies, charges, charge-response forces and Born
+tensors are scatter-added with `index_add_` on that device, which is the
+ghost-force reverse communication of a domain-decomposed code done as a device
+primitive. Convert explicitly when you want numpy:
+
+```python
+from deepmd_lr.nvalchemi import evaluate_partitioned, to_numpy
+
+out = evaluate_partitioned(model, coord, atype, cell, n_partitions=2, devices=[...])
+out["force"]                      # torch tensor on the gather device
+to_numpy(out)["force"]            # numpy (N, 3), one explicit download
+```
+
+`DistributedEvaluator` keeps the tensor path: the forces go straight into the
+buffer the warp integrator aliases, so they never leave the GPU between steps,
+and `results` converts an entry to numpy only when it is read
+(`results_on_device=True` skips even that). One download per step remains, the
+energy scalar, because the call returns it as a Python float.
+
+Measured effect of removing the host gather, compressed, 98,304 atoms on one
+GB10: long-range 344 to 315 ms/step, long-range with Born tensors 442 to 358.
+Short-range is unchanged, because its step had only one transfer to remove. On
+two H200s the difference is within run-to-run scatter. The gather was never the
+ceiling: at 98k atoms a compressed step is 48 % host-side partitioning, 19 %
+neighbour search, 17 % edge sort for the compressed kernel, 16 % network, and
+under 1 % gather.
+
+## Limits
 
 - **`stress` is available, opt-in.** Pass `compute_virial=True` and read
   `evaluator.virial` (eV) or `evaluator.stress` (eV/Å³, ASE's sign convention).

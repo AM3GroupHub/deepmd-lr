@@ -421,14 +421,14 @@ class TestKernel:
         model.compute_born = True
         coord, atype, cell = frame(n_mol=8, box=12.0)
         serial = model(coord, atype, box=cell)
-        parted = DRV.evaluate_partitioned(
+        parted = DRV.to_numpy(DRV.evaluate_partitioned(
             model,
             coord[0].cpu().numpy(),
             atype[0].cpu().numpy(),
             cell[0].cpu().numpy(),
             n_partitions=n_part,
             compute_born=True,
-        )
+        ))
         assert abs(parted["energy"] - float(serial["energy"])) < 1e-6
         np.testing.assert_allclose(
             parted["force"], serial["force"][0].detach().cpu().numpy(), atol=1e-6

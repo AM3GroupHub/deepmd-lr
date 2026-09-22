@@ -81,6 +81,10 @@ def atomic_masses(model: Any, atype: np.ndarray) -> np.ndarray:
 class _LazyNumpy(dict):
     """A result dict whose tensors become numpy arrays on first access.
 
+    The lazy twin of :func:`~deepmd_lr.nvalchemi.driver.to_numpy`: the driver
+    returns device tensors, and this defers each download to the moment the
+    entry is actually read.
+
     The evaluator assembles everything on the GPU; most callers read one or
     two entries per step, if any, so converting all of them eagerly would
     reintroduce the host traffic the device gather removed. 0-d tensors become
@@ -368,7 +372,6 @@ class DistributedEvaluator:
             compute_born=self.compute_born,
             charge_spin=self.charge_spin,
             eps_inf=self.eps_inf,
-            as_tensor=True,
         )
         # Results stay on the device; `_LazyNumpy` hands out numpy on access,
         # so a caller that reads `results["charge"]` pays for that copy and a
