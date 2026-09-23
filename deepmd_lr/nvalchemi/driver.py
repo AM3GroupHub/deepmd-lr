@@ -62,6 +62,39 @@ __all__ = [
 ]
 
 
+def _ensure_cuda_ops_registered() -> None:
+    """Register deepmd-kit's lazy CUDA fake implementations, single-threaded.
+
+    deepmd-kit 3.2.0 registers these on first use with a check-then-set on a
+    module global (``_cpu_library``), which is not thread-safe: with the
+    threaded launch phase, two threads can both see "not registered" and race,
+    the loser raising ``register_fake: the operator ... already has an fake
+    impl registered`` (seen on 4 V100s). Running every registrar once on this
+    thread makes all later calls short-circuit on the same guard. Each
+    registrar no-ops when the op library is absent, so a CPU-wheel install is
+    unaffected.
+    """
+    from deepmd.kernels.cuda import edge_force_virial, graph_fitting
+    from deepmd.kernels.cuda.dpa1 import canonical as dpa1_canonical
+    from deepmd.kernels.cuda.dpa1 import graph_compress as dpa1_compress
+    from deepmd.kernels.cuda.dpa1 import graph_descriptor
+    from deepmd.kernels.cuda.dpa1 import graph_energy_force
+    from deepmd.kernels.cuda.dpa4c import canonical as dpa4c_canonical
+    from deepmd.kernels.cuda.dpa4c import graph_compress as dpa4c_compress
+
+    for registrar in (
+        graph_fitting,
+        edge_force_virial,
+        dpa1_canonical,
+        dpa1_compress,
+        graph_descriptor,
+        graph_energy_force,
+        dpa4c_canonical,
+        dpa4c_compress,
+    ):
+        registrar.ensure_registered()
+
+
 def _current_device(device) -> contextlib.AbstractContextManager:
     """Make ``device`` the CUDA *current* device for the block.
 
@@ -459,6 +492,9 @@ def evaluate_partitioned(
         len(groups) > 1 if launch_threads is None else bool(launch_threads)
     )
     if threaded:
+        # The launch threads below may run their first-ever forward, whose
+        # lazy fake-op registration is racy; complete it here, single-threaded.
+        _ensure_cuda_ops_registered()
         with ThreadPoolExecutor(max_workers=len(groups)) as pool:
             # `result()` re-raises whatever a worker raised, on this thread.
             for future in [pool.submit(launch_group, g) for g in groups.values()]:
