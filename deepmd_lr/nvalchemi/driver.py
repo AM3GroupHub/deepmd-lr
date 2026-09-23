@@ -24,6 +24,7 @@ logic is tested on a single-GPU machine.
 
 import contextlib
 import copy
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import (
     Any,
@@ -77,8 +78,7 @@ def _ensure_cuda_ops_registered() -> None:
     from deepmd.kernels.cuda import edge_force_virial, graph_fitting
     from deepmd.kernels.cuda.dpa1 import canonical as dpa1_canonical
     from deepmd.kernels.cuda.dpa1 import graph_compress as dpa1_compress
-    from deepmd.kernels.cuda.dpa1 import graph_descriptor
-    from deepmd.kernels.cuda.dpa1 import graph_energy_force
+    from deepmd.kernels.cuda.dpa1 import graph_descriptor, graph_energy_force
     from deepmd.kernels.cuda.dpa4c import canonical as dpa4c_canonical
     from deepmd.kernels.cuda.dpa4c import graph_compress as dpa4c_compress
 
@@ -93,6 +93,55 @@ def _ensure_cuda_ops_registered() -> None:
         dpa4c_compress,
     ):
         registrar.ensure_registered()
+
+
+# Devices whose torch CUDA linear-algebra library has been loaded, and the lock
+# that lets exactly one thread make a first pass over a device. Both are
+# process-global because the state they protect is: a dlopen, and whatever
+# else a backend builds on first use.
+_LINALG_READY: set = set()
+_WARM_UP_LOCK = threading.Lock()
+
+
+def _ensure_cuda_linalg_loaded(device) -> None:
+    """Load torch's lazy CUDA linear-algebra library on ``device``.
+
+    The neighbour search inverts the cell (``torch.linalg.inv``) and takes its
+    determinant, and both dispatch through ATen stubs that ``dlopen``
+    ``libtorch_cuda_linalg.so`` on first use. That loader asserts it runs at
+    most once, so two launch threads reaching it together raise ``lazy wrapper
+    should be called at most once`` (seen on 4 V100s). Doing it here, before
+    any pool exists, leaves the threads with nothing left to load.
+
+    Three ops, because they are three separate stubs: ``inv`` and ``solve``
+    reach ``lu_solve``, ``det`` reaches ``lu_factor``. A 3x3 identity is the
+    whole cost, and the cuSOLVER and cuBLAS handles this builds for the device
+    are themselves lazily created, so they stop being a race too.
+    """
+    device = torch.device(device)
+    if device.type != "cuda" or device in _LINALG_READY:
+        return
+    with _current_device(device):
+        probe = torch.eye(3, dtype=torch.float64, device=device)
+        torch.linalg.inv(probe)
+        torch.linalg.det(probe)
+        torch.linalg.solve(probe, probe)
+    _LINALG_READY.add(device)
+
+
+def _warm_devices(model) -> set:
+    """The devices on which ``model`` has already completed one launch pass.
+
+    Kept on the model rather than in a module global so that a second model --
+    compressed where the first was not, say -- gets its own first pass, and so
+    that the bookkeeping dies with the model it describes.
+    """
+    warm = getattr(model, "_nvalchemi_warm_devices", None)
+    if warm is None:
+        warm = set()
+        with contextlib.suppress(AttributeError, RuntimeError, TypeError):
+            model._nvalchemi_warm_devices = warm
+    return warm
 
 
 def _current_device(device) -> contextlib.AbstractContextManager:
@@ -475,10 +524,30 @@ def evaluate_partitioned(
                 part, device, out, raw, node_coord, eps, graph, cap_edge_vec
             )
 
+    warm = _warm_devices(model)
+
     def launch_group(group):
-        """Every partition that shares one device, in order, in one thread."""
-        for item in group:
-            launch_one(*item)
+        """Every partition that shares one device, in order, in one thread.
+
+        The first pass over a device holds the warm-up lock. What runs under
+        this phase builds state lazily and is not thread-safe while it does:
+        warp's kernel cache, whose code generation raised ``'Adjoint' object
+        has no attribute ...`` when eight threads entered it together on
+        V100s. Holding the lock for that pass means the build happens once, on
+        one thread, while the others wait; from the second pass on the lock is
+        never taken and the devices run concurrently as before. It costs one
+        serialised step per device, and unlike warming each backend by name it
+        also covers the lazy paths we have not met yet.
+        """
+        device = torch.device(group[0][2])
+        if device in warm:
+            for item in group:
+                launch_one(*item)
+            return
+        with _WARM_UP_LOCK:
+            for item in group:
+                launch_one(*item)
+            warm.add(device)
 
     groups: dict = {}
     for index, (part, device) in enumerate(zip(parts, devices, strict=True)):
@@ -491,10 +560,17 @@ def evaluate_partitioned(
     threaded = (
         len(groups) > 1 if launch_threads is None else bool(launch_threads)
     )
-    if threaded:
-        # The launch threads below may run their first-ever forward, whose
-        # lazy fake-op registration is racy; complete it here, single-threaded.
+    # Whatever a first-ever forward would initialise lazily and racily is
+    # completed here, on this thread, before any pool exists: deepmd-kit's
+    # fake-op registration and torch's CUDA linear-algebra library. What
+    # cannot be warmed by name is left to the lock in `launch_group`. Skipped
+    # once every device has made a pass, which is what keeps this off the
+    # per-step budget.
+    if any(device not in warm for device in groups):
         _ensure_cuda_ops_registered()
+        for device in groups:
+            _ensure_cuda_linalg_loaded(device)
+    if threaded:
         with ThreadPoolExecutor(max_workers=len(groups)) as pool:
             # `result()` re-raises whatever a worker raised, on this thread.
             for future in [pool.submit(launch_group, g) for g in groups.values()]:

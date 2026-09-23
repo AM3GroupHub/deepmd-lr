@@ -176,6 +176,32 @@ partitions sharing a device share a model replica whose capture state is not
 re-entrant. On two A40s the launch phase went from 54.7 to 38.1 ms at 98,304
 atoms, and the parallel gain from 1.31x to 1.88x against an ideal 2x.
 
+### The first pass over a device runs alone
+
+Threading the launch phase exposed a class of bug that the sequential loop
+could never hit: libraries under this phase that build state on first use and
+are not thread-safe while they do it. Three were found by running the scaling
+matrix on 4 and 8 V100s, and each failed the whole row:
+
+| what is lazy | how it failed | how it is handled |
+|---|---|---|
+| deepmd-kit's fake-op registration | `register_fake: the operator ... already has an fake impl registered` | every registrar is run by name before the pool |
+| torch's CUDA linear-algebra library, `dlopen`ed by the cell inverse in the neighbour search | `lazy wrapper should be called at most once` | a 3x3 `inv`/`det`/`solve` probe per device before the pool |
+| warp's code generation | `'Adjoint' object has no attribute ...`, a half-built kernel handed to a second thread | the first pass over a device holds a warm-up lock |
+
+The first two can be warmed by name, so they are. The third cannot without
+compiling every registered warp module, which takes minutes, so instead the
+*first* pass over a device holds a lock: the build happens once, on one
+thread, while the others wait, and from the second pass on the lock is never
+taken. The cost is one serialised step per device per model, and it also
+covers the lazy paths we have not met yet.
+
+Note what this deliberately does not do: fall back to the sequential loop for
+the first evaluation. `launch_threads=True` is a request, and a caller that
+makes it on step one still gets the pool -- serialised, but off the main
+thread. The bookkeeping lives on the model, so a second model (compressed
+where the first was not) warms again rather than inheriting a flag.
+
 ## What the driver returns
 
 `evaluate_partitioned` assembles on the gather device and returns **device

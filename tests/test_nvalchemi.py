@@ -377,6 +377,151 @@ class _Exploding:
         raise RuntimeError("partition exploded")
 
 
+class TestFirstPassIsSerialised:
+    """The first pass over a device runs alone; every later pass does not.
+
+    Backends under this phase build state on first use and are not thread-safe
+    while they do it. Two were found by running the scaling matrix on V100s:
+    torch's CUDA linear-algebra library, whose loader asserts it runs at most
+    once, and warp's code generation, which handed a worker a half-built
+    ``Adjoint``. The first is warmed by name before the pool; the second, and
+    anything else lazy, is covered by making the first pass hold a lock.
+
+    What must NOT be the fix: running the first evaluation on the main thread.
+    Threading is a documented request, and a caller that asks for it on step
+    one must get it.
+    """
+
+    @pytest.fixture(scope="class")
+    def model(self):
+        m = build(long_range=True)
+        m.eval()
+        return m
+
+    @staticmethod
+    def _counting_lock(monkeypatch):
+        """Replace the module's warm-up lock with one that counts entries."""
+        import threading  # noqa: PLC0415
+
+        from deepmd_lr.nvalchemi import driver as drv  # noqa: PLC0415
+
+        class Counter:
+            def __init__(self):
+                self.entries = 0
+                self._lock = threading.Lock()
+
+            def __enter__(self):
+                self._lock.acquire()
+                self.entries += 1
+                return self
+
+            def __exit__(self, *exc):
+                self._lock.release()
+                return False
+
+        counter = Counter()
+        monkeypatch.setattr(drv, "_WARM_UP_LOCK", counter)
+        return counter
+
+    def test_only_the_first_pass_over_a_device_takes_the_lock(
+        self, system, model, monkeypatch
+    ):
+        """Serialising every step would throw the parallelism away."""
+        coord, atype, cell, *_ = system
+        fresh = build(long_range=True).eval()
+        counter = self._counting_lock(monkeypatch)
+        common = {"n_partitions": 2, "devices": [DEVICE] * 2, "launch_threads": True}
+        evaluate_partitioned(fresh, coord, atype, cell, **common)
+        assert counter.entries == 1, "the first pass must be serialised"
+        evaluate_partitioned(fresh, coord, atype, cell, **common)
+        evaluate_partitioned(fresh, coord, atype, cell, **common)
+        assert counter.entries == 1, "later passes must run lock-free"
+
+    def test_a_different_model_warms_again(self, system, model, monkeypatch):
+        """A compressed model reaches kernels the uncompressed one never did,
+        so the bookkeeping is per model, not a module-wide flag."""
+        coord, atype, cell, *_ = system
+        counter = self._counting_lock(monkeypatch)
+        common = {"n_partitions": 2, "devices": [DEVICE] * 2, "launch_threads": True}
+        for _ in range(2):
+            model_n = build(long_range=True).eval()
+            evaluate_partitioned(model_n, coord, atype, cell, **common)
+        assert counter.entries == 2
+
+    def test_the_first_pass_still_runs_off_the_main_thread(self, system, monkeypatch):
+        """Serialised is not the same as sequential: the pool is still used."""
+        import threading  # noqa: PLC0415
+
+        from deepmd_lr.nvalchemi import driver as drv  # noqa: PLC0415
+
+        coord, atype, cell, *_ = system
+        seen: set[str] = set()
+        original = drv.partition_graph
+
+        def record(*args, **kwargs):
+            seen.add(threading.current_thread().name)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(drv, "partition_graph", record)
+        evaluate_partitioned(
+            build(long_range=True).eval(),
+            coord, atype, cell,
+            n_partitions=2, devices=[DEVICE] * 2, launch_threads=True,
+        )
+        assert seen and threading.main_thread().name not in seen, seen
+
+    def test_the_serialised_pass_gives_the_same_numbers(self, system, model):
+        """The lock reorders nothing: a warm model and a cold one agree."""
+        coord, atype, cell, *_ = system
+        common = {
+            "n_partitions": 2,
+            "devices": [DEVICE] * 2,
+            "compute_born": True,
+            "launch_threads": True,
+        }
+        cold_model = build(long_range=True).eval()
+        cold = to_numpy(
+            evaluate_partitioned(cold_model, coord, atype, cell, **common)
+        )
+        warm_model = build(long_range=True).eval()
+        evaluate_partitioned(warm_model, coord, atype, cell, **common)
+        warm = to_numpy(evaluate_partitioned(warm_model, coord, atype, cell, **common))
+        for key in ("force", "charge", "born_charge", "atom_energy"):
+            np.testing.assert_allclose(warm[key], cold[key], atol=1e-10, err_msg=key)
+
+
+class TestLazyBackendsAreWarmed:
+    """The paths that can be warmed by name are, before any pool exists."""
+
+    def test_the_cuda_linalg_library_is_loaded_for_each_device(self, system):
+        """`torch.linalg.inv` of the cell is what the neighbour search runs."""
+        from deepmd_lr.nvalchemi import driver as drv  # noqa: PLC0415
+
+        coord, atype, cell, *_ = system
+        drv._LINALG_READY.discard(torch.device(DEVICE))
+        evaluate_partitioned(
+            build(long_range=True).eval(),
+            coord, atype, cell,
+            n_partitions=2, devices=[DEVICE] * 2,
+        )
+        assert torch.device(DEVICE) in drv._LINALG_READY
+
+    def test_the_probe_runs_once_and_skips_a_host_device(self, monkeypatch):
+        """Once loaded it is never touched again, and there is nothing to load
+        for a device without CUDA."""
+        from deepmd_lr.nvalchemi import driver as drv  # noqa: PLC0415
+
+        calls = []
+        monkeypatch.setattr(
+            torch.linalg, "inv", lambda t: calls.append(t.device) or torch.eye(3)
+        )
+        drv._LINALG_READY.discard(torch.device(DEVICE))
+        drv._ensure_cuda_linalg_loaded(DEVICE)
+        drv._ensure_cuda_linalg_loaded(DEVICE)
+        drv._ensure_cuda_linalg_loaded("cpu")
+        assert len(calls) == 1
+
+
 class TestGatherIsOnTheDevice:
     """One assembly path, and it ends on the gather device.
 
