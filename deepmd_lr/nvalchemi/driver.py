@@ -57,6 +57,7 @@ from deepmd_lr.nvalchemi.partition import (
 
 __all__ = [
     "device_replicas",
+    "forget_warm_devices",
     "evaluate_partitioned",
     "partition_charges",
     "partition_graph",
@@ -127,6 +128,36 @@ def _ensure_cuda_linalg_loaded(device) -> None:
         torch.linalg.det(probe)
         torch.linalg.solve(probe, probe)
     _LINALG_READY.add(device)
+
+
+def forget_warm_devices(model) -> None:
+    """Make the next launch pass over ``model`` a first pass again.
+
+    Callers that change *what the launch phase runs* should call this: a new
+    system size, a new partition count, a rebuilt decomposition. The lock the
+    first pass takes is what keeps two threads out of a lazy build, and a
+    build can be triggered again by a configuration this model has not run
+    before -- a generic warp kernel specialised on argument types it has not
+    seen, for instance.
+    """
+    warm = getattr(model, "_nvalchemi_warm_devices", None)
+    if warm is not None:
+        warm.clear()
+
+
+def _is_warp_build_race(exc: BaseException) -> bool:
+    """Whether ``exc`` is warp reading a kernel it is still building.
+
+    ``Adjoint`` is what warp calls a kernel's intermediate representation; it
+    is not about backward passes, and this failure appears with no backward in
+    sight. Several of its attributes are set while the module is hashed, which
+    warp does under its own code generation lock -- but the launch path reads
+    them *without* that lock, so a thread launching a kernel whose overload
+    another thread has just created can read a half-built object and raise
+    ``'Adjoint' object has no attribute ...``. Retrying the pass serialised is
+    enough: by then the build has finished.
+    """
+    return isinstance(exc, AttributeError) and "Adjoint" in str(exc)
 
 
 def _warm_devices(model) -> set:
@@ -541,9 +572,16 @@ def evaluate_partitioned(
         """
         device = torch.device(group[0][2])
         if device in warm:
-            for item in group:
-                launch_one(*item)
-            return
+            try:
+                for item in group:
+                    launch_one(*item)
+                return
+            except AttributeError as exc:
+                # A build this device had not triggered before, racing another
+                # thread. The pass is idempotent -- every partition writes its
+                # own slot -- so run it again below, serialised.
+                if not _is_warp_build_race(exc):
+                    raise
         with _WARM_UP_LOCK:
             for item in group:
                 launch_one(*item)

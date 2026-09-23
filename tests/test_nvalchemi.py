@@ -799,6 +799,111 @@ class TestLazyBackendsAreWarmed:
         assert len(calls) == 1
 
 
+class TestLazyBuildsKeepBeingSerialised:
+    """One serialised pass at start-up is not enough.
+
+    The failure that survived the first fix, on a 4-GPU V100 box: warp calls a
+    kernel's intermediate representation ``Adjoint``, sets several of its
+    attributes while hashing the module under its own code generation lock,
+    and then *reads* them on the launch path without that lock. A thread
+    launching a kernel whose overload another thread has just created sees a
+    half-built object. Nothing to do with backward passes, and it can happen
+    at any step, not only the first -- a configuration the process has not run
+    before is enough. Two answers: go back to a first pass whenever the shapes
+    change, and retry a pass that loses the race.
+    """
+
+    @pytest.fixture(scope="class")
+    def model(self):
+        m = build(long_range=False)
+        m.eval()
+        return m
+
+    def test_a_rebuild_makes_the_next_pass_serialise_again(self, system, model):
+        from deepmd_lr.nvalchemi import driver as drv  # noqa: PLC0415
+
+        coord, atype, cell, *_ = system
+        fresh = build(long_range=False).eval()
+        evaluate_partitioned(
+            fresh, coord, atype, cell, n_partitions=2,
+            devices=[DEVICE] * 2, launch_threads=True,
+        )
+        assert getattr(fresh, "_nvalchemi_warm_devices", set()), "should be warm"
+        drv.forget_warm_devices(fresh)
+        assert not fresh._nvalchemi_warm_devices
+
+    def test_the_evaluator_re_warms_on_every_rebuild(self, system, model):
+        """A rebuild changes the shapes, which is when a new build can start."""
+        coord, atype, cell, *_ = system
+        ev = DistributedEvaluator(
+            model, atype, cell, devices=[DEVICE], memory_headroom=None
+        )
+        ev(coord)
+        assert model._nvalchemi_warm_devices, "the first pass warmed the device"
+        ev._rebuild(torch.as_tensor(coord, device=ev.home))
+        assert not model._nvalchemi_warm_devices, "a rebuild must re-warm"
+
+    def test_a_lost_build_race_is_retried_instead_of_failing(self, system, model):
+        """The pass is idempotent, so the answer to the race is to run it again."""
+        from deepmd_lr.nvalchemi import driver as drv  # noqa: PLC0415
+
+        coord, atype, cell, *_ = system
+        want = to_numpy(
+            evaluate_partitioned(
+                model, coord, atype, cell, n_partitions=2, devices=[DEVICE] * 2
+            )
+        )
+        warm = build(long_range=False).eval()
+        evaluate_partitioned(
+            warm, coord, atype, cell, n_partitions=2,
+            devices=[DEVICE] * 2, launch_threads=True,
+        )
+        original = drv.partition_graph
+        failures = {"left": 1}
+
+        def flaky(*args, **kwargs):
+            if failures["left"]:
+                failures["left"] -= 1
+                raise AttributeError(
+                    "'Adjoint' object has no attribute "
+                    "'scalar_tid_extent_limit_candidate'"
+                )
+            return original(*args, **kwargs)
+
+        drv.partition_graph = flaky
+        try:
+            out = to_numpy(
+                evaluate_partitioned(
+                    warm, coord, atype, cell, n_partitions=2,
+                    devices=[DEVICE] * 2, launch_threads=True,
+                )
+            )
+        finally:
+            drv.partition_graph = original
+        assert failures["left"] == 0, "the race must actually have been provoked"
+        np.testing.assert_allclose(out["force"], want["force"], atol=1e-10)
+
+    def test_another_attribute_error_is_not_retried(self, system, model):
+        """Only warp's build race is a retry; a real bug must still surface."""
+        from deepmd_lr.nvalchemi import driver as drv  # noqa: PLC0415
+
+        coord, atype, cell, *_ = system
+        original = drv.partition_graph
+
+        def broken(*args, **kwargs):
+            raise AttributeError("'NoneType' object has no attribute 'shape'")
+
+        drv.partition_graph = broken
+        try:
+            with pytest.raises(AttributeError, match="NoneType"):
+                evaluate_partitioned(
+                    model, coord, atype, cell, n_partitions=2,
+                    devices=[DEVICE] * 2, launch_threads=True,
+                )
+        finally:
+            drv.partition_graph = original
+
+
 class TestGatherIsOnTheDevice:
     """One assembly path, and it ends on the gather device.
 

@@ -232,7 +232,7 @@ matrix on 4 and 8 V100s, and each failed the whole row:
 |---|---|---|
 | deepmd-kit's fake-op registration | `register_fake: the operator ... already has an fake impl registered` | every registrar is run by name before the pool |
 | torch's CUDA linear-algebra library, `dlopen`ed by the cell inverse in the neighbour search | `lazy wrapper should be called at most once` | a 3x3 `inv`/`det`/`solve` probe per device before the pool |
-| warp's code generation | `'Adjoint' object has no attribute ...`, a half-built kernel handed to a second thread | the first pass over a device holds a warm-up lock |
+| warp's code generation | `'Adjoint' object has no attribute ...`, a half-built kernel handed to a second thread | the first pass over a device holds a warm-up lock, and a pass that loses the race is retried under it |
 
 The first two can be warmed by name, so they are. The third cannot without
 compiling every registered warp module, which takes minutes, so instead the
@@ -240,6 +240,21 @@ compiling every registered warp module, which takes minutes, so instead the
 thread, while the others wait, and from the second pass on the lock is never
 taken. The cost is one serialised step per device per model, and it also
 covers the lazy paths we have not met yet.
+
+One serialised pass at start-up is not enough on its own. `Adjoint` is what
+warp calls a kernel's intermediate representation, nothing to do with backward
+passes; several of its attributes are set while the module is hashed, which
+warp does under its own code generation lock, and then read on the launch path
+*without* that lock. A thread launching a kernel whose overload another thread
+has just created therefore reads a half-built object -- and a new overload can
+appear at any step, not only the first, whenever the process meets argument
+types it has not run before. So two more things: a rebuild puts the devices
+back to a first pass, since that is when the shapes change, and a pass that
+loses the race anyway is simply run again under the lock. The pass is
+idempotent, every partition writing its own slot, and the retry costs one
+launch phase where the alternative was a dead row. Measured on a 4-GPU V100
+box, this was the difference between 3 failed rows and 0; 8 GPUs had already
+been clean, which was timing luck rather than a different code path.
 
 Note what this deliberately does not do: fall back to the sequential loop for
 the first evaluation. `launch_threads=True` is a request, and a caller that

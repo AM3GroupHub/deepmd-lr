@@ -54,6 +54,7 @@ from deepmd_lr.compress import (
 from deepmd_lr.nvalchemi.driver import (
     device_replicas,
     evaluate_partitioned,
+    forget_warm_devices,
 )
 from deepmd_lr.nvalchemi.partition import (
     default_skin,
@@ -426,7 +427,15 @@ class DistributedEvaluator:
         return 2.0 * moved > self.skin
 
     def _rebuild(self, tracked: torch.Tensor) -> None:
-        """Re-partition at the current skin and restart the displacement clock."""
+        """Re-partition at the current skin and restart the displacement clock.
+
+        A rebuild changes the shapes the launch phase runs on, which is when a
+        library under it can start a lazy build it has not done before, so the
+        next pass goes back to being a first pass and takes the warm-up lock.
+        It costs one serialised launch phase against a rebuild that is orders
+        of magnitude more expensive.
+        """
+        forget_warm_devices(self.model)
         # The only host copy of the coordinates: the spatial decomposition is
         # a numpy/scipy routine, and it runs only when the skin says so.
         self._partitions = partition_system(
