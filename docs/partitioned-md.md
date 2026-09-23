@@ -174,12 +174,35 @@ uncompressed long-range model, where the old fixed 1 A skin had fitted: the
 rule grants 25 % more nodes on top of a halo that is already 2.5x the owned
 count when the slabs are that thin.
 
-Memory therefore enters as a cap rather than as a term in the formula. On an
-out-of-memory the evaluator halves the skin, rebuilds the decomposition and
-retries the step, and that value becomes a ceiling the geometry rule may not
-climb back over, `set_cell` under a barostat included. A run with memory to
-spare never enters the path; `evaluator.skin_backoffs` counts the reductions
-and each one warns. An explicitly chosen skin is never overridden, and the
+Memory therefore enters as a cap that is **measured**, not as a term in the
+formula. The first evaluation is a probe: it runs at the floor skin, the
+smallest halo there is, and its peak allocation divided by its node count is
+what a node costs. That coefficient spans a factor of thirty between models,
+which is exactly why no formula can carry it:
+
+| model | bytes per node | linear fit error |
+|---|---|---|
+| uncompressed long-range | 755 kB | 0.3 % |
+| compressed long-range | 24.3 kB | 1.2 % |
+
+The footprint is linear in the node count, so the coefficient extrapolates to
+any other skin, and the skin becomes the largest value whose predicted
+footprint fits `memory_headroom` (0.8 by default) of what this process could
+hold on the device -- free memory plus its own cached blocks, so a co-tenant
+process is accounted for. It is only ever a ceiling: the geometry rule still
+decides whenever memory is not the binding constraint. Measured at 41,472
+atoms uncompressed, predicted against actual peak: 47.4 against 47.23 GiB.
+
+Density is what turns a skin into a node count, and it enters through the node
+count the probe actually **counted**, not through `N/V`: for a slab, an
+interface or anything with a void, the counted occupancy is right where a
+uniform density is not.
+
+The reactive path remains underneath, because a prediction can still be wrong
+when another process grows on the same device. On an out-of-memory the
+evaluator halves the skin, rebuilds and retries the step, and that value
+becomes a ceiling too, `set_cell` under a barostat included.
+`evaluator.skin_backoffs` counts the reductions and each one warns. An explicitly chosen skin is never overridden, and the
 backoff stops at 0.1 A, below which the halo is not what is filling the
 device. Lowering the skin instead of raising it in the rule was rejected on
 measurement: an owned-count-relative rule gives 1.2 A at eight partitions,

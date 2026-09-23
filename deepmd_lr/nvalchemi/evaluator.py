@@ -58,6 +58,7 @@ from deepmd_lr.nvalchemi.driver import (
 from deepmd_lr.nvalchemi.partition import (
     default_skin,
     partition_system,
+    skin_for_node_ratio,
 )
 
 __all__ = [
@@ -187,6 +188,15 @@ class DistributedEvaluator:
         Run each device's partitions in its own thread while the forwards are
         queued. ``None`` (default) means on whenever more than one device is
         in use; see :func:`~deepmd_lr.nvalchemi.driver.evaluate_partitioned`.
+    memory_headroom
+        Fraction of usable device memory the halo may be sized for, ``0.8`` by
+        default. The first evaluation is a probe: it runs at the floor skin,
+        measures what a node costs in bytes there, and the skin is then set to
+        the largest value that fits the budget, never above what the geometry
+        rule asks for. ``None`` skips the probe and the measurement, which is
+        what a run that wants the geometry rule and nothing else should pass.
+        The out-of-memory backoff stays either way, since a prediction can
+        still be wrong when another process is sharing the device.
     results_on_device
         Keep :attr:`results` as device tensors. By default they are wrapped so
         that each entry is converted to numpy on first access -- the forces
@@ -231,6 +241,7 @@ class DistributedEvaluator:
         eps_inf: float = 1.0,
         results_on_device: bool = False,
         launch_threads: bool | None = None,
+        memory_headroom: float | None = 0.8,
     ) -> None:
         if not devices:
             raise ValueError("DistributedEvaluator needs at least one device")
@@ -239,6 +250,10 @@ class DistributedEvaluator:
                 raise ValueError(f"skin must be a number or 'auto', got {skin!r}")
         elif skin < 0:
             raise ValueError(f"skin must be non-negative, got {skin}")
+        if memory_headroom is not None and not 0.0 < memory_headroom <= 1.0:
+            raise ValueError(
+                f"memory_headroom must be in (0, 1], got {memory_headroom}"
+            )
 
         self.model = model
         self.devices = list(devices)
@@ -298,7 +313,24 @@ class DistributedEvaluator:
         self._skin_cap = float("inf")
         #: How often the halo has been given back to free memory.
         self.skin_backoffs = 0
+        #: Fraction of usable device memory the halo may be sized for, or
+        #: ``None`` to skip the measurement entirely.
+        self.memory_headroom = (
+            None if memory_headroom is None else float(memory_headroom)
+        )
+        #: Bytes the footprint costs per node, filled in by the probe step.
+        self.bytes_per_node: float | None = None
         self.skin = self._auto_skin() if self._skin_is_auto else float(skin)
+        #: Whether the first evaluation is still the probe. It runs at the
+        #: floor skin, which is the smallest halo there is, so that the step
+        #: that measures the footprint is also the one least likely to fail.
+        self._probe_pending = (
+            self._skin_is_auto
+            and self.memory_headroom is not None
+            and any(torch.device(d).type == "cuda" for d in self.devices)
+        )
+        if self._probe_pending:
+            self.skin = min(self.skin, MIN_AUTO_SKIN)
 
         # Compress BEFORE the replicas are made, so the deep copies carry the
         # tables; the run's charge state is folded in here, once.
@@ -409,6 +441,72 @@ class DistributedEvaluator:
         self._calls_since_rebuild = 0
         self.rebuild_count += 1
 
+    def _nodes_per_device(self) -> dict[torch.device, int]:
+        """How many nodes each device is holding under the current halo."""
+        nodes: dict[torch.device, int] = {}
+        for part, device in zip(self._partitions, self.devices, strict=True):
+            key = torch.device(device)
+            nodes[key] = nodes.get(key, 0) + int(part.n_node)
+        return nodes
+
+    def _fit_skin_to_memory(self) -> None:
+        """Choose the halo the device can actually hold, from one measurement.
+
+        The geometry rule knows how many *nodes* a skin costs but not what a
+        node costs in bytes, and that coefficient spans a factor of thirty:
+        measured here, 755 kB per node for an uncompressed long-range model
+        against 24.3 kB compressed. So it is measured rather than assumed. The
+        probe step runs at the floor skin, the smallest halo there is; its
+        peak allocation divided by its node count is the coefficient, and the
+        footprint is linear in the node count to 0.3 % (uncompressed) and
+        1.2 % (compressed) across sizes and skins, which is what makes the
+        extrapolation to another skin sound.
+
+        Density is what turns a skin into a node count, and it enters through
+        the node count this step actually *counted* rather than through
+        ``N/V``: for a slab, an interface or anything with a void, the counted
+        occupancy is right where a uniform density is not.
+
+        The budget is a fraction of what this process could hold on the device
+        -- free memory plus what its own allocator is already caching -- so a
+        co-tenant process is accounted for. The result is only ever a ceiling:
+        the geometry rule still decides the skin whenever memory is not the
+        binding constraint, which on a half-empty device it never is.
+        """
+        nodes = self._nodes_per_device()
+        ratios = []
+        for device, count in nodes.items():
+            if device.type != "cuda" or count == 0:
+                continue
+            peak = float(torch.cuda.max_memory_allocated(device))
+            if peak <= 0.0:
+                continue
+            free, _total = torch.cuda.mem_get_info(device)
+            usable = float(free) + float(torch.cuda.memory_reserved(device))
+            ratios.append(self.memory_headroom * usable / peak)
+            self.bytes_per_node = max(self.bytes_per_node or 0.0, peak / count)
+        if not ratios:
+            return
+        affordable = skin_for_node_ratio(
+            self.cell,
+            self._rcut,
+            len(self.devices),
+            min(ratios),
+            skin_from=self.skin,
+        )
+        wanted = default_skin(self.cell, self._rcut, len(self.devices))
+        if affordable < wanted:
+            warnings.warn(
+                f"the halo the geometry rule asks for ({wanted:.2f} A) does not "
+                f"fit in {self.memory_headroom:.0%} of this device's memory at "
+                f"{self.bytes_per_node / 1024:.0f} kB per node, so it is capped "
+                f"at {max(affordable, MIN_AUTO_SKIN):.2f} A. A compressed model "
+                f"or more partitions would buy the halo back.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+        self._skin_cap = min(self._skin_cap, max(affordable, MIN_AUTO_SKIN))
+
     def _evaluate(self, tracked: torch.Tensor) -> dict[str, Any]:
         """One evaluation, giving the halo back if a device runs out of memory.
 
@@ -514,11 +612,28 @@ class DistributedEvaluator:
                 f"got {tuple(tracked.shape)}"
             )
 
+        if self._probe_pending:
+            # A clean peak for the probe: this object's own first step, not
+            # whatever else has run in this process. The one side effect the
+            # measurement has, and it happens once.
+            for device in {torch.device(d) for d in self.devices}:
+                if device.type == "cuda":
+                    torch.cuda.reset_peak_memory_stats(device)
+
         if self._needs_rebuild(tracked):
             self._rebuild(tracked)
         self._calls_since_rebuild += 1
 
         out = self._evaluate(tracked)
+
+        if self._probe_pending:
+            self._probe_pending = False
+            self._fit_skin_to_memory()
+            self.skin = self._auto_skin()
+            # The probe ran on the floor skin; the halo the rest of the run
+            # wants is a different one, so the decomposition is rebuilt on the
+            # next call rather than kept.
+            self._reference_positions = None
         # Results stay on the device; `_LazyNumpy` hands out numpy on access,
         # so a caller that reads `results["charge"]` pays for that copy and a
         # caller that reads nothing pays for none. `results_on_device` skips

@@ -246,7 +246,9 @@ class TestSkinDefault:
         from deepmd_lr.nvalchemi import DistributedEvaluator  # noqa: PLC0415
 
         _coord, atype, cell, *_ = system
-        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE])
+        ev = DistributedEvaluator(
+            model, atype, cell, devices=[DEVICE], memory_headroom=None
+        )
         before = ev.skin
         ev.set_cell(cell * 2.0)
         assert ev.skin > before
@@ -266,7 +268,9 @@ class TestSkinDefault:
         from deepmd_lr.nvalchemi import DistributedEvaluator  # noqa: PLC0415
 
         coord, atype, cell, *_ = system
-        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE])
+        ev = DistributedEvaluator(
+            model, atype, cell, devices=[DEVICE], memory_headroom=None
+        )
         assert ev.skin == pytest.approx(default_skin(cell, float(model.get_rcut()), 1))
         explicit = DistributedEvaluator(
             model, atype, cell, devices=[DEVICE], skin=2.5
@@ -377,6 +381,138 @@ class _Exploding:
         raise RuntimeError("partition exploded")
 
 
+class TestSkinIsFittedToMemory:
+    """The halo is chosen from a measurement, not from a guess about bytes.
+
+    The geometry rule knows how many nodes a skin costs. What a node costs in
+    bytes belongs to the model and spans a factor of thirty: 755 kB per node
+    for an uncompressed long-range model against 24.3 kB compressed, measured
+    on this machine. So the first evaluation is a probe at the floor skin, and
+    the skin the rest of the run uses is the largest one whose extrapolated
+    footprint fits the budget -- never more than the geometry rule asks for.
+    """
+
+    @pytest.fixture(scope="class")
+    def model(self):
+        m = build(long_range=False)
+        m.eval()
+        return m
+
+    @staticmethod
+    def _pin_memory(monkeypatch, peak, free, reserved=0):
+        """Fix the three device numbers the fit reads."""
+        monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda d=None: peak)
+        monkeypatch.setattr(torch.cuda, "memory_reserved", lambda d=None: reserved)
+        monkeypatch.setattr(torch.cuda, "mem_get_info", lambda d=None: (free, free))
+
+    def test_the_probe_runs_at_the_floor_then_the_rule_decides(self, system, model):
+        from deepmd_lr.nvalchemi.evaluator import MIN_AUTO_SKIN  # noqa: PLC0415
+
+        coord, atype, cell, *_ = system
+        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE])
+        assert ev.skin == pytest.approx(MIN_AUTO_SKIN)
+        ev(coord)
+        # This device has room to spare, so the geometry rule still decides.
+        assert ev.skin == pytest.approx(default_skin(cell, ev._rcut, 1))
+        assert ev.bytes_per_node is not None and ev.bytes_per_node > 0
+        rebuilds = ev.rebuild_count
+        ev(coord)
+        assert ev.rebuild_count == rebuilds + 1, "the probe halo must be replaced"
+
+    def test_a_budget_that_does_not_fit_caps_the_halo(self, system, model):
+        from deepmd_lr.nvalchemi.evaluator import MIN_AUTO_SKIN  # noqa: PLC0415
+
+        coord, atype, cell, *_ = system
+        ev = DistributedEvaluator(
+            model, atype, cell, devices=[DEVICE], memory_headroom=1e-6
+        )
+        with pytest.warns(RuntimeWarning, match="does not fit"):
+            ev(coord)
+        assert ev.skin == pytest.approx(MIN_AUTO_SKIN)
+        assert ev.skin < default_skin(cell, ev._rcut, 1)
+
+    def test_the_fitted_skin_is_the_arithmetic_it_claims(
+        self, system, model, monkeypatch
+    ):
+        """A budget of twice the probe's footprint buys twice the nodes."""
+        from deepmd_lr.nvalchemi.evaluator import MIN_AUTO_SKIN  # noqa: PLC0415
+        from deepmd_lr.nvalchemi.partition import (  # noqa: PLC0415
+            halo_node_ratio,
+            skin_for_node_ratio,
+        )
+
+        coord, atype, cell, *_ = system
+        peak, free = 8 * 2**30, 20 * 2**30
+        headroom = 0.8
+        ev = DistributedEvaluator(
+            model, atype, cell, devices=[DEVICE], memory_headroom=headroom
+        )
+        self._pin_memory(monkeypatch, peak=peak, free=free)
+        ev(coord)
+        ratio = headroom * free / peak
+        expected = min(
+            skin_for_node_ratio(cell, ev._rcut, 1, ratio, skin_from=MIN_AUTO_SKIN),
+            default_skin(cell, ev._rcut, 1),
+        )
+        assert ev.skin == pytest.approx(expected, rel=1e-6)
+        # and the prediction that skin encodes: at most `ratio` times the
+        # nodes the probe actually counted.
+        got = halo_node_ratio(cell, ev._rcut, 1, ev.skin, MIN_AUTO_SKIN)
+        assert got <= ratio + 1e-9
+
+    def test_a_tight_budget_binds_before_the_geometry_rule(
+        self, system, model, monkeypatch
+    ):
+        coord, atype, cell, *_ = system
+        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE])
+        self._pin_memory(monkeypatch, peak=8 * 2**30, free=int(8.5 * 2**30))
+        with pytest.warns(RuntimeWarning, match="does not fit"):
+            ev(coord)
+        assert ev.skin < default_skin(cell, ev._rcut, 1)
+
+    def test_none_skips_the_probe_entirely(self, system, model):
+        coord, atype, cell, *_ = system
+        ev = DistributedEvaluator(
+            model, atype, cell, devices=[DEVICE], memory_headroom=None
+        )
+        assert ev.skin == pytest.approx(default_skin(cell, ev._rcut, 1))
+        ev(coord)
+        assert ev.bytes_per_node is None
+        assert ev.skin == pytest.approx(default_skin(cell, ev._rcut, 1))
+
+    def test_an_explicit_skin_is_never_probed(self, system, model):
+        coord, atype, cell, *_ = system
+        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE], skin=2.5)
+        assert ev.skin == 2.5
+        ev(coord)
+        assert ev.skin == 2.5
+        assert ev.bytes_per_node is None
+
+    def test_the_probe_changes_no_numbers(self, system, model):
+        """A halo only has to cover the cutoff; its thickness is a cost knob."""
+        coord, atype, cell, *_ = system
+        plain = DistributedEvaluator(
+            model, atype, cell, devices=[DEVICE], memory_headroom=None
+        )
+        want_e, want_f = plain(coord)
+        want_f = want_f.clone()
+        probed = DistributedEvaluator(model, atype, cell, devices=[DEVICE])
+        probed(coord)
+        energy, forces = probed(coord)
+        assert energy == pytest.approx(want_e, abs=1e-9)
+        np.testing.assert_allclose(
+            forces.cpu().numpy(), want_f.cpu().numpy(), atol=1e-10
+        )
+
+    def test_a_nonsensical_headroom_is_refused(self, system, model):
+        _coord, atype, cell, *_ = system
+        for bad in (0.0, -0.5, 1.5):
+            with pytest.raises(ValueError, match="memory_headroom"):
+                DistributedEvaluator(
+                    model, atype, cell, devices=[DEVICE], memory_headroom=bad
+                )
+
+
 class TestSkinBacksOffWhenMemoryRunsOut:
     """The halo is the one part of the footprint this class chooses.
 
@@ -415,11 +551,15 @@ class TestSkinBacksOffWhenMemoryRunsOut:
         self, system, model, monkeypatch
     ):
         coord, atype, cell, *_ = system
-        reference = DistributedEvaluator(model, atype, cell, devices=[DEVICE])
+        reference = DistributedEvaluator(
+            model, atype, cell, devices=[DEVICE], memory_headroom=None
+        )
         want_energy, want_forces = reference(coord)
         want_forces = want_forces.clone()
 
-        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE])
+        ev = DistributedEvaluator(
+            model, atype, cell, devices=[DEVICE], memory_headroom=None
+        )
         before = ev.skin
         self._fail_n_times(monkeypatch, 1)
         with pytest.warns(RuntimeWarning, match="out of memory"):
@@ -433,7 +573,9 @@ class TestSkinBacksOffWhenMemoryRunsOut:
 
     def test_it_keeps_halving_until_it_fits(self, system, model, monkeypatch):
         coord, atype, cell, *_ = system
-        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE])
+        ev = DistributedEvaluator(
+            model, atype, cell, devices=[DEVICE], memory_headroom=None
+        )
         before = ev.skin
         self._fail_n_times(monkeypatch, 3)
         with pytest.warns(RuntimeWarning):
@@ -444,7 +586,9 @@ class TestSkinBacksOffWhenMemoryRunsOut:
     def test_the_new_ceiling_survives_a_barostat(self, system, model, monkeypatch):
         """`set_cell` re-runs the geometry rule, which must not climb back."""
         coord, atype, cell, *_ = system
-        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE])
+        ev = DistributedEvaluator(
+            model, atype, cell, devices=[DEVICE], memory_headroom=None
+        )
         self._fail_n_times(monkeypatch, 1)
         with pytest.warns(RuntimeWarning):
             ev(coord)
@@ -471,7 +615,9 @@ class TestSkinBacksOffWhenMemoryRunsOut:
         from deepmd_lr.nvalchemi.evaluator import MIN_AUTO_SKIN  # noqa: PLC0415
 
         coord, atype, cell, *_ = system
-        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE])
+        ev = DistributedEvaluator(
+            model, atype, cell, devices=[DEVICE], memory_headroom=None
+        )
         self._fail_n_times(monkeypatch, 10**6)
         with (
             pytest.warns(RuntimeWarning, match="floor"),
@@ -482,7 +628,9 @@ class TestSkinBacksOffWhenMemoryRunsOut:
 
     def test_any_other_failure_is_not_swallowed(self, system, model, monkeypatch):
         coord, atype, cell, *_ = system
-        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE])
+        ev = DistributedEvaluator(
+            model, atype, cell, devices=[DEVICE], memory_headroom=None
+        )
         before = ev.skin
         self._fail_n_times(monkeypatch, 1, error=ValueError("not a memory problem"))
         with pytest.raises(ValueError, match="not a memory problem"):
@@ -495,7 +643,9 @@ class TestSkinBacksOffWhenMemoryRunsOut:
     ):
         """warp and the allocator behind the search raise a bare RuntimeError."""
         coord, atype, cell, *_ = system
-        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE])
+        ev = DistributedEvaluator(
+            model, atype, cell, devices=[DEVICE], memory_headroom=None
+        )
         self._fail_n_times(
             monkeypatch, 1, error=RuntimeError("Failed to allocate 4 GiB on cuda:0")
         )

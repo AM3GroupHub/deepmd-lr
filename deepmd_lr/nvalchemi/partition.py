@@ -40,7 +40,12 @@ from scipy.spatial import (
     cKDTree,
 )
 
-__all__ = ["Partition", "partition_system"]
+__all__ = [
+    "Partition",
+    "halo_node_ratio",
+    "partition_system",
+    "skin_for_node_ratio",
+]
 
 
 @dataclass
@@ -144,6 +149,80 @@ def _image_shifts(cell: np.ndarray, pbc, rcut: float) -> np.ndarray:
     return np.array(list(product(*ranges)), dtype=int)
 
 
+def _halo_edges(cell: np.ndarray, rcut: float, n_partitions: int) -> np.ndarray:
+    """The three edges of one partition's halo box at zero skin."""
+    lengths = np.linalg.norm(np.asarray(cell, dtype=float).reshape(3, 3), axis=1)
+    # `partition_system` slabs along the longest cell vector, so that edge --
+    # and only that one -- is divided among the partitions.
+    lengths[int(np.argmax(lengths))] /= max(int(n_partitions), 1)
+    return lengths + 2.0 * rcut
+
+
+def _largest_skin(admissible, upper_guess: float) -> float:
+    """The largest non-negative skin ``admissible`` accepts, by bisection.
+
+    ``admissible`` must be monotone: true below some skin and false above it.
+    Bracket first, then bisect. A fixed upper bound is not a bracket: for a
+    very anisotropic cell -- edges [100, 100, 1], say -- even a skin of half
+    the shortest edge can stay well inside the bound, and returning that cap
+    would hand back an arbitrary number rather than the largest admissible one.
+    The halo volume grows without bound in the skin, so doubling terminates.
+    """
+    if not admissible(0.0):
+        return 0.0
+    lo, hi = 0.0, max(float(upper_guess), 1.0)
+    for _ in range(64):
+        if not admissible(hi):
+            break
+        lo, hi = hi, 2.0 * hi
+    else:  # pragma: no cover - the volume is cubic in s; 2**64 cannot survive
+        raise RuntimeError("no skin is large enough to violate the bound")
+    for _ in range(40):
+        mid = 0.5 * (lo + hi)
+        if admissible(mid):
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+def halo_node_ratio(
+    cell: np.ndarray,
+    rcut: float,
+    n_partitions: int,
+    skin: float,
+    skin_from: float = 0.0,
+) -> float:
+    """How many times as many nodes a halo at ``skin`` holds as one at
+    ``skin_from``.
+
+    Nodes are density times volume, and the density cancels in the ratio, which
+    is why this needs no atom count. Its use is the other direction: multiply
+    by a node count someone has actually *counted* and the answer is an
+    absolute prediction for a different skin -- which is what a memory budget
+    has to be written in. See
+    :meth:`~deepmd_lr.nvalchemi.evaluator.DistributedEvaluator._fit_skin_to_memory`.
+    """
+    base = _halo_edges(cell, rcut, n_partitions)
+    return float(np.prod((base + 2.0 * skin) / (base + 2.0 * skin_from)))
+
+
+def skin_for_node_ratio(
+    cell: np.ndarray,
+    rcut: float,
+    n_partitions: int,
+    ratio: float,
+    skin_from: float = 0.0,
+) -> float:
+    """The largest skin whose halo stays within ``ratio`` of the one at
+    ``skin_from`` -- the inverse of :func:`halo_node_ratio`."""
+    base = _halo_edges(cell, rcut, n_partitions)
+    return _largest_skin(
+        lambda s: halo_node_ratio(cell, rcut, n_partitions, s, skin_from) <= ratio,
+        upper_guess=float(base.min()),
+    )
+
+
 def default_skin(
     cell: np.ndarray,
     rcut: float,
@@ -184,37 +263,7 @@ def default_skin(
     :class:`~deepmd_lr.nvalchemi.evaluator.DistributedEvaluator` caps this
     value by measurement instead, halving it whenever a device runs out.
     """
-    lengths = np.linalg.norm(np.asarray(cell, dtype=float).reshape(3, 3), axis=1)
-    # `partition_system` slabs along the longest cell vector, so that edge --
-    # and only that one -- is divided among the partitions.
-    lengths[int(np.argmax(lengths))] /= max(int(n_partitions), 1)
-    base = lengths + 2.0 * rcut
-
-    def inflation(s: float) -> float:
-        return float(np.prod((base + 2.0 * s) / base))
-
-    ceiling = 1.0 + float(tolerance)
-    if ceiling <= 1.0:
-        return 0.0
-    # Bracket first, then bisect. A fixed upper bound is not a bracket: for a
-    # very anisotropic cell -- edges [100, 100, 1], say -- even a skin of half
-    # the shortest edge stays well inside the tolerance, and returning that cap
-    # would hand back an arbitrary number rather than the largest admissible
-    # one. `inflation` grows without bound in ``s``, so doubling terminates.
-    lo, hi = 0.0, max(float(lengths.min()), 1.0)
-    for _ in range(64):
-        if inflation(hi) > ceiling:
-            break
-        lo, hi = hi, 2.0 * hi
-    else:  # pragma: no cover - `inflation` is cubic in s; 2**64 cannot survive
-        raise RuntimeError(f"no skin reaches an inflation of {ceiling}")
-    for _ in range(40):
-        mid = 0.5 * (lo + hi)
-        if inflation(mid) <= ceiling:
-            lo = mid
-        else:
-            hi = mid
-    return lo
+    return skin_for_node_ratio(cell, rcut, n_partitions, 1.0 + float(tolerance))
 
 
 def partition_system(
