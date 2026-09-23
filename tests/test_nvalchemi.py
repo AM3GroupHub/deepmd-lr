@@ -377,6 +377,133 @@ class _Exploding:
         raise RuntimeError("partition exploded")
 
 
+class TestSkinBacksOffWhenMemoryRunsOut:
+    """The halo is the one part of the footprint this class chooses.
+
+    The geometry rule sizes it blind to bytes: the same 25 % of extra nodes
+    whether a node costs a compressed descriptor's memory or an uncompressed
+    one's several times that. At 98,304 atoms on eight devices that was the
+    difference between running and an out-of-memory, where the old fixed 1 A
+    skin fitted. Predicting the footprint means guessing bytes per node for a
+    model this class never inspects; reacting to it does not.
+    """
+
+    @pytest.fixture(scope="class")
+    def model(self):
+        m = build(long_range=False)
+        m.eval()
+        return m
+
+    @staticmethod
+    def _fail_n_times(monkeypatch, failures, error=None):
+        """Make the first ``failures`` evaluations report an out-of-memory."""
+        from deepmd_lr.nvalchemi import evaluator as ev_mod  # noqa: PLC0415
+
+        real = ev_mod.evaluate_partitioned
+        left = {"n": failures}
+
+        def fake(*args, **kwargs):
+            if left["n"]:
+                left["n"] -= 1
+                raise error or torch.cuda.OutOfMemoryError("CUDA out of memory")
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(ev_mod, "evaluate_partitioned", fake)
+        return left
+
+    def test_the_halo_shrinks_and_the_step_still_completes(
+        self, system, model, monkeypatch
+    ):
+        coord, atype, cell, *_ = system
+        reference = DistributedEvaluator(model, atype, cell, devices=[DEVICE])
+        want_energy, want_forces = reference(coord)
+        want_forces = want_forces.clone()
+
+        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE])
+        before = ev.skin
+        self._fail_n_times(monkeypatch, 1)
+        with pytest.warns(RuntimeWarning, match="out of memory"):
+            energy, forces = ev(coord)
+        assert ev.skin == pytest.approx(0.5 * before)
+        assert ev.skin_backoffs == 1
+        assert energy == pytest.approx(want_energy, abs=1e-9)
+        np.testing.assert_allclose(
+            forces.cpu().numpy(), want_forces.cpu().numpy(), atol=1e-10
+        )
+
+    def test_it_keeps_halving_until_it_fits(self, system, model, monkeypatch):
+        coord, atype, cell, *_ = system
+        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE])
+        before = ev.skin
+        self._fail_n_times(monkeypatch, 3)
+        with pytest.warns(RuntimeWarning):
+            ev(coord)
+        assert ev.skin == pytest.approx(before / 8)
+        assert ev.skin_backoffs == 3
+
+    def test_the_new_ceiling_survives_a_barostat(self, system, model, monkeypatch):
+        """`set_cell` re-runs the geometry rule, which must not climb back."""
+        coord, atype, cell, *_ = system
+        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE])
+        self._fail_n_times(monkeypatch, 1)
+        with pytest.warns(RuntimeWarning):
+            ev(coord)
+        capped = ev.skin
+        ev.set_cell(cell * 2.0)
+        assert ev.skin == pytest.approx(capped)
+        assert default_skin(cell * 2.0, ev._rcut, 1) > capped
+
+    def test_an_explicit_skin_is_the_callers_and_is_not_touched(
+        self, system, model, monkeypatch
+    ):
+        coord, atype, cell, *_ = system
+        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE], skin=2.5)
+        self._fail_n_times(monkeypatch, 1)
+        with pytest.raises(torch.cuda.OutOfMemoryError):
+            ev(coord)
+        assert ev.skin == 2.5
+        assert ev.skin_backoffs == 0
+
+    def test_the_floor_ends_the_backoff_rather_than_looping(
+        self, system, model, monkeypatch
+    ):
+        """Below the floor the halo is not what is filling the device."""
+        from deepmd_lr.nvalchemi.evaluator import MIN_AUTO_SKIN  # noqa: PLC0415
+
+        coord, atype, cell, *_ = system
+        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE])
+        self._fail_n_times(monkeypatch, 10**6)
+        with (
+            pytest.warns(RuntimeWarning, match="floor"),
+            pytest.raises(torch.cuda.OutOfMemoryError),
+        ):
+            ev(coord)
+        assert ev.skin == pytest.approx(MIN_AUTO_SKIN)
+
+    def test_any_other_failure_is_not_swallowed(self, system, model, monkeypatch):
+        coord, atype, cell, *_ = system
+        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE])
+        before = ev.skin
+        self._fail_n_times(monkeypatch, 1, error=ValueError("not a memory problem"))
+        with pytest.raises(ValueError, match="not a memory problem"):
+            ev(coord)
+        assert ev.skin == before
+        assert ev.skin_backoffs == 0
+
+    def test_a_plain_runtime_error_about_memory_counts(
+        self, system, model, monkeypatch
+    ):
+        """warp and the allocator behind the search raise a bare RuntimeError."""
+        coord, atype, cell, *_ = system
+        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE])
+        self._fail_n_times(
+            monkeypatch, 1, error=RuntimeError("Failed to allocate 4 GiB on cuda:0")
+        )
+        with pytest.warns(RuntimeWarning):
+            ev(coord)
+        assert ev.skin_backoffs == 1
+
+
 class TestFirstPassIsSerialised:
     """The first pass over a device runs alone; every later pass does not.
 

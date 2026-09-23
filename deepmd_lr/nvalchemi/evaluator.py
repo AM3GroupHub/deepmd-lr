@@ -35,6 +35,8 @@ and forces for one configuration at a time and its integrators cannot use
 on-device state, which is the whole point of this path.
 """
 
+import traceback
+import warnings
 from typing import (
     Any,
 )
@@ -62,6 +64,25 @@ __all__ = [
     "DistributedEvaluator",
     "atomic_masses",
 ]
+
+
+#: Below this the halo is no longer what is using the memory, so backing off
+#: further would trade real speed for nothing.
+MIN_AUTO_SKIN = 0.1
+
+
+def _is_out_of_memory(exc: BaseException) -> bool:
+    """Whether ``exc`` is a device that ran out of memory.
+
+    Torch raises its own class; warp and the allocator behind the neighbour
+    search raise a plain ``RuntimeError`` whose message is the only signal.
+    """
+    if isinstance(exc, torch.cuda.OutOfMemoryError | MemoryError):
+        return True
+    if not isinstance(exc, RuntimeError):
+        return False
+    text = str(exc).lower()
+    return "out of memory" in text or "failed to allocate" in text
 
 
 def atomic_masses(model: Any, atype: np.ndarray) -> np.ndarray:
@@ -130,7 +151,10 @@ class DistributedEvaluator:
         the default, sizes it from the cell, the cutoff and the partition
         count -- see :func:`~deepmd_lr.nvalchemi.partition.default_skin`, which
         documents why a constant is the wrong answer at both ends of the size
-        range. The value actually used is :attr:`skin`.
+        range. The value actually used is :attr:`skin`, and an ``"auto"`` skin
+        is halved and capped whenever a device runs out of memory, since the
+        geometry rule cannot see how many bytes a node costs -- see
+        :meth:`_evaluate`. An explicit value is never overridden.
     repartition_every
         Force a rebuild every N calls regardless. ``None`` uses the skin
         criterion alone, which is exact rather than merely usually right.
@@ -268,6 +292,12 @@ class DistributedEvaluator:
         #: to buy the rebuild reduction it was chosen for.
         self._skin_is_auto = isinstance(skin, str)
         self._rcut = float(model.get_rcut())
+        #: A ceiling the geometry rule may not exceed, lowered every time a
+        #: device runs out of memory. Infinite until that happens, so a run
+        #: that fits pays nothing for this.
+        self._skin_cap = float("inf")
+        #: How often the halo has been given back to free memory.
+        self.skin_backoffs = 0
         self.skin = self._auto_skin() if self._skin_is_auto else float(skin)
 
         # Compress BEFORE the replicas are made, so the deep copies carry the
@@ -310,8 +340,19 @@ class DistributedEvaluator:
         return atomic_masses(self.model, self.atype)
 
     def _auto_skin(self) -> float:
-        """The geometry rule, against the cell this evaluator holds now."""
-        return default_skin(self.cell, self._rcut, len(self.devices))
+        """The geometry rule, never above a ceiling memory has forced on us.
+
+        The rule sizes the halo from the cell, the cutoff and the partition
+        count, because those are what decide how much ghost work a skin buys
+        and how often the rebuild runs. What it cannot see is how many bytes a
+        node costs: that is a property of the model -- an uncompressed
+        descriptor holds several times what a compressed one does -- and of
+        the step, so no geometric rule can predict it. Memory therefore enters
+        as a cap, set by measurement when a device actually runs out.
+        """
+        return min(
+            default_skin(self.cell, self._rcut, len(self.devices)), self._skin_cap
+        )
 
     def set_cell(self, cell: Any) -> None:
         """Replace the cell and invalidate the partitioning.
@@ -352,6 +393,102 @@ class DistributedEvaluator:
         moved = float((positions - self._reference_positions).norm(dim=1).max())
         return 2.0 * moved > self.skin
 
+    def _rebuild(self, tracked: torch.Tensor) -> None:
+        """Re-partition at the current skin and restart the displacement clock."""
+        # The only host copy of the coordinates: the spatial decomposition is
+        # a numpy/scipy routine, and it runs only when the skin says so.
+        self._partitions = partition_system(
+            tracked.cpu().numpy(),
+            self.cell,
+            float(self.model.get_rcut()),
+            len(self.devices),
+            pbc=(True, True, True),
+            skin=self.skin,
+        )
+        self._reference_positions = tracked.clone()
+        self._calls_since_rebuild = 0
+        self.rebuild_count += 1
+
+    def _evaluate(self, tracked: torch.Tensor) -> dict[str, Any]:
+        """One evaluation, giving the halo back if a device runs out of memory.
+
+        The halo is the one part of the footprint this object chooses, and the
+        geometry rule chooses it blind to bytes: it grants the same 25 % of
+        extra nodes whether each node costs a compressed descriptor's memory
+        or an uncompressed one's several times that. At 98,304 atoms on eight
+        devices that was the difference between running and an out-of-memory,
+        while the old fixed 1 A skin fitted.
+
+        Predicting the footprint instead would mean guessing bytes per node
+        for a model this class never inspects. Reacting to it needs no guess:
+        on an out-of-memory the skin is halved, the decomposition rebuilt and
+        the step retried, and the new value becomes a ceiling the geometry
+        rule may not climb back over -- including through ``set_cell`` under a
+        barostat. A run with memory to spare never enters this path.
+
+        An explicitly chosen skin is the caller's and is never overridden; so
+        is a skin already down at :data:`MIN_AUTO_SKIN`, where the halo is no
+        longer what is filling the device.
+
+        Expect it to overshoot by one halving. Measured at 41,472 atoms with
+        the allocator capped between the two footprints, the retry took two
+        reductions (3.34 -> 1.67 -> 0.84 A) where a fresh process fits at
+        1.67: the retry runs in an allocator that has already been fragmented
+        by the failed step, and a collection before it does not change that.
+        The cap is one-way, so a run pays this once and keeps the smaller
+        halo; forces are unaffected (2e-6 eV/A against an unconstrained run,
+        which is the nondeterminism floor).
+        """
+        while True:
+            try:
+                return evaluate_partitioned(
+                    self.model,
+                    tracked,
+                    self.atype,
+                    self.cell,
+                    n_partitions=len(self.devices),
+                    devices=self.devices,
+                    partitions=self._partitions,
+                    replicas=self._replicas,
+                    compute_virial=self.compute_virial,
+                    compute_born=self.compute_born,
+                    charge_spin=self.charge_spin,
+                    eps_inf=self.eps_inf,
+                    launch_threads=self.launch_threads,
+                )
+            except Exception as exc:
+                if not _is_out_of_memory(exc) or not self._skin_is_auto:
+                    raise
+                if self.skin <= MIN_AUTO_SKIN:
+                    warnings.warn(
+                        f"out of memory with the halo already at its floor "
+                        f"({self.skin:.2f} A) after {self.skin_backoffs} "
+                        f"reduction(s): the halo is not what is filling the "
+                        f"device. Fewer atoms per device, a compressed model or "
+                        f"more partitions are the levers left.",
+                        RuntimeWarning,
+                        stacklevel=3,
+                    )
+                    raise
+                # The traceback holds every frame of the failed forward, and
+                # every frame holds tensors. Dropping them is what makes the
+                # memory the retry needs available again.
+                traceback.clear_frames(exc.__traceback__)
+                shrunk = max(0.5 * self.skin, MIN_AUTO_SKIN)
+            self._skin_cap = shrunk
+            self.skin = shrunk
+            self.skin_backoffs += 1
+            torch.cuda.empty_cache()
+            self._rebuild(tracked)
+            warnings.warn(
+                f"a device ran out of memory, so the halo skin was reduced to "
+                f"{shrunk:.2f} A and the step retried; the geometry rule will "
+                f"not exceed that for the rest of this run. Pass an explicit "
+                f"`skin=` to take the decision yourself.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+
     def __call__(self, positions: Any) -> tuple[float, torch.Tensor]:
         """Energy in eV and forces in eV/angstrom at ``positions``.
 
@@ -378,36 +515,10 @@ class DistributedEvaluator:
             )
 
         if self._needs_rebuild(tracked):
-            # The only host copy of the coordinates: the spatial decomposition
-            # is a numpy/scipy routine, and it runs only when the skin says so.
-            self._partitions = partition_system(
-                tracked.cpu().numpy(),
-                self.cell,
-                float(self.model.get_rcut()),
-                len(self.devices),
-                pbc=(True, True, True),
-                skin=self.skin,
-            )
-            self._reference_positions = tracked.clone()
-            self._calls_since_rebuild = 0
-            self.rebuild_count += 1
+            self._rebuild(tracked)
         self._calls_since_rebuild += 1
 
-        out = evaluate_partitioned(
-            self.model,
-            tracked,
-            self.atype,
-            self.cell,
-            n_partitions=len(self.devices),
-            devices=self.devices,
-            partitions=self._partitions,
-            replicas=self._replicas,
-            compute_virial=self.compute_virial,
-            compute_born=self.compute_born,
-            charge_spin=self.charge_spin,
-            eps_inf=self.eps_inf,
-            launch_threads=self.launch_threads,
-        )
+        out = self._evaluate(tracked)
         # Results stay on the device; `_LazyNumpy` hands out numpy on access,
         # so a caller that reads `results["charge"]` pays for that copy and a
         # caller that reads nothing pays for none. `results_on_device` skips

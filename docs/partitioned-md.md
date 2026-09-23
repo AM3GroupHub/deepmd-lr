@@ -164,6 +164,28 @@ partition count (`partition.default_skin`). That is 1.4 Å at 1,536 atoms,
 4.3 Å at 98,304 and 5.3 Å at 192,000, and 4.3 Å is where the measurement put
 the optimum. Pass a number to override; `evaluator.skin` reports what was used.
 
+**What the rule cannot see: bytes.** The skin is sized from the cell, the
+cutoff and the partition count, because those decide how much ghost work it
+buys and how often the rebuild runs. How many bytes a node costs is a property
+of the *model* -- an uncompressed descriptor holds several times what a
+compressed one does -- and of the step, so no geometric rule can predict it. It
+showed up as an out-of-memory at 98,304 atoms on eight devices with an
+uncompressed long-range model, where the old fixed 1 A skin had fitted: the
+rule grants 25 % more nodes on top of a halo that is already 2.5x the owned
+count when the slabs are that thin.
+
+Memory therefore enters as a cap rather than as a term in the formula. On an
+out-of-memory the evaluator halves the skin, rebuilds the decomposition and
+retries the step, and that value becomes a ceiling the geometry rule may not
+climb back over, `set_cell` under a barostat included. A run with memory to
+spare never enters the path; `evaluator.skin_backoffs` counts the reductions
+and each one warns. An explicitly chosen skin is never overridden, and the
+backoff stops at 0.1 A, below which the halo is not what is filling the
+device. Lowering the skin instead of raising it in the rule was rejected on
+measurement: an owned-count-relative rule gives 1.2 A at eight partitions,
+which is the old fixed default and puts the step straight back into the
+rebuild-dominated regime the auto skin exists to escape.
+
 **`launch_threads` (default `None` = on above one device).** The neighbour
 search performs eight blocking device-to-host reads per partition per step
 (three in `_max_radius_tuple`, two device queries, the cell-list size estimate,

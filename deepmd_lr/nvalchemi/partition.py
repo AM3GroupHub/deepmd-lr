@@ -177,6 +177,12 @@ def default_skin(
     The estimate treats the cell as orthorhombic and the density as uniform,
     which is what a default needs to be: cheap and roughly right. Pass an
     explicit ``skin`` when the system is neither.
+
+    What it deliberately does not model is memory. Bytes per node belong to
+    the model, not the geometry -- an uncompressed descriptor holds several
+    times what a compressed one does -- so
+    :class:`~deepmd_lr.nvalchemi.evaluator.DistributedEvaluator` caps this
+    value by measurement instead, halving it whenever a device runs out.
     """
     lengths = np.linalg.norm(np.asarray(cell, dtype=float).reshape(3, 3), axis=1)
     # `partition_system` slabs along the longest cell vector, so that edge --
