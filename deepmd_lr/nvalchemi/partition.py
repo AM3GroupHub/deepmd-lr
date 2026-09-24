@@ -42,6 +42,7 @@ from scipy.spatial import (
 
 __all__ = [
     "Partition",
+    "decomposition_grid",
     "halo_node_ratio",
     "partition_system",
     "skin_for_node_ratio",
@@ -168,13 +169,45 @@ def _image_shifts(cell: np.ndarray, pbc, rcut: float) -> np.ndarray:
     return np.array(list(product(*ranges)), dtype=int)
 
 
+def decomposition_grid(
+    cell: np.ndarray, n_partitions: int, rcut: float
+) -> tuple[int, int, int]:
+    """How many pieces each cell axis is cut into, ``(n0, n1, n2)``.
+
+    The choice that minimises one partition's halo box, ``prod(l_i / n_i +
+    2 rcut)``: what a device has to hold is its owned block *plus* a shell of
+    ghosts `rcut` deep on every side, and the shell is what does not shrink
+    when the block does. Cutting one axis into thin slabs keeps the other two
+    faces full size, so at eight partitions each device held about 2.8 times
+    its share of atoms at 98,304; cutting three axes in half holds about
+    2.3 times. With a single partition, or a count that only factors one way,
+    this is the slab it always was.
+
+    Ties -- a cube cut in two, say -- go to the grid that cuts the lowest
+    axis first, which is the axis the slab rule used to pick for a cube.
+    """
+    n = max(int(n_partitions), 1)
+    lengths = np.linalg.norm(np.asarray(cell, dtype=float).reshape(3, 3), axis=1)
+    best = None
+    for n0 in range(1, n + 1):
+        if n % n0:
+            continue
+        for n1 in range(1, n // n0 + 1):
+            if (n // n0) % n1:
+                continue
+            grid = (n0, n1, n // n0 // n1)
+            cost = float(np.prod(lengths / np.array(grid) + 2.0 * rcut))
+            key = (round(cost, 6), -grid[0], -grid[1])
+            if best is None or key < best[0]:
+                best = (key, grid)
+    return best[1]
+
+
 def _halo_edges(cell: np.ndarray, rcut: float, n_partitions: int) -> np.ndarray:
     """The three edges of one partition's halo box at zero skin."""
     lengths = np.linalg.norm(np.asarray(cell, dtype=float).reshape(3, 3), axis=1)
-    # `partition_system` slabs along the longest cell vector, so that edge --
-    # and only that one -- is divided among the partitions.
-    lengths[int(np.argmax(lengths))] /= max(int(n_partitions), 1)
-    return lengths + 2.0 * rcut
+    grid = decomposition_grid(cell, n_partitions, rcut)
+    return lengths / np.array(grid, dtype=float) + 2.0 * rcut
 
 
 def _largest_skin(admissible, upper_guess: float) -> float:
@@ -293,12 +326,15 @@ def partition_system(
     pbc=(True, True, True),
     skin: float = 0.0,
 ) -> list[Partition]:
-    """Split atoms into ``n_partitions`` slabs, each with an ``rcut`` halo.
+    """Split atoms into ``n_partitions`` blocks, each with an ``rcut`` halo.
 
-    The split is along the longest cell vector, by fractional coordinate. That
-    is cruder load balancing than DistMLIP's graph partitioning, but the
-    correctness contract is identical and it has no compiled dependency; the
-    partitioner can be swapped later without touching anything downstream.
+    The blocks form a grid, :func:`decomposition_grid` pieces per cell axis,
+    chosen to make each block's halo as small as the count allows -- slabs for
+    two partitions, 2 x 2 x 1 for four and 2 x 2 x 2 for eight on a cubic box.
+    Each cut is by fractional coordinate at equal atom count. That is cruder
+    load balancing than DistMLIP's graph partitioning, but the correctness
+    contract is identical and it has no compiled dependency; the partitioner
+    can be swapped later without touching anything downstream.
 
     Parameters
     ----------
@@ -330,23 +366,38 @@ def partition_system(
             f"{n_partitions} partitions requested for only {n_atoms} atoms"
         )
 
-    # Assign owners by fractional coordinate along the longest cell vector.
+    # Assign owners on a grid of blocks, `decomposition_grid` pieces per axis.
     inverse = np.linalg.inv(cell)
     frac = coord @ inverse
-    axis = int(np.argmax(np.linalg.norm(cell, axis=1)))
-    key = frac[:, axis]
-    if pbc[axis]:
-        key = key - np.floor(key)
-    else:
-        lo, hi = key.min(), key.max()
-        key = (key - lo) / (hi - lo + 1e-12)
-    # Equal-count slabs rather than equal-width: atom density is not uniform,
+    keys = np.empty_like(frac)
+    for axis in range(3):
+        key = frac[:, axis]
+        if pbc[axis]:
+            key = key - np.floor(key)
+        else:
+            lo, hi = key.min(), key.max()
+            key = (key - lo) / (hi - lo + 1e-12)
+        keys[:, axis] = key
+    # Equal-count blocks rather than equal-width: atom density is not uniform,
     # and for a slab system with vacuum equal-width would leave empty
-    # partitions.
-    order = np.argsort(key, kind="stable")
+    # partitions. Cut one axis at a time, each group by its own sort, so the
+    # counts stay equal however the density varies; with one axis cut this is
+    # exactly the stable-sort-and-split the slab rule always did.
+    grid = decomposition_grid(cell, n_partitions, rcut)
+    groups = [np.arange(n_atoms)]
+    for axis in range(3):
+        if grid[axis] == 1:
+            continue
+        groups = [
+            piece
+            for group in groups
+            for piece in np.array_split(
+                group[np.argsort(keys[group, axis], kind="stable")], grid[axis]
+            )
+        ]
     owner = np.empty(n_atoms, dtype=int)
-    for p, chunk in enumerate(np.array_split(order, n_partitions)):
-        owner[chunk] = p
+    for p, members in enumerate(groups):
+        owner[members] = p
 
     # No shortcut for a single partition: it still owns every atom but still
     # needs periodic images as ghosts, because the subgraph is built

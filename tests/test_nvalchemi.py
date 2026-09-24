@@ -292,11 +292,14 @@ class TestSkinDefault:
         return m
 
     def test_halo_inflation_stays_within_the_tolerance(self):
+        from deepmd_lr.nvalchemi.partition import decomposition_grid  # noqa: PLC0415
+
         cell = np.diag([99.43] * 3)
-        for parts in (1, 2, 4):
+        for parts in (1, 2, 4, 8):
             skin = default_skin(cell, 6.0, parts, tolerance=0.25)
-            edges = np.array([99.43] * 3)
-            edges[0] /= parts
+            edges = np.array([99.43] * 3) / np.array(
+                decomposition_grid(cell, parts, 6.0), dtype=float
+            )
             base = edges + 12.0
             assert float(np.prod((base + 2 * skin) / base)) <= 1.25 + 1e-9
 

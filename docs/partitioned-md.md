@@ -112,6 +112,33 @@ E_pot + E_kin + sum_k Q_k eta_dot_k^2 / 2 + N_dof kT eta_1 + kT sum_{k>1} eta_k
 > as the square of the coupling strength, so weak coupling is the safe regime.
 > Treat NVE as the trustworthy conservation check.
 
+### How the atoms are split
+
+Into a grid of blocks, not slabs. What a device has to hold is its owned block
+plus a shell of ghosts `rcut + skin` deep on every side, and that shell is the
+part that does not shrink when the block does. Slabs keep two faces at full
+cell size however thin they get; cutting more axes keeps every face smaller.
+`decomposition_grid` picks, per partition count, the factorisation that
+minimises one block's halo box: slabs for two, 2 x 2 x 1 for four, 2 x 2 x 2
+for eight on a cubic box, and slabs again along a long axis when the box is
+elongated enough. Each cut is at equal atom count, one axis at a time.
+
+What that buys, as nodes on the busiest device, water at the auto skin:
+
+| atoms | partitions | slabs | grid | change |
+|---|---|---:|---:|---:|
+| 12,288 | 4 | 9,761 | 8,855 | -9 % |
+| 12,288 | 8 | 7,192 | 5,034 | -30 % |
+| 41,472 | 4 | 26,015 | 23,555 | -9 % |
+| 41,472 | 8 | 17,600 | 13,067 | -26 % |
+| 98,304 | 4 | 52,898 | 49,135 | -7 % |
+| 98,304 | 8 | 33,942 | 26,623 | -22 % |
+
+Two partitions are unchanged, since a slab is the only way to cut in two. An
+uncompressed step is device-bound -- about 5 ms of host work at 41,472 atoms
+against hundreds on the device -- and its work follows the node count, so the
+busiest device's count is what sets the step.
+
 ### What is split and what is not
 
 | piece | cost at 6520 atoms | treatment |
@@ -172,7 +199,7 @@ compressed one does -- and of the step, so no geometric rule can predict it. It
 showed up as an out-of-memory at 98,304 atoms on eight devices with an
 uncompressed long-range model, where the old fixed 1 A skin had fitted: the
 rule grants 25 % more nodes on top of a halo that is already 2.5x the owned
-count when the slabs are that thin.
+count when the blocks are that small.
 
 Memory therefore enters as a cap that is **measured**, not as a term in the
 formula. The first evaluation is a probe: it runs at the floor skin, the
