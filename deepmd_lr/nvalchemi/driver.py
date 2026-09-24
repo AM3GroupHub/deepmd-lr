@@ -61,6 +61,34 @@ __all__ = [
 ]
 
 
+def _condition_on(model, charge_spin, device, dtype) -> torch.Tensor | None:
+    """The frame condition on ``device``, resolved once rather than every step.
+
+    Resolving it means uploading a Python pair and, for a compressed model,
+    comparing it with the state folded into the tables -- each of which blocks
+    the host until ``device`` has drained. The answer only depends on the
+    requested pair, so it is kept on the replica under that pair. A tensor
+    argument is resolved per call instead: it could be mutated in place, and
+    then a cached copy would be quietly out of date.
+    """
+    if isinstance(charge_spin, torch.Tensor):
+        return resolve_charge_spin(
+            model, charge_spin, 1, torch.empty((), dtype=dtype, device=device)
+        )
+    requested = model.get_default_chg_spin() if charge_spin is None else charge_spin
+    key = (
+        torch.device(device),
+        dtype,
+        None if requested is None else tuple(float(x) for x in requested),
+    )
+    cache = model.__dict__.setdefault("_nvalchemi_conditions", {})
+    if key not in cache:
+        cache[key] = resolve_charge_spin(
+            model, charge_spin, 1, torch.empty((), dtype=dtype, device=device)
+        )
+    return cache[key]
+
+
 def _current_device(device) -> contextlib.AbstractContextManager:
     """Make ``device`` the CUDA *current* device for the block.
 
@@ -350,9 +378,7 @@ def evaluate_partitioned(
         """One partition's forward, on its own device."""
         with _current_device(device):
             local = replicas[torch.device(device)]
-            condition = resolve_charge_spin(
-                local, charge_spin, 1, torch.empty((), dtype=dtype, device=device)
-            )
+            condition = _condition_on(local, charge_spin, device, dtype)
             # One strain leaf per partition. They cannot be shared -- a leaf
             # lives on one device -- but the virial is a sum of contributions,
             # so per-device leaves and summed gradients are equivalent.
@@ -375,8 +401,7 @@ def evaluate_partitioned(
                 requires_grad=long_range,
                 strain=strain,
             )
-            n_node = torch.tensor([part.n_node], dtype=torch.int64, device=device)
-            n_local = torch.tensor([part.n_owned], dtype=torch.int64, device=device)
+            n_node, n_local = part.counts_on(device)
 
             if getattr(local.atomic_model.descriptor, "compress", False):
                 # The compressed kernel needs the destination CSR views, attached

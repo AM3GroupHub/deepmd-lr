@@ -127,6 +127,25 @@ class Partition:
             self._views[key] = t
         return t
 
+    def counts_on(self, device) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(n_node, n_local)`` as one-element device tensors, built once.
+
+        The model's lower interface takes them as tensors. Making them from
+        Python ints every step is an upload from pageable memory, and that
+        blocks the host until everything already queued on ``device`` has
+        run -- twice per partition per step, for two integers that only change
+        when the partition does.
+        """
+        key = ("counts", torch.device(device))
+        c = self._views.get(key)
+        if c is None:
+            c = (
+                torch.tensor([self.n_node], dtype=torch.int64, device=device),
+                torch.tensor([self.n_owned], dtype=torch.int64, device=device),
+            )
+            self._views[key] = c
+        return c
+
 
 def _image_shifts(cell: np.ndarray, pbc, rcut: float) -> np.ndarray:
     """Lattice translations that could bring an image within ``rcut``.
