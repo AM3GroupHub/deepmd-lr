@@ -36,9 +36,6 @@ from deepmd.dpmodel.utils.neighbor_graph import (
 from deepmd.dpmodel.utils.neighbor_graph.csr import (
     attach_edge_csr,
 )
-from deepmd.dpmodel.utils.neighbor_graph.graph import (
-    NeighborGraph,
-)
 
 from deepmd_lr.born import (
     screening_factor,
@@ -219,48 +216,10 @@ def partition_graph(
         if strain is None
         else torch.bmm(node_coord, strain.transpose(-1, -2).unsqueeze(0))
     )
+    graph = build_neighbor_graph_fast(search_coord, node_type, None, rcut)
 
-    # The search is the expensive half of a step -- a cell list plus eight
-    # blocking device-to-host reads -- and it does not have to run every step.
-    # The partition already carries a skin: every pair within `rcut` of an
-    # owned atom is inside a list searched at `rcut + skin` until some atom has
-    # moved `skin / 2`, which is precisely when the partition itself is
-    # rebuilt. So search once at the padded cutoff, keep the integer topology
-    # on the partition, and let each later step recompute only the geometry.
-    cached = part.edges_on(device) if part.skin > 0.0 else None
-    if cached is None:
-        graph = build_neighbor_graph_fast(
-            search_coord.detach(), node_type, None, rcut + max(part.skin, 0.0)
-        )
-        # Fold in what never changes between rebuilds: the search's own
-        # padding, and the rule that a partition only owns edges whose centre
-        # it owns. What is left to decide per step is the cutoff alone.
-        keep = graph.edge_mask & (graph.edge_index[1] < part.n_owned)
-        if part.skin > 0.0:
-            part.cache_edges(device, graph.edge_index, keep, graph.n_node)
-        edge_index, n_node = graph.edge_index, graph.n_node
-    else:
-        edge_index, keep, n_node = cached
-
-    src, dst = edge_index[0], edge_index[1]
-    flat = search_coord.reshape(-1, 3)
-    # `r_src - r_dst`, the graph's own convention, and the only geometry the
-    # model sees -- so the backward reaches `node_coord` (and the strain)
-    # through this whether the topology was searched now or three steps ago.
-    edge_vec = flat[src] - flat[dst]
-    edge_mask = keep & (edge_vec.detach().square().sum(-1) <= rcut * rcut)
-    # Padding is zero-length by construction upstream (`pad_and_guard_edges`
-    # points dummies at node 0 with a zero vector), so an edge dropped by the
-    # cutoff is zeroed rather than left long: the descriptor's tables are
-    # built for `[0, rcut]` and a masked-but-oversized vector would be a new
-    # thing to ask of them.
-    edge_vec = edge_vec * edge_mask.unsqueeze(-1)
-    graph = NeighborGraph(
-        n_node=n_node,
-        edge_index=edge_index,
-        edge_vec=edge_vec,
-        edge_mask=edge_mask,
-    )
+    owned_dst = graph.edge_index[1] < part.n_owned
+    graph.edge_mask = graph.edge_mask & owned_dst
     return graph, node_type.reshape(-1), node_coord
 
 
