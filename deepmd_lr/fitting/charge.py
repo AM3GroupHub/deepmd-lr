@@ -64,7 +64,21 @@ def resolve_charge_spin(
         raise ValueError(
             "charge_spin must hold one [charge, multiplicity] pair per frame"
         )
-    return condition.reshape(-1, 2).expand(nf, 2)
+    condition = condition.reshape(-1, 2).expand(nf, 2)
+    # A compressed DPA4C reads the charge state baked into its tables and
+    # ignores the runtime condition; a request that differs would be honoured
+    # by the projection and silently dropped by the descriptor.
+    folded = getattr(model, "_compressed_charge_spin", None)
+    if folded is not None and not torch.equal(
+        condition, condition.new_tensor(folded).expand_as(condition)
+    ):
+        raise ValueError(
+            f"charge_spin {condition[0].tolist()} differs from the state "
+            f"{list(folded)} folded into the compressed tables, which the "
+            "kernel reads instead of the runtime condition. Compress with "
+            "charge_spin set to this run's state, or run uncompressed."
+        )
+    return condition
 
 
 def charge_mask(model: Any, atype: torch.Tensor) -> torch.Tensor:

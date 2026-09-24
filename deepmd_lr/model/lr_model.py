@@ -47,6 +47,9 @@ it matters.
 import contextlib
 import copy
 import json
+import math
+import os
+from numbers import Real
 from typing import (
     Any,
 )
@@ -57,6 +60,9 @@ from deepmd.dpmodel.model.model_factory import (
 )
 from deepmd.dpmodel.utils.neighbor_graph.derivatives import (
     edge_force_virial,
+)
+from deepmd.kernels.utils import (
+    cuda_infer_level,
 )
 from deepmd.pt_expt.descriptor import (
     BaseDescriptor,
@@ -110,6 +116,27 @@ RECIPROCAL_KEY = "reciprocal"
 #: in serialized checkpoints, so existing inputs and models keep working.
 _LEGACY_RECIPROCAL_KEY = "pme"
 
+#: Raised wherever compression is asked for, or found, without the compiled
+#: kernel. The wording carries the consequence, because the alternative is a
+#: model that says it is compressed and runs at the old speed.
+_NO_KERNEL = (
+    "compression needs the compiled operator "
+    "`torch.ops.deepmd.dpa4c_graph_compress`, which is not loaded. The PyPI "
+    "deepmd-kit wheel does not ship it: build deepmd-kit 3.2.0 from source "
+    "with DP_VARIANT=cuda and run in that environment. Without the kernel the "
+    "tables are built and then silently ignored -- `DescrptDPA4C.call_graph` "
+    "falls back to the uncompressed math, so nothing gets faster."
+)
+
+
+def _kernel_available() -> bool:
+    """Whether ``deepmd::dpa4c_graph_compress`` is registered in this process."""
+    from deepmd.kernels.cuda.dpa4c.graph_compress import (
+        op_available,
+    )
+
+    return bool(op_available())
+
 
 def _strip_comments(block: dict) -> dict:
     """Drop DeePMD-kit's ``_comment`` annotation keys from a config block.
@@ -160,6 +187,14 @@ class LongRangeEnergyModel(EnergyModel):
         #: `atomic_model` is the base's very object. A plain bool, not a
         #: module: see `deepmd_lr.same_as`.
         self._same_as_link = False
+        #: How many `_capturing_backbone` contexts are open. The graph lower
+        #: is allowed only inside one -- that is where the long-range term
+        #: gets added -- and captures nest, so this is a count, not a flag.
+        self._capture_depth = 0
+        #: The (charge, multiplicity) folded into the compressed tables, or
+        #: None. The compressed kernel ignores the runtime condition, so a
+        #: forward with a different one is refused (`resolve_charge_spin`).
+        self._compressed_charge_spin: tuple[float, float] | None = None
 
     def change_out_bias(
         self, merged: Any, bias_adjust_mode: str = "change-by-statistic"
@@ -344,6 +379,18 @@ class LongRangeEnergyModel(EnergyModel):
         why it is not applied to the coordinates and cell before.
         """
         descriptor = self.atomic_model.descriptor
+        if getattr(descriptor, "compress", False):
+            # At DP_CUDA_INFER=1 the compressed branch lives inside
+            # `call_graph`, so the energy pass is always captured and this
+            # second pass never runs. Reaching it means the capture was
+            # bypassed -- refuse rather than quietly run the slow math on a
+            # graph that carries no CSR views.
+            raise RuntimeError(
+                "the fallback charge pass was reached on a compressed model; "
+                "the shared-backbone capture should have been taken. "
+                "Compressed evaluation supports only the captured route -- "
+                "check DP_CUDA_INFER (it must be exactly 1)."
+            )
         graph = build_neighbor_graph_fast(coord, atype, box, descriptor.get_rcut())
         if strain is not None:
             # The virial needs d(charge)/d(strain). Building the graph from
@@ -412,6 +459,12 @@ class LongRangeEnergyModel(EnergyModel):
         and restored afterwards, exception or not.
 
         Yields an empty dict when there is no long-range term to feed.
+
+        While a capture is open the graph lower is permitted
+        (``_capture_depth``): whoever holds this context is the one adding the
+        long-range term afterwards -- ``forward`` here, or the partitioned
+        driver. Any other caller of the lower is one that would silently
+        report the short-range energy alone.
         """
         captured: dict = {}
         if not self.has_long_range:
@@ -443,9 +496,11 @@ class LongRangeEnergyModel(EnergyModel):
         # restores the descriptor to the state it was actually in.
         had_own = "call_graph" in descriptor.__dict__
         descriptor.call_graph = capture
+        self._capture_depth += 1
         try:
             yield captured
         finally:
+            self._capture_depth -= 1
             if had_own:
                 descriptor.call_graph = unhooked
             else:
@@ -614,6 +669,17 @@ class LongRangeEnergyModel(EnergyModel):
             # Fallback: run the backbone again on our own strained graph. Used
             # when the energy path did not route through the graph lower, so
             # nothing was captured.
+            if getattr(self.atomic_model.descriptor, "compress", False):
+                # Compressed inference is defined only on the captured route;
+                # the fallback would rebuild a CSR-less graph and run the
+                # uncompressed math while the model still claims otherwise.
+                raise RuntimeError(
+                    "a compressed model took the fallback path: the shared "
+                    "backbone was not captured. The usual cause is "
+                    "DP_CUDA_INFER changed after compression; it must be "
+                    "exactly 1 (2 selects a fused kernel that bypasses "
+                    "`descriptor.call_graph`)."
+                )
             if self.compute_born:
                 # The fallback rebuilds its own graph, so there is no captured
                 # `edge_vec` to differentiate and no cheap route to Z. This
@@ -776,6 +842,177 @@ class LongRangeEnergyModel(EnergyModel):
         if self.has_long_range:
             self._refuse_export("The lower (neighbour-list) interface")
         return super().forward_lower(*args, **kwargs)
+
+    def forward_lower_canonical_graph(self, *args: Any, **kwargs: Any) -> Any:
+        """Refuse the compact canonical lower, traced for a compressed export."""
+        if self.has_long_range:
+            self._refuse_export("Canonical graph-lower export (compressed `dp freeze`)")
+        return super().forward_lower_canonical_graph(*args, **kwargs)
+
+    def forward_common_lower_graph(
+        self,
+        atype: torch.Tensor,
+        n_node: torch.Tensor,
+        n_local: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_vec: torch.Tensor,
+        edge_mask: torch.Tensor,
+        destination_order: torch.Tensor | None = None,
+        destination_row_ptr: torch.Tensor | None = None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> dict[str, torch.Tensor]:
+        """The graph lower, permitted only where the long-range term is added.
+
+        This is the method ``DeepPot``/``dp test`` call on a checkpoint and
+        the one compiled training traces, and it returns the short-range
+        energy alone -- so outside a ``_capturing_backbone`` context it is
+        refused for the same reason ``dp freeze`` is. ``forward`` and the
+        partitioned driver both hold that context and add the term themselves.
+
+        It is also the one choke point every compressed evaluation passes
+        through, serial or partitioned, so the preconditions of the
+        compressed kernel are enforced here on every step: without the CSR
+        views, the operator, or ``DP_CUDA_INFER=1``, ``DescrptDPA4C.call_graph``
+        would fall back to the uncompressed math without saying so.
+        """
+        if self.has_long_range and self._capture_depth == 0:
+            self._refuse_export(
+                "The graph-lower interface (DeepPot, `dp test`, compiled training)"
+            )
+        if getattr(self.atomic_model.descriptor, "compress", False):
+            if not _kernel_available():
+                raise RuntimeError(_NO_KERNEL)
+            # Level before CSR: at level 0 upstream builds no CSR at all, so
+            # the missing views are the symptom and the level is the cause.
+            level = cuda_infer_level()
+            if level != 1:
+                raise RuntimeError(
+                    f"DP_CUDA_INFER={level} on a compressed model: at 0 the "
+                    "tables are built and never used, at 2 a fused kernel "
+                    "bypasses the shared backbone. Set DP_CUDA_INFER=1."
+                )
+            if destination_order is None or destination_row_ptr is None:
+                raise RuntimeError(
+                    "a compressed DPA4C needs the destination CSR views on "
+                    "every graph and this one carries none, so the descriptor "
+                    "would silently fall back to the uncompressed math. Graphs "
+                    "built by DeePMD-kit's own forward get them from "
+                    "`get_geo_compress()`; a hand-built graph needs "
+                    "`attach_edge_csr`."
+                )
+        return super().forward_common_lower_graph(
+            atype,
+            n_node,
+            n_local,
+            edge_index,
+            edge_vec,
+            edge_mask,
+            destination_order,
+            destination_row_ptr,
+            *args,
+            **kwargs,
+        )
+
+    def enable_compression(
+        self,
+        table_extrapolate: float = 5,
+        table_stride_1: float = 0.01,
+        table_stride_2: float = 0.1,
+        check_frequency: int = -1,
+        *,
+        charge_spin: Any = None,
+    ) -> None:
+        """Compress the DPA4C backbone for inference; the rest is untouched.
+
+        Upstream's signature, kept so any caller of the DeePMD-kit method
+        meets the same checks. For DPA4C only ``table_stride_1`` matters: the
+        radial table spans ``[0, rcut]`` analytically, so the extrapolation,
+        second stride and overflow check are all discarded upstream.
+
+        What it commits you to, and why each is refused rather than warned:
+
+        * The compiled kernel must be loaded (see :mod:`deepmd_lr.compress`).
+        * An evaluation snapshot: a compressed DPA4C cannot re-enter training.
+        * ``DP_CUDA_INFER`` becomes ``1`` if unset -- the one process-global
+          side effect here, because DeePMD-kit re-reads the variable on every
+          call and offers no API for it; a second switch to remember would be
+          redundant with asking for compression. Level 2 is refused for every
+          model: its fused energy/force kernel bypasses
+          ``descriptor.call_graph``, and with it the shared backbone, the
+          charge response and the Born charges.
+        * The frame condition is **folded into the tables**. With
+          ``add_chg_spin_ebd`` the kernel reads the charge state baked in at
+          this call, not the one passed at forward time; pass the run's
+          ``charge_spin`` here, and a forward with a different one is refused.
+
+        Nothing is persisted. The tables are a deterministic function of the
+        weights, the stride and the charge state, and build in well under a
+        second, so they are rebuilt at load rather than saved.
+        """
+        if isinstance(table_stride_1, bool) or not isinstance(table_stride_1, Real):
+            raise TypeError("table_stride_1 must be a positive finite number")
+        if not math.isfinite(table_stride_1) or table_stride_1 <= 0:
+            raise ValueError("table_stride_1 must be positive and finite")
+        if not _kernel_available():
+            raise RuntimeError(_NO_KERNEL)
+        if self.training:
+            raise RuntimeError(
+                "compress an evaluation snapshot: call `.eval()` first. A "
+                "compressed DPA4C cannot re-enter training mode."
+            )
+        level = cuda_infer_level()
+        if level >= 2:
+            raise RuntimeError(
+                "DP_CUDA_INFER=2 selects the fused energy/force kernel, which "
+                "bypasses `descriptor.call_graph`: the charge head could no "
+                "longer share the backbone and Born charges would be refused. "
+                "Set DP_CUDA_INFER=1, the level compression needs."
+            )
+        descriptor = self.atomic_model.descriptor
+        state = None
+        if self.atomic_model.add_chg_spin_ebd:
+            from deepmd.utils.charge_state import validate_charge_state
+
+            condition = torch.as_tensor(
+                self.get_default_chg_spin() if charge_spin is None else charge_spin,
+                dtype=torch.float64,
+            ).reshape(-1)
+            if condition.numel() != 2:
+                raise ValueError(
+                    "charge_spin must hold one [charge, multiplicity] pair"
+                )
+            state = list(validate_charge_state(condition.tolist()))
+
+        # Upstream registers/replaces buffers and sets these attributes. Preserve
+        # the original objects so failed construction also preserves shared refs.
+        buffers = descriptor._buffers.copy()
+        nonpersistent = descriptor._non_persistent_buffers_set.copy()
+        was_compressed = descriptor.compress
+        had_scalars = hasattr(descriptor, "_compression_scalars")
+        scalars = getattr(descriptor, "_compression_scalars", None)
+        try:
+            super().enable_compression(
+                table_extrapolate, table_stride_1, table_stride_2, check_frequency
+            )
+            if state is not None:
+                descriptor.apply_charge_state(state)
+        except BaseException:
+            descriptor._buffers.clear()
+            descriptor._buffers.update(buffers)
+            descriptor._non_persistent_buffers_set.clear()
+            descriptor._non_persistent_buffers_set.update(nonpersistent)
+            descriptor.compress = was_compressed
+            if had_scalars:
+                descriptor._compression_scalars = scalars
+            elif hasattr(descriptor, "_compression_scalars"):
+                del descriptor._compression_scalars
+            raise
+        if state is not None:
+            self._compressed_charge_spin = (state[0], state[1])
+        # Only successful compression changes the process-wide inference level.
+        if level == 0:
+            os.environ["DP_CUDA_INFER"] = "1"
 
     def compute_or_load_stat(
         self, sampled_func: Any, *args: Any, **kwargs: Any

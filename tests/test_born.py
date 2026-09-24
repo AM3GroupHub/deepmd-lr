@@ -372,14 +372,14 @@ class TestDistributed:
         )
 
     def test_matches_the_serial_tensor_at_every_partition_count(self):
-        from deepmd_lr.nvalchemi import evaluate_partitioned  # noqa: PLC0415
+        from deepmd_lr.nvalchemi import evaluate_partitioned, to_numpy  # noqa: PLC0415
 
         model, c, a, cl, coord, atype, cell = self._setup()
         model.compute_born = True
         serial = model(coord, atype, box=cell)["born_charge"][0].cpu().numpy()
 
         for n_part in (1, 2, 4):
-            out = evaluate_partitioned(
+            out = to_numpy(evaluate_partitioned(
                 model,
                 c,
                 a,
@@ -387,7 +387,7 @@ class TestDistributed:
                 n_partitions=n_part,
                 devices=[DEVICE] * n_part,
                 compute_born=True,
-            )
+            ))
             got = out["born_charge"]
             assert got.shape == (len(c), 3, 3)
             assert np.abs(got - serial).max() < 1e-10, (
@@ -396,12 +396,12 @@ class TestDistributed:
             )
 
     def test_off_by_default(self):
-        from deepmd_lr.nvalchemi import evaluate_partitioned  # noqa: PLC0415
+        from deepmd_lr.nvalchemi import evaluate_partitioned, to_numpy  # noqa: PLC0415
 
         model, c, a, cl, *_ = self._setup()
-        out = evaluate_partitioned(
+        out = to_numpy(evaluate_partitioned(
             model, c, a, cl, n_partitions=2, devices=[DEVICE] * 2
-        )
+        ))
         assert "born_charge" not in out
 
     def test_exposed_on_the_evaluator(self):
@@ -425,13 +425,13 @@ class TestDistributed:
         number -- but it would die only when Born was enabled, which is easy
         to miss.
         """
-        from deepmd_lr.nvalchemi import evaluate_partitioned  # noqa: PLC0415
+        from deepmd_lr.nvalchemi import evaluate_partitioned, to_numpy  # noqa: PLC0415
 
         model, c, a, cl, *_ = self._setup()
-        plain = evaluate_partitioned(
+        plain = to_numpy(evaluate_partitioned(
             model, c, a, cl, n_partitions=2, devices=[DEVICE] * 2
-        )
-        withz = evaluate_partitioned(
+        ))
+        withz = to_numpy(evaluate_partitioned(
             model,
             c,
             a,
@@ -439,7 +439,7 @@ class TestDistributed:
             n_partitions=2,
             devices=[DEVICE] * 2,
             compute_born=True,
-        )
+        ))
         assert (
             np.abs(
                 withz["force_charge_response"] - plain["force_charge_response"]

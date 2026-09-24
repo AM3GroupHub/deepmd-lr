@@ -197,7 +197,7 @@ ev, masses = build_evaluator(model, symbols, cell,
 ```
 
 Worth it above a few thousand atoms per card and not below — see the
-[main README](../../README.md#limits) for the measured scaling.
+[partitioned MD](../../docs/partitioned-md.md#limits) for the measured scaling.
 
 ## Throughput
 

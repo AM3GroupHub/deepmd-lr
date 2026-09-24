@@ -33,6 +33,9 @@ import torch
 from deepmd.dpmodel.utils.neighbor_graph import (
     segment_sum,
 )
+from deepmd.dpmodel.utils.neighbor_graph.csr import (
+    attach_edge_csr,
+)
 
 from deepmd_lr.born import (
     screening_factor,
@@ -58,6 +61,24 @@ __all__ = [
 ]
 
 
+def _current_device(device) -> contextlib.AbstractContextManager:
+    """Make ``device`` the CUDA *current* device for the block.
+
+    Tensor placement alone is not enough for the compressed DPA4C operator:
+    measured on two H200s, a compressed model whose every buffer sits on
+    ``cuda:1`` returns forces wrong by 5 eV/A when ``cuda:0`` is current, and
+    the right ones (1e-5 of the uncompressed reference) once ``cuda:1`` is
+    current -- the uncompressed path is indifferent. The operator evidently
+    binds something (a stream, a workspace) to the current device rather than
+    to its arguments' device. So every per-partition block runs with its own
+    device current. Cheap: it is a thread-local switch, not a synchronisation.
+    """
+    device = torch.device(device)
+    if device.type != "cuda":
+        return contextlib.nullcontext()
+    return torch.cuda.device(device)
+
+
 def device_replicas(model, devices) -> dict:
     """One model per distinct device.
 
@@ -74,52 +95,12 @@ def device_replicas(model, devices) -> dict:
     home = next(model.parameters()).device
     replicas = {}
     for device in {torch.device(d) for d in devices}:
-        replicas[device] = (
-            model if device == home else copy.deepcopy(model).to(device).eval()
-        )
+        if device == home:
+            replicas[device] = model
+            continue
+        with _current_device(device):
+            replicas[device] = copy.deepcopy(model).to(device).eval()
     return replicas
-
-
-@contextlib.contextmanager
-def _capture_backbone(model):
-    """Record the descriptor output of one partition's energy pass.
-
-    The charge head reads the same features the energy head just produced, so
-    the backbone need only run once per partition -- the saving the serial
-    model already takes via ``LongRangeEnergyModel._capturing_backbone``.
-
-    What has to be recorded alongside the features is the ``edge_vec`` the
-    descriptor actually saw. ``forward_common_lower_graph`` does
-    ``edge_vec.detach().requires_grad_(True)`` (make_model.py:668) to make it
-    the leaf for the energy backward, so the captured features hang off THAT
-    leaf and not off the partition's ``node_coord``. Anything differentiating
-    them has to target the captured leaf; see ``_charge_response_force``.
-
-    Yields a dict that is empty if nothing was captured, in which case the
-    caller falls back to running the backbone again.
-    """
-    descriptor = model.atomic_model.descriptor
-    unhooked = descriptor.call_graph
-    captured: dict = {}
-
-    def capture(graph, atype_flat, *args, **kwargs):
-        out = unhooked(graph, atype_flat, *args, **kwargs)
-        # Only the first call is the energy head's.
-        if not captured:
-            captured.update(
-                features=out[0], rot_mat=out[1], edge_vec=graph.edge_vec
-            )
-        return out
-
-    had_own = "call_graph" in descriptor.__dict__
-    descriptor.call_graph = capture
-    try:
-        yield captured
-    finally:
-        if had_own:
-            descriptor.call_graph = unhooked
-        else:
-            del descriptor.call_graph
 
 
 def _usable_capture(captured) -> bool:
@@ -152,6 +133,15 @@ def partition_charges(model, graph, node_type, n_owned: int, charge_spin=None):
     handled once the partitions are assembled.
     """
     descriptor = model.atomic_model.descriptor
+    if getattr(descriptor, "compress", False):
+        # Compressed inference is defined only on the captured route: this
+        # second pass would run the uncompressed math on a CSR-less graph
+        # while the model still claims to be compressed.
+        raise RuntimeError(
+            "the fallback charge pass was reached on a compressed model; the "
+            "shared-backbone capture should have been taken. Check "
+            "DP_CUDA_INFER (it must be exactly 1)."
+        )
     charge_spin_kwargs = (
         {"charge_spin": charge_spin} if model.atomic_model.supports_charge_spin else {}
     )
@@ -165,10 +155,16 @@ def partition_charges(model, graph, node_type, n_owned: int, charge_spin=None):
     return raw.reshape(-1)[:n_owned]
 
 
-def partition_graph(part: Partition, coord: np.ndarray, atype: np.ndarray,
-                    rcut: float, device: Any, dtype=torch.float64,
-                    requires_grad: bool = False,
-                    strain: torch.Tensor | None = None):
+def partition_graph(
+    part: Partition,
+    coord: np.ndarray,
+    atype: np.ndarray,
+    rcut: float,
+    device: Any,
+    dtype=torch.float64,
+    requires_grad: bool = False,
+    strain: torch.Tensor | None = None,
+):
     """Build one partition's neighbour graph, keeping only owned destinations.
 
     Built with ``box=None`` -- non-periodic. The halo already carries explicit
@@ -195,16 +191,26 @@ def partition_graph(part: Partition, coord: np.ndarray, atype: np.ndarray,
 
     Returns ``(graph, node_type_flat, node_coord)``. ``node_coord`` is the
     unstrained leaf, so a backward reaches both it and the strain.
+
+    ``coord`` may be a device tensor or a numpy array; either way the node
+    set is gathered on ``device`` with :meth:`Partition.views`, never
+    concatenated on the host.
     """
-    node_coord = torch.tensor(
-        part.coordinates(coord)[None, ...],
-        dtype=dtype,
-        device=device,
-        requires_grad=requires_grad,
+    # One gather, on the device: owned nodes plus ghosts shifted into place,
+    # taken from the global coordinate tensor with this partition's cached
+    # index tensors. A numpy argument is uploaded once, here, so there is no
+    # second implementation that assembles nodes on the host.
+    coord_t = (
+        coord
+        if isinstance(coord, torch.Tensor)
+        else torch.as_tensor(np.asarray(coord, dtype=np.float64))
     )
-    node_type = torch.tensor(
-        part.types(atype)[None, ...], dtype=torch.int64, device=device
-    )
+    v = part.views(device, dtype)
+    c = coord_t.detach().to(device=device, dtype=dtype)
+    nodes = torch.cat([c[v["owned"]], c[v["ghost"]] + v["shift"]])
+    node_coord = nodes.unsqueeze(0).clone().requires_grad_(requires_grad)
+    node_type = part.types_on(atype, device).unsqueeze(0)
+
     search_coord = (
         node_coord
         if strain is None
@@ -236,6 +242,14 @@ def evaluate_partitioned(
 ) -> dict[str, Any]:
     """Run ``model`` over spatial partitions and assemble the global result.
 
+    Everything is assembled on the gather device and **returned there**:
+    per-partition forces, energies and charges are moved device-to-device and
+    scatter-added with ``index_add_`` -- the ghost-force reverse communication
+    of a domain-decomposed code, done as a device primitive rather than a
+    serial host loop. There is no host-side assembly path; a caller that wants
+    numpy arrays converts explicitly with :func:`to_numpy`, which makes the
+    download a visible line rather than a hidden default.
+
     Parameters
     ----------
     gather_device
@@ -258,6 +272,7 @@ def evaluate_partitioned(
     Returns
     -------
     dict
+        Device tensors on the gather device, scalars as 0-d tensors:
         ``energy``, ``force`` ``(N, 3)``, ``atom_energy`` ``(N,)``, and when the
         model carries a long-range term also ``charge`` ``(N,)``,
         ``energy_short_range``, ``energy_long_range``, and ``dE_dq`` ``(N,)``
@@ -265,8 +280,17 @@ def evaluate_partitioned(
         charge head.
     """
     rcut = float(model.get_rcut())
+    coord_np = (
+        None if isinstance(coord, torch.Tensor) else np.asarray(coord, dtype=np.float64)
+    )
     parts = (
-        partition_system(coord, cell, rcut, n_partitions, pbc)
+        partition_system(
+            coord_np if coord_np is not None else coord.detach().cpu().numpy(),
+            cell,
+            rcut,
+            n_partitions,
+            pbc,
+        )
         if partitions is None
         else partitions
     )
@@ -281,11 +305,16 @@ def evaluate_partitioned(
     if replicas is None:
         replicas = device_replicas(model, devices)
     long_range = getattr(model, "has_long_range", False)
-    n_atoms = len(coord)
-    force = np.zeros((n_atoms, 3))
-    atom_energy = np.zeros(n_atoms)
-    raw_charge = np.zeros(n_atoms)
-    energy = 0.0
+    home = torch.device(gather_device if gather_device is not None else devices[0])
+    coord_t = (
+        coord.detach().to(device=home, dtype=dtype)
+        if isinstance(coord, torch.Tensor)
+        else torch.as_tensor(coord_np, dtype=dtype, device=home)
+    )
+    n_atoms = coord_t.shape[0]
+    force = torch.zeros((n_atoms, 3), dtype=dtype, device=home)
+    atom_energy = torch.zeros(n_atoms, dtype=dtype, device=home)
+    raw_charge = torch.zeros(n_atoms, dtype=dtype, device=home) if long_range else None
 
     # ---- launch phase -------------------------------------------------------
     # Queue every partition's work WITHOUT touching the host. A `.cpu()` here
@@ -294,78 +323,116 @@ def evaluate_partitioned(
     # one after the other. Kernel launches are asynchronous and each device has
     # its own stream, so deferring the transfers is what buys the overlap.
     launched = []
-    virial = np.zeros((3, 3)) if compute_virial else None
+    virial = torch.zeros((3, 3), dtype=dtype, device=home) if compute_virial else None
+    # Distribute the coordinates to every device BEFORE any forward is queued.
+    # A cross-device copy runs on the SOURCE device's current stream, behind
+    # whatever is already enqueued there: issued inside the loop, the copy for
+    # partition 1 would sit behind partition 0's entire forward on the home
+    # device, and device 1 would idle until device 0 finished -- the two
+    # GPUs would run one after the other. Measured on two H200s: 0.7x.
+    coord_on = {}
+    for device in devices:
+        dev = torch.device(device)
+        if dev not in coord_on:
+            with _current_device(dev):
+                coord_on[dev] = coord_t.to(device=dev, dtype=dtype)
     for part, device in zip(parts, devices, strict=True):
-        local = replicas[torch.device(device)]
-        condition = resolve_charge_spin(
-            local, charge_spin, 1, torch.empty((), dtype=dtype, device=device)
-        )
-        # One strain leaf per partition. They cannot be shared -- a leaf
-        # lives on one device -- but the virial is a sum of contributions,
-        # so per-device leaves and summed gradients are equivalent.
-        eps = strain = None
-        if compute_virial:
-            eps = torch.zeros(
-                (3, 3), dtype=dtype, device=device, requires_grad=True
+        with _current_device(device):
+            local = replicas[torch.device(device)]
+            condition = resolve_charge_spin(
+                local, charge_spin, 1, torch.empty((), dtype=dtype, device=device)
             )
-            strain = torch.eye(3, dtype=dtype, device=device) + 0.5 * (
-                eps + eps.transpose(-1, -2)
+            # One strain leaf per partition. They cannot be shared -- a leaf
+            # lives on one device -- but the virial is a sum of contributions,
+            # so per-device leaves and summed gradients are equivalent.
+            eps = strain = None
+            if compute_virial:
+                eps = torch.zeros(
+                    (3, 3), dtype=dtype, device=device, requires_grad=True
+                )
+                strain = torch.eye(3, dtype=dtype, device=device) + 0.5 * (
+                    eps + eps.transpose(-1, -2)
+                )
+            # `requires_grad` only when the charge-response backward will need it.
+            graph, node_type, node_coord = partition_graph(
+                part,
+                coord_on[torch.device(device)],
+                atype,
+                rcut,
+                device,
+                dtype,
+                requires_grad=long_range,
+                strain=strain,
             )
-        # `requires_grad` only when the charge-response backward will need it.
-        graph, node_type, node_coord = partition_graph(
-            part, coord, atype, rcut, device, dtype,
-            requires_grad=long_range, strain=strain,
-        )
-        n_node = torch.tensor([part.n_node], dtype=torch.int64, device=device)
-        n_local = torch.tensor([part.n_owned], dtype=torch.int64, device=device)
+            n_node = torch.tensor([part.n_node], dtype=torch.int64, device=device)
+            n_local = torch.tensor([part.n_owned], dtype=torch.int64, device=device)
 
-        with _capture_backbone(local) if long_range else contextlib.nullcontext(
-            {}
-        ) as captured:
-            out = local.forward_common_lower_graph(
-                node_type,
-                n_node,
-                n_local,
-                graph.edge_index,
-                graph.edge_vec,
-                graph.edge_mask,
-                charge_spin=condition,
+            if getattr(local.atomic_model.descriptor, "compress", False):
+                # The compressed kernel needs the destination CSR views, attached
+                # AFTER the ownership mask: `build_edge_csr` routes masked edges
+                # into a padding segment using the mask it is shown, so attaching
+                # inside the builder would leave ghost-destination edges in owned
+                # rows. `canonicalize=False` leaves `edge_vec` the very tensor the
+                # search produced, so the charge-response backward below still
+                # reaches `node_coord` through it.
+                graph = attach_edge_csr(graph, part.n_node)
+            # The model's own capture context: it records the backbone output the
+            # charge head reuses, and it is what permits the graph lower -- any
+            # caller outside one would be reporting the short-range energy alone.
+            capture = (
+                local._capturing_backbone()
+                if long_range
+                else contextlib.nullcontext({})
             )
-        # Charges come from the SAME descriptor pass the energy head just ran,
-        # and the tensor is kept live so the charge-response force can
-        # backpropagate through it later. Falling back to a second pass only
-        # when the capture cannot carry the gradient.
-        raw = cap_edge_vec = None
-        if long_range:
-            if _usable_capture(captured):
-                raw = charges_from_capture(
-                    local, captured, node_type, part.n_owned
+            with capture as captured:
+                out = local.forward_common_lower_graph(
+                    node_type,
+                    n_node,
+                    n_local,
+                    graph.edge_index,
+                    graph.edge_vec,
+                    graph.edge_mask,
+                    destination_order=graph.destination_order,
+                    destination_row_ptr=graph.destination_row_ptr,
+                    source_order=graph.source_order,
+                    source_row_ptr=graph.source_row_ptr,
+                    destination_sorted=graph.destination_sorted,
+                    charge_spin=condition,
                 )
-                cap_edge_vec = captured["edge_vec"]
-            else:
-                raw = partition_charges(
-                    local, graph, node_type, part.n_owned, condition
-                )
-        launched.append(
-            (part, device, out, raw, node_coord, eps, graph, cap_edge_vec)
-        )
+            # Charges come from the SAME descriptor pass the energy head just ran,
+            # and the tensor is kept live so the charge-response force can
+            # backpropagate through it later. Falling back to a second pass only
+            # when the capture cannot carry the gradient.
+            raw = cap_edge_vec = None
+            if long_range:
+                if _usable_capture(captured):
+                    raw = charges_from_capture(local, captured, node_type, part.n_owned)
+                    cap_edge_vec = captured["edge_vec"]
+                else:
+                    raw = partition_charges(
+                        local, graph, node_type, part.n_owned, condition
+                    )
+            launched.append(
+                (part, device, out, raw, node_coord, eps, graph, cap_edge_vec)
+            )
 
     # ---- gather phase -------------------------------------------------------
     # Now synchronise. Every device has been given its work, so the transfers
     # below wait on kernels that have been running concurrently.
+    # The transfers are device-to-device onto the gather device and the
+    # scatter-adds are device primitives, so no partition waits for the host
+    # and no GPU idles while a CPU loop runs. `.to()` between devices does not
+    # synchronise the host; it orders on the streams.
     for part, _device, out, raw, _node_coord, _eps, _graph, _cap in launched:
-        ids = part.global_ids()
+        v = part.views(home, dtype)
         if compute_virial:
             # Each edge survives in exactly one partition, so the per-partition
             # virials sum to the global one exactly -- the same ownership
             # argument as the forces.
-            virial += (
-                out["energy_derv_c_redu"].reshape(3, 3).detach().cpu().numpy()
-            )
+            virial += out["energy_derv_c_redu"].reshape(3, 3).detach().to(home, dtype)
         # Energy: owned atoms only. Each atom is scored by exactly one owner.
-        per_atom = out["energy"].reshape(-1).detach().cpu().numpy()
-        atom_energy[part.owned] += per_atom[: part.n_owned]
-        energy += float(per_atom[: part.n_owned].sum())
+        per_atom = out["energy"].reshape(-1).detach().to(home, dtype)
+        atom_energy.index_add_(0, v["owned"], per_atom[: part.n_owned])
 
         # Force: every node, ghosts included. A ghost carries the reaction to
         # an owned atom's edge, and that belongs to the ghost's owner --
@@ -374,28 +441,30 @@ def evaluate_partitioned(
         # `energy_derv_r` is already the force, not the energy gradient --
         # `_to_public_keys` maps it straight onto the public "force" key with
         # no sign change.
-        node_force = out["energy_derv_r"].reshape(part.n_node, 3)
-        np.add.at(force, ids, node_force.detach().cpu().numpy())
+        node_force = (
+            out["energy_derv_r"].reshape(part.n_node, 3).detach().to(home, dtype)
+        )
+        force.index_add_(0, v["ids"], node_force)
 
         if long_range:
-            raw_charge[part.owned] = raw.detach().cpu().numpy()
+            raw_charge.index_copy_(0, v["owned"], raw.detach().to(home, dtype))
 
+    energy = atom_energy.sum()
     result = {"energy": energy, "force": force, "atom_energy": atom_energy}
     if compute_virial:
-        result["virial"] = virial.copy()
-        result["virial_short_range"] = virial.copy()
+        result["virial"] = virial.clone()
+        result["virial_short_range"] = virial.clone()
     if not long_range:
         return result
 
-    gather = gather_device if gather_device is not None else devices[0]
     result["energy_short_range"] = energy
     result.update(
         _long_range_global(
-            replicas[torch.device(gather)],
-            coord,
+            replicas[home],
+            coord_t,
             cell,
             raw_charge,
-            gather,
+            home,
             dtype,
             compute_virial=compute_virial,
             atype=atype,
@@ -411,7 +480,7 @@ def evaluate_partitioned(
         # Before `_charge_response_force`, which backpropagates through the
         # same `raw` tensors without retaining the graph.
         result["born_charge"] = _born_charges_partitioned(
-            launched, len(coord), result["charge"], eps_inf=eps_inf
+            launched, n_atoms, result["charge"], home, dtype, eps_inf=eps_inf
         )
     # The energy above used the model's own charges; only the report is
     # rescaled to screened charges, and after Born so its delta term saw the
@@ -421,23 +490,39 @@ def evaluate_partitioned(
         result["charge"] = result["charge"] * factor
 
     response_force, response_virial = _charge_response_force(
-        launched, len(coord), result["dE_dq"], compute_virial=compute_virial
+        launched, n_atoms, result["dE_dq"], home, dtype, compute_virial=compute_virial
     )
     result["force_charge_response"] = response_force
     result["force"] = result["force"] + response_force
     if compute_virial:
         result["virial"] = (
-            result["virial"]
-            + result["virial_long_range"]
-            + response_virial
+            result["virial"] + result["virial_long_range"] + response_virial
         )
         result["virial_charge_response"] = response_virial
     return result
 
 
+def to_numpy(result: dict) -> dict:
+    """Copy a :func:`evaluate_partitioned` result to the host.
+
+    Arrays become numpy, 0-d tensors become Python floats. This is the only
+    download in the pipeline and it is the caller's explicit choice: the
+    driver assembles and returns on the device, so a step that never reads a
+    result on the host never pays for one.
+    """
+    out = {}
+    for key, value in result.items():
+        if isinstance(value, torch.Tensor):
+            value = value.detach()
+            out[key] = float(value) if value.ndim == 0 else value.cpu().numpy()
+        else:
+            out[key] = value
+    return out
+
+
 def _born_charges_partitioned(
-    launched, n_atoms: int, charge, *, eps_inf: float = 1.0
-) -> np.ndarray:
+    launched, n_atoms: int, charge, home, dtype, *, eps_inf: float = 1.0
+) -> torch.Tensor:
     r"""Born effective charge tensors, assembled across partitions.
 
     The global total-charge projection is not an obstacle here, for the same
@@ -465,50 +550,52 @@ def _born_charges_partitioned(
     and those edges live in the neighbour's partition. Neither partition sees
     all of atom i's terms alone; the scatter-add is what completes the sum.
     """
-    born = np.zeros((n_atoms, 3, 3))
+    born = torch.zeros((n_atoms, 3, 3), dtype=dtype, device=home)
     contributions = []
     # Launch every backward before transferring anything, for the same reason
     # the forward pass is staged.
     for part, _device, _out, raw, _node_coord, _eps, graph, cap in launched:
-        # One VJP per partition. `raw` already holds owned atoms only, and
-        # every kept edge has an owned destination, so this is exactly
-        # d raw_{dst(e)} / d edge_vec_e for the edges this partition owns.
-        # With a captured backbone the features hang off the leaf
-        # `forward_common_lower_graph` made, not off `graph.edge_vec`. The two
-        # are numerically identical, so the outer product below is unaffected;
-        # only the differentiation target changes.
-        leaf = cap if cap is not None else graph.edge_vec
-        (g,) = torch.autograd.grad(raw.sum(), leaf, retain_graph=True)
-        # Defensive: `partition_graph` masked ghost-destination edges before
-        # the descriptor ran, so those gradients are already identically zero.
-        g = g * graph.edge_mask[:, None].to(g.dtype)
-        outer = graph.edge_vec.detach()[:, :, None] * g[:, None, :]
-        src = graph.edge_index[0].to(torch.int64)
-        dst = graph.edge_index[1].to(torch.int64)
-        node = 0.5 * (
-            segment_sum(outer, dst, part.n_node)
-            - segment_sum(outer, src, part.n_node)
-        )
-        contributions.append((part, node))
+        with _current_device(raw.device):
+            # One VJP per partition. `raw` already holds owned atoms only, and
+            # every kept edge has an owned destination, so this is exactly
+            # d raw_{dst(e)} / d edge_vec_e for the edges this partition owns.
+            # With a captured backbone the features hang off the leaf
+            # `forward_common_lower_graph` made, not off `graph.edge_vec`. The two
+            # are numerically identical, so the outer product below is unaffected;
+            # only the differentiation target changes.
+            leaf = cap if cap is not None else graph.edge_vec
+            (g,) = torch.autograd.grad(raw.sum(), leaf, retain_graph=True)
+            # Defensive: `partition_graph` masked ghost-destination edges before
+            # the descriptor ran, so those gradients are already identically zero.
+            g = g * graph.edge_mask[:, None].to(g.dtype)
+            outer = graph.edge_vec.detach()[:, :, None] * g[:, None, :]
+            src = graph.edge_index[0].to(torch.int64)
+            dst = graph.edge_index[1].to(torch.int64)
+            node = 0.5 * (
+                segment_sum(outer, dst, part.n_node)
+                - segment_sum(outer, src, part.n_node)
+            )
+            contributions.append((part, node))
 
     for part, node in contributions:
-        np.add.at(
-            born,
-            part.global_ids(),
-            node.reshape(part.n_node, 3, 3).detach().cpu().numpy(),
+        born.index_add_(
+            0,
+            part.views(home, dtype)["ids"],
+            node.reshape(part.n_node, 3, 3).detach().to(home, dtype),
         )
     # The delta term, from the globally projected charges. Adding it here
     # rather than per partition is what makes the acoustic sum rule come out
     # as the system's actual total charge.
-    born += np.asarray(charge).reshape(-1, 1, 1) * np.eye(3)[None]
+    eye = torch.eye(3, dtype=dtype, device=home)
+    born = born + charge.reshape(-1, 1, 1).to(home, dtype) * eye
     # Screened tensor, Z~ = sqrt(eps_inf) Z -- same factor as the serial
     # `born_charges`, applied once to the assembled whole.
     return born * screening_factor(eps_inf)
 
 
 def _charge_response_force(
-    launched, n_atoms: int, dE_dq, compute_virial: bool = False
-) -> tuple[np.ndarray, np.ndarray | None]:
+    launched, n_atoms: int, dE_dq, home, dtype, compute_virial: bool = False
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     r"""The force from charges shifting as atoms move.
 
     Because the charges are predicted rather than fixed, the long-range force
@@ -539,49 +626,58 @@ def _charge_response_force(
     """
     # dE_dq already differentiates through the global, possibly masked projection.
     cotangent = dE_dq
-    force = np.zeros((n_atoms, 3))
-    virial = np.zeros((3, 3)) if compute_virial else None
+    force = torch.zeros((n_atoms, 3), dtype=dtype, device=home)
+    virial = torch.zeros((3, 3), dtype=dtype, device=home) if compute_virial else None
 
     # Launch every backward first, then transfer, for the same reason the
     # forward pass is staged: a `.cpu()` between them serialises the devices.
     gradients = []
     for part, _device, _out, raw, node_coord, eps, graph, cap in launched:
-        weights = torch.tensor(
-            cotangent[part.owned], dtype=raw.dtype, device=raw.device
-        )
-        targets = [node_coord] if eps is None else [node_coord, eps]
-        if cap is None:
-            grads = torch.autograd.grad((raw * weights).sum(), targets)
-        else:
-            # Two stages, because the captured features hang off the detached
-            # leaf `forward_common_lower_graph` created, which has no path back
-            # to `node_coord` (or to the strain). First the VJP onto that leaf,
-            # then push it through the partition's own `edge_vec`, which IS a
-            # function of both. The leaves are numerically identical, so the
-            # composition is the exact chain rule, and routing through
-            # `graph.edge_vec` keeps the strain derivative the virial needs.
-            (g_e,) = torch.autograd.grad(
-                (raw * weights).sum(), cap, retain_graph=True
+        with _current_device(raw.device):
+            weights = cotangent[part.views(home, dtype)["owned"]].to(
+                device=raw.device, dtype=raw.dtype
             )
-            grads = torch.autograd.grad(
-                (graph.edge_vec * g_e.detach()).sum(), targets
-            )
-        gradients.append((part, grads[0], grads[1] if eps is not None else None))
+            targets = [node_coord] if eps is None else [node_coord, eps]
+            if cap is None:
+                grads = torch.autograd.grad((raw * weights).sum(), targets)
+            else:
+                # Two stages, because the captured features hang off the detached
+                # leaf `forward_common_lower_graph` created, which has no path back
+                # to `node_coord` (or to the strain). First the VJP onto that leaf,
+                # then push it through the partition's own `edge_vec`, which IS a
+                # function of both. The leaves are numerically identical, so the
+                # composition is the exact chain rule, and routing through
+                # `graph.edge_vec` keeps the strain derivative the virial needs.
+                (g_e,) = torch.autograd.grad(
+                    (raw * weights).sum(), cap, retain_graph=True
+                )
+                grads = torch.autograd.grad(
+                    (graph.edge_vec * g_e.detach()).sum(), targets
+                )
+            gradients.append((part, grads[0], grads[1] if eps is not None else None))
 
     for part, gradient, grad_eps in gradients:
-        np.add.at(
-            force,
-            part.global_ids(),
-            -gradient.reshape(part.n_node, 3).detach().cpu().numpy(),
+        force.index_add_(
+            0,
+            part.views(home, dtype)["ids"],
+            -gradient.reshape(part.n_node, 3).detach().to(home, dtype),
         )
         if compute_virial:
-            virial -= grad_eps.reshape(3, 3).detach().cpu().numpy()
+            virial -= grad_eps.reshape(3, 3).detach().to(home, dtype)
     return force, virial
 
 
 def _long_range_global(
-    model, coord, cell, raw_charge, device, dtype, compute_virial: bool = False,
-    *, atype, charge_spin=None,
+    model,
+    coord,
+    cell,
+    raw_charge,
+    device,
+    dtype,
+    compute_virial: bool = False,
+    *,
+    atype,
+    charge_spin=None,
 ) -> dict:
     """The global half: project the charges, then evaluate the reciprocal sum.
 
@@ -590,13 +686,25 @@ def _long_range_global(
     short-ranged and is added per partition in Phase C -- taking ``dE/dq`` out
     as a plain value here is what keeps the autograd graph on one device.
     """
-    n_atoms = len(coord)
-    coord_t = torch.tensor(
-        coord[None, ...], dtype=dtype, device=device, requires_grad=True
+    n_atoms = coord.shape[0]
+    coord_t = (
+        torch.as_tensor(coord, dtype=dtype, device=device)
+        .detach()
+        .reshape(1, n_atoms, 3)
+        .clone()
+        .requires_grad_(True)
     )
-    cell_t = torch.tensor(cell.reshape(1, 3, 3), dtype=dtype, device=device)
-    charge_t = torch.tensor(
-        raw_charge[None, ...], dtype=dtype, device=device, requires_grad=True
+    cell_t = torch.as_tensor(
+        cell if isinstance(cell, torch.Tensor) else np.asarray(cell),
+        dtype=dtype,
+        device=device,
+    ).reshape(1, 3, 3)
+    charge_t = (
+        torch.as_tensor(raw_charge, dtype=dtype, device=device)
+        .detach()
+        .reshape(1, n_atoms)
+        .clone()
+        .requires_grad_(True)
     )
 
     eps = None
@@ -627,13 +735,13 @@ def _long_range_global(
     grad_coord, grad_charge = grads[0], grads[1]
 
     return {
-        "charge": charge.reshape(-1).detach().cpu().numpy(),
-        "energy_long_range": float(total.detach()),
-        "atom_energy_long_range": atom_energy.reshape(-1).detach().cpu().numpy(),
-        "force_long_range": -grad_coord.reshape(n_atoms, 3).detach().cpu().numpy(),
-        "dE_dq": grad_charge.reshape(-1).detach().cpu().numpy(),
+        "charge": charge.reshape(-1).detach(),
+        "energy_long_range": total.detach(),
+        "atom_energy_long_range": atom_energy.reshape(-1).detach(),
+        "force_long_range": -grad_coord.reshape(n_atoms, 3).detach(),
+        "dE_dq": grad_charge.reshape(-1).detach(),
         **(
-            {"virial_long_range": -grads[2].reshape(3, 3).detach().cpu().numpy()}
+            {"virial_long_range": -grads[2].reshape(3, 3).detach()}
             if eps is not None
             else {}
         ),

@@ -46,6 +46,9 @@ from deepmd_lr.born import (
     field_force,
     screening_factor,
 )
+from deepmd_lr.compress import (
+    compress_model,
+)
 from deepmd_lr.nvalchemi.driver import (
     device_replicas,
     evaluate_partitioned,
@@ -73,6 +76,37 @@ def atomic_masses(model: Any, atype: np.ndarray) -> np.ndarray:
     type_map = model.get_type_map()
     masses = np.array([table[atomic_numbers[name]] for name in type_map])
     return masses[np.asarray(atype, dtype=np.int64).reshape(-1)]
+
+
+class _LazyNumpy(dict):
+    """A result dict whose tensors become numpy arrays on first access.
+
+    The lazy twin of :func:`~deepmd_lr.nvalchemi.driver.to_numpy`: the driver
+    returns device tensors, and this defers each download to the moment the
+    entry is actually read.
+
+    The evaluator assembles everything on the GPU; most callers read one or
+    two entries per step, if any, so converting all of them eagerly would
+    reintroduce the host traffic the device gather removed. 0-d tensors become
+    Python floats, matching the numpy contract of ``evaluate_partitioned``.
+    """
+
+    def __getitem__(self, key):
+        value = dict.__getitem__(self, key)
+        if isinstance(value, torch.Tensor):
+            value = value.detach()
+            value = float(value) if value.ndim == 0 else value.cpu().numpy()
+            dict.__setitem__(self, key, value)
+        return value
+
+    def get(self, key, default=None):
+        return self[key] if key in self else default
+
+    def items(self):
+        return [(k, self[k]) for k in self]
+
+    def values(self):
+        return [self[k] for k in self]
 
 
 class DistributedEvaluator:
@@ -119,6 +153,16 @@ class DistributedEvaluator:
     charge_spin
         Fixed (total charge, spin multiplicity) for this system. If omitted,
         use the model's configured default condition.
+    results_on_device
+        Keep :attr:`results` as device tensors. By default they are wrapped so
+        that each entry is converted to numpy on first access -- the forces
+        the integrator consumes never leave the GPU either way.
+    compress
+        ``True`` to compress the DPA4C backbone at DeePMD-kit's default table
+        stride, or a float stride in angstrom. Done before the device replicas
+        are made, with ``charge_spin`` folded into the tables. Needs a
+        deepmd-kit built from source with the CUDA operators and is refused
+        otherwise; see ``LongRangeEnergyModel.enable_compression``.
 
     eps_inf
         High-frequency dielectric constant of the medium, default ``1.0``
@@ -149,7 +193,9 @@ class DistributedEvaluator:
         compute_born: bool = False,
         efield: Any = None,
         charge_spin: torch.Tensor | tuple[float, float] | None = None,
+        compress: bool | float = False,
         eps_inf: float = 1.0,
+        results_on_device: bool = False,
     ) -> None:
         if not devices:
             raise ValueError("DistributedEvaluator needs at least one device")
@@ -194,10 +240,15 @@ class DistributedEvaluator:
         #: Validated here so a typo fails at construction, not mid-run.
         screening_factor(eps_inf)
         self.eps_inf = float(eps_inf)
+        #: Leave ``results`` as device tensors instead of the lazy numpy view.
+        self.results_on_device = bool(results_on_device)
         self.home = next(model.parameters()).device
         self.atype = np.asarray(atype, dtype=np.int64).reshape(-1)
         self.cell = np.asarray(cell, dtype=np.float64).reshape(3, 3)
 
+        # Compress BEFORE the replicas are made, so the deep copies carry the
+        # tables; the run's charge state is folded in here, once.
+        compress_model(model, compress, charge_spin=charge_spin)
         # One deepcopy per non-home device, held for the life of the driver
         # rather than rebuilt per call.
         self._replicas = device_replicas(model, self.devices)
@@ -280,9 +331,7 @@ class DistributedEvaluator:
         signature an integrator consumes stays the same either way.
         """
         if isinstance(positions, torch.Tensor):
-            tracked = positions.detach().to(
-                device=self.home, dtype=torch.float64
-            )
+            tracked = positions.detach().to(device=self.home, dtype=torch.float64)
         else:
             tracked = torch.as_tensor(
                 np.asarray(positions, dtype=np.float64).reshape(-1, 3),
@@ -294,10 +343,11 @@ class DistributedEvaluator:
                 f"got {tuple(tracked.shape)}"
             )
 
-        coord = tracked.cpu().numpy()
         if self._needs_rebuild(tracked):
+            # The only host copy of the coordinates: the spatial decomposition
+            # is a numpy/scipy routine, and it runs only when the skin says so.
             self._partitions = partition_system(
-                coord,
+                tracked.cpu().numpy(),
                 self.cell,
                 float(self.model.get_rcut()),
                 len(self.devices),
@@ -311,7 +361,7 @@ class DistributedEvaluator:
 
         out = evaluate_partitioned(
             self.model,
-            coord,
+            tracked,
             self.atype,
             self.cell,
             n_partitions=len(self.devices),
@@ -323,27 +373,31 @@ class DistributedEvaluator:
             charge_spin=self.charge_spin,
             eps_inf=self.eps_inf,
         )
-        self.results = out
-        self.virial = out.get("virial")
+        # Results stay on the device; `_LazyNumpy` hands out numpy on access,
+        # so a caller that reads `results["charge"]` pays for that copy and a
+        # caller that reads nothing pays for none. `results_on_device` skips
+        # the wrapper for callers that want the tensors themselves.
+        self.results = out if self.results_on_device else _LazyNumpy(out)
+        self.virial = (
+            None if out.get("virial") is None else out["virial"].detach().cpu().numpy()
+        )
         # INVARIANT: this writes INTO the preallocated buffer and never
         # rebinds `self.forces`, so a warp view taken once stays live for the
         # life of the object -- which is what lets `Thermo` bind it a single
         # time instead of rewrapping every step. Turning either this or the
         # `+=` below into an assignment would silently freeze the forces every
         # MD driver sees. `tests/test_nvalchemi.py` pins the pointer.
-        self.forces.copy_(
-            torch.as_tensor(out["force"], dtype=torch.float64, device=self.home)
-        )
+        self.forces.copy_(out["force"].to(device=self.home, dtype=torch.float64))
         if self.efield is not None:
             # Through `field_force` rather than an einsum written out again:
             # which index of Z contracts with E is a convention that has been
             # wrong here before, and one definition cannot drift from another.
-            born = torch.as_tensor(
-                out["born_charge"], dtype=torch.float64, device=self.home
-            )
+            born = out["born_charge"].to(device=self.home, dtype=torch.float64)
             response = field_force(born[None], self.efield)[0]
             self.forces += response
             # Kept separately so a caller can watch the field term without
             # re-deriving it, and so `out["force"]` stays the field-free force.
-            self.results["field_force"] = response.cpu().numpy()
+            self.results["field_force"] = (
+                response if self.results_on_device else response.cpu().numpy()
+            )
         return float(out["energy"]), self.forces

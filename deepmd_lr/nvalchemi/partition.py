@@ -28,12 +28,14 @@ the boundary.
 
 from dataclasses import (
     dataclass,
+    field,
 )
 from itertools import (
     product,
 )
 
 import numpy as np
+import torch
 from scipy.spatial import (
     cKDTree,
 )
@@ -60,6 +62,8 @@ class Partition:
     owned: np.ndarray
     ghost: np.ndarray
     ghost_shift: np.ndarray
+    #: Device-resident index tensors, built once per device (see :meth:`views`).
+    _views: dict = field(default_factory=dict, repr=False, compare=False)
 
     @property
     def n_owned(self) -> int:
@@ -75,12 +79,48 @@ class Partition:
 
     def coordinates(self, coord: np.ndarray) -> np.ndarray:
         """Node coordinates: owned as-is, ghosts shifted into place."""
-        return np.concatenate(
-            [coord[self.owned], coord[self.ghost] + self.ghost_shift]
-        )
+        return np.concatenate([coord[self.owned], coord[self.ghost] + self.ghost_shift])
 
     def types(self, atype: np.ndarray) -> np.ndarray:
         return np.concatenate([atype[self.owned], atype[self.ghost]])
+
+    def views(self, device, dtype=torch.float64) -> dict:
+        """This partition's index tensors on ``device``, built once and cached.
+
+        ``owned`` and ``ghost`` are global atom indices, ``ids`` their
+        concatenation in node order, ``shift`` the ghosts' Cartesian offsets.
+        The partitioning is reused across many steps, so uploading these
+        every step would be the kind of per-step host traffic the device
+        gather exists to remove.
+        """
+        key = (str(torch.device(device)), dtype)
+        v = self._views.get(key)
+        if v is None:
+            dev = torch.device(device)
+            ids = torch.as_tensor(self.global_ids(), dtype=torch.int64, device=dev)
+            v = {
+                "ids": ids,
+                "owned": ids[: self.n_owned],
+                "ghost": ids[self.n_owned :],
+                "shift": torch.as_tensor(
+                    np.asarray(self.ghost_shift, dtype=np.float64).reshape(-1, 3),
+                    dtype=dtype,
+                    device=dev,
+                ),
+            }
+            self._views[key] = v
+        return v
+
+    def types_on(self, atype: np.ndarray, device) -> torch.Tensor:
+        """Node types on ``device``, cached (the type of an atom never changes)."""
+        key = ("types", str(torch.device(device)))
+        t = self._views.get(key)
+        if t is None:
+            t = torch.as_tensor(
+                self.types(atype), dtype=torch.int64, device=torch.device(device)
+            )
+            self._views[key] = t
+        return t
 
 
 def _image_shifts(cell: np.ndarray, pbc, rcut: float) -> np.ndarray:
@@ -187,14 +227,15 @@ def partition_system(
         # Anything within rcut of an owned atom is needed to complete that
         # atom's neighbour shell.
         near = tree.query_ball_point(coord[owned], r=halo)
-        candidates = np.unique(np.concatenate([np.asarray(x, dtype=int)
-                                               for x in near])) if len(near) else \
-            np.empty(0, dtype=int)
+        candidates = (
+            np.unique(np.concatenate([np.asarray(x, dtype=int) for x in near]))
+            if len(near)
+            else np.empty(0, dtype=int)
+        )
         # Drop the owned atoms' own unshifted copies; a shifted copy of an
         # owned atom is a legitimate ghost when the cell is small.
-        is_self = (
-            np.isin(image_atom[candidates], owned)
-            & (np.abs(image_shift[candidates]).sum(axis=1) == 0)
+        is_self = np.isin(image_atom[candidates], owned) & (
+            np.abs(image_shift[candidates]).sum(axis=1) == 0
         )
         ghosts = candidates[~is_self]
         partitions.append(
