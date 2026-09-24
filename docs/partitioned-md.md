@@ -144,7 +144,7 @@ of 40, with results identical to rebuilding every step. `repartition_every=1`
 forces a rebuild each step; it changes timing, never results — there is a test
 asserting exactly that.
 
-### Two knobs that decide multi-GPU scaling
+### The knob that decides multi-GPU scaling
 
 **`skin` (default `"auto"`).** The decomposition is reused until an atom has
 moved half the skin, then rebuilt on the host by a spatial sort whose cost
@@ -209,58 +209,45 @@ measurement: an owned-count-relative rule gives 1.2 A at eight partitions,
 which is the old fixed default and puts the step straight back into the
 rebuild-dominated regime the auto skin exists to escape.
 
-**`launch_threads` (default `None` = on above one device).** The neighbour
-search performs eight blocking device-to-host reads per partition per step
-(three in `_max_radius_tuple`, two device queries, the cell-list size estimate,
-the cell-list query, and the capacity check in `nv_search_matrix`). From one
-thread they serialise the devices whatever the CUDA streams do, because the
-host cannot queue partition k+1 while partition k's search is still running.
-Giving each *device* its own thread fixes it -- `.item()` releases the GIL
-while it waits. One thread per device rather than per partition, because
-partitions sharing a device share a model replica whose capture state is not
-re-entrant. On two A40s the launch phase went from 54.7 to 38.1 ms at 98,304
-atoms, and the parallel gain from 1.31x to 1.88x against an ideal 2x.
+### Why the launch phase is single-threaded
 
-### The first pass over a device runs alone
+The neighbour search performs eight blocking device-to-host reads per
+partition per step (three in `_max_radius_tuple`, two device queries, the
+cell-list size estimate, the cell-list query, and the capacity check in
+`nv_search_matrix`). From one thread those serialise the devices whatever the
+CUDA streams do, because the host cannot queue partition k+1 while partition
+k's search is still running. Giving each *device* its own thread did recover
+much of it: on two A40s the launch phase went from 54.7 to 38.1 ms at 98,304
+atoms, a parallel gain of 1.31x to 1.88x against an ideal 2x.
 
-Threading the launch phase exposed a class of bug that the sequential loop
-could never hit: libraries under this phase that build state on first use and
-are not thread-safe while they do it. Three were found by running the scaling
-matrix on 4 and 8 V100s, and each failed the whole row:
+It was removed anyway. Every lazily-initialised library under this phase turned
+out to be unsafe while it initialises, and each one cost whole rows of a
+multi-GPU scaling matrix:
 
-| what is lazy | how it failed | how it is handled |
-|---|---|---|
-| deepmd-kit's fake-op registration | `register_fake: the operator ... already has an fake impl registered` | every registrar is run by name before the pool |
-| torch's CUDA linear-algebra library, `dlopen`ed by the cell inverse in the neighbour search | `lazy wrapper should be called at most once` | a 3x3 `inv`/`det`/`solve` probe per device before the pool |
-| warp's code generation | `'Adjoint' object has no attribute ...`, a half-built kernel handed to a second thread | the first pass over a device holds a warm-up lock, and a pass that loses the race is retried under it |
+| what is lazy | how it failed |
+|---|---|
+| deepmd-kit's fake-op registration | `register_fake: the operator ... already has an fake impl registered` |
+| torch's CUDA linear-algebra library, loaded by the cell inverse in the neighbour search | `lazy wrapper should be called at most once` |
+| warp's code generation | `'Adjoint' object has no attribute ...`, a half-built kernel read by another thread |
 
-The first two can be warmed by name, so they are. The third cannot without
-compiling every registered warp module, which takes minutes, so instead the
-*first* pass over a device holds a lock: the build happens once, on one
-thread, while the others wait, and from the second pass on the lock is never
-taken. The cost is one serialised step per device per model, and it also
-covers the lazy paths we have not met yet.
+Four fixes in -- warming two of them by name, serialising the first pass over
+each device, going back to a first pass on every rebuild, retrying a pass that
+lost the race -- a 4-GPU V100 run still lost rows, and the short-range case at
+3,456 atoms ran at 1612 ms per step against 101 ms single-threaded, with
+12,288 atoms hanging past thirteen minutes. A constant factor under 2x does not
+justify that. The loop runs one partition at a time, in order, and the whole
+class of failure goes with it.
 
-One serialised pass at start-up is not enough on its own. `Adjoint` is what
-warp calls a kernel's intermediate representation, nothing to do with backward
-passes; several of its attributes are set while the module is hashed, which
-warp does under its own code generation lock, and then read on the launch path
-*without* that lock. A thread launching a kernel whose overload another thread
-has just created therefore reads a half-built object -- and a new overload can
-appear at any step, not only the first, whenever the process meets argument
-types it has not run before. So two more things: a rebuild puts the devices
-back to a first pass, since that is when the shapes change, and a pass that
-loses the race anyway is simply run again under the lock. The pass is
-idempotent, every partition writing its own slot, and the retry costs one
-launch phase where the alternative was a dead row. Measured on a 4-GPU V100
-box, this was the difference between 3 failed rows and 0; 8 GPUs had already
-been clean, which was timing luck rather than a different code path.
+What stayed from that work, because it is load-bearing for correctness rather
+than for overlap:
 
-Note what this deliberately does not do: fall back to the sequential loop for
-the first evaluation. `launch_threads=True` is a request, and a caller that
-makes it on step one still gets the pool -- serialised, but off the main
-thread. The bookkeeping lives on the model, so a second model (compressed
-where the first was not) warms again rather than inheriting a flag.
+- **`_current_device` around each partition.** The compressed operator binds
+  the *current* device rather than its arguments' device: without this, a
+  compressed model whose buffers sit on `cuda:1` returns forces wrong by
+  5 eV/A while `cuda:0` is current.
+- **One coordinate copy per device, taken before the loop.** Every partition
+  on a device reads the same full array and gathers its own rows, so this is
+  one upload per device instead of one per partition.
 
 ## What the driver returns
 

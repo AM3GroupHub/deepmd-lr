@@ -54,7 +54,6 @@ from deepmd_lr.compress import (
 from deepmd_lr.nvalchemi.driver import (
     device_replicas,
     evaluate_partitioned,
-    forget_warm_devices,
 )
 from deepmd_lr.nvalchemi.partition import (
     default_skin,
@@ -185,10 +184,6 @@ class DistributedEvaluator:
     charge_spin
         Fixed (total charge, spin multiplicity) for this system. If omitted,
         use the model's configured default condition.
-    launch_threads
-        Run each device's partitions in its own thread while the forwards are
-        queued. ``None`` (default) means on whenever more than one device is
-        in use; see :func:`~deepmd_lr.nvalchemi.driver.evaluate_partitioned`.
     memory_headroom
         Fraction of usable device memory the halo may be sized for, ``0.8`` by
         default. The first evaluation is a probe: it runs at the floor skin,
@@ -241,7 +236,6 @@ class DistributedEvaluator:
         compress: bool | float = False,
         eps_inf: float = 1.0,
         results_on_device: bool = False,
-        launch_threads: bool | None = None,
         memory_headroom: float | None = 0.8,
     ) -> None:
         if not devices:
@@ -297,7 +291,6 @@ class DistributedEvaluator:
         self.results_on_device = bool(results_on_device)
         #: One thread per device in the launch phase; ``None`` means on
         #: whenever more than one device is used. See `evaluate_partitioned`.
-        self.launch_threads = launch_threads
         self.home = next(model.parameters()).device
         self.atype = np.asarray(atype, dtype=np.int64).reshape(-1)
         self.cell = np.asarray(cell, dtype=np.float64).reshape(3, 3)
@@ -427,15 +420,7 @@ class DistributedEvaluator:
         return 2.0 * moved > self.skin
 
     def _rebuild(self, tracked: torch.Tensor) -> None:
-        """Re-partition at the current skin and restart the displacement clock.
-
-        A rebuild changes the shapes the launch phase runs on, which is when a
-        library under it can start a lazy build it has not done before, so the
-        next pass goes back to being a first pass and takes the warm-up lock.
-        It costs one serialised launch phase against a rebuild that is orders
-        of magnitude more expensive.
-        """
-        forget_warm_devices(self.model)
+        """Re-partition at the current skin and restart the displacement clock."""
         # The only host copy of the coordinates: the spatial decomposition is
         # a numpy/scipy routine, and it runs only when the skin says so.
         self._partitions = partition_system(
@@ -561,7 +546,6 @@ class DistributedEvaluator:
                     compute_born=self.compute_born,
                     charge_spin=self.charge_spin,
                     eps_inf=self.eps_inf,
-                    launch_threads=self.launch_threads,
                 )
             except Exception as exc:
                 if not _is_out_of_memory(exc) or not self._skin_is_auto:
