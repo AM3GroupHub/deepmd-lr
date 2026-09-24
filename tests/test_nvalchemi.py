@@ -128,6 +128,78 @@ class TestPartitioner:
             partition_system(coord, cell, RCUT, len(coord) + 1)
 
 
+class TestHaloMatchesABallQuery:
+    """The rebuild's ghost set is exactly "every image within the halo of an
+    owned atom" -- the definition, computed here the slow way as a reference.
+
+    The rebuild used to compute it that way too, with a ball query returning a
+    Python list of neighbours per owned atom; at 98,304 atoms that was 2.3 s of
+    a serial host step. It now filters images through the owned atoms'
+    fractional bounding box grown by the halo, then keeps those whose nearest
+    owned atom is in range. Same set, same order, byte for byte.
+    """
+
+    @staticmethod
+    def reference(coord, cell, rcut, parts, pbc, skin):
+        from itertools import product  # noqa: PLC0415
+
+        from scipy.spatial import cKDTree  # noqa: PLC0415
+
+        mine = partition_system(coord, cell, rcut, parts, pbc, skin=skin)
+        halo = rcut + skin
+        volume = abs(np.linalg.det(cell))
+        ranges = []
+        for axis in range(3):
+            if not pbc[axis]:
+                ranges.append([0])
+                continue
+            other = [cell[i] for i in range(3) if i != axis]
+            n = int(np.ceil(halo / (volume / np.linalg.norm(np.cross(*other)))))
+            ranges.append(list(range(-n, n + 1)))
+        offsets = np.array(list(product(*ranges)), dtype=int) @ cell
+        images = (coord[None] + offsets[:, None]).reshape(-1, 3)
+        atom = np.tile(np.arange(len(coord)), len(offsets))
+        shift = np.repeat(offsets, len(coord), axis=0)
+        tree = cKDTree(images)
+        for part in mine:
+            near = tree.query_ball_point(coord[part.owned], r=halo)
+            cand = np.unique(np.concatenate([np.asarray(x, dtype=int) for x in near]))
+            self_copy = np.isin(atom[cand], part.owned) & (
+                np.abs(shift[cand]).sum(axis=1) == 0
+            )
+            ghosts = cand[~self_copy]
+            np.testing.assert_array_equal(part.ghost, atom[ghosts])
+            np.testing.assert_array_equal(part.ghost_shift, shift[ghosts])
+
+    @pytest.mark.parametrize("parts", [1, 2, 3])
+    @pytest.mark.parametrize("skin", [0.0, 2.0])
+    def test_periodic_box(self, system, parts, skin):
+        coord, _atype, cell, *_ = system
+        self.reference(np.asarray(coord), np.asarray(cell), RCUT, parts,
+                       (True, True, True), skin)
+
+    def test_unwrapped_drifted_coordinates(self, system):
+        """MD positions leave the cell; the bounding box must follow them."""
+        coord, _atype, cell, *_ = system
+        rng = np.random.default_rng(0)
+        drifted = np.asarray(coord) + rng.normal(0, 3.0, np.shape(coord)) + [30, -20, 5]
+        self.reference(drifted, np.asarray(cell), RCUT, 2, (True, True, True), 1.0)
+
+    def test_triclinic_cell(self, system):
+        coord, _atype, cell, *_ = system
+        cell = np.asarray(cell, dtype=float)
+        tilted = cell.copy()
+        tilted[1, 0] += 0.4 * cell[0, 0]
+        tilted[2, 1] += 0.3 * cell[1, 1]
+        coord = np.asarray(coord) @ np.linalg.inv(cell) @ tilted
+        self.reference(coord, tilted, RCUT, 2, (True, True, True), 1.5)
+
+    def test_non_periodic_axis(self, system):
+        coord, _atype, cell, *_ = system
+        self.reference(np.asarray(coord), np.asarray(cell), RCUT, 2,
+                       (True, True, False), 1.0)
+
+
 class TestPartitionCountInvariance:
     """The Phase A gate."""
 

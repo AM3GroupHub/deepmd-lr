@@ -360,19 +360,49 @@ def partition_system(
     images = (coord[None, :, :] + offsets[:, None, :]).reshape(-1, 3)
     image_atom = np.tile(np.arange(n_atoms), len(shifts))
     image_shift = np.repeat(offsets, n_atoms, axis=0)
-    tree = cKDTree(images)
+    # Fractional coordinates of every image, and how far a Euclidean step of
+    # `halo` can move each fractional coordinate: the distance between the
+    # planes f_j = c and f_j = c + d is d times the cell's perpendicular width
+    # along j, so no point within `halo` of x differs from it by more than
+    # `halo / width_j` in f_j.
+    image_frac = images @ inverse
+    volume = abs(np.linalg.det(cell))
+    widths = np.array(
+        [
+            volume / np.linalg.norm(np.cross(cell[(j + 1) % 3], cell[(j + 2) % 3]))
+            for j in range(3)
+        ]
+    )
+    reach = halo / widths
+    # Upper bound handed to the nearest-neighbour query. `query_ball_point`
+    # counted distances equal to `r`; `query` keeps only distances strictly
+    # below its bound, so nudge it by one ulp to keep the same boundary.
+    bound = np.nextafter(halo, np.inf)
+    own_frac = coord @ inverse
 
     partitions = []
     for p in range(n_partitions):
         owned = np.flatnonzero(owner == p)
-        # Anything within rcut of an owned atom is needed to complete that
-        # atom's neighbour shell.
-        near = tree.query_ball_point(coord[owned], r=halo)
-        candidates = (
-            np.unique(np.concatenate([np.asarray(x, dtype=int) for x in near]))
-            if len(near)
-            else np.empty(0, dtype=int)
+        # Anything within `halo` of an owned atom is needed to complete that
+        # atom's neighbour shell. Two passes, both without Python-level
+        # neighbour lists (which is what made this the slowest thing in a
+        # rebuild: millions of list objects at 98,304 atoms):
+        #   1. keep images inside the owned atoms' fractional bounding box
+        #      grown by `reach` -- a superset, by the bound above;
+        #   2. of those, keep the ones whose NEAREST owned atom is within
+        #      `halo`, which is exactly the set a ball query would return.
+        lo = own_frac[owned].min(axis=0) - reach
+        hi = own_frac[owned].max(axis=0) + reach
+        boxed = np.flatnonzero(
+            np.all((image_frac >= lo) & (image_frac <= hi), axis=1)
         )
+        if len(owned) and len(boxed):
+            nearest, _ = cKDTree(coord[owned]).query(
+                images[boxed], k=1, distance_upper_bound=bound, workers=-1
+            )
+            candidates = boxed[np.isfinite(nearest)]
+        else:
+            candidates = np.empty(0, dtype=int)
         # Drop the owned atoms' own unshifted copies; a shifted copy of an
         # owned atom is a legitimate ghost when the cell is small.
         is_self = np.isin(image_atom[candidates], owned) & (
