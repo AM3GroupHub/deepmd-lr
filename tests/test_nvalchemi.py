@@ -568,6 +568,148 @@ class TestSkinBacksOffWhenMemoryRunsOut:
         assert ev.skin_backoffs == 1
 
 
+class TestVerletCachedSearch:
+    """The neighbour search is Verlet-cached, like the halo it lives in.
+
+    A partition is rebuilt when some atom has moved half the skin. Until then
+    every pair within ``rcut`` of an owned atom is inside a list searched at
+    ``rcut + skin``, so the search does not have to run again: the topology is
+    kept and each step recomputes only the geometry -- the edge vectors, and
+    the cutoff mask over them. The search is the expensive half of a step
+    (a cell list plus eight blocking host reads), and on a compressed model it
+    is 27 to 31 % of it.
+    """
+
+    @pytest.fixture(scope="class")
+    def model(self):
+        m = build(long_range=False)
+        m.eval()
+        return m
+
+    @staticmethod
+    def _count_searches(monkeypatch):
+        from deepmd_lr.nvalchemi import driver as drv  # noqa: PLC0415
+
+        calls = {"n": 0}
+        original = drv.build_neighbor_graph_fast
+
+        def counted(*args, **kwargs):
+            calls["n"] += 1
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(drv, "build_neighbor_graph_fast", counted)
+        return calls
+
+    def test_the_search_runs_once_per_partition_per_rebuild(
+        self, system, model, monkeypatch
+    ):
+        coord, atype, cell, *_ = system
+        ev = DistributedEvaluator(
+            model, atype, cell, devices=[DEVICE] * 2, memory_headroom=None
+        )
+        calls = self._count_searches(monkeypatch)
+        ev(coord)
+        assert calls["n"] == 2, "one search per partition on the first step"
+        for _ in range(5):
+            ev(coord)
+        assert ev.rebuild_count == 1
+        assert calls["n"] == 2, "later steps must not search again"
+
+    def test_a_rebuild_searches_again(self, system, model, monkeypatch):
+        """The cache lives on the partition, so it dies when the halo does."""
+        coord, atype, cell, *_ = system
+        ev = DistributedEvaluator(
+            model, atype, cell, devices=[DEVICE], memory_headroom=None,
+            repartition_every=1,
+        )
+        calls = self._count_searches(monkeypatch)
+        for _ in range(3):
+            ev(coord)
+        assert calls["n"] == 3 and ev.rebuild_count == 3
+
+    def test_the_cached_topology_gives_the_fresh_answer(self, system, model):
+        """Moving less than half the skin must not change a single number."""
+        coord, atype, cell, *_ = system
+        fresh = DistributedEvaluator(
+            model, atype, cell, devices=[DEVICE], memory_headroom=None,
+            repartition_every=1,
+        )
+        cached = DistributedEvaluator(
+            model, atype, cell, devices=[DEVICE], memory_headroom=None
+        )
+        rng = np.random.default_rng(11)
+        positions = np.asarray(coord, dtype=np.float64)
+        for _ in range(4):
+            e_fresh, f_fresh = fresh(positions)
+            e_cached, f_cached = cached(positions)
+            assert float(e_cached) == pytest.approx(float(e_fresh), abs=1e-9)
+            np.testing.assert_allclose(
+                f_cached.cpu().numpy(), f_fresh.cpu().numpy(), atol=1e-9
+            )
+            # A drift well inside the skin: what the criterion promises covers.
+            positions = positions + rng.normal(0.0, 0.01, positions.shape)
+        assert cached.rebuild_count == 1, "the drift must not have forced a rebuild"
+
+    def test_a_partition_with_no_skin_is_never_cached(self, system, model):
+        """With no padding the list is only valid for the positions it was
+        searched at, so there is nothing to reuse."""
+        coord, atype, cell, *_ = system
+        parts = partition_system(coord, cell, RCUT, 2, (True, True, True))
+        assert all(p.skin == 0.0 for p in parts)
+        for part in parts:
+            partition_graph(
+                part, coord, atype, RCUT, DEVICE, torch.float64
+            )
+            assert part.edges_on(DEVICE) is None
+
+    def test_a_skinned_partition_caches_the_topology(self, system, model):
+        coord, atype, cell, *_ = system
+        parts = partition_system(coord, cell, RCUT, 2, (True, True, True), skin=2.0)
+        part = parts[0]
+        graph, _types, _nodes = partition_graph(
+            part, coord, atype, RCUT, DEVICE, torch.float64
+        )
+        cached = part.edges_on(DEVICE)
+        assert cached is not None
+        edge_index, keep, _n_node = cached
+        assert edge_index.shape[0] == 2
+        # The padded list is longer than what survives the cutoff, which is the
+        # whole point: those are the pairs that may come into range next step.
+        assert int(keep.sum()) >= int(graph.edge_mask.sum())
+        assert not keep.requires_grad and not edge_index.requires_grad
+
+    def test_the_cutoff_mask_matches_a_plain_search(self, system, model):
+        """Padding then masking is the same edge set, not merely a similar one.
+
+        Compared on one partition, so the node indices mean the same thing on
+        both sides: a plain search at ``rcut`` against the padded search this
+        code runs, masked back down.
+        """
+        from deepmd_lr.neighbors import build_neighbor_graph_fast  # noqa: PLC0415
+
+        coord, atype, cell, *_ = system
+        part = partition_system(
+            coord, cell, RCUT, 2, (True, True, True), skin=2.0
+        )[0]
+        graph, _t, _n = partition_graph(
+            part, coord, atype, RCUT, DEVICE, torch.float64
+        )
+        nodes = torch.as_tensor(
+            part.coordinates(np.asarray(coord, dtype=np.float64)), device=DEVICE
+        ).unsqueeze(0)
+        types = part.types_on(atype, DEVICE).unsqueeze(0)
+        plain = build_neighbor_graph_fast(nodes, types, None, RCUT)
+        plain_mask = plain.edge_mask & (plain.edge_index[1] < part.n_owned)
+
+        def pairs(edge_index, mask):
+            kept = edge_index[:, mask].t().cpu().numpy()
+            return {tuple(int(x) for x in row) for row in kept}
+
+        assert pairs(graph.edge_index, graph.edge_mask) == pairs(
+            plain.edge_index, plain_mask
+        )
+
+
 class TestGatherIsOnTheDevice:
     """One assembly path, and it ends on the gather device.
 

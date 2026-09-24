@@ -209,6 +209,42 @@ measurement: an owned-count-relative rule gives 1.2 A at eight partitions,
 which is the old fixed default and puts the step straight back into the
 rebuild-dominated regime the auto skin exists to escape.
 
+### The search is cached too
+
+The decomposition was Verlet-cached from the start; the neighbour search
+inside it was not, and ran every step for every partition. It is the expensive
+half of a step -- a cell list plus eight blocking device-to-host reads -- so
+that fixed cost is what makes more GPUs slower than fewer at small atom counts.
+
+It does not have to run. A partition is rebuilt when some atom has moved half
+the skin, and until then every pair within `rcut` of an owned atom is inside a
+list searched at `rcut + skin`. So the search happens once per rebuild, at the
+padded cutoff, and what it returns -- the integer topology and the static part
+of the mask -- is kept on the partition. Each later step recomputes only the
+geometry: the edge vectors from the current node coordinates, and the cutoff
+mask over them. The cache lives on the `Partition` object, so it is invalidated
+by the same criterion that invalidates the halo, with no second rule to keep in
+step with the first.
+
+Two details make it exact rather than nearly exact. The edge set is identical:
+a padded search masked back to `rcut` gives the same pairs as a plain search at
+`rcut`, checked directly. And an edge the cutoff drops has its vector zeroed
+rather than left long, which matches what upstream padding already does, so the
+descriptor's tables are never asked about a distance beyond the range they were
+built for.
+
+Measured on one GB10 with a compressed long-range model, against the same run
+searching every step:
+
+| atoms | searched every step | cached | saved |
+|---|---|---|---|
+| 1,536 | 17.9 ms | 12.5 ms | 30 % |
+| 5,184 | 41.2 ms | 29.1 ms | 29 % |
+| 12,288 | 92.2 ms | 67.1 ms | 27 % |
+
+Uncompressed the same saving is there but invisible, about 3 %, because the
+descriptor dominates everything else.
+
 ### Why the launch phase is single-threaded
 
 The neighbour search performs eight blocking device-to-host reads per

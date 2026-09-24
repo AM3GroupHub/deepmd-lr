@@ -62,13 +62,22 @@ class Partition:
         of the same atom are in range.
     ghost_shift
         Cartesian offset applied to each ghost, shape ``(n_ghost, 3)``.
+    skin
+        The halo padding this partition was built with. It is what makes the
+        neighbour list reusable: every pair within ``rcut`` of an owned atom
+        stays inside a list searched at ``rcut + skin`` until some atom has
+        moved ``skin / 2``, which is the same criterion that invalidates the
+        partition itself.
     """
 
     owned: np.ndarray
     ghost: np.ndarray
     ghost_shift: np.ndarray
+    skin: float = 0.0
     #: Device-resident index tensors, built once per device (see :meth:`views`).
     _views: dict = field(default_factory=dict, repr=False, compare=False)
+    #: The searched edge list per device (see :meth:`edges_on`).
+    _edges: dict = field(default_factory=dict, repr=False, compare=False)
 
     @property
     def n_owned(self) -> int:
@@ -126,6 +135,29 @@ class Partition:
             )
             self._views[key] = t
         return t
+
+    def edges_on(self, device) -> tuple | None:
+        """The cached edge list for ``device``: ``(edge_index, keep, n_node)``.
+
+        ``None`` until :meth:`cache_edges` has stored one. The cache lives on
+        the partition, so it dies exactly when the partition does -- which is
+        when the Verlet criterion says the halo is stale. There is no second
+        invalidation rule to keep in step with the first.
+        """
+        return self._edges.get(torch.device(device))
+
+    def cache_edges(self, device, edge_index, keep, n_node) -> None:
+        """Store the searched edge list for ``device``.
+
+        Only the integer topology and the static mask, never the graph object:
+        that one carries ``edge_vec``, which is an autograd leaf, and holding
+        it would pin a whole step's tape for the life of the partition.
+        """
+        self._edges[torch.device(device)] = (
+            edge_index.detach(),
+            keep.detach(),
+            n_node.detach(),
+        )
 
 
 def _image_shifts(cell: np.ndarray, pbc, rcut: float) -> np.ndarray:
@@ -365,6 +397,7 @@ def partition_system(
                 owned=owned,
                 ghost=image_atom[ghosts],
                 ghost_shift=image_shift[ghosts],
+                skin=float(skin),
             )
         )
     return partitions
