@@ -153,10 +153,11 @@ def _validated_charge_owner(
     own = {k: v for k, v in branch["long_range"]["charge_net"].items() if not k.startswith("_")}
     theirs = {k: v for k, v in base["long_range"]["charge_net"].items() if not k.startswith("_")}
     if own != theirs:
+        differing = sorted(k for k in set(own) | set(theirs) if own.get(k) != theirs.get(k))
         raise ValueError(
             f"branch {key!r}: its `charge_net` block differs from {owner!r}'s "
-            f"({sorted(set(own.items()) ^ set(theirs.items()))}). One charge head "
-            "has one configuration; write it identically on both branches."
+            f"in {differing}. One charge head has one configuration; write it "
+            "identically on both branches."
         )
     if _alpha(base["long_range"]) != _alpha(branch["long_range"]):
         raise ValueError(
