@@ -133,7 +133,7 @@ class TestIdentity:
         """Unique parameters = everything of one theory + the other theory's energy head."""
         models, wrapper, _ = build()
         n_dft = len(list(models["ttt_dft"].parameters()))
-        n_mace_fitting = len(list(models["ttt_mace"].atomic_model.fitting.parameters()))
+        n_mace_fitting = len(list(models["ttt_mace"].atomic_model.fitting_net.parameters()))
         assert len(list(wrapper.parameters())) == n_dft + n_mace_fitting
 
 
@@ -157,16 +157,16 @@ class TestGradients:
         self._clear(models)
         self._grads(models["ttt_dft"])
         assert self._has_grad(models["ttt_dft"].charge_fitting)
-        assert self._has_grad(models["ttt_dft"].atomic_model.fitting)
-        assert not self._has_grad(models["ttt_mace"].atomic_model.fitting)
+        assert self._has_grad(models["ttt_dft"].atomic_model.fitting_net)
+        assert not self._has_grad(models["ttt_mace"].atomic_model.fitting_net)
 
     def test_a_mace_batch_moves_the_shared_charges_and_the_mace_head_only(self):
         models, _, _ = build()
         self._clear(models)
         self._grads(models["ttf_mace"])
         assert self._has_grad(models["ttt_dft"].charge_fitting)  # the same object
-        assert self._has_grad(models["ttt_mace"].atomic_model.fitting)
-        assert not self._has_grad(models["ttt_dft"].atomic_model.fitting)
+        assert self._has_grad(models["ttt_mace"].atomic_model.fitting_net)
+        assert not self._has_grad(models["ttt_dft"].atomic_model.fitting_net)
 
 
 class TestPhysics:
@@ -185,7 +185,7 @@ class TestPhysics:
         # two freshly seeded energy heads with the same seed give the same short-range energy;
         # perturb one to show they are independent modules
         with torch.no_grad():
-            for p in models["ttt_mace"].atomic_model.fitting.parameters():
+            for p in models["ttt_mace"].atomic_model.fitting_net.parameters():
                 p.add_(0.01)
         b2 = models["ttt_mace"](coord, atype, box=cell)
         a2 = models["ttt_dft"](coord, atype, box=cell)
@@ -215,4 +215,4 @@ class TestRoundTrip:
         assert all(models2[k].charge_fitting is head for k in HEADS)
         for p, q in zip(models["ttt_dft"].charge_fitting.parameters(), head.parameters()):
             assert torch.equal(p, q)
-        assert models2["ttt_dft"].atomic_model.fitting is not models2["ttt_mace"].atomic_model.fitting
+        assert models2["ttt_dft"].atomic_model.fitting_net is not models2["ttt_mace"].atomic_model.fitting_net
