@@ -117,7 +117,7 @@ class TestIdentity:
         models, _, _ = build()
         dft, mace = models["ttt_dft"].atomic_model, models["ttt_mace"].atomic_model
         assert dft is not mace
-        assert dft.fitting is not mace.fitting
+        assert dft.fitting_net is not mace.fitting_net
         assert dft.out_bias.data_ptr() != mace.out_bias.data_ptr()
         # the boundary links are their theory's model
         assert models["ttf_dft"].atomic_model is dft
