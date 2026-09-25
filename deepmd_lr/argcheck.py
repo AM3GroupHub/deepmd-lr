@@ -29,6 +29,7 @@ from deepmd_lr.model.lr_model import (
     RECIPROCAL_KEY,
 )
 from deepmd_lr.same_as import (
+    CHARGE_SAME_AS_KEY,
     SAME_AS_KEY,
 )
 
@@ -107,6 +108,21 @@ def dp_lr_model_args() -> Argument:
                     "over periodic images has to differ. Such a branch may "
                     "set only `long_range`, `model_branch_alias` and `info`; "
                     "everything else is inherited."
+                ),
+            ),
+            Argument(
+                CHARGE_SAME_AS_KEY,
+                str,
+                optional=True,
+                default=None,
+                doc=(
+                    "Name of another base branch in `model_dict` whose charge "
+                    "head this branch uses. This branch keeps its own energy "
+                    "fitting net and energy zero (a different level of theory), "
+                    "but the per-atom charges -- and with them the long-range "
+                    "term, which holds no weights -- are one shared model. Both "
+                    "branches must write an identical `charge_net` block and the "
+                    "same alpha; `same_as` links of either branch follow it."
                 ),
             ),
             _long_range_args(),

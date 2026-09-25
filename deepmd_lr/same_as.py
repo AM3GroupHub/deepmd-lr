@@ -71,10 +71,15 @@ from __future__ import annotations
 import copy
 from typing import Any
 
-__all__ = ["SAME_AS_KEY", "expand_same_as", "groups", "install", "pool"]
+__all__ = ["CHARGE_SAME_AS_KEY", "SAME_AS_KEY", "charge_groups", "expand_same_as", "groups", "install", "pool"]
 
 #: The branch key that names the branch this one copies.
 SAME_AS_KEY = "same_as"
+#: ``charge_same_as``: a *base* branch (its own energy head and energy zero) that
+#: uses another base branch's charge head -- one shared charge network under two
+#: levels of theory. The long-range term holds no weights, so sharing the charge
+#: head is all it takes for both theories to see one electrostatics.
+CHARGE_SAME_AS_KEY = "charge_same_as"
 
 #: What a ``same_as`` branch may write for itself. Everything else is
 #: inherited, and writing it would be discarded by the aliasing below -- so it
@@ -90,6 +95,75 @@ _LONG_RANGE_ALLOWED = frozenset({"reciprocal", "pme"})
 def _real_keys(block: dict[str, Any]) -> set[str]:
     """Keys that configure something, ignoring ``_comment`` annotations."""
     return {key for key in block if not key.startswith("_")}
+
+
+def charge_groups(model_dict: dict[str, Any]) -> dict[str, list[str]]:
+    """Map each charge-owning base branch to every branch that must use its charge head.
+
+    The list holds the owner first, then each ``charge_same_as`` branch, then
+    the ``same_as`` links of all of those (a link is its base, so it follows its
+    base's charge head). Empty for an ordinary config.
+    """
+    out: dict[str, list[str]] = {}
+    links = groups(model_dict)
+    for key, branch in model_dict.items():
+        if not isinstance(branch, dict) or branch.get(SAME_AS_KEY):
+            # A `same_as` link is its base (after expansion it even carries the
+            # base's `charge_same_as`); it is listed through its base below.
+            continue
+        owner = branch.get(CHARGE_SAME_AS_KEY)
+        if not owner:
+            continue
+        _validated_charge_owner(model_dict, key, owner, branch)
+        members = out.setdefault(owner, [owner] + links.get(owner, [owner])[1:])
+        members.append(key)
+        members.extend(links.get(key, [key])[1:])
+    return out
+
+
+def _validated_charge_owner(
+    model_dict: dict[str, Any], key: str, owner: str, branch: dict[str, Any]
+) -> dict[str, Any]:
+    """Refuse every way a shared charge head could be built wrong."""
+    if owner == key:
+        raise ValueError(f"branch {key!r}: `{CHARGE_SAME_AS_KEY}` cannot point at itself")
+    if owner not in model_dict or not isinstance(model_dict[owner], dict):
+        raise ValueError(
+            f"branch {key!r}: `{CHARGE_SAME_AS_KEY}` names {owner!r}, which is not "
+            f"a branch. Available: {sorted(model_dict)}"
+        )
+    base = model_dict[owner]
+    if base.get(SAME_AS_KEY) or base.get(CHARGE_SAME_AS_KEY):
+        raise ValueError(
+            f"branch {key!r}: {owner!r} must be the branch that OWNS the charge "
+            f"head -- not a `{SAME_AS_KEY}` link and not itself a "
+            f"`{CHARGE_SAME_AS_KEY}` branch (no chains)."
+        )
+    if branch.get(SAME_AS_KEY):
+        raise ValueError(
+            f"branch {key!r}: a `{SAME_AS_KEY}` link inherits its base's charge "
+            f"head already; put `{CHARGE_SAME_AS_KEY}` on the base branch."
+        )
+    for name, block in ((owner, base), (key, branch)):
+        if block.get("type") != "dp_lr" or not (block.get("long_range") or {}).get("charge_net"):
+            raise ValueError(
+                f"branch {name!r}: `{CHARGE_SAME_AS_KEY}` needs a `dp_lr` branch "
+                "with a `long_range.charge_net` block on both sides."
+            )
+    own = {k: v for k, v in branch["long_range"]["charge_net"].items() if not k.startswith("_")}
+    theirs = {k: v for k, v in base["long_range"]["charge_net"].items() if not k.startswith("_")}
+    if own != theirs:
+        raise ValueError(
+            f"branch {key!r}: its `charge_net` block differs from {owner!r}'s "
+            f"({sorted(set(own.items()) ^ set(theirs.items()))}). One charge head "
+            "has one configuration; write it identically on both branches."
+        )
+    if _alpha(base["long_range"]) != _alpha(branch["long_range"]):
+        raise ValueError(
+            f"branch {key!r}: alpha differs from {owner!r}. One charge head "
+            "serves one Coulomb split."
+        )
+    return base
 
 
 def groups(model_dict: dict[str, Any]) -> dict[str, list[str]]:
@@ -322,6 +396,13 @@ def _alias_groups(wrapper: Any) -> None:
             # A plain bool: assigning a Module here would register a submodule
             # and recurse into the state dict.
             link._same_as_link = True
+    # `charge_same_as`: one charge head under several theories. Done AFTER the
+    # `same_as` aliasing so that a link that was just pointed at its base's
+    # charge head is pointed again at the owner's.
+    for owner, members in charge_groups(model_dict).items():
+        head = wrapper.model[owner].charge_fitting
+        for key in members[1:]:
+            wrapper.model[key].charge_fitting = head
 
 
 def install() -> None:

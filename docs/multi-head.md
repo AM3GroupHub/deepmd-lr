@@ -134,3 +134,22 @@ neutral-to-better per branch; if one branch is clearly worse, reweight with
 `model_prob` or train it separately — `shared_level` cannot be relaxed for
 DPA4C.
 
+
+### One charge head under two theories: `charge_same_as` (deepmd-lr-40def07-qshare, 2026-09-26)
+
+When the branches are different levels of theory but should share ONE electrostatics — the charges are a property of
+the geometry, only the short-range energy differs — put `charge_same_as: "<owner branch>"` on the borrowing base branch.
+It keeps its own `fitting_net` and energy zero; its `charge_fitting` becomes the owner's module object (aliased, not
+copied), and `same_as` links of either branch follow. Both branches must write an identical `charge_net` block and the
+same `alpha`; no chains; the owner must be a base branch. The long-range term itself holds no weights, so "sharing the
+long-range term" means only that both theories use the same `alpha`, method, mesh rule and ttt / ttf boundaries.
+
+```json
+"ttt_dft":  {"type": "dp_lr", "descriptor": "backbone", "fitting_net": {...}, "long_range": {"charge_net": {...}, "reciprocal": {...3D...}}},
+"ttf_dft":  {"same_as": "ttt_dft", "long_range": {"reciprocal": {...slab...}}},
+"ttt_mace": {"type": "dp_lr", "descriptor": "backbone", "fitting_net": {...}, "charge_same_as": "ttt_dft",
+             "long_range": {"charge_net": {...identical...}, "reciprocal": {...3D...}}},
+"ttf_mace": {"same_as": "ttt_mace", "long_range": {"reciprocal": {...slab...}}}
+```
+Tests: `tests/test_charge_same_as.py` (identity, optimizer parameter count, gradient routing per theory, state-dict
+round trip, equal charges under both theories, links differ by the slab correction only).
