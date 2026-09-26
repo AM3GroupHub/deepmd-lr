@@ -7,8 +7,8 @@ rebuilding -- and nothing else. It has no timestep, no ensemble, no
 thermostat and no velocities: those belong to whoever is integrating.
 
 Energy and forces always; the virial and stress on request, since they cost
-an extra strain leaf per partition and a second backward through the charge
-head. The ``(energy, forces)`` return signature does not change either way,
+an extra strain leaf per partition and an extra target in the charge-response
+backward. The ``(energy, forces)`` return signature does not change either way,
 so an integrator is unaffected by the choice.
 
 nvalchemiops' integrators are half-step kernels with no driver of their own,
@@ -112,7 +112,8 @@ class _LazyNumpy(dict):
     The evaluator assembles everything on the GPU; most callers read one or
     two entries per step, if any, so converting all of them eagerly would
     reintroduce the host traffic the device gather removed. 0-d tensors become
-    Python floats, matching the numpy contract of ``evaluate_partitioned``.
+    Python floats, exactly as :func:`~deepmd_lr.nvalchemi.driver.to_numpy`
+    converts them.
     """
 
     def __getitem__(self, key):
@@ -152,10 +153,11 @@ class DistributedEvaluator:
         the default, sizes it from the cell, the cutoff and the partition
         count -- see :func:`~deepmd_lr.nvalchemi.partition.default_skin`, which
         documents why a constant is the wrong answer at both ends of the size
-        range. The value actually used is :attr:`skin`, and an ``"auto"`` skin
-        is halved and capped whenever a device runs out of memory, since the
-        geometry rule cannot see how many bytes a node costs -- see
-        :meth:`_evaluate`. An explicit value is never overridden.
+        range. The value actually used is :attr:`skin`. An ``"auto"`` skin is
+        also fitted to the device, since the geometry rule cannot see how many
+        bytes a node costs: the first step measures that cost (see
+        ``memory_headroom``), and a device that runs out anyway halves and caps
+        the skin (see :meth:`_evaluate`). An explicit value is never overridden.
     repartition_every
         Force a rebuild every N calls regardless. ``None`` uses the skin
         criterion alone, which is exact rather than merely usually right.
@@ -169,7 +171,7 @@ class DistributedEvaluator:
         Also assemble the virial, exposed as :attr:`virial` (eV) and
         :attr:`stress` (eV/angstrom^3, ASE sign convention) after each call.
         Off by default because it costs an extra strain leaf per partition
-        and a second backward through the charge head.
+        and an extra target in the charge-response backward.
     efield
         Uniform external field in V/angstrom, or ``None``. Adds the response
         force ``F_ib = E_a Z_iab`` to every returned force and implies
@@ -372,7 +374,8 @@ class DistributedEvaluator:
         node costs: that is a property of the model -- an uncompressed
         descriptor holds several times what a compressed one does -- and of
         the step, so no geometric rule can predict it. Memory therefore enters
-        as a cap, set by measurement when a device actually runs out.
+        as a cap set by measurement: the first-step probe
+        (:meth:`_fit_skin_to_memory`), lowered again whenever a device runs out.
         """
         return min(
             default_skin(self.cell, self._rcut, len(self.devices)), self._skin_cap
@@ -509,8 +512,8 @@ class DistributedEvaluator:
         devices that was the difference between running and an out-of-memory,
         while the old fixed 1 A skin fitted.
 
-        Predicting the footprint instead would mean guessing bytes per node
-        for a model this class never inspects. Reacting to it needs no guess:
+        The first-step probe predicts the footprint from a measured cost per
+        node; this is the net under it, and it needs no prediction at all:
         on an out-of-memory the skin is halved, the decomposition rebuilt and
         the step retried, and the new value becomes a ceiling the geometry
         rule may not climb back over -- including through ``set_cell`` under a

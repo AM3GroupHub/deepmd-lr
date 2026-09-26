@@ -14,7 +14,8 @@ Two things are necessarily global and so happen after the gather:
   *raw* charges; the projection runs once on the assembled vector.
 - **The reciprocal sum itself**, which is a structure factor over every atom.
   This is exactly what does not survive spatial decomposition -- splitting it
-  across ranks gave 2.0% error at 2 ranks and 36.5% at 8 (see LAMMPS.md).
+  across ranks in a LAMMPS domain decomposition gave 2.0% error at 2 ranks
+  and 36.5% at 8.
 
 Devices are handled DistMLIP-style: one process, tensors moved with ``.to()``,
 no ``torch.distributed``. Passing the same device several times
@@ -223,7 +224,8 @@ def partition_graph(
     transform as a coordinate -- so straining the assembled node set is
     exact, and the strain reaches ``edge_vec`` through the coordinates rather
     than through a box. That is why the partitioned virial does not need a
-    cell-differentiable neighbour builder, unlike the serial path.
+    cell-differentiable neighbour builder -- nor does the serial path, which
+    strains its finished edge vectors instead.
 
     Returns ``(graph, node_type_flat, node_coord)``. ``node_coord`` is the
     unstrained leaf, so a backward reaches both it and the strain.
@@ -308,8 +310,8 @@ def evaluate_partitioned(
         ``energy``, ``force`` ``(N, 3)``, ``atom_energy`` ``(N,)``, and when the
         model carries a long-range term also ``charge`` ``(N,)``,
         ``energy_short_range``, ``energy_long_range``, and ``dE_dq`` ``(N,)``
-        -- the last is what Phase C backpropagates through each partition's
-        charge head.
+        -- the last is what :func:`_charge_response_force` backpropagates
+        through each partition's charge head.
     """
     rcut = float(model.get_rcut())
     coord_np = (
@@ -706,8 +708,9 @@ def _long_range_global(
 
     Returns the direct force ``-dE/dr`` at fixed charge, and ``dE/dq``. The
     remaining *charge-response* force, ``-sum_j (dE/dq_j) dq_j/dr_i``, is
-    short-ranged and is added per partition in Phase C -- taking ``dE/dq`` out
-    as a plain value here is what keeps the autograd graph on one device.
+    short-ranged and is added per partition by :func:`_charge_response_force`
+    -- taking ``dE/dq`` out as a plain value here is what keeps the autograd
+    graph on one device.
     """
     n_atoms = coord.shape[0]
     coord_t = coord.detach().reshape(1, n_atoms, 3).clone().requires_grad_(True)

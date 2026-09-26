@@ -306,7 +306,7 @@ class Thermo:
         # Imported lazily: `vec9d` lives in the one nvalchemiops module with a
         # packaging bug (`flat_virial_to_vec9` is exported but undefined), and
         # an upstream break should not take out `import deepmd_lr.nvalchemi`.
-        from nvalchemiops.dynamics.integrators import (  # noqa: PLC0415
+        from nvalchemiops.dynamics.integrators import (
             compute_pressure_tensor,
             vec9d,
         )
@@ -351,10 +351,9 @@ class Thermo:
         The first logged interval is **dropped** when there is more than one,
         because it carries kernel compilation -- on this machine that is
         ~1 s against a ~30 ms step, and a least-squares fit over all points
-        still comes out 2x high (measured). Excluding it is what the
-        benchmarks in `experiments/` do, and it is the only thing that
-        actually recovers the steady-state rate. The remaining points are then
-        fitted by least squares.
+        still comes out 2x high (measured). Excluding it is the only thing
+        that actually recovers the steady-state rate. The remaining points are
+        then fitted by least squares.
 
         This measures the loop as it actually ran, `log` included. Logging
         every step means a device synchronisation every step, and that cost is
@@ -421,7 +420,7 @@ class Thermo:
         a trajectory frame actually needs. ASE's velocity units are these
         units, so nothing is converted.
         """
-        from ase import Atoms  # noqa: PLC0415
+        from ase import Atoms
 
         return Atoms(
             symbols=self._symbols,

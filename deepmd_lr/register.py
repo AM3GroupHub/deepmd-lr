@@ -32,7 +32,7 @@ from deepmd_lr.model import (  # registers the `dp_lr` model type
 )
 
 # Unlike the three imports above, this one is not registration-by-decorator:
-# it wraps three DeePMD-kit symbols. It is called last because it imports
+# it wraps four DeePMD-kit symbols. It is called last because it imports
 # `deepmd.pt_expt.train.training`, and we are running *inside*
 # `deepmd.pt_expt.__init__`. Kept here rather than at `same_as` import time so
 # that merely importing the module -- which `argcheck` does, for one constant

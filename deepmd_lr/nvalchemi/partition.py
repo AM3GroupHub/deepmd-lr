@@ -187,13 +187,12 @@ def decomposition_grid(
     2 rcut)``: what a device has to hold is its owned block *plus* a shell of
     ghosts `rcut` deep on every side, and the shell is what does not shrink
     when the block does. Cutting one axis into thin slabs keeps the other two
-    faces full size, so at eight partitions each device held about 2.8 times
-    its share of atoms at 98,304; cutting three axes in half holds about
-    2.3 times. With a single partition, or a count that only factors one way,
-    this is the slab it always was.
+    faces full size, so at eight partitions of 98,304 atoms each device holds
+    about 2.8 times its share; cutting three axes in half, about 2.3 times. A
+    count that only factors one way -- a prime -- can only be cut into slabs.
 
     Ties -- a cube cut in two, say -- go to the grid that cuts the lowest
-    axis first, which is the axis the slab rule used to pick for a cube.
+    axis first.
     """
     n = max(int(n_partitions), 1)
     lengths = np.linalg.norm(np.asarray(cell, dtype=float).reshape(3, 3), axis=1)
@@ -322,7 +321,8 @@ def default_skin(
     the model, not the geometry -- an uncompressed descriptor holds several
     times what a compressed one does -- so
     :class:`~deepmd_lr.nvalchemi.evaluator.DistributedEvaluator` caps this
-    value by measurement instead, halving it whenever a device runs out.
+    value by measurement instead: a first-step probe of the cost per node, and
+    a halving whenever a device runs out anyway.
     """
     return skin_for_node_ratio(cell, rcut, n_partitions, 1.0 + float(tolerance))
 
@@ -390,8 +390,7 @@ def partition_system(
     # Equal-count blocks rather than equal-width: atom density is not uniform,
     # and for a slab system with vacuum equal-width would leave empty
     # partitions. Cut one axis at a time, each group by its own sort, so the
-    # counts stay equal however the density varies; with one axis cut this is
-    # exactly the stable-sort-and-split the slab rule always did.
+    # counts stay equal however the density varies.
     grid = decomposition_grid(cell, n_partitions, rcut)
     groups = [np.arange(n_atoms)]
     for axis in range(3):
@@ -408,12 +407,10 @@ def partition_system(
     for p, members in enumerate(groups):
         owner[members] = p
 
-    # No shortcut for a single partition: it still owns every atom but still
-    # needs periodic images as ghosts, because the subgraph is built
-    # non-periodically. Returning an empty halo here silently dropped every
-    # interaction across the boundary.
-
-    # Every periodic image that could reach into some partition.
+    # Every periodic image that could reach into some partition. A single
+    # partition needs them too: it owns every atom, but its subgraph is built
+    # non-periodically, so its ghosts are the only interactions across the
+    # boundary.
     halo = rcut + skin
     shifts = _image_shifts(cell, pbc, halo)
     offsets = shifts @ cell
@@ -427,9 +424,9 @@ def partition_system(
     # `halo / width_j` in f_j.
     image_frac = images @ inverse
     reach = halo / _perpendicular_widths(cell)
-    # Upper bound handed to the nearest-neighbour query. `query_ball_point`
-    # counted distances equal to `r`; `query` keeps only distances strictly
-    # below its bound, so nudge it by one ulp to keep the same boundary.
+    # Upper bound handed to the nearest-neighbour query. `query` keeps only
+    # distances strictly below its bound, so nudge it by one ulp: the halo is
+    # a closed ball, and an image at exactly `halo` is a ghost.
     bound = np.nextafter(halo, np.inf)
 
     partitions = []

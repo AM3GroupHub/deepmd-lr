@@ -113,9 +113,9 @@ def dp_lr_model_args() -> Argument:
         ],
         doc=(
             "Energy model with an explicit long-range electrostatic term "
-            "(PME or Ewald, via nvalchemi-toolkit-ops). Without a `long_range` "
-            "block "
-            "it is exactly the standard energy model."
+            "(PME or Ewald via nvalchemi-toolkit-ops, or the isolated term for "
+            "systems without a cell). Without a `long_range` block it is "
+            "exactly the standard energy model."
         ),
     )
 

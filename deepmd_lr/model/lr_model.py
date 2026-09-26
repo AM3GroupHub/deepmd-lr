@@ -32,16 +32,11 @@ for ``r -> (I + e) r``.
 
 Cost
 ----
-The charge head needs the descriptor, and the short-range path consumes and
-discards its own descriptor output, so a frame currently runs the descriptor
-twice. Correctness first: sharing one pass means giving the atomic model a
-second, non-reducible ``charge`` output, and ``init_out_stat`` sizes its bias
-and std buffers from *every* output key -- which would entangle charges with
-the out-stat and data-statistics machinery that has no charge labels. The
-carry-through itself is known to work (``fit_output_to_model_output_graph``
-does ``model_ret = dict(fit_ret.items())`` and merely skips reduction for
-non-reducible keys), so the optimization is available later if profiling says
-it matters.
+The charge head reads the descriptor features the energy head has already
+computed: ``_capturing_backbone`` records them during the energy pass, so a
+frame runs the descriptor once. A second pass, ``_predict_charges``, runs only
+when the energy path did not route through the graph lower and so left nothing
+to capture.
 """
 
 import contextlib
@@ -194,7 +189,7 @@ def _is_compressed(model) -> bool:
 
 @BaseModel.register(MODEL_TYPE)
 class LongRangeEnergyModel(EnergyModel):
-    """Energy model that will carry an explicit long-range electrostatic term.
+    """Energy model that carries an explicit long-range electrostatic term.
 
     Reached from an input file through ``model.type: "dp_lr"``. The generic
     dispatch in ``deepmd.dpmodel.model.model_factory.get_model`` ends with

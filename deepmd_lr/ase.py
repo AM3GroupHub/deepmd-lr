@@ -39,7 +39,7 @@ from deepmd_lr.compress import (
 
 __all__ = ["LongRangeCalculator", "load_model", "select_neighbor_graph_method"]
 
-#: eV/A^3 is what ASE expects for stress; DeePMD-kit reports the virial in eV.
+#: The prefix every parameter carries in a checkpoint's state dict.
 _STATE_PREFIX = "model.Default."
 
 
