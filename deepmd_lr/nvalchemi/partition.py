@@ -43,6 +43,7 @@ from scipy.spatial import (
 __all__ = [
     "Partition",
     "decomposition_grid",
+    "default_skin",
     "halo_node_ratio",
     "partition_system",
     "skin_for_node_ratio",

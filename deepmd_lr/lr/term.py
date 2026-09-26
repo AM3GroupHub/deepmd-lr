@@ -292,7 +292,6 @@ class LongRangeEnergy(torch.nn.Module):
         self.mesh_dimensions = mesh_dimensions
         self.spline_order = int(spline_order)
         self.k_cutoff = None if k_cutoff is None else float(k_cutoff)
-        self.accuracy = float(accuracy)
 
     #: This term is only defined under periodic boundary conditions.
     needs_cell = True

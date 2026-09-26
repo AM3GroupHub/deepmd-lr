@@ -59,6 +59,7 @@ __all__ = [
     "evaluate_partitioned",
     "partition_charges",
     "partition_graph",
+    "to_numpy",
 ]
 
 
@@ -273,7 +274,6 @@ def evaluate_partitioned(
     devices: list[Any] | None = None,
     pbc=(True, True, True),
     dtype=torch.float64,
-    gather_device: Any | None = None,
     partitions: list[Partition] | None = None,
     replicas: dict | None = None,
     compute_virial: bool = False,
@@ -293,8 +293,6 @@ def evaluate_partitioned(
 
     Parameters
     ----------
-    gather_device
-        Where the long-range term is evaluated. Defaults to the first device.
     partitions
         Reuse a previously built partitioning instead of rebuilding. Valid as
         long as its halo still covers every neighbour -- see the skin logic in
@@ -338,7 +336,9 @@ def evaluate_partitioned(
     if replicas is None:
         replicas = device_replicas(model, devices)
     long_range = getattr(model, "has_long_range", False)
-    home = torch.device(gather_device if gather_device is not None else devices[0])
+    # Results are assembled, and the long-range term evaluated, on the first
+    # device.
+    home = torch.device(devices[0])
     coord_t = (
         coord.detach().to(device=home, dtype=dtype)
         if isinstance(coord, torch.Tensor)

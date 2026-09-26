@@ -279,15 +279,10 @@ class Thermo:
         return self.evaluator.volume
 
     @property
-    def stress(self) -> np.ndarray | None:
-        """Stress in eV/angstrom^3, ASE's sign convention."""
-        return self.evaluator.stress
-
-    @property
     def pressure(self) -> float:
         """Isotropic pressure in eV/angstrom^3.
 
-        Native units, matching :attr:`stress` and matching what the barostat
+        Native units, matching the evaluator's ``stress`` and what the barostat
         kernels consume -- a GPa-valued property would force a conversion back
         before feeding one, in the direction where an error is silent.
         """
