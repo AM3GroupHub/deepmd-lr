@@ -289,8 +289,6 @@ class DistributedEvaluator:
         self.eps_inf = float(eps_inf)
         #: Leave ``results`` as device tensors instead of the lazy numpy view.
         self.results_on_device = bool(results_on_device)
-        #: One thread per device in the launch phase; ``None`` means on
-        #: whenever more than one device is used. See `evaluate_partitioned`.
         self.home = next(model.parameters()).device
         self.atype = np.asarray(atype, dtype=np.int64).reshape(-1)
         self.cell = np.asarray(cell, dtype=np.float64).reshape(3, 3)
@@ -531,6 +529,9 @@ class DistributedEvaluator:
         halo; forces are unaffected (2e-6 eV/A against an unconstrained run,
         which is the nondeterminism floor).
         """
+        # The retry runs after the `except` block on purpose: leaving it unbinds
+        # `exc`, which frees the failed step's traceback -- and every tensor its
+        # frames hold -- before `empty_cache()` is asked to hand memory back.
         while True:
             try:
                 return evaluate_partitioned(

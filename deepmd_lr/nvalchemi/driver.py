@@ -26,6 +26,7 @@ import contextlib
 import copy
 from typing import (
     Any,
+    NamedTuple,
 )
 
 import numpy as np
@@ -59,6 +60,18 @@ __all__ = [
     "partition_charges",
     "partition_graph",
 ]
+
+
+class _Launched(NamedTuple):
+    """What the launch phase keeps of one partition for the phases after it."""
+
+    part: Partition
+    out: dict
+    raw: torch.Tensor | None
+    node_coord: torch.Tensor
+    eps: torch.Tensor | None
+    graph: Any
+    cap: torch.Tensor | None
 
 
 def _condition_on(model, charge_spin, device, dtype) -> torch.Tensor | None:
@@ -310,17 +323,10 @@ def evaluate_partitioned(
     coord_np = (
         None if isinstance(coord, torch.Tensor) else np.asarray(coord, dtype=np.float64)
     )
-    parts = (
-        partition_system(
-            coord_np if coord_np is not None else coord.detach().cpu().numpy(),
-            cell,
-            rcut,
-            n_partitions,
-            pbc,
-        )
-        if partitions is None
-        else partitions
-    )
+    parts = partitions
+    if parts is None:
+        host = coord.detach().cpu().numpy() if coord_np is None else coord_np
+        parts = partition_system(host, cell, rcut, n_partitions, pbc)
     if devices is None:
         devices = [next(model.parameters()).device] * len(parts)
     if len(devices) != len(parts):
@@ -342,25 +348,17 @@ def evaluate_partitioned(
     force = torch.zeros((n_atoms, 3), dtype=dtype, device=home)
     atom_energy = torch.zeros(n_atoms, dtype=dtype, device=home)
     raw_charge = torch.zeros(n_atoms, dtype=dtype, device=home) if long_range else None
+    virial = torch.zeros((3, 3), dtype=dtype, device=home) if compute_virial else None
 
     # ---- launch phase -------------------------------------------------------
     # Queue every partition's work WITHOUT touching the host. A `.cpu()` here
     # would synchronise, and the partition on the next device could not start
-    # until this one finished -- which is how two GPUs end up running strictly
-    # one after the other. Kernel launches are asynchronous and each device has
-    # its own stream, so deferring the transfers is what buys the overlap.
-    #
-    # The loop is single-threaded, and deliberately. Giving each device its own
-    # thread did recover some of the overlap the neighbour search's blocking
-    # host reads take away -- 1.31x to 1.88x of an ideal 2x, on two A40s at
-    # 98,304 atoms -- but underneath it every lazily-initialised library became
-    # a race: deepmd-kit's fake-op registration, torch's CUDA linear-algebra
-    # loader, warp's kernel build. Four fixes in, a 4-GPU V100 run still lost
-    # rows, and the short-range case at 3,456 atoms went from 101 ms a step to
-    # 1612, with 12,288 atoms hanging past thirteen minutes. A modest constant
-    # factor is not worth that: one thread, in partition order.
-    launched: list = [None] * len(parts)
-    virial = torch.zeros((3, 3), dtype=dtype, device=home) if compute_virial else None
+    # until this one finished. Kernel launches are asynchronous and each device
+    # has its own stream, so a device keeps computing while the host moves on
+    # to the next partition -- except inside the neighbour search, whose
+    # blocking host reads wait for their own device. The loop is deliberately
+    # single-threaded; `docs/partitioned-md.md` records why threads were tried
+    # and removed.
     # One copy of the coordinates per device, not per partition: every
     # partition on a device reads the same full array and gathers its own rows
     # out of it, so four partitions sharing a GPU would otherwise upload the
@@ -374,8 +372,12 @@ def evaluate_partitioned(
         if dev not in coord_on:
             with _current_device(dev):
                 coord_on[dev] = coord_t.to(device=dev, dtype=dtype)
-    def launch_one(index, part, device):
-        """One partition's forward, on its own device."""
+    def launch_one(part, device) -> _Launched:
+        """One partition's forward, on its own device.
+
+        A function rather than a loop body so that each partition's captured
+        features are released when it returns, before the next one runs.
+        """
         with _current_device(device):
             local = replicas[torch.device(device)]
             condition = _condition_on(local, charge_spin, device, dtype)
@@ -448,21 +450,18 @@ def evaluate_partitioned(
                     raw = partition_charges(
                         local, graph, node_type, part.n_owned, condition
                     )
-            launched[index] = (
-                part, device, out, raw, node_coord, eps, graph, cap_edge_vec
-            )
+            return _Launched(part, out, raw, node_coord, eps, graph, cap_edge_vec)
 
-    for index, (part, device) in enumerate(zip(parts, devices, strict=True)):
-        launch_one(index, part, device)
+    launched = [
+        launch_one(part, device) for part, device in zip(parts, devices, strict=True)
+    ]
 
     # ---- gather phase -------------------------------------------------------
-    # Now synchronise. Every device has been given its work, so the transfers
-    # below wait on kernels that have been running concurrently.
-    # The transfers are device-to-device onto the gather device and the
-    # scatter-adds are device primitives, so no partition waits for the host
-    # and no GPU idles while a CPU loop runs. `.to()` between devices does not
+    # Every device has been given its work. The transfers are device-to-device
+    # onto the gather device and the scatter-adds are device primitives, so no
+    # GPU idles while a CPU loop runs. `.to()` between devices does not
     # synchronise the host; it orders on the streams.
-    for part, _device, out, raw, _node_coord, _eps, _graph, _cap in launched:
+    for part, out, raw, *_ in launched:
         v = part.views(home, dtype)
         if compute_virial:
             # Each edge survives in exactly one partition, so the per-partition
@@ -593,7 +592,7 @@ def _born_charges_partitioned(
     contributions = []
     # Launch every backward before transferring anything, for the same reason
     # the forward pass is staged.
-    for part, _device, _out, raw, _node_coord, _eps, graph, cap in launched:
+    for part, _out, raw, _node_coord, _eps, graph, cap in launched:
         with _current_device(raw.device):
             # One VJP per partition. `raw` already holds owned atoms only, and
             # every kept edge has an owned destination, so this is exactly
@@ -664,16 +663,15 @@ def _charge_response_force(
     information.
     """
     # dE_dq already differentiates through the global, possibly masked projection.
-    cotangent = dE_dq
     force = torch.zeros((n_atoms, 3), dtype=dtype, device=home)
     virial = torch.zeros((3, 3), dtype=dtype, device=home) if compute_virial else None
 
     # Launch every backward first, then transfer, for the same reason the
     # forward pass is staged: a `.cpu()` between them serialises the devices.
     gradients = []
-    for part, _device, _out, raw, node_coord, eps, graph, cap in launched:
+    for part, _out, raw, node_coord, eps, graph, cap in launched:
         with _current_device(raw.device):
-            weights = cotangent[part.views(home, dtype)["owned"]].to(
+            weights = dE_dq[part.views(home, dtype)["owned"]].to(
                 device=raw.device, dtype=raw.dtype
             )
             targets = [node_coord] if eps is None else [node_coord, eps]
@@ -726,25 +724,13 @@ def _long_range_global(
     as a plain value here is what keeps the autograd graph on one device.
     """
     n_atoms = coord.shape[0]
-    coord_t = (
-        torch.as_tensor(coord, dtype=dtype, device=device)
-        .detach()
-        .reshape(1, n_atoms, 3)
-        .clone()
-        .requires_grad_(True)
-    )
+    coord_t = coord.detach().reshape(1, n_atoms, 3).clone().requires_grad_(True)
     cell_t = torch.as_tensor(
         cell if isinstance(cell, torch.Tensor) else np.asarray(cell),
         dtype=dtype,
         device=device,
     ).reshape(1, 3, 3)
-    charge_t = (
-        torch.as_tensor(raw_charge, dtype=dtype, device=device)
-        .detach()
-        .reshape(1, n_atoms)
-        .clone()
-        .requires_grad_(True)
-    )
+    charge_t = raw_charge.detach().reshape(1, n_atoms).clone().requires_grad_(True)
 
     eps = None
     if compute_virial:
@@ -761,7 +747,8 @@ def _long_range_global(
     else:
         coord_in, cell_in = coord_t, cell_t
 
-    condition = resolve_charge_spin(model, charge_spin, 1, coord_t)
+    # Resolved once per model and device; the launch phase already validated it.
+    condition = _condition_on(model, charge_spin, device, dtype)
     total_charge = 0.0 if condition is None else condition[:, 0]
     types = torch.as_tensor(atype, dtype=torch.int64, device=device).reshape(1, -1)
     charge = project_to_total_charge(
@@ -773,15 +760,13 @@ def _long_range_global(
     grads = torch.autograd.grad(total, targets)
     grad_coord, grad_charge = grads[0], grads[1]
 
-    return {
+    out = {
         "charge": charge.reshape(-1).detach(),
         "energy_long_range": total.detach(),
         "atom_energy_long_range": atom_energy.reshape(-1).detach(),
         "force_long_range": -grad_coord.reshape(n_atoms, 3).detach(),
         "dE_dq": grad_charge.reshape(-1).detach(),
-        **(
-            {"virial_long_range": -grads[2].reshape(3, 3).detach()}
-            if eps is not None
-            else {}
-        ),
     }
+    if eps is not None:
+        out["virial_long_range"] = -grads[2].reshape(3, 3).detach()
+    return out
