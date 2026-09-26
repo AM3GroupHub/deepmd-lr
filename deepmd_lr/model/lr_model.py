@@ -316,13 +316,15 @@ class LongRangeEnergyModel(EnergyModel):
         # after a swap describes the term it actually has rather than the one
         # it was trained with.
         script = getattr(self, "model_def_script", None)
-        if script:
-            recorded = json.loads(script)
-            block = recorded.get(LONG_RANGE_KEY)
-            if block is not None:
-                block.pop(_LEGACY_RECIPROCAL_KEY, None)
-                block[RECIPROCAL_KEY] = self.long_range_energy.serialize()
-                self.model_def_script = json.dumps(recorded)
+        if not script:
+            return
+        recorded = json.loads(script)
+        block = recorded.get(LONG_RANGE_KEY)
+        if block is None:
+            return
+        block.pop(_LEGACY_RECIPROCAL_KEY, None)
+        block[RECIPROCAL_KEY] = self.long_range_energy.serialize()
+        self.model_def_script = json.dumps(recorded)
 
     @classmethod
     def get_model(cls, model_params: dict) -> "LongRangeEnergyModel":
@@ -335,7 +337,6 @@ class LongRangeEnergyModel(EnergyModel):
         :func:`get_model_components`, which owns the ``ntypes`` / ``type_map``
         / ``dim_descrpt`` injection that is easy to get subtly wrong.
         """
-        model_params_old = copy.deepcopy(model_params)
         data = copy.deepcopy(model_params)
         data.pop("type", None)
 
@@ -363,7 +364,7 @@ class LongRangeEnergyModel(EnergyModel):
             charge_fitting=charge_fitting,
             long_range_energy=long_range_energy,
         )
-        model.model_def_script = json.dumps(model_params_old)
+        model.model_def_script = json.dumps(model_params)
         return model
 
     @classmethod

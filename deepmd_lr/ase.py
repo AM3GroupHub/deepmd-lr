@@ -275,35 +275,27 @@ class LongRangeCalculator(Calculator):
             ) from exc
         return torch.tensor(indices, dtype=torch.int64, device=self.device)
 
-    def calculate(
-        self,
-        atoms: Any = None,
-        properties: list[str] | None = None,
-        system_changes: list[str] = all_changes,
-    ) -> None:
-        super().calculate(atoms, properties or ["energy"], system_changes)
-        atoms = self.atoms
+    def _check_pbc(self, atoms) -> bool:
+        """Refuse a boundary condition this model cannot evaluate.
 
-        # Only a term that actually sums over periodic images needs a cell.
-        # This check used to reject every non-periodic frame unconditionally,
-        # which was wrong twice over: a short-range model has no such
-        # requirement at all, and a slab configured as pbc=[T, T, F] is
-        # exactly what `slab_correction` exists to handle.
+        Only a term that actually sums over periodic images needs a cell. This
+        check used to reject every non-periodic frame unconditionally, which
+        was wrong twice over: a short-range model has no such requirement at
+        all, and a slab configured as pbc=[T, T, F] is exactly what
+        `slab_correction` exists to handle. Returns whether any axis is
+        periodic.
+        """
         periodic = bool(atoms.pbc.any())
-        needs_cell = (
-            self._has_long_range and self.model.long_range_energy.needs_cell
-        )
-        if needs_cell and not periodic:
-            raise ValueError(
-                "this model's long-range term uses method "
-                f"'{self.model.long_range_energy.method}', which sums over "
-                f"periodic images, but the Atoms object has pbc={atoms.pbc} "
-                "and so no cell to repeat. For an isolated molecule build the "
-                "model with `long_range.reciprocal.method: 'isolated'`."
-            )
-
         if self._has_long_range:
             term = self.model.long_range_energy
+            if term.needs_cell and not periodic:
+                raise ValueError(
+                    "this model's long-range term uses method "
+                    f"'{term.method}', which sums over "
+                    f"periodic images, but the Atoms object has pbc={atoms.pbc} "
+                    "and so no cell to repeat. For an isolated molecule build the "
+                    "model with `long_range.reciprocal.method: 'isolated'`."
+                )
             expected_pbc = term.pbc if term.needs_cell else (False, False, False)
             if not np.array_equal(atoms.pbc, expected_pbc):
                 raise ValueError(
@@ -314,6 +306,17 @@ class LongRangeCalculator(Calculator):
             raise ValueError(
                 "Partial pbc is unsupported by the short-range graph interface"
             )
+        return periodic
+
+    def calculate(
+        self,
+        atoms: Any = None,
+        properties: list[str] | None = None,
+        system_changes: list[str] = all_changes,
+    ) -> None:
+        super().calculate(atoms, properties or ["energy"], system_changes)
+        atoms = self.atoms
+        periodic = self._check_pbc(atoms)
 
         coord = torch.tensor(
             np.asarray(atoms.get_positions()),
@@ -360,12 +363,10 @@ class LongRangeCalculator(Calculator):
         # Stress is force per area, so it needs a volume to divide by. The
         # virial itself is still meaningful without a cell -- it is the pair
         # sum -- but there is nothing to normalize it against.
-        if "virial" in out and periodic and self.efield is not None:
-            # The field's own contribution to the stress is a separate
-            # derivation and is not attempted here. Reporting the field-free
-            # stress under a field would be quietly wrong, so report none.
-            pass
-        elif "virial" in out and periodic:
+        # Under a field, none: the field's own contribution to the stress is a
+        # separate derivation not attempted here, and reporting the field-free
+        # stress would be quietly wrong.
+        if "virial" in out and periodic and self.efield is None:
             virial = out["virial"].reshape(3, 3).detach().cpu().numpy()
             # ASE wants stress = -virial / volume, in Voigt order.
             stress = -virial / atoms.get_volume()
@@ -381,11 +382,8 @@ class LongRangeCalculator(Calculator):
             )
         # Diagnostics. The energy split is per-frame and reduces to a scalar;
         # charges are per-atom and keep their axis.
-        for key, name in (
-            ("energy_short_range", "energy_short_range"),
-            ("energy_long_range", "energy_long_range"),
-        ):
+        for key in ("energy_short_range", "energy_long_range"):
             if key in out:
-                self.results[name] = float(out[key].reshape(-1)[0].detach())
+                self.results[key] = float(out[key].reshape(-1)[0].detach())
         if "charge" in out:
             self.results["charges"] = out["charge"].reshape(-1).detach().cpu().numpy()

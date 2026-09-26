@@ -57,6 +57,12 @@ BUILTIN_COLUMNS = {
 DEFAULT_COLUMNS = ("step", "time", "temp", "epot", "ekin", "etot")
 
 
+def _column_header(name: str) -> str:
+    """A log column's header: its name, its unit if it has one, right-aligned."""
+    unit = BUILTIN_COLUMNS.get(name)
+    return f"{name + (f' [{unit}]' if unit else ''):>15s}"
+
+
 class Thermo:
     """MD state plus its thermodynamic report.
 
@@ -248,7 +254,7 @@ class Thermo:
     @property
     def kinetic_energy(self) -> float:
         """Total kinetic energy in eV."""
-        compute_kinetic_energy(self.velocities, self.masses, self._ke_w)
+        self.update_kinetic_energy()
         return float(self._ke_w.numpy()[0])
 
     @property
@@ -259,7 +265,7 @@ class Thermo:
         motion was removed -- which :meth:`maxwell_boltzmann` does. Set
         velocities by hand and the report is biased by ``3/(3N-3)``.
         """
-        compute_kinetic_energy(self.velocities, self.masses, self._ke_w)
+        self.update_kinetic_energy()
         compute_temperature(self._ke_w, self._temp_w, self.natoms)
         return float(self._temp_w.numpy()[0]) / kB
 
@@ -467,12 +473,7 @@ class Thermo:
                 f"{self.row_names}. The rows are a table; keep them aligned."
             )
         if not self._header_written:
-            def _head(n: str) -> str:
-                unit = BUILTIN_COLUMNS.get(n)
-                return f"{n + (f' [{unit}]' if unit else ''):>15s}"
-
-            head = "".join(_head(n) for n in names)
-            self._emit(head)
+            self._emit("".join(_column_header(n) for n in names))
             self._header_written = True
 
         self._clock.append((step, time.perf_counter()))

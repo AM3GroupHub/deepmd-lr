@@ -424,7 +424,7 @@ class DistributedEvaluator:
         self._partitions = partition_system(
             tracked.cpu().numpy(),
             self.cell,
-            float(self.model.get_rcut()),
+            self._rcut,
             len(self.devices),
             pbc=(True, True, True),
             skin=self.skin,
