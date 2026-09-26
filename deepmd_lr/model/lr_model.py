@@ -151,6 +151,47 @@ def _strip_comments(block: dict) -> dict:
     return {k: v for k, v in block.items() if not k.startswith("_comment")}
 
 
+def _symmetric_strain(dtype, device, batch: tuple[int, ...] = ()):
+    """A strain leaf ``eps`` and the transform ``I + sym(eps)`` it defines.
+
+    ``eps`` is the leaf a virial differentiates with respect to; only its
+    symmetric part acts, so a rotation cannot masquerade as stress. ``batch``
+    prepends frame axes: ``()`` for one ``(3, 3)`` strain, ``(nf,)`` for one per
+    frame.
+    """
+    eps = torch.zeros((*batch, 3, 3), dtype=dtype, device=device, requires_grad=True)
+    identity = torch.eye(3, dtype=dtype, device=device).expand(*batch, 3, 3)
+    return eps, identity + 0.5 * (eps + eps.transpose(-1, -2))
+
+
+def _run_backbone(model, graph, atype_flat, charge_spin):
+    """Run ``model``'s descriptor on ``graph``: ``(features, rot_mat)``.
+
+    The charge head must see the SAME frame conditioning as the energy head,
+    or the two descriptor passes disagree about what system they are
+    describing. Gated on the descriptor's own capability, exactly as
+    ``DPAtomicModel.forward_atomic_graph`` gates it -- only the DPA4 family
+    accepts the keyword, and ``dp_lr`` allows any descriptor.
+    """
+    descriptor = model.atomic_model.descriptor
+    kwargs = (
+        {"charge_spin": charge_spin}
+        if model.atomic_model.supports_charge_spin
+        else {}
+    )
+    return descriptor.call_graph(
+        graph,
+        atype_flat,
+        type_embedding=descriptor.graph_type_embedding_table(),
+        **kwargs,
+    )
+
+
+def _is_compressed(model) -> bool:
+    """Whether ``model``'s descriptor is running from compressed tables."""
+    return bool(getattr(model.atomic_model.descriptor, "compress", False))
+
+
 @BaseModel.register(MODEL_TYPE)
 class LongRangeEnergyModel(EnergyModel):
     """Energy model that will carry an explicit long-range electrostatic term.
@@ -379,7 +420,7 @@ class LongRangeEnergyModel(EnergyModel):
         why it is not applied to the coordinates and cell before.
         """
         descriptor = self.atomic_model.descriptor
-        if getattr(descriptor, "compress", False):
+        if _is_compressed(self):
             # At DP_CUDA_INFER=1 the compressed branch lives inside
             # `call_graph`, so the energy pass is always captured and this
             # second pass never runs. Reaching it means the capture was
@@ -416,34 +457,11 @@ class LongRangeEnergyModel(EnergyModel):
             graph.edge_vec = torch.einsum(
                 "eab,eb->ea", strain[frame_of_edge], graph.edge_vec
             )
-        atype_flat = atype.reshape(-1)
-        # The charge head must see the SAME frame conditioning as the energy
-        # head, or the two descriptor passes disagree about what system they
-        # are describing. Gated on the descriptor's own capability, exactly as
-        # `DPAtomicModel.forward_atomic_graph` gates it -- only the DPA4
-        # family accepts the keyword, and `dp_lr` allows any descriptor.
-        charge_spin_kwargs = (
-            {"charge_spin": charge_spin}
-            if self.atomic_model.supports_charge_spin
-            else {}
-        )
-        gg, rot_mat = descriptor.call_graph(
-            graph,
-            atype_flat,
-            type_embedding=descriptor.graph_type_embedding_table(),
-            **charge_spin_kwargs,
-        )
-        raw = self.charge_fitting.call_graph(gg, atype_flat, gr=rot_mat)["charge"]
-        raw = raw.reshape(coord.shape[0], coord.shape[1])
-
-        # Column 0 of charge_spin is the frame's total charge; absent it, the
-        # frame is assumed neutral, which is the common case in training data.
-        total = (
-            charge_spin[:, 0].to(raw.dtype)
-            if charge_spin is not None
-            else torch.zeros(raw.shape[0], dtype=raw.dtype, device=raw.device)
-        )
-        return project_to_total_charge(raw, total, mask=mask)
+        gg, rot_mat = _run_backbone(self, graph, atype.reshape(-1), charge_spin)
+        # The same head and projection a captured backbone goes through. Column
+        # 0 of charge_spin is the frame's total charge; absent it, the frame is
+        # assumed neutral, the common case in training data.
+        return self._charges_from_features(gg, rot_mat, atype, charge_spin, mask)
 
     @contextlib.contextmanager
     def _capturing_backbone(self) -> Any:
@@ -585,11 +603,7 @@ class LongRangeEnergyModel(EnergyModel):
         # force differentiable with respect to them.
         base_coord = coord.detach().reshape(nf, nloc, 3)
         base_box = None if box is None else box.detach().reshape(nf, 3, 3)
-        eps = torch.zeros(
-            (nf, 3, 3), dtype=dtype, device=device, requires_grad=True
-        )
-        sym = 0.5 * (eps + eps.transpose(-1, -2))
-        strain = torch.eye(3, dtype=dtype, device=device).expand(nf, 3, 3) + sym
+        eps, strain = _symmetric_strain(dtype, device, batch=(nf,))
 
         leaf_coord = base_coord.clone().requires_grad_(True)
         # Row vectors: r' = r (I + eps)^T, and the cell rows transform alike.
@@ -669,7 +683,7 @@ class LongRangeEnergyModel(EnergyModel):
             # Fallback: run the backbone again on our own strained graph. Used
             # when the energy path did not route through the graph lower, so
             # nothing was captured.
-            if getattr(self.atomic_model.descriptor, "compress", False):
+            if _is_compressed(self):
                 # Compressed inference is defined only on the captured route;
                 # the fallback would rebuild a CSR-less graph and run the
                 # uncompressed math while the model still claims otherwise.
@@ -880,7 +894,7 @@ class LongRangeEnergyModel(EnergyModel):
             self._refuse_export(
                 "The graph-lower interface (DeepPot, `dp test`, compiled training)"
             )
-        if getattr(self.atomic_model.descriptor, "compress", False):
+        if _is_compressed(self):
             if not _kernel_available():
                 raise RuntimeError(_NO_KERNEL)
             # Level before CSR: at level 0 upstream builds no CSR at all, so

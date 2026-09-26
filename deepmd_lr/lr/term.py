@@ -111,6 +111,22 @@ from nvalchemiops.torch.interactions.electrostatics.slab import (
     compute_slab_correction,
 )
 
+#: Ewald's default truncation: ``exp(-k^2 / 4 alpha^2)`` falls to this at
+#: ``k_cutoff``.
+DEFAULT_ACCURACY = 1e-6
+
+
+def _check_inputs(coord: torch.Tensor, charge: torch.Tensor) -> None:
+    """Refuse coordinates and charges whose shapes do not describe frames."""
+    if coord.ndim != 3 or coord.shape[-1] != 3:
+        raise ValueError(f"coord must have shape (nf, nloc, 3), got {coord.shape}")
+    if charge.shape != coord.shape[:2]:
+        raise ValueError(
+            f"charge must have shape (nf, nloc) = {coord.shape[:2]}, "
+            f"got {charge.shape}"
+        )
+
+
 #: Highest B-spline interpolation order nvalchemiops computes correctly.
 #:
 #: At order >= 7 ``pme_reciprocal_space`` silently drops the entire
@@ -172,7 +188,7 @@ class LongRangeEnergy(torch.nn.Module):
         mesh_dimensions: tuple[int, int, int] | list[int] | None = None,
         spline_order: int = DEFAULT_SPLINE_ORDER,
         k_cutoff: float | None = None,
-        accuracy: float = 1e-6,
+        accuracy: float = DEFAULT_ACCURACY,
         slab_correction: bool = False,
         pbc: tuple[bool, bool, bool] | list[bool] | None = None,
         **kwargs: Any,
@@ -215,7 +231,7 @@ class LongRangeEnergy(torch.nn.Module):
             for name, value in (("k_cutoff", k_cutoff),)
             if value is not None
         ]
-        if accuracy != 1e-6:
+        if accuracy != DEFAULT_ACCURACY:
             supplied_ewald.append("accuracy")
 
         if method == "ewald" and supplied_pme:
@@ -374,13 +390,7 @@ class LongRangeEnergy(torch.nn.Module):
                 "boundary conditions; for an isolated system use a real-space "
                 "Coulomb or DSF term instead."
             )
-        if coord.ndim != 3 or coord.shape[-1] != 3:
-            raise ValueError(f"coord must have shape (nf, nloc, 3), got {coord.shape}")
-        if charge.shape != coord.shape[:2]:
-            raise ValueError(
-                f"charge must have shape (nf, nloc) = {coord.shape[:2]}, "
-                f"got {charge.shape}"
-            )
+        _check_inputs(coord, charge)
 
         nf, nloc = coord.shape[0], coord.shape[1]
         cell = box.reshape(nf, 3, 3)
@@ -531,7 +541,7 @@ class IsolatedLongRangeEnergy(torch.nn.Module):
         mesh_dimensions: tuple[int, int, int] | list[int] | None = None,
         spline_order: int = DEFAULT_SPLINE_ORDER,
         k_cutoff: float | None = None,
-        accuracy: float = 1e-6,
+        accuracy: float = DEFAULT_ACCURACY,
         slab_correction: bool = False,
         pbc: tuple[bool, bool, bool] | list[bool] | None = None,
         **kwargs: Any,
@@ -553,7 +563,7 @@ class IsolatedLongRangeEnergy(torch.nn.Module):
                 ("mesh_dimensions", mesh_dimensions, None),
                 ("spline_order", spline_order, DEFAULT_SPLINE_ORDER),
                 ("k_cutoff", k_cutoff, None),
-                ("accuracy", accuracy, 1e-6),
+                ("accuracy", accuracy, DEFAULT_ACCURACY),
                 ("slab_correction", slab_correction, False),
                 ("pbc", pbc, None),
             )
@@ -615,15 +625,7 @@ class IsolatedLongRangeEnergy(torch.nn.Module):
             Per-atom energy in eV, shape ``(nf, nloc, 1)``.
         """
         del box
-        if coord.ndim != 3 or coord.shape[-1] != 3:
-            raise ValueError(
-                f"coord must have shape (nf, nloc, 3), got {coord.shape}"
-            )
-        if charge.shape != coord.shape[:2]:
-            raise ValueError(
-                f"charge must have shape (nf, nloc) = {coord.shape[:2]}, "
-                f"got {charge.shape}"
-            )
+        _check_inputs(coord, charge)
 
         nf, nloc = coord.shape[0], coord.shape[1]
         q = charge if mask is None else charge * mask.to(charge.dtype)

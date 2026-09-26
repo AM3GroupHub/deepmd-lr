@@ -52,6 +52,7 @@ from deepmd_lr.compress import (
     compress_model,
 )
 from deepmd_lr.nvalchemi.driver import (
+    _to_host,
     device_replicas,
     evaluate_partitioned,
 )
@@ -117,8 +118,7 @@ class _LazyNumpy(dict):
     def __getitem__(self, key):
         value = dict.__getitem__(self, key)
         if isinstance(value, torch.Tensor):
-            value = value.detach()
-            value = float(value) if value.ndim == 0 else value.cpu().numpy()
+            value = _to_host(value)
             dict.__setitem__(self, key, value)
         return value
 

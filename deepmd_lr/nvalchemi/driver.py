@@ -31,20 +31,23 @@ from typing import (
 
 import numpy as np
 import torch
-from deepmd.dpmodel.utils.neighbor_graph import (
-    segment_sum,
-)
 from deepmd.dpmodel.utils.neighbor_graph.csr import (
     attach_edge_csr,
 )
 
 from deepmd_lr.born import (
+    edge_born_response,
     screening_factor,
 )
 from deepmd_lr.fitting.charge import (
     charge_mask,
     project_to_total_charge,
     resolve_charge_spin,
+)
+from deepmd_lr.model.lr_model import (
+    _is_compressed,
+    _run_backbone,
+    _symmetric_strain,
 )
 from deepmd_lr.neighbors import (
     build_neighbor_graph_fast,
@@ -174,8 +177,7 @@ def partition_charges(model, graph, node_type, n_owned: int, charge_spin=None):
     The projection is deliberately NOT applied -- it is a global constraint,
     handled once the partitions are assembled.
     """
-    descriptor = model.atomic_model.descriptor
-    if getattr(descriptor, "compress", False):
+    if _is_compressed(model):
         # Compressed inference is defined only on the captured route: this
         # second pass would run the uncompressed math on a CSR-less graph
         # while the model still claims to be compressed.
@@ -184,15 +186,7 @@ def partition_charges(model, graph, node_type, n_owned: int, charge_spin=None):
             "shared-backbone capture should have been taken. Check "
             "DP_CUDA_INFER (it must be exactly 1)."
         )
-    charge_spin_kwargs = (
-        {"charge_spin": charge_spin} if model.atomic_model.supports_charge_spin else {}
-    )
-    features, rot_mat = descriptor.call_graph(
-        graph,
-        node_type,
-        type_embedding=descriptor.graph_type_embedding_table(),
-        **charge_spin_kwargs,
-    )
+    features, rot_mat = _run_backbone(model, graph, node_type, charge_spin)
     raw = model.charge_fitting.call_graph(features, node_type, gr=rot_mat)["charge"]
     return raw.reshape(-1)[:n_owned]
 
@@ -386,12 +380,7 @@ def evaluate_partitioned(
             # so per-device leaves and summed gradients are equivalent.
             eps = strain = None
             if compute_virial:
-                eps = torch.zeros(
-                    (3, 3), dtype=dtype, device=device, requires_grad=True
-                )
-                strain = torch.eye(3, dtype=dtype, device=device) + 0.5 * (
-                    eps + eps.transpose(-1, -2)
-                )
+                eps, strain = _symmetric_strain(dtype, device)
             # `requires_grad` only when the charge-response backward will need it.
             graph, node_type, node_coord = partition_graph(
                 part,
@@ -405,7 +394,7 @@ def evaluate_partitioned(
             )
             n_node, n_local = part.counts_on(device)
 
-            if getattr(local.atomic_model.descriptor, "compress", False):
+            if _is_compressed(local):
                 # The compressed kernel needs the destination CSR views, attached
                 # AFTER the ownership mask: `build_edge_csr` routes masked edges
                 # into a padding segment using the mask it is shown, so attaching
@@ -548,14 +537,15 @@ def to_numpy(result: dict) -> dict:
     driver assembles and returns on the device, so a step that never reads a
     result on the host never pays for one.
     """
-    out = {}
-    for key, value in result.items():
-        if isinstance(value, torch.Tensor):
-            value = value.detach()
-            out[key] = float(value) if value.ndim == 0 else value.cpu().numpy()
-        else:
-            out[key] = value
-    return out
+    return {key: _to_host(value) for key, value in result.items()}
+
+
+def _to_host(value):
+    """A tensor as numpy -- a 0-d one as a Python float; anything else as is."""
+    if not isinstance(value, torch.Tensor):
+        return value
+    value = value.detach()
+    return float(value) if value.ndim == 0 else value.cpu().numpy()
 
 
 def _born_charges_partitioned(
@@ -603,15 +593,11 @@ def _born_charges_partitioned(
             # only the differentiation target changes.
             leaf = cap if cap is not None else graph.edge_vec
             (g,) = torch.autograd.grad(raw.sum(), leaf, retain_graph=True)
-            # Defensive: `partition_graph` masked ghost-destination edges before
-            # the descriptor ran, so those gradients are already identically zero.
-            g = g * graph.edge_mask[:, None].to(g.dtype)
-            outer = graph.edge_vec.detach()[:, :, None] * g[:, None, :]
-            src = graph.edge_index[0].to(torch.int64)
-            dst = graph.edge_index[1].to(torch.int64)
-            node = 0.5 * (
-                segment_sum(outer, dst, part.n_node)
-                - segment_sum(outer, src, part.n_node)
+            # The mask is defensive: `partition_graph` masked ghost-destination
+            # edges before the descriptor ran, so those gradients are zero.
+            node = edge_born_response(
+                g, graph.edge_vec.detach(), graph.edge_index, graph.edge_mask,
+                part.n_node,
             )
             contributions.append((part, node))
 
@@ -737,10 +723,7 @@ def _long_range_global(
         # Strain coordinates and cell together; the reciprocal sum is
         # evaluated on one device, so this is the same construction the
         # serial model uses.
-        eps = torch.zeros((3, 3), dtype=dtype, device=device, requires_grad=True)
-        strain = torch.eye(3, dtype=dtype, device=device) + 0.5 * (
-            eps + eps.transpose(-1, -2)
-        )
+        eps, strain = _symmetric_strain(dtype, device)
         transform = strain.transpose(-1, -2).unsqueeze(0)
         coord_in = torch.bmm(coord_t, transform)
         cell_in = torch.bmm(cell_t, transform)

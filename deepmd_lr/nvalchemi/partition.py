@@ -156,18 +156,26 @@ def _image_shifts(cell: np.ndarray, pbc, rcut: float) -> np.ndarray:
     than assumed to be +-1: a thin cell needs more images, and silently
     missing one would drop real neighbours.
     """
-    volume = abs(np.linalg.det(cell))
+    widths = _perpendicular_widths(cell)
     ranges = []
     for axis in range(3):
         if not pbc[axis]:
             ranges.append([0])
             continue
-        other = [cell[i] for i in range(3) if i != axis]
-        area = np.linalg.norm(np.cross(*other))
-        width = volume / area  # perpendicular width along this axis
-        n = int(np.ceil(rcut / width))
+        n = int(np.ceil(rcut / widths[axis]))
         ranges.append(list(range(-n, n + 1)))
     return np.array(list(product(*ranges)), dtype=int)
+
+
+def _perpendicular_widths(cell: np.ndarray) -> np.ndarray:
+    """The cell's width perpendicular to each pair of faces: ``V / |a_j x a_k|``."""
+    volume = abs(np.linalg.det(cell))
+    return np.array(
+        [
+            volume / np.linalg.norm(np.cross(cell[(j + 1) % 3], cell[(j + 2) % 3]))
+            for j in range(3)
+        ]
+    )
 
 
 def decomposition_grid(
@@ -418,19 +426,11 @@ def partition_system(
     # along j, so no point within `halo` of x differs from it by more than
     # `halo / width_j` in f_j.
     image_frac = images @ inverse
-    volume = abs(np.linalg.det(cell))
-    widths = np.array(
-        [
-            volume / np.linalg.norm(np.cross(cell[(j + 1) % 3], cell[(j + 2) % 3]))
-            for j in range(3)
-        ]
-    )
-    reach = halo / widths
+    reach = halo / _perpendicular_widths(cell)
     # Upper bound handed to the nearest-neighbour query. `query_ball_point`
     # counted distances equal to `r`; `query` keeps only distances strictly
     # below its bound, so nudge it by one ulp to keep the same boundary.
     bound = np.nextafter(halo, np.inf)
-    own_frac = coord @ inverse
 
     partitions = []
     for p in range(n_partitions):
@@ -443,8 +443,8 @@ def partition_system(
         #      grown by `reach` -- a superset, by the bound above;
         #   2. of those, keep the ones whose NEAREST owned atom is within
         #      `halo`, which is exactly the set a ball query would return.
-        lo = own_frac[owned].min(axis=0) - reach
-        hi = own_frac[owned].max(axis=0) + reach
+        lo = frac[owned].min(axis=0) - reach
+        hi = frac[owned].max(axis=0) + reach
         boxed = np.flatnonzero(
             np.all((image_frac >= lo) & (image_frac <= hi), axis=1)
         )
