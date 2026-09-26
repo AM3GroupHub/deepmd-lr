@@ -125,9 +125,8 @@ Pad the cell the same way you padded it for training.
 
 ## Caveats
 
-- **34 frames trains nothing.** Scale-up paths on the same physics:
-  `experiments/lifsi/` (300 frames, 6520 atoms, real DFT-quality labels) is
-  the production set this example is a miniature of.
+- **34 frames trains nothing.** This is a miniature of a production set of
+  300 frames of 6520 atoms with DFT-quality labels, which is not shipped here.
 - The harmonic wall in the source energies is an artifact of how the
   trajectory was generated, not physics you want a model to learn. It is
   another reason to treat the numbers here as illustrative only.

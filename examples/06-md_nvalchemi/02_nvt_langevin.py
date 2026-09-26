@@ -11,9 +11,9 @@ relaxation time is `1/friction` of those:
     friction 0.1   ->   102 fs      the default here
     friction 0.5   ->    20 fs      very strong; perturbs dynamics
 
-Start from a lattice like the one below and the first few hundred fs are
-equilibration, not sampling -- the artificial structure dumps potential energy
-into heat faster than a weak thermostat removes it.
+Start from a poorly equilibrated structure and the first few hundred fs are
+equilibration, not sampling -- the excess potential energy turns into heat
+faster than a weak thermostat removes it.
 
     python 02_nvt_langevin.py --model ../../path/to/model.ckpt.pt
 """

@@ -54,15 +54,17 @@ At the default 0.01 the graft is continuous and the head is alive:
 | grafted init  | 0.0002 eV | 4.1e-03 | 0.168 eV/Å |
 | after stage 3 | 0.0492 eV | 8.7e-02 | 0.175 eV/Å |
 
-### EMA is on by default
+### EMA is always on
 
-`dp_lr` training keeps an exponential moving average of the parameters,
+Training keeps an exponential moving average of the parameters,
 `ema = 0.999 * ema + 0.001 * param` after every optimizer step, and writes it
 next to the live checkpoint as `model_ema.ckpt-<step>.pt` (pointer
-`model_ema.ckpt.pt`). The plugin sets `"enable_ema": true, "ema_decay": 0.999`
-in `training` whenever the model is `dp_lr` and you have not written
-`enable_ema` yourself — an explicit `false` is respected, and so is your own
-decay. Plain DeePMD-kit runs are untouched.
+`model_ema.ckpt.pt`). While the plugin is installed this is enforced for every
+training run, `dp_lr` or a plain DeePMD-kit model alike: `enable_ema` is set to
+`true` even when the input says `false`. `ema_decay` defaults to 0.999, and a
+decay you write yourself is kept. The change is applied to a copy of the raw
+input before normalization, so the saved `out.json` shows what actually ran;
+your input file is not rewritten.
 
 Why: the default loss schedule weights forces a thousand times more than
 energy at the start and hands the weight to energy as the learning rate
@@ -81,11 +83,11 @@ What to know:
 - **A new run is a new average.** `--init-model` (Plan B's stage 3, a graft,
   a fine-tune) drops the previous accumulator and starts averaging from the
   loaded weights; only `--restart` continues it.
-- **Short runs: turn it off.** After 200 steps the snapshot is still 82 %
-  initial weights. Below a few thousand steps set `"enable_ema": false`, or
-  use a smaller decay (0.99 averages ~100 steps).
-- DeePMD-kit supports EMA only for `zero_stage < 2`; the default is not
-  applied otherwise.
+- **Short runs: shorten the window.** After 200 steps a 0.999 average is still
+  82 % initial weights. EMA cannot be switched off, so below a few thousand
+  steps use a smaller decay: 0.99 averages ~100 steps.
+- **`zero_stage >= 2` is refused.** DeePMD-kit supports EMA only for
+  `zero_stage < 2`, and the plugin raises rather than train without it.
 
 The examples write both keys explicitly so a reader sees what will run.
 
@@ -159,7 +161,7 @@ drift.
 | Energies fine, forces bad | `alpha`/mesh mismatch | check the mesh resolves `1/(2·alpha)` |
 | CUDA OOM during statistics | `data_stat_nbatch` default of 10 on large frames | set `data_stat_nbatch: 1` in the model block |
 | `RuntimeError: compression needs the compiled operator ...` | the PyPI wheel has no `dpa4c_graph_compress` kernel | [build the CUDA operators](compression.md#building-the-cuda-operators), or drop `compress=` |
-| `RuntimeError: DP_CUDA_INFER=2 on a compressed model` | level 2 bypasses `call_graph` and the shared backbone | `export DP_CUDA_INFER=1` |
+| `RuntimeError: DP_CUDA_INFER=2 selects the fused energy/force kernel ...` when compressing, or `DP_CUDA_INFER=2 on a compressed model` at run time | level 2 bypasses `call_graph` and the shared backbone | `export DP_CUDA_INFER=1` |
 | `RuntimeError: ... needs the destination CSR views` | a hand-built graph reached a compressed model | build it with `with_csr=True`, or `attach_edge_csr` |
 | `ValueError: charge_spin ... differs from the state ... folded into the compressed tables` | the run's condition is not the one compressed with | pass that `charge_spin` to the calculator/evaluator, which folds it in |
 | `NotImplementedError: The graph-lower interface (DeepPot, dp test, ...)` | a long-range checkpoint evaluated through DeepPot/`dp test` | use `LongRangeCalculator` or the nvalchemi evaluator; only they see the cell |

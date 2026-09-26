@@ -20,7 +20,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest", "pytest-cov", "torch-pme==0.3.2"]
+test = ["pytest", "pytest-cov"]
 
 # The hook that makes a fork unnecessary: deepmd/pt_expt/__init__.py calls
 # load_entry_point("deepmd.pt_expt"), so this runs at backend import and our

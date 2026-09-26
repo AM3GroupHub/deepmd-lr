@@ -18,13 +18,11 @@ model.ckpt*
 out.json
 input_v2_compat.json
 
-# Data. Datasets are never vendored: each example's README says how to rebuild
-# them. Tracking a bare type.raw without its set.000/*.npy just leaves a
-# confusing fragment in a fresh clone.
+# Data. Datasets are never vendored. Tracking a bare type.raw without its
+# set.000/*.npy just leaves a confusing fragment in a fresh clone.
 *.npy
 *.hdf5
 *.h5
-experiments/water_real/data
 
 # Tool caches
 .pytest_cache/
@@ -39,25 +37,16 @@ warp_cache/
 .idea/
 .DS_Store
 
-# The example is kept local, not vendored: it points at datasets and
-# checkpoints that live outside the repo. No trailing slash -- `data` and
-# `run` there are usually symlinks to scratch, and a `dir/` pattern matches
-# only real directories.
-PLAN.md
-
-# Experiment data and run directories. Scoped deliberately: a bare
-# `experiments/` here once swallowed the whole tree, so new analysis scripts
-# were silently unaddable while already-tracked ones kept working.
+# Experiment scripts, data and run directories stay local.
 experiments/
 
-# Uploaded trajectories and anything derived from them. The LiFSI xyz alone
-# is 3.1 GB; examples/README.md says how to rebuild the dataset from it.
+# Uploaded trajectories and anything derived from them; the LiFSI xyz alone
+# is 3.1 GB.
 *.xyz
 *.traj
 
-# ...except the two example datasets, which are small and deliberate. Each is
-# a few hundred KB to 1.6 MB, and shipping them is what makes those examples
-# runnable rather than merely readable. Everything else stays unvendored.
+# ...except the small, deliberate example structures, which are what makes
+# those examples runnable rather than merely readable.
 !examples/02-molecules/*.xyz
 !examples/03-slab/*.xyz
 !examples/06-md_nvalchemi/*.xyz

@@ -28,7 +28,7 @@ checking in your own data before anything else:
 
 - **Every frame holds the same atoms in the same order.** That is what lets the
   whole trajectory be *one* DeePMD system. If your file mixes species or atom
-  counts, it must be split first — see `examples/02-*` if present, or
+  counts, it must be split first — see [`02-molecules`](../02-molecules), or
   `scripts/xyz_to_deepmd.py`, which refuses such a file with a clear message
   rather than writing a silently wrong `type.raw`.
 - **The cell is fixed and fully periodic.** No `nopbc`, no slab correction.
@@ -72,8 +72,8 @@ extension guess, `--index` subsamples, e.g. `--index ::5`).
 
 ```
 data/train/
-  type.raw          192 lines: 0 0 0 ... 1 1 1     <- LOCAL indices
-  type_map.raw      H O                            <- what those indices mean
+  type.raw          192 lines: 1 1 ... 8 8 8       <- atomic numbers
+  type_map.raw      X H He Li ... Og (119 entries) <- what those indices mean
   set.000/
     coord.npy   (544, 576)    = (nframes, natoms*3)
     force.npy   (544, 576)
@@ -83,10 +83,11 @@ data/train/
 
 Three things here trip people up:
 
-**`type.raw` is local, not global.** Its integers index *this system's*
-`type_map.raw`, not the model's `type_map`. DeePMD-kit remaps them at load
-time. That is what lets a water system (`[H, O]`) and an electrolyte system
-(`[C, F, H, Li, N, O, S]`) share one model without renumbering anything.
+**`type.raw` indexes this system's `type_map.raw`**, not the model's
+`type_map`; DeePMD-kit remaps them at load time. With the full-table default
+the two coincide, so an index is the atomic number everywhere. Converted with
+`--type-map present`, a system's indices are local to its own short map and
+the remap is what lets different systems share one model.
 
 **`box.npy` present ⇔ periodic.** For an isolated molecule there is no
 `box.npy` and instead an empty file named `nopbc`, whose presence makes the
@@ -170,10 +171,9 @@ dp --pt-expt train input.json
 Measured here: **0.16 s/batch**, so the configured 200,000 steps is about
 **9 hours** on one GPU.
 
-To warm-start from a pretrained DPA4C instead, see the repository README —
-note that
-`--finetune` refits the energy bias to your data at startup, which is a
-separate decision from training itself.
+To warm-start from a pretrained DPA4C instead, note that `--finetune` refits
+the energy bias to your data at startup, which is a separate decision from
+training itself.
 
 ## Step 5 — what to watch in `lcurve.out`
 
@@ -189,7 +189,8 @@ step  rmse_val  rmse_trn  rmse_e_val  rmse_e_trn  rmse_f_val  rmse_f_trn  lr
 - **Watch the charges.** The long-range term is only as meaningful as the
   charges feeding it. If `mean|q|` collapses toward zero, the model has learned
   to switch the term off rather than use it, and you have paid for it without
-  benefit. "What to watch" in the repository README covers how to check.
+  benefit. ["What to watch"](../../docs/training.md#what-to-watch) covers how
+  to check.
 
 ## Is the long-range term earning its place?
 

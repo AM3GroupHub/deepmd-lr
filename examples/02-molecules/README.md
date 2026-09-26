@@ -70,17 +70,18 @@ still one system.
 ```
 data/C1H1O4S2/train/
   nopbc                       <- empty marker; there is NO box.npy
-  type.raw                    <- indices into THIS system's type_map.raw
-  type_map.raw                <- C H O S
+  type.raw                    <- indices into this system's type_map.raw
+  type_map.raw                <- the full periodic table (119 entries)
   set.000/charge_spin.npy     <- (nframes, 2) = [charge, multiplicity]
   set.000/{coord,energy,force}.npy
 ```
 
-**Four systems, four different `type_map.raw`.** The model has *one* global
-`type_map` — the union, `[C, Cl, H, N, O, P, S, Si]` — and each system's
-`type.raw` indexes its own local list, which DeePMD-kit remaps at load time.
-That indirection is what lets systems with different element subsets share one
-model without renumbering anything.
+**Four systems, one `type_map`.** Every system is written against the full
+periodic table, the same list the model's `input.json` carries, so a type index
+is the atomic number in every directory and systems with different element
+subsets share one model without renumbering anything. (`--type-map present`
+writes a short per-system list instead; DeePMD-kit then remaps each system's
+local indices at load time.)
 
 **`nopbc`** is an empty file whose *presence* is the mechanism: the loader sees
 it and hands the model `box = None`.

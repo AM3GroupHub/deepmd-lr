@@ -43,7 +43,7 @@ pip install "e3nn>=0.5.9" "vesin[torch]" mpich
 pip install "nvalchemi-toolkit-ops>=0.4.1" "warp-lang>=1.13.0"
 
 # 5. data / MD / dev tooling
-pip install "dpdata>=0.2.7" "ase>=3.23.0" pytest pytest-cov ruff pre-commit
+pip install "dpdata>=0.2.7" "ase>=3.23.0" pytest pytest-cov ruff
 ```
 
 **`mpich` is required, not optional.** The PyPI wheel is cibuildwheel-built,
@@ -191,8 +191,8 @@ persistence: [docs/compression.md](docs/compression.md).
 | [born-charges.md](docs/born-charges.md) | Born effective charges and MD in an external field |
 | [partitioned-md.md](docs/partitioned-md.md) | `DistributedEvaluator`, `Thermo`, nvalchemiops conventions, scaling |
 | [neighbour-lists.md](docs/neighbour-lists.md) | which neighbour list runs, and the measured thresholds |
-| [tests.md](docs/tests.md) · [results.md](docs/results.md) | what the suite pins; the benchmark |
+| [tests.md](docs/tests.md) | what the suite pins |
 
 ```bash
-pytest tests/ -q          # 415 tests on the wheel; +13 kernel tests with a CUDA build
+pytest tests/ -q          # on the wheel; the 13 kernel tests need a CUDA build
 ```

@@ -45,7 +45,7 @@ needs, a branch must state.
 
 ```jsonc
 "shared_dict": {
-  "type_map_all": ["C", "Cl", "F", "H", "Li", "N", "O", "P", "S", "Si"],
+  "type_map_all": ["X", "H", "He", ..., "Og"],   // the full periodic table
   "backbone": { "type": "dpa4c", ... }
 },
 "model_dict": {
@@ -63,11 +63,11 @@ cannot, which is exactly what lets the boundary treatment differ per branch.
 The fitting nets here are deliberately *not* shared — three levels of theory
 need three heads.
 
-### One `type_map`, the union
+### One `type_map`
 
-Multi-task asserts a single `type_map`, so it is the union of all three:
-`[C, Cl, F, H, Li, N, O, P, S, Si]`. No dataset is renumbered — each system
-keeps its own local `type_map.raw` and DeePMD-kit remaps at load time.
+Multi-task asserts a single `type_map`. Here it is the full periodic table,
+the same list every dataset was converted against, so no dataset is renumbered
+and a type index is the atomic number in every branch.
 
 ### Same `alpha` in every branch
 

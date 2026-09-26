@@ -2,7 +2,7 @@
 
 Worked example: [`examples/05-pseudo-head`](../examples/05-pseudo-head).
 
-Multi-head above answers "different levels of theory". A different question:
+[Multi-head](multi-head.md) answers "different levels of theory". A different question:
 your dataset is **one** level of theory, but contains both periodic bulk cells
 and 2D-periodic slabs. Separate heads would be wrong — they would each fit
 their own energy zero and each see half the data.

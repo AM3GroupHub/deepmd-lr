@@ -2,8 +2,8 @@
 
 The ensemble that asks most of the model: the barostat is driven by the
 pressure tensor, which needs the **virial**, so the evaluator must be built
-with `compute_virial=True`. That costs almost nothing -- DeePMD-kit's lower
-graph already produces the virial alongside the force.
+with `compute_virial=True`. That costs a strain leaf per partition and an
+extra target in the charge-response backward.
 
 The part specific to this package is the cell. `DistributedEvaluator` builds
 its spatial partitioning against the cell it was given, and the Verlet

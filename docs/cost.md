@@ -49,5 +49,5 @@ charge-response backward runs through the fused kernel too. Against the
 uncompressed model on 50 water frames the tabulation error is 1e-5 eV/Å in
 force and 1e-7 e in charge and Born tensors — three orders of magnitude below
 the model's error against DFT; stride 0.002 Å gains nothing over the default
-0.01. Reproduce with `experiments/compress_bench/`.
+0.01.
 
