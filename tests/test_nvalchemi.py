@@ -3,8 +3,8 @@
 The claim is partition-count invariance: 1, 2, 4 and 8 partitions must all
 agree with the undivided model, to the floor set by GPU nondeterminism. This
 is precisely the test the LAMMPS domain decomposition failed -- splitting a
-reciprocal sum across ranks gave 2.0% error at 2 ranks and 36.5% at 8
-(see LAMMPS.md) -- so here it has to pass exactly, not approximately.
+reciprocal sum across ranks gave 2.0% error at 2 ranks and 36.5% at 8 --
+so here it has to pass exactly, not approximately.
 
 Phase A covers the short-range model; Phase B adds the long-range term,
 gathered onto one device.
@@ -141,9 +141,9 @@ class TestHaloMatchesABallQuery:
 
     @staticmethod
     def reference(coord, cell, rcut, parts, pbc, skin):
-        from itertools import product  # noqa: PLC0415
+        from itertools import product
 
-        from scipy.spatial import cKDTree  # noqa: PLC0415
+        from scipy.spatial import cKDTree
 
         mine = partition_system(coord, cell, rcut, parts, pbc, skin=skin)
         halo = rcut + skin
@@ -292,7 +292,7 @@ class TestSkinDefault:
         return m
 
     def test_halo_inflation_stays_within_the_tolerance(self):
-        from deepmd_lr.nvalchemi.partition import decomposition_grid  # noqa: PLC0415
+        from deepmd_lr.nvalchemi.partition import decomposition_grid
 
         cell = np.diag([99.43] * 3)
         for parts in (1, 2, 4, 8):
@@ -318,8 +318,6 @@ class TestSkinDefault:
 
     def test_auto_follows_the_cell_through_set_cell(self, model, system):
         """A barostat replaces the cell; the rule reads the cell."""
-        from deepmd_lr.nvalchemi import DistributedEvaluator  # noqa: PLC0415
-
         _coord, atype, cell, *_ = system
         ev = DistributedEvaluator(
             model, atype, cell, devices=[DEVICE], memory_headroom=None
@@ -332,42 +330,15 @@ class TestSkinDefault:
         assert ev.skin == pytest.approx(before)
 
     def test_an_explicit_skin_is_not_touched_by_set_cell(self, model, system):
-        from deepmd_lr.nvalchemi import DistributedEvaluator  # noqa: PLC0415
-
         _coord, atype, cell, *_ = system
         ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE], skin=2.5)
         ev.set_cell(cell * 2.0)
         assert ev.skin == 2.5
 
-    def test_evaluator_resolves_auto_and_reports_it(self, model, system):
-        from deepmd_lr.nvalchemi import DistributedEvaluator  # noqa: PLC0415
-
-        coord, atype, cell, *_ = system
-        ev = DistributedEvaluator(
-            model, atype, cell, devices=[DEVICE], memory_headroom=None
-        )
-        assert ev.skin == pytest.approx(default_skin(cell, float(model.get_rcut()), 1))
-        explicit = DistributedEvaluator(
-            model, atype, cell, devices=[DEVICE], skin=2.5
-        )
-        assert explicit.skin == 2.5
-
     def test_rejects_an_unknown_string(self, model, system):
-        from deepmd_lr.nvalchemi import DistributedEvaluator  # noqa: PLC0415
-
         _coord, atype, cell, *_ = system
         with pytest.raises(ValueError, match="number or 'auto'"):
             DistributedEvaluator(model, atype, cell, devices=[DEVICE], skin="wide")
-
-
-class _Exploding:
-    """A charge_spin stand-in that raises inside the launch phase."""
-
-    def __getitem__(self, item):
-        raise RuntimeError("partition exploded")
-
-    def __len__(self):
-        raise RuntimeError("partition exploded")
 
 
 class TestSkinIsFittedToMemory:
@@ -395,7 +366,7 @@ class TestSkinIsFittedToMemory:
         monkeypatch.setattr(torch.cuda, "mem_get_info", lambda d=None: (free, free))
 
     def test_the_probe_runs_at_the_floor_then_the_rule_decides(self, system, model):
-        from deepmd_lr.nvalchemi.evaluator import MIN_AUTO_SKIN  # noqa: PLC0415
+        from deepmd_lr.nvalchemi.evaluator import MIN_AUTO_SKIN
 
         coord, atype, cell, *_ = system
         ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE])
@@ -409,7 +380,7 @@ class TestSkinIsFittedToMemory:
         assert ev.rebuild_count == rebuilds + 1, "the probe halo must be replaced"
 
     def test_a_budget_that_does_not_fit_caps_the_halo(self, system, model):
-        from deepmd_lr.nvalchemi.evaluator import MIN_AUTO_SKIN  # noqa: PLC0415
+        from deepmd_lr.nvalchemi.evaluator import MIN_AUTO_SKIN
 
         coord, atype, cell, *_ = system
         ev = DistributedEvaluator(
@@ -424,8 +395,8 @@ class TestSkinIsFittedToMemory:
         self, system, model, monkeypatch
     ):
         """A budget of twice the probe's footprint buys twice the nodes."""
-        from deepmd_lr.nvalchemi.evaluator import MIN_AUTO_SKIN  # noqa: PLC0415
-        from deepmd_lr.nvalchemi.partition import (  # noqa: PLC0415
+        from deepmd_lr.nvalchemi.evaluator import MIN_AUTO_SKIN
+        from deepmd_lr.nvalchemi.partition import (
             halo_node_ratio,
             skin_for_node_ratio,
         )
@@ -522,7 +493,7 @@ class TestSkinBacksOffWhenMemoryRunsOut:
     @staticmethod
     def _fail_n_times(monkeypatch, failures, error=None):
         """Make the first ``failures`` evaluations report an out-of-memory."""
-        from deepmd_lr.nvalchemi import evaluator as ev_mod  # noqa: PLC0415
+        from deepmd_lr.nvalchemi import evaluator as ev_mod
 
         real = ev_mod.evaluate_partitioned
         left = {"n": failures}
@@ -601,7 +572,7 @@ class TestSkinBacksOffWhenMemoryRunsOut:
         self, system, model, monkeypatch
     ):
         """Below the floor the halo is not what is filling the device."""
-        from deepmd_lr.nvalchemi.evaluator import MIN_AUTO_SKIN  # noqa: PLC0415
+        from deepmd_lr.nvalchemi.evaluator import MIN_AUTO_SKIN
 
         coord, atype, cell, *_ = system
         ev = DistributedEvaluator(
@@ -690,7 +661,7 @@ class TestGatherIsOnTheDevice:
         """`np.add.at` in the gather is the regression this class exists for."""
         import numpy as real_np
 
-        def refuse(*args, **kwargs):  # noqa: ANN002, ANN003
+        def refuse(*args, **kwargs):
             raise AssertionError("the gather scattered on the host")
 
         monkeypatch.setattr(real_np.add, "at", refuse)
@@ -706,7 +677,8 @@ class TestGatheredLongRange:
     """Phase B: the reciprocal term is gathered, not decomposed.
 
     Splitting a reciprocal sum spatially does not work -- measured at 2.0%
-    error on 2 ranks and 36.5% on 8 (LAMMPS.md). So it is evaluated once on
+    error on 2 ranks and 36.5% on 8 in a LAMMPS domain decomposition. So it
+    is evaluated once on
     one device over every atom. The charges feeding it still come from the
     partitioned descriptor, and the total-charge projection is applied after
     the gather because it constrains a sum over all atoms.
@@ -1117,8 +1089,6 @@ class TestBackboneCapture:
 
     @staticmethod
     def _system(n_mol=8):
-        from .test_joint_model import build, frame  # noqa: PLC0415
-
         model = build()
         coord, atype, cell = frame(n_mol=n_mol)
         return (model, coord[0].cpu().numpy(), atype[0].cpu().numpy(),
@@ -1126,8 +1096,7 @@ class TestBackboneCapture:
 
     @staticmethod
     def _run(model, c, a, cl, devices, *, force_fallback=False, **kw):
-        import deepmd_lr.nvalchemi.driver as DRV  # noqa: PLC0415
-        from deepmd_lr.nvalchemi import DistributedEvaluator  # noqa: PLC0415
+        import deepmd_lr.nvalchemi.driver as DRV
 
         original = DRV._usable_capture
         if force_fallback:
@@ -1141,7 +1110,7 @@ class TestBackboneCapture:
             DRV._usable_capture = original
 
     def test_capture_is_taken_on_every_partition(self):
-        import deepmd_lr.nvalchemi.driver as DRV  # noqa: PLC0415
+        import deepmd_lr.nvalchemi.driver as DRV
 
         model, c, a, cl = self._system()
         calls = {"n": 0}

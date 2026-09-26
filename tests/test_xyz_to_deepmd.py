@@ -274,8 +274,6 @@ class TestPeriodicTableDefault:
     def test_a_dummy_atom_in_the_data_is_refused(self, tmp_path, monkeypatch):
         """Slot 0 exists to be unused. Now that "X" is in the table, a frame
         carrying one would otherwise be quietly assigned to it."""
-        from ase import Atoms
-
         monkeypatch.setattr(x2d, "load_frames", lambda *a: [Atoms("XH")])
         monkeypatch.setattr(
             "sys.argv",

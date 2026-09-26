@@ -250,7 +250,7 @@ def pad_vacuum(frames, target, axis=2):
         if results:
             # Re-attach. A rigid translation along one axis leaves energies and
             # forces unchanged, so the saved values are still the right ones.
-            from ase.calculators.singlepoint import (  # noqa: PLC0415
+            from ase.calculators.singlepoint import (
                 SinglePointCalculator,
             )
 
@@ -275,7 +275,7 @@ def collect(frames, symbols):
         for atoms in frames:
             try:
                 got.append(np.asarray(getter(atoms), dtype=np.float64).reshape(-1))
-            except Exception:  # noqa: BLE001 -- any calculator failure means "absent"
+            except Exception:  # any calculator failure means "absent"
                 got.append(None)
         present = [g is not None for g in got]
         if not any(present):
@@ -328,7 +328,7 @@ def charge_spin_from(frames):
             try:
                 total = float(atoms.get_initial_charges().sum())
                 charge = total if abs(total) > 1e-8 else 0.0
-            except Exception:  # noqa: BLE001
+            except Exception:
                 charge = 0.0
         spin = next(
             (

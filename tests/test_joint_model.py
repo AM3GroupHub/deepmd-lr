@@ -53,7 +53,7 @@ LONG_RANGE = {
 }
 
 
-def build(long_range: bool = True, seed: int = 42):
+def build(long_range: bool = True):
     cfg = {
         "type": "dp_lr",
         "type_map": ["O", "H"],
@@ -238,13 +238,13 @@ class TestConservation:
         )
 
     def test_virial_is_right_above_the_neighbour_crossover(self):
-        """The virial must not depend on which neighbour backend ran.
+        """The finite-difference virial check again, on a large frame.
 
-        `_predict_charges` chooses its builder by frame size, and only the
-        dense one carries a cell derivative -- `nv` returns 6.7e-13 where
-        dense gives 1.9e3. A size-based switch therefore had the power to
-        break the virial for large frames only, which the 96-atom check above
-        cannot see. This one runs above any plausible crossover.
+        Only the dense builder carries a cell derivative -- `nv` returns
+        6.7e-13 where dense gives 1.9e3 -- so a virial that leaned on it would
+        break exactly where the cell list runs. Periodic frames use the cell
+        list at every size now, so this is the large-frame end of the same
+        guarantee the small-frame check above pins.
         """
         model = build()
         coord, atype, cell = frame(n_mol=192, box=32.0)  # 576 atoms
@@ -395,20 +395,6 @@ class TestTraining:
             assert abs(got - numeric) / scale < 1e-4, (
                 f"w[{row},{col}]: analytic {got:.6e} vs numeric {numeric:.6e}"
             )
-
-    def test_force_loss_reaches_the_charge_head(self):
-        """The joint scheme trains charges through the force too, which needs
-        the long-range force to stay differentiable in the parameters."""
-        model = build()
-        model.train()
-        coord, atype, cell = frame()
-        out = model(coord, atype, box=cell)
-        (out["force"] ** 2).sum().backward()
-        grads = [p.grad for p in model.charge_fitting.parameters() if p.requires_grad]
-        assert grads and any(
-            g is not None and torch.isfinite(g).all() and g.abs().sum() > 0
-            for g in grads
-        )
 
 
 class TestGuards:

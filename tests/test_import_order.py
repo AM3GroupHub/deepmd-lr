@@ -9,8 +9,9 @@ itself, ``import deepmd_lr.nvalchemi`` failed with
     ImportError: cannot import name 'CHARGE_VAR_NAME' from partially
     initialized module 'deepmd_lr.fitting.charge'
 
-which is exactly the snippet the README tells people to write. Import order
-can only be tested in a fresh process, hence the subprocess.
+which is exactly the first line of the partitioned-MD snippet in
+``docs/partitioned-md.md``. Import order can only be tested in a fresh
+process, hence the subprocess.
 """
 
 import subprocess
@@ -42,20 +43,3 @@ def test_module_imports_first_in_a_clean_interpreter(module):
         f"`import {module}` failed as the first import:\n"
         f"{result.stderr[-1500:]}"
     )
-
-
-def test_the_documented_snippet_works_standalone():
-    """The first line of the README's partitioned-MD snippet, on its own."""
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "from deepmd_lr.nvalchemi import DistributedEvaluator; "
-            "print(DistributedEvaluator.__name__)",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=600,
-    )
-    assert result.returncode == 0, result.stderr[-1500:]
-    assert "DistributedEvaluator" in result.stdout

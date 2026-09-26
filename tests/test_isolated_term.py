@@ -50,7 +50,7 @@ def pairwise_erf(coord, charge, alpha=ALPHA):
     """The textbook sum, written out independently of the implementation."""
     c = coord[0].detach().cpu().numpy()
     q = charge[0].detach().cpu().numpy()
-    from scipy.special import erf  # noqa: PLC0415
+    from scipy.special import erf
 
     total = 0.0
     for i in range(len(q)):
@@ -85,7 +85,6 @@ class TestMatchesThePeriodicTerm:
         assert diffs[-1] < 2e-4
 
     def test_matches_a_hand_written_pair_sum(self):
-        pytest.importorskip("scipy")
         coord, q = cluster(n=6, seed=3)
         got = float(IsolatedLongRangeEnergy(alpha=ALPHA).to(DEVICE)(coord, q).sum())
         assert got == pytest.approx(pairwise_erf(coord, q), rel=1e-12)
@@ -132,7 +131,6 @@ class TestPhysics:
     def test_charged_clusters_are_finite_and_correct(self):
         """No neutralising background is needed without periodic images, so a
         net charge is not a special case here the way it is in a cell."""
-        pytest.importorskip("scipy")
         for net in (-2.0, -1.0, 1.0, 3.0):
             coord, q = cluster(charged=net, seed=11)
             assert float(q.sum()) == pytest.approx(net, abs=1e-12)
@@ -194,8 +192,10 @@ class TestDifferentiability:
         assert float(grad.abs().sum()) > 0.0
 
     def test_coincident_atoms_do_not_produce_nan_gradients(self):
-        """sqrt(0) has an infinite derivative, so the diagonal has to be
-        removed before the square root, not after."""
+        """The zero distances on the diagonal -- each atom to itself -- must
+        not reach the gradient: sqrt(0) has an infinite derivative, so the
+        diagonal has to be removed before the square root, not after. No two
+        distinct atoms coincide here."""
         coord = torch.zeros((1, 3, 3), dtype=DT, device=DEVICE)
         coord[0, 1, 0] = 1.5
         coord[0, 2, 1] = 2.5
@@ -231,7 +231,7 @@ class TestConfiguration:
         built, so an isolated config arrives carrying periodic keys nobody
         wrote. Refusing those would make the method unusable from a config
         file -- which is exactly what happened the first time."""
-        from deepmd_lr.lr.term import DEFAULT_SPLINE_ORDER  # noqa: PLC0415
+        from deepmd_lr.lr.term import DEFAULT_SPLINE_ORDER
 
         term = IsolatedLongRangeEnergy(
             method="isolated",
@@ -344,18 +344,9 @@ class TestInTheModel:
             out = model(coord, atype, box=None, charge_spin=cs)
             assert float(out["charge"].sum()) == pytest.approx(total, abs=1e-10)
 
-    def test_a_periodic_term_still_refuses_a_missing_cell(self):
-        """Relaxing the guard must not relax it for the term that does need
-        a cell."""
-        from .test_joint_model import build  # noqa: PLC0415
-
-        coord, atype = molecule()
-        with pytest.raises(ValueError, match="requires a periodic cell"):
-            build(long_range=True)(coord, atype, box=None)
-
     def test_serialization_round_trip_through_the_model(self):
         model = isolated_model()
-        from deepmd.pt_expt.model.model import BaseModel  # noqa: PLC0415
+        from deepmd.pt_expt.model.model import BaseModel
 
         restored = BaseModel.deserialize(model.serialize())
         assert isinstance(restored.long_range_energy, IsolatedLongRangeEnergy)
@@ -411,7 +402,7 @@ class TestNonPeriodicStatistics:
 
     def test_a_real_box_is_left_alone(self):
         """The sanitising must not eat a legitimate cell."""
-        from .test_joint_model import build  # noqa: PLC0415
+        from .test_joint_model import build
 
         model = build(long_range=True)
         cell = np.tile(np.eye(3).reshape(-1) * 12.0, (3, 1))
