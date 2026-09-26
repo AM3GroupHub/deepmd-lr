@@ -47,6 +47,8 @@ distinct A40s is covered by the library's own multi-GPU validation.
 | restart = uninterrupted run (Langevin, Nose-Hoover, NPT) | positions agree to 7e-7 Å, NPT cell to 3e-10 Å; logs match |
 | SIGTERM mid-run; SIGKILL after a checkpoint | clean stop, checkpoint, exit 0; after the kill, `--restart` trims the log and trajectory back to the checkpoint, with no duplicate steps |
 | Nose-Hoover NVT, 1 ps, 300 K | ⟨T⟩ 307 K over the second half; Econs drift −0.034 meV/atom/ps |
+| NPT: logging every step vs never, 200 steps | identical within GPU noise (7.8e-7 Å). Before the fix they were 1.0e-4 Å apart: reading the pressure for the log rewrote the barostat's input |
+| NPT, MTK conserved quantity H′, dt 0.5 → 0.25 fs | rms 0.0218 → 0.0054 meV/atom (O(dt²)); thermostat and reported temperature both count 3N − 3 degrees of freedom |
 | FIRE pre-relaxation | from an MD snapshot: 380 steps to 0.038 eV/Å, bonds intact. A badly distorted box made the minimiser collapse atoms, since the model has no short-range wall there; the script aborts with that diagnosis |
 | blow-up (dt 8 fs) | stopped at the next log row with exit code 2 and `blowup.extxyz` written |
 

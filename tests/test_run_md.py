@@ -12,12 +12,14 @@ so these tests pin the plumbing rather than the physics:
 
 import importlib.util
 import json
+import math
 import pathlib
 
 import ase.io
 import numpy as np
 import pytest
 import torch
+import warp as wp
 from ase import Atoms
 
 from .test_joint_model import build, frame
@@ -106,6 +108,52 @@ def test_restart_reproduces_an_uninterrupted_run(inputs, tmp_path, ensemble):
     lb = np.loadtxt(tmp_path / "b" / "md.log")
     assert la[:, 0].tolist() == lb[:, 0].tolist()      # no duplicated rows
     np.testing.assert_allclose(lb[:, 1:-1], la[:, 1:-1], atol=1e-5)
+
+
+def test_logging_does_not_change_an_npt_trajectory(inputs, tmp_path):
+    """A log row reads the pressure. That used to overwrite the pressure the
+    next barostat half-step consumed, so logging every step changed the run."""
+    common = [*ENSEMBLES["npt"], "--steps", "40", "--traj-every", "0",
+              "--checkpoint-every", "40"]
+    assert run(inputs, tmp_path / "quiet", *common, "--log-every", "40") == 0
+    assert run(inputs, tmp_path / "loud", *common, "--log-every", "1") == 0
+    with np.load(tmp_path / "quiet" / "checkpoint.npz") as q, \
+            np.load(tmp_path / "loud" / "checkpoint.npz") as lo:
+        np.testing.assert_allclose(lo["positions"], q["positions"], atol=1e-9)
+        np.testing.assert_allclose(lo["cell"], q["cell"], atol=1e-11)
+        np.testing.assert_allclose(lo["npt_cell_v"], q["npt_cell_v"], atol=1e-14)
+
+
+@pytest.mark.parametrize("ensemble", ["nhc", "npt"])
+def test_the_thermostat_rests_at_the_reported_temperature(inputs, tmp_path,
+                                                          ensemble):
+    """One definition of the kinetic degrees of freedom, 3N - 3, for both the
+    thermostat's target and the temperature it is judged by. So at exactly the
+    reported target temperature the chain feels no force. The NPT kernels
+    count 3N unless told otherwise; left at that, eta_dot moved by
+    -3 kT / Q_0 per half-step and held the system 3N/(3N-3) hot."""
+    ckpt, xyz = inputs
+    a = run_md.parse_args(["--model", str(ckpt), "--structure", str(xyz),
+                           "--out", str(tmp_path), *ENSEMBLES[ensemble]])
+    atoms, model = run_md.load_system(a, "cuda:0")
+    ev = run_md.make_evaluator(model, atoms, ["cuda:0"], a)
+    th = run_md.Thermo(ev, atoms.get_positions(),
+                       velocities=np.zeros((len(atoms), 3)),
+                       timestep=a.dt, temperature=a.temperature)
+    th.maxwell_boltzmann(a.temperature, seed=1)
+    wp.to_torch(th.velocities).mul_(math.sqrt(a.temperature / th.temperature))
+    assert th.temperature == pytest.approx(a.temperature, rel=1e-12)
+    folder = run_md.Folder(th)
+    integ = run_md.build_integrator(a, th, folder, seed=1)
+    folder.evaluate()
+    if ensemble == "npt":
+        th.update_kinetic_energy()
+        integ._thermostat()
+    else:
+        integ._chain()
+    # Only the first link feels the particles (2 KE - N_f kT); the others are
+    # pulled by -kT/Q_k from rest whatever N_f is.
+    assert abs(integ.eta_dot.numpy().reshape(-1)[0]) < 1e-12
 
 
 def _step0(out):

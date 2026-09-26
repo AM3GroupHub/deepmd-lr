@@ -175,6 +175,9 @@ class Thermo:
 
         # --- scratch, allocated once ------------------------------------
         self._ke_w = self.zeros(1)
+        #: The getters' own kinetic energy. Kernels consume `_ke_w`, and a
+        #: getter writing it would let a log change the next step.
+        self._ke_probe = self.zeros(1)
         self._temp_w = self.zeros(1)
         #: Volume as a device array, for kernels that take one.
         self.volume_w = self.scalar(evaluator.volume)
@@ -186,6 +189,8 @@ class Thermo:
         self.press_w = None
         self._virial_w = None
         self._kin_w = None
+        self._press_probe = None
+        self._kin_probe = None
 
         self.energy = float("nan")
         self._symbols = [
@@ -253,9 +258,15 @@ class Thermo:
 
     @property
     def kinetic_energy(self) -> float:
-        """Total kinetic energy in eV."""
-        self.update_kinetic_energy()
-        return float(self._ke_w.numpy()[0])
+        """Total kinetic energy in eV.
+
+        Measured into scratch of its own, never into :attr:`ke_w`: the NPT
+        thermostat and barostat consume ``ke_w``, so a getter that refreshed it
+        would let logging change the trajectory. :meth:`update_kinetic_energy`
+        is what refreshes ``ke_w``.
+        """
+        compute_kinetic_energy(self.velocities, self.masses, self._ke_probe)
+        return float(self._ke_probe.numpy()[0])
 
     @property
     def temperature(self) -> float:
@@ -263,10 +274,11 @@ class Thermo:
 
         nvalchemiops divides by ``3N - 3``, i.e. it assumes the centre-of-mass
         motion was removed -- which :meth:`maxwell_boltzmann` does. Set
-        velocities by hand and the report is biased by ``3/(3N-3)``.
+        velocities by hand and the report is biased by ``3/(3N-3)``. Like
+        :attr:`kinetic_energy`, it leaves :attr:`ke_w` alone.
         """
-        self.update_kinetic_energy()
-        compute_temperature(self._ke_w, self._temp_w, self.natoms)
+        compute_kinetic_energy(self.velocities, self.masses, self._ke_probe)
+        compute_temperature(self._ke_probe, self._temp_w, self.natoms)
         return float(self._temp_w.numpy()[0]) / kB
 
     @property
@@ -291,18 +303,28 @@ class Thermo:
         Native units, matching the evaluator's ``stress`` and what the barostat
         kernels consume -- a GPa-valued property would force a conversion back
         before feeding one, in the direction where an error is silent.
+
+        From the current velocities and the virial of the last evaluation,
+        computed into scratch of its own, never into :attr:`press_w`. The
+        barostat consumes ``press_w``, and when this getter refreshed it, a
+        log row changed the pressure the next barostat half-step saw.
         """
-        self.update_pressure()
-        p = self.press_w.numpy()[0]
+        self._pressure_into(probe=True)
+        p = self._press_probe.numpy()[0]
         return float(p[0] + p[4] + p[8]) / 3.0
 
     def update_pressure(self) -> None:
-        """Refresh the pressure tensor from the current virial and velocities.
+        """Refresh :attr:`press_w`, the barostat's input, from the current
+        virial and velocities.
 
         Owns the mixed layouts nvalchemiops wants here -- flat ``vec9`` for the
         virial and pressure, ``mat33`` for the cell, and a 2-D ``(1, 9)``
         kinetic tensor -- so no caller has to know them.
         """
+        self._pressure_into(probe=False)
+
+    def _pressure_into(self, probe: bool) -> None:
+        """The pressure tensor into the getter's scratch or into ``press_w``."""
         # Imported lazily: `vec9d` lives in the one nvalchemiops module with a
         # packaging bug (`flat_virial_to_vec9` is exported but undefined), and
         # an upstream break should not take out `import deepmd_lr.nvalchemi`.
@@ -320,12 +342,18 @@ class Thermo:
             self._virial_w = wp.zeros(1, dtype=vec9d, device=self.device)
             self.press_w = wp.zeros(1, dtype=vec9d, device=self.device)
             self._kin_w = wp.zeros((1, 9), dtype=wp.float64, device=self.device)
+            self._press_probe = wp.zeros(1, dtype=vec9d, device=self.device)
+            self._kin_probe = wp.zeros((1, 9), dtype=wp.float64, device=self.device)
+        # Shared by both paths: it only ever holds the evaluator's virial, so
+        # either path rewrites it with the same numbers.
         self._virial_w.assign(
             np.asarray(self.evaluator.virial, dtype=np.float64).reshape(1, 9)
         )
+        kinetic, pressure = ((self._kin_probe, self._press_probe) if probe
+                             else (self._kin_w, self.press_w))
         compute_pressure_tensor(
             self.velocities, self.masses, self._virial_w, self.cell,
-            self._kin_w, self.press_w, self.volume_w,
+            kinetic, pressure, self.volume_w,
         )
 
     def update_kinetic_energy(self) -> None:

@@ -337,7 +337,8 @@ def parse_args(argv=None) -> argparse.Namespace:
                         "noise; default: random, recorded in run.json")
     g.add_argument("--keep-velocities", action="store_true",
                    help="take the initial velocities from the structure file "
-                        "(e.g. a previous final.extxyz) instead of drawing them")
+                        "(e.g. a previous final.extxyz) instead of drawing "
+                        "them; any centre-of-mass drift is removed")
     g.add_argument("--relax-steps", type=int, default=0,
                    help="FIRE relaxation of positions (cell fixed) before MD; "
                         "0 = off. Recommended for freshly built boxes")
@@ -687,10 +688,26 @@ class NoseHooverChain(Integrator):
 class IsotropicMTK(Integrator):
     """Isotropic MTK NPT with a Nose-Hoover chain thermostat.
 
-    After the barostat moves the cell, `th.set_cell()` pushes it to the
-    evaluator, which invalidates the partitioning. That is correct and costs a
-    repartition every step. Skipping it would leave ghost images at stale
-    offsets, giving quietly wrong forces.
+    The step is the palindrome thermostat, barostat, kick | drift | kick,
+    barostat, thermostat. Three points are not in the kernel signatures:
+
+    - Fresh inputs. The kinetic energy and pressure are refreshed right before
+      each barostat/thermostat half-step, as LAMMPS' fix nh does. The barostat
+      must see the current state, never a value cached earlier in the step. An
+      earlier version reused the pressure from before the last kick, and
+      because the Thermo.pressure getter rewrote that cache, logging changed
+      the trajectory. With the refresh, the MTK conserved quantity is kept to
+      O(dt^2) as before: 0.0218 -> 0.0054 meV/atom rms from dt 0.5 to 0.25 fs.
+    - Degrees of freedom. The kernels compute N_f = 3 * (the count they are
+      given). The centre of mass is at rest and stays there (forces sum to
+      zero, and both drags scale velocities uniformly), so the moving degrees
+      of freedom are 3N - 3: the kernels get N - 1. That matches the masses
+      below and Thermo.temperature. Given N, they held the system 3N/(3N-3)
+      hot, which is 0.5 % at 192 atoms.
+    - The cell. After the barostat moves the cell, `th.set_cell()` pushes it
+      to the evaluator, which invalidates the partitioning. That is correct
+      and costs a repartition every step. Skipping it would leave ghost images
+      at stale offsets, giving quietly wrong forces.
     """
 
     def __init__(self, th, evaluate, folder, pressure_gpa, tau_t_fs, tau_p_fs,
@@ -712,33 +729,35 @@ class IsotropicMTK(Integrator):
         # W = (ndof + 3) kT tau_p^2
         self.cell_mass = th.scalar((ndof + 3) * kT * (tau_p_fs * units.fs) ** 2)
         self.target_p = th.scalar(pressure_gpa * units.GPa)
+        # N - 1, so that the kernels' N_f = 3 * count is 3N - 3.
+        self.dof_count = wp.array([th.n_atoms - 1], dtype=wp.int32,
+                                  device=th.device)
 
-    def prepare(self):
+    def _refresh(self):
+        """Kinetic energy and pressure of the current state, for the kernels."""
+        self.th.update_kinetic_energy()
         self.th.update_pressure()
 
     def _thermostat(self):
         th = self.th
         npt_thermostat_half_step(self.eta, self.eta_dot, th.ke_w, th.kT,
-                                 self.th_mass, th.natoms, self.L, th.dt)
+                                 self.th_mass, self.dof_count, self.L, th.dt)
 
     def _barostat(self):
         th = self.th
         npt_barostat_half_step(self.cell_v, th.press_w, self.target_p,
-                               th.volume_w, self.cell_mass, th.ke_w, th.natoms,
-                               th.dt)
+                               th.volume_w, self.cell_mass, th.ke_w,
+                               self.dof_count, th.dt)
 
     def _kick(self):
         th = self.th
         npt_velocity_half_step(th.velocities, th.masses, th.forces, self.cell_v,
-                               eta_dots=self.eta_dot, num_atoms=th.natoms,
+                               eta_dots=self.eta_dot, num_atoms=self.dof_count,
                                dt=th.dt)
 
     def step(self, index):
-        # The nine stages of nvalchemiops' own run_npt_step (and example 05):
-        # the second half uses the kinetic energy and pressure measured right
-        # after the force call, as the library's reference step does.
         th = self.th
-        th.update_kinetic_energy()
+        self._refresh()
         self._thermostat()
         self._barostat()
         self._kick()
@@ -748,9 +767,8 @@ class IsotropicMTK(Integrator):
         th.set_cell()                                # evaluator + volume
         self.folder.set_cell(th.evaluator.cell)      # and the fold
         self.evaluate()
-        th.update_pressure()
-        th.update_kinetic_energy()
         self._kick()
+        self._refresh()                              # after the kick
         self._barostat()
         self._thermostat()
 
@@ -1181,6 +1199,12 @@ def run_md(a: argparse.Namespace) -> int:
               "(especially with --compress); --benchmark measures it", flush=True)
 
     ev = make_evaluator(model, atoms, devices, a)
+    if velocities is not None and not a.restart:
+        # Every temperature and thermostat here counts 3N - 3 degrees of
+        # freedom, which assumes the centre of mass is at rest. Kept
+        # velocities (from a Langevin run, say) need not be.
+        m = ev.masses()
+        velocities = velocities - (m[:, None] * velocities).sum(0) / m.sum()
     th = Thermo(ev, atoms.get_positions(),
                 velocities=np.zeros((n, 3)) if velocities is None else velocities,
                 timestep=a.dt, temperature=a.temperature)

@@ -89,6 +89,11 @@ found by running into them:
 - **`ndof` dtypes disagree.** `nhc_compute_masses` requires int32 while
   `nhc_thermostat_chain_update` and `nhc_compute_chain_energy` require
   float64. That is a Warp launch error, not a cast, so keep both.
+- **The NPT kernels count `N_f = 3 ×` the atom count they are given.** The
+  centre of mass does not move, so pass `N − 1` for `3N − 3`, the count
+  `Thermo.temperature` uses; otherwise the system is held `3N/(3N−3)` hot.
+  Refresh `ke_w` and `press_w` (`update_kinetic_energy`, `update_pressure`)
+  right before each barostat half-step; `Thermo`'s getters never write them.
 
 Units: the model works in angstrom and eV. Pair that with masses in amu and a
 timestep in ASE time units (`A sqrt(amu/eV)`) and the set is self-consistent.

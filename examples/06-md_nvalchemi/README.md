@@ -95,7 +95,7 @@ Time is the other one. One ASE time unit is **10.181 fs**, and `friction` is in
 | 0.1 | 102 fs | the default in `02` |
 | 0.5 | 20 fs | very strong; use under a field |
 
-## Three API conventions you cannot guess
+## API conventions you cannot guess
 
 Found by running into them:
 
@@ -110,6 +110,15 @@ Found by running into them:
   2-D `(B, 9)`. Only `cells` is `mat33`. `vec9d` comes from nvalchemiops, not
   from warp — `wp.vec9d` does not exist. `Thermo.update_pressure` owns this
   mess so no script has to.
+- **The NPT kernels count `3N` degrees of freedom** unless told otherwise:
+  each computes `N_f = 3 × (the atom count passed)`. The centre of mass does
+  not move, so pass `N − 1` to all three, as `05` does. Pass `N` and the
+  system is held `3N/(3N−3)` hot.
+- **Refresh right before the barostat reads.** `ke_w` and `press_w` hold
+  whatever was last computed into them, so call `update_kinetic_energy()` and
+  `update_pressure()` before each barostat/thermostat half-step, after the
+  second kick too. `Thermo`'s getters never write them, so logging cannot
+  change a run.
 
 The NHC chain update is also called once at **each end** of the step, not once
 per step.
