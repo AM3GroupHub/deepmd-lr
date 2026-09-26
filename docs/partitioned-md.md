@@ -49,8 +49,9 @@ cannot touch on-device state, which is the point of this path.
 
 ### Driving it with nvalchemiops
 
-nvalchemiops ships half-step kernels and no driver, so the loop is yours. NVE
-is four lines:
+nvalchemiops ships half-step kernels and no driver, so the loop is yours; for
+a ready-made one with restarts and a GPU-count benchmark, see
+[examples/07-multi-gpu-md](../examples/07-multi-gpu-md). NVE is four lines:
 
 ```python
 from nvalchemiops.dynamics.integrators import (

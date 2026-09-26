@@ -48,6 +48,8 @@ build that silently lost its operator cannot pass.
   `DistributedEvaluator`.
 - `test_thermo.py` — `Thermo`'s measurements, warp aliasing, cell sync,
   logging and throughput arithmetic.
+- `test_run_md.py` — the production MD driver in `examples/07-multi-gpu-md`:
+  every ensemble, restarts, partitions, the coordinate fold, exit codes.
 - `test_compress.py`, `test_compress_arguments.py`,
   `test_compress_atomic_state.py`, `test_compress_required.py` — compressed
   DPA4C inference: every refusal, the graph-lower guard, argument validation,

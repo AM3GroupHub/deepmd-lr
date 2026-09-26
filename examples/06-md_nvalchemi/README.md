@@ -2,7 +2,8 @@
 
 nvalchemiops ships integrator **kernels** and no driver, so the loop belongs to
 you. That is the point of these six scripts: each is a complete, runnable loop
-to copy, not a wrapper hiding one.
+to copy, not a wrapper hiding one. For production runs -- restarts, several
+GPUs, a trajectory -- use the driver in [07](../07-multi-gpu-md) instead.
 
 Every script was run to produce the numbers below.
 

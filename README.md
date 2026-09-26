@@ -110,6 +110,7 @@ match ([dataset layout](docs/dataset-layout.md)).
 | [04](examples/04-multi-head) | all three at once | `shared_dict`/`model_dict`, and the gradient clipping it needs |
 | [05](examples/05-pseudo-head) | bulk + slab, one weight set | `same_as`, and setting the long-range type at load |
 | [06](examples/06-md_nvalchemi) | MD with nvalchemiops | NVE, NVT, NPT and a field, one runnable loop each |
+| [07](examples/07-multi-gpu-md) | production MD, one or more GPUs | one command: restarts, a GPU-count benchmark, pre-relaxation |
 
 `scripts/xyz_to_deepmd.py` converts a trajectory ASE can read into a DeePMD
 dataset, including the `--split-by-composition` and `--vacuum` cases the
@@ -135,8 +136,9 @@ VelocityVerlet(atoms, timestep=0.5 * units.fs).run(10000)
 ```
 
 For MD that never leaves the GPU, and for several GPUs, use the nvalchemiops
-path — `examples/06-md_nvalchemi` has a runnable loop per ensemble
-([partitioned MD](docs/partitioned-md.md)). A field run, Born effective
+path — `examples/06-md_nvalchemi` has a runnable loop per ensemble, and
+`examples/07-multi-gpu-md/run_md.py` is a ready-made driver for production
+runs ([partitioned MD](docs/partitioned-md.md)). A field run, Born effective
 charges, and reporting them screened by a medium's ε∞ (`eps_inf=`):
 [born-charges](docs/born-charges.md).
 
