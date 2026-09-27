@@ -43,7 +43,7 @@ distinct A40s is covered by the library's own multi-GPU validation.
 | NVE, dt 0.5 → 0.25 fs, 0.5 ps each | Etot fluctuation 0.0185 → 0.0051 meV/atom (3.6x, O(dt²)); drift ≈ 0.01 meV/atom/ps at both |
 | compressed vs uncompressed (`--compress`) | step-0 energy within 1.4e-6 eV and forces within 7.6e-6 eV/Å; identical NVE drift and fluctuation; 11 vs ~37 ms/step |
 | two partitions vs one | energy within 1.5e-6 eV and forces within 1.8e-6 eV/Å at step 0; 6e-6 after 20 steps |
-| unwrapped input: 60 atoms moved by up to 3 lattice vectors | same energies and forces within 1e-6. Without the script's fold the evaluator was off by 699 eV and 98 eV/Å (see *Known limitations*) |
+| unwrapped input: 60 atoms moved by up to 3 lattice vectors | same energies and forces within 1e-6. Before the library folded at each rebuild, the evaluator was off by 699 eV and 98 eV/Å here |
 | restart = uninterrupted run (Langevin, Nose-Hoover, NPT) | positions agree to 7e-7 Å, NPT cell to 3e-10 Å; logs match |
 | SIGTERM mid-run; SIGKILL after a checkpoint | clean stop, checkpoint, exit 0; after the kill, `--restart` trims the log and trajectory back to the checkpoint, with no duplicate steps |
 | Nose-Hoover NVT, 1 ps, 300 K | ⟨T⟩ 307 K over the second half; Econs drift −0.034 meV/atom/ps |
@@ -59,10 +59,5 @@ distinct A40s is covered by the library's own multi-GPU validation.
 - **Periodic systems only.** The partitioned evaluator assumes periodicity in
   all three directions, so slabs and molecules in vacuum are not supported by
   this script.
-- **Unwrapped coordinates.** The evaluator currently drops neighbours once
-  unwrapped atoms spread more than about one cutoff beyond the cell, and MD
-  never wraps. The script therefore hands the evaluator folded positions
-  (the `Folder` class) while keeping the trajectory unwrapped. It is a
-  workaround until the library folds coordinates itself.
 - **NPT repartitions every step**, so it is slower than NVT. Use it to reach
   the density, then produce in NVT.
