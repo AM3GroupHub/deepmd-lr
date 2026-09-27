@@ -58,10 +58,17 @@ the model first.
 - `test_nvalchemi.py` — the partitioner and halo (including unwrapped
   coordinates), the skin rules and memory probe, the device gather, the gathered long-range term and virial, and
   `DistributedEvaluator`.
-- `test_thermo.py` — `Thermo`'s measurements, warp aliasing, cell sync,
-  logging and throughput arithmetic.
-- `test_run_md.py` — the production MD driver in `examples/07-multi-gpu-md`:
-  every ensemble, restarts, partitions, the coordinate fold, exit codes.
+- `test_thermo.py` — `Thermo`'s measurements, warp aliasing, cell sync, and
+  the guards that make one evaluator safe to share (`fresh`,
+  `cell_is_current`, `set_state`).
+- `test_md.py` — the MD classes and `FIRE`: each integrator against a
+  hand-written kernel loop, one evaluator carrying a whole workflow, `atoms`
+  kept in step both ways, run semantics and observers, checkpoints, the log,
+  conservation (NVE and NPT as dt², the Nosé–Hoover invariant), FIRE's
+  refusals, and the dipole current.
+- `test_run_md.py` — the production MD driver in `examples/07-multi-gpu-md`,
+  which delegates to those classes: every ensemble, restarts, partitions,
+  unwrapped input, exit codes.
 - `test_compress.py`, `test_compress_arguments.py`,
   `test_compress_atomic_state.py`, `test_compress_required.py` — compressed
   DPA4C inference: every refusal, the graph-lower guard, argument validation,

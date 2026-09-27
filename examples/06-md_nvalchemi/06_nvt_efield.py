@@ -25,12 +25,14 @@ The net force is `Q.E`, exactly zero for a neutral cell, so nothing drifts.
 import argparse
 
 import numpy as np
-from nvalchemiops.dynamics.integrators import (
-    langevin_baoab_finalize,
-    langevin_baoab_half_step,
-)
+from ase import units
 
-from deepmd_lr.nvalchemi import Thermo, build_evaluator, read_structure
+from deepmd_lr.nvalchemi import (
+    Langevin,
+    build_evaluator,
+    maxwell_boltzmann,
+    read_structure,
+)
 
 
 def alignment(p, oxy, hyd, L) -> float:
@@ -69,37 +71,25 @@ def main():
 
     atoms = read_structure(a.structure, a.index)
     ev = build_evaluator(a.model, atoms, efield=[a.efield, 0.0, 0.0])
-    th = Thermo(
-        ev, atoms.get_positions(), timestep=a.dt, temperature=a.temperature,
-        columns=("step", "time", "temp", "epot"),
-        every=max(a.steps // 10, 1),
-    )
-    friction = th.scalar(a.friction)
+    maxwell_boltzmann(atoms, temperature_K=a.temperature, seed=a.seed)
     sym = np.array(atoms.get_chemical_symbols())
     oxy, hyd = np.where(sym == "O")[0], np.where(sym == "H")[0]
     lengths = np.diag(np.asarray(atoms.get_cell()))
-
-    th.evaluate()
-    print(f"NVT + field  {th.n_atoms} atoms  E_x {a.efield} V/A  "
+    md = Langevin(
+        ev, atoms, a.dt * units.fs, temperature_K=a.temperature, friction=a.friction,
+        seed=a.seed, logfile="-", loginterval=max(a.steps // 20, 1),
+        extra_columns={
+            "cos_x": lambda m: alignment(m.thermo.positions.numpy(), oxy, hyd, lengths),
+            "maxZ": lambda m: float(np.abs(m.results["born_charge"]).max()),
+        })
+    print(f"NVT + field  {len(atoms)} atoms  E_x {a.efield} V/A  "
           f"T {a.temperature} K  friction {a.friction}")
-    for step in range(a.steps + 1):
-        Z = ev.results["born_charge"]
-        th.log(step,
-               cos_x=alignment(th.positions.numpy(), oxy, hyd, lengths),
-               maxZ=float(np.abs(Z).max()))
-        if step == a.steps:
-            break
-        langevin_baoab_half_step(th.positions, th.velocities, th.forces,
-                                 th.masses, th.dt, th.kT, friction,
-                                 a.seed + step)
-        th.evaluate()
-        langevin_baoab_finalize(th.velocities, th.forces, th.masses, th.dt)
+    md.run(a.steps)
 
-    half = len(th.rows) // 2
-    rows = th.rows[half:]
-    print(f"\n  {th.performance()}")
-    print(f"  second half: <cos_x> {sum(r[4] for r in rows)/len(rows):+.4f}, "
-          f"T {sum(r[2] for r in rows)/len(rows):.1f} K")
+    half = md.rows[len(md.rows) // 2:]
+    print(f"\n  {md.performance()}")
+    print(f"  second half: <cos_x> {np.mean([r['cos_x'] for r in half]):+.4f}, "
+          f"T {np.mean([r['T[K]'] for r in half]):.1f} K")
     net = np.abs(ev.results["field_force"].sum(axis=0)).max()
     print(f"  net field force {net:.2e} eV/A  (zero for a neutral cell)")
     print("  If maxZ climbs above a few, the field is distorting the structure")

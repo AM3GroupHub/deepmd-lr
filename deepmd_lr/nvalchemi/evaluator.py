@@ -133,6 +133,13 @@ class _LazyNumpy(dict):
         return [self[k] for k in self]
 
 
+_VIRIAL_UNDER_FIELD = (
+    "compute_virial and efield cannot be combined: the field's contribution "
+    "to the stress is a separate derivation, and reporting the field-free "
+    "virial under a field would be quietly wrong."
+)
+
+
 class DistributedEvaluator:
     """Evaluate a ``dp_lr`` model over spatial partitions, one per device.
 
@@ -141,8 +148,9 @@ class DistributedEvaluator:
     model
         A ``dp_lr`` model, already on its home device.
     atype, cell
-        Atom types ``(natoms,)`` and the cell ``(3, 3)``. Both fixed for the
-        life of the driver; a changing cell means rebuilding it.
+        Atom types ``(natoms,)`` and the cell ``(3, 3)``. The types are fixed
+        for the life of the driver; a barostat changes the cell through
+        :meth:`set_cell`.
     devices
         One device per partition. Repeats are accepted and exercise the
         partitioning arithmetic, but only distinct devices test placement.
@@ -274,12 +282,7 @@ class DistributedEvaluator:
                     "block, so it predicts no charges."
                 )
             if self.compute_virial:
-                raise ValueError(
-                    "compute_virial and efield cannot be combined: the "
-                    "field's contribution to the stress is a separate "
-                    "derivation, and reporting the field-free virial under a "
-                    "field would be quietly wrong."
-                )
+                raise ValueError(_VIRIAL_UNDER_FIELD)
             # The field force is built from Z, so Z has to be assembled.
             self.compute_born = True
         self.charge_spin = charge_spin
@@ -337,6 +340,11 @@ class DistributedEvaluator:
         self._calls_since_rebuild = 0
 
         self.rebuild_count = 0
+        #: Completed evaluations. Several MD objects may share this evaluator,
+        #: one after another, and all of them view the same forces buffer; a
+        #: Thermo compares this count with the one it saw at its own last
+        #: evaluation to know whether the forces are still its own.
+        self.calls = 0
         self.results: dict[str, Any] = {}
         self.virial: np.ndarray | None = None
         self.forces = torch.zeros(
@@ -364,6 +372,23 @@ class DistributedEvaluator:
     def masses(self) -> np.ndarray:
         """Standard masses for this system, in amu."""
         return atomic_masses(self.model, self.atype)
+
+    def set_compute_virial(self, flag: bool) -> None:
+        """Switch the virial on or off for the evaluations that follow.
+
+        One evaluator can then carry a relaxation and an NVT stage without
+        paying for the virial, and an NPT stage with it, instead of a second
+        evaluator copying the model onto every device again. Refused under a
+        field, for the reason the constructor refuses the combination. The
+        first-step memory probe did not price the virial; should switching it
+        on outgrow a device, the out-of-memory backoff shrinks the skin.
+        """
+        flag = bool(flag)
+        if flag and self.efield is not None:
+            raise ValueError(_VIRIAL_UNDER_FIELD)
+        self.compute_virial = flag
+        if not flag:
+            self.virial = None
 
     def _auto_skin(self) -> float:
         """The geometry rule, never above a ceiling memory has forced on us.
@@ -648,7 +673,7 @@ class DistributedEvaluator:
         # life of the object -- which is what lets `Thermo` bind it a single
         # time instead of rewrapping every step. Turning either this or the
         # `+=` below into an assignment would silently freeze the forces every
-        # MD driver sees. `tests/test_nvalchemi.py` pins the pointer.
+        # MD driver sees. `tests/test_thermo.py` pins the pointer.
         self.forces.copy_(out["force"].to(device=self.home, dtype=torch.float64))
         if self.efield is not None:
             # Through `field_force` rather than an einsum written out again:
@@ -662,4 +687,5 @@ class DistributedEvaluator:
             self.results["field_force"] = (
                 response if self.results_on_device else response.cpu().numpy()
             )
+        self.calls += 1
         return float(out["energy"]), self.forces

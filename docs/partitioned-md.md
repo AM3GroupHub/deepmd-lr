@@ -15,26 +15,11 @@ evaluator = DistributedEvaluator(
 energy, forces = evaluator(positions)      # eV, eV/angstrom
 ```
 
-`Thermo` is the other half an MD loop needs — it owns the state those kernels
-mutate (positions, velocities, masses, forces, cell, timestep, each a warp
-array bound once) and reports the thermodynamics, which nvalchemiops does not
-do at all. It takes `temperature` in kelvin and builds the `k_B T` array
-itself, so nothing downstream has a reason to write that conversion.
-`examples/06-md_nvalchemi` has a loop per ensemble.
-
-```python
-from deepmd_lr.nvalchemi import Thermo, build_evaluator, read_structure
-
-atoms = read_structure("start.xyz")
-ev = build_evaluator("model.ckpt.pt", atoms, compute_virial=True)
-th = Thermo(ev, atoms.get_positions(), timestep=0.5, temperature=300.0,
-            columns=("step", "time", "temp", "press", "vol"))
-```
-
 **That is the whole object.** It owns the partitioning, the ghost halo, the
 per-device replicas and the decision of when to rebuild — and nothing else.
 No timestep, no ensemble, no thermostat, no velocities: those belong to
-whoever is integrating. Swapping NVE for NPT changes your loop and not this.
+whoever is integrating. Swapping NVE for NPT changes the integrator and not
+this.
 
 `positions` may be a torch tensor — including the one an integrator is
 mutating in place — or anything `np.asarray` accepts. Forces come back as a
@@ -47,35 +32,131 @@ integrator's sake. `evaluator.results` carries the energy split and charges;
 returns energy and forces one configuration at a time and its integrators
 cannot touch on-device state, which is the point of this path.
 
-### Driving it with nvalchemiops
+### The MD classes
 
-nvalchemiops ships half-step kernels and no driver, so the loop is yours; for
-a ready-made one with restarts and a GPU-count benchmark, see
-[examples/07-multi-gpu-md](../examples/07-multi-gpu-md). NVE is four lines:
+The integrators follow ASE: the evaluator and an `ase.Atoms` come first, the
+parameters go to `__init__`, and `run(steps)` advances. One evaluator carries
+a whole workflow:
+
+```python
+from ase import units
+from deepmd_lr.nvalchemi import (
+    FIRE, IsotropicMTKNPT, NoseHooverChainNVT, build_evaluator,
+    maxwell_boltzmann, read_structure,
+)
+
+atoms = read_structure("start.xyz")
+ev = build_evaluator("model.ckpt.pt", atoms, devices=["cuda:0", "cuda:1"])
+FIRE(ev, atoms).run(fmax=0.05)
+maxwell_boltzmann(atoms, temperature_K=300, seed=7)
+NoseHooverChainNVT(ev, atoms, 0.5 * units.fs, temperature_K=300,
+                   tdamp=100 * units.fs, logfile="nvt.log",
+                   loginterval=100).run(20_000)
+ev.set_compute_virial(True)                     # only NPT pays for the virial
+npt = IsotropicMTKNPT(ev, atoms, 0.5 * units.fs, temperature_K=300,
+                      pressure_au=1e-4 * units.GPa, tdamp=100 * units.fs,
+                      pdamp=1000 * units.fs, logfile="npt.log",
+                      trajectory="npt.traj", traj_interval=500)
+npt.run(20_000)
+```
+
+| class | what | the `Econs` column |
+|---|---|---|
+| `VelocityVerlet` | NVE | Etot |
+| `Langevin` | NVT, BAOAB; `fixcm=True` keeps the centre of mass at rest | none |
+| `NoseHooverChainNVT` | NVT, Nosé–Hoover chain | Etot + the chain energy |
+| `IsotropicMTKNPT` | NPT, MTK, isotropic cell | the MTK H′ |
+| `FIRE` | relaxes the positions; the cell is fixed | — |
+
+The units are exactly ASE's: `timestep` in ASE time (`0.5 * units.fs`),
+`friction` in 1/ASE time, `tdamp` and `pdamp` in ASE time, `pressure_au` in
+eV/Å³, `temperature_K` in kelvin.
+
+**Who owns what.**
+
+| object | built by | owns |
+|---|---|---|
+| `DistributedEvaluator` | you, once | the model replicas, the partitioning and skin, the forces buffer, the cell |
+| `Thermo` | each MD object, in its `__init__` | positions, velocities, masses and the forces view, on the device; the measurements |
+| the MD object | you | the timestep and ensemble parameters, the thermostat and barostat state, the step count, the log, the trajectory, observers, checkpoints |
+
+`md.evaluator` is a read-only property returning `md.thermo.evaluator`, which
+is the object you built. No class ever builds or copies an evaluator. Sharing
+it between stages is safe by construction:
+
+- **Forces.** The stages share one forces buffer. An object that another has
+  evaluated since re-evaluates before its first kick (`Thermo.fresh`).
+- **Cell.** An object built before an NPT stage moved the cell refuses to
+  step (`Thermo.cell_is_current`).
+- **Atoms.** `atoms` must match the evaluator's atom order and cell. ASE
+  constraints and non-periodic axes are refused rather than ignored.
+- **Virial.** `set_compute_virial` switches it on for the stage that needs
+  it; it is refused under a field.
+
+Two objects stepping one evaluator at the same time are not supported; one
+after another is the design.
+
+**`atoms` stays in step with the device, both ways.**
+- **Device to `atoms`:** positions (unwrapped), momenta, the cell and a
+  `SinglePointCalculator` are written back at log, trajectory and observer
+  intervals, and at the end of every `run`, even one that raised.
+- **`atoms` to device:** edits made between runs or inside an observer are
+  uploaded before the next step. A cheap every-step observer can skip the
+  sync with `attach(fn, 1, sync_atoms=False)`.
+
+Nothing adds a host synchronisation per step beyond the evaluator's own.
+Measured on water on one GB10, the classes cost what a hand-written kernel
+loop costs:
+
+| ms/step | 192 atoms | 12,288 atoms, compressed |
+|---|---:|---:|
+| hand-written velocity Verlet | 35.8 | 36.1 |
+| `VelocityVerlet` | 35.7 | 36.4 |
+| hand-written Nosé–Hoover chain | 40.0 | 36.0 |
+| `NoseHooverChainNVT` | 40.5 | 36.1 |
+
+These are medians of three interleaved runs; the runs spread by about ±3 ms at
+192 atoms and ±1 ms at 12,288, and logging every 100 steps changes nothing
+measurable.
+
+**Checkpoints** hold the state, the class and its parameters, and a
+fingerprint of the model and system. `Cls.from_checkpoint(ev, atoms, path)`
+continues exactly: Langevin's noise is seeded per step, so a restart draws
+what an uninterrupted run would. After a hard kill it trims the log and the
+trajectory back to the checkpoint. For a ready-made driver with restarts
+across jobs, signal handling and a GPU-count benchmark, see
+[examples/07-multi-gpu-md](../examples/07-multi-gpu-md).
+
+### Your own loop
+
+For an integrator the classes lack, drive nvalchemiops' kernels on a
+`Thermo` directly, or subclass `MolecularDynamics` and write `step()` — the
+kernels around exactly one `self.thermo.evaluate()` — to get the log,
+trajectory, observers and checkpoints for free.
+[`07_custom_loop.py`](../examples/06-md_nvalchemi/07_custom_loop.py) shows
+both. NVE on a `Thermo`:
 
 ```python
 from nvalchemiops.dynamics.integrators import (
     velocity_verlet_position_update, velocity_verlet_velocity_finalize,
 )
-vec = lambda t: wp.from_torch(t, dtype=wp.vec3d)
 
-energy, forces = evaluator(positions)
+th = Thermo(ev, atoms.get_positions(), velocities=atoms.get_velocities(),
+            masses=atoms.get_masses())
+dt = th.scalar(0.5 * units.fs)                   # the loop owns time
+th.evaluate()
 for _ in range(steps):
     velocity_verlet_position_update(
-        vec(positions), vec(velocities), vec(forces),
-        wp.from_torch(masses), wp.from_torch(dt),
-    )
-    energy, forces = evaluator(positions)
-    velocity_verlet_velocity_finalize(
-        vec(velocities), vec(forces), wp.from_torch(masses), wp.from_torch(dt),
-    )
+        th.positions, th.velocities, th.forces, th.masses, dt)
+    th.evaluate()
+    velocity_verlet_velocity_finalize(th.velocities, th.forces, th.masses, dt)
 ```
 
 Available kernels: velocity Verlet (NVE), Langevin BAOAB, Nosé–Hoover chain,
 NPT and NPH (MTK), and velocity rescaling.
 
-Three conventions to respect, none of them guessable from the signatures, all
-found by running into them:
+The classes handle these conventions. None can be guessed from the
+signatures, and all were found by running into them:
 
 - **Temperature is `k_B T` in energy units, not Kelvin.** Every nvalchemiops
   dynamics entry point documents it that way. For eV,
@@ -83,38 +164,67 @@ found by running into them:
 - **Half-step factors are inconsistent between kernels.** Measured:
   `nhc_velocity_half_step` and `velocity_verlet_position_update` apply their
   own factor of ½ (`dv = (F/m) dt/2`), `nhc_position_update` does not
-  (`dr = v dt`), and `nhc_thermostat_chain_update` advances `eta` by
-  `half_dt` internally. So the **full `dt`** goes to every call, and the
-  chain update is called once at each end of the step.
+  (`dr = v dt`), and `nhc_thermostat_chain_update` scales the velocities by
+  a half step, `exp(−eta_dot dt/2)`. So the **full `dt`** goes to every call,
+  and the chain update is called once at each end of the step. Passing `dt/2`
+  to the Nosé–Hoover kick halves every force.
 - **`ndof` dtypes disagree.** `nhc_compute_masses` requires int32 while
   `nhc_thermostat_chain_update` and `nhc_compute_chain_energy` require
   float64. That is a Warp launch error, not a cast, so keep both.
+- **`total_scale` accumulates.** Reset it to 1 before every chain update; the
+  kernel multiplies into it.
+- **The Nosé–Hoover chain energy needs `eta / 2`.** While scaling the
+  velocities by a half step, the chain update moves `eta` by `eta_dot dt/2`
+  twice, a full `eta_dot dt`; called at both ends of the step, `eta` runs
+  twice as fast as `eta_dot` implies. The dynamics are right either way; only
+  the conserved quantity is off.
 - **The NPT kernels count `N_f = 3 ×` the atom count they are given.** The
   centre of mass does not move, so pass `N − 1` for `3N − 3`, the count
   `Thermo.temperature` uses; otherwise the system is held `3N/(3N−3)` hot.
   Refresh `ke_w` and `press_w` (`update_kinetic_energy`, `update_pressure`)
   right before each barostat half-step; `Thermo`'s getters never write them.
+- **Never rebind a `Thermo` array.** The kernels write into the bound
+  buffers; `th.set_state(...)` copies new values in.
 
 Units: the model works in angstrom and eV. Pair that with masses in amu and a
 timestep in ASE time units (`A sqrt(amu/eV)`) and the set is self-consistent.
 Take both constants from ASE — `from ase.units import fs, kB`.
 
-With a thermostat, watch the **MTK invariant** rather than the physical total
-— a thermostat moves the latter on purpose:
+### What is conserved
+
+With a thermostat, watch the extended energy — the `Econs` column — rather
+than the physical total, which a thermostat moves on purpose. For the
+Nosé–Hoover chain it is
 
 ```
-E_pot + E_kin + sum_k Q_k eta_dot_k^2 / 2 + N_dof kT eta_1 + kT sum_{k>1} eta_k
+E_pot + E_kin + sum_k Q_k eta_dot_k^2 / 2 + N_f kT eta_1 + kT sum_{k>1} eta_k
 ```
 
-> One caveat, measured and unresolved. That invariant drifts a few meV/atom
-> per 20 fs at strong Nosé–Hoover coupling, and the drift is **independent of
-> the timestep** — 2.2237, 2.2355, 2.2385 meV/atom at dt = 0.5, 0.25, 0.125
-> fs — and unchanged by the Yoshida–Suzuki `nloops`. So it is not integration
-> error. The same system under NVE conserves cleanly and as `dt^2` (−0.0159,
-> −0.0040, −0.0010), and the chain-energy expression matches the analytic
-> formula exactly, so it is neither the forces nor the bookkeeping. It scales
-> as the square of the coupling strength, so weak coupling is the safe regime.
-> Treat NVE as the trustworthy conservation check.
+with `eta` half the kernel's own array, `Q_1 = N_f kT tdamp²` and
+`Q_k = kT tdamp²` for `k > 1`. Measured on water (192 atoms, 100 fs from one
+start), it is conserved as dt² at any coupling:
+
+| `tdamp` | dt 0.5 fs | 0.25 fs | 0.125 fs |
+|---|---:|---:|---:|
+| 20 fs, `eta / 2` | 0.0224 | 0.0057 | 0.0014 |
+| 100 fs, `eta / 2` | 0.0226 | 0.0057 | 0.0014 |
+| 20 fs, the kernel's `eta` | +9.95 | +10.48 | +10.61 |
+
+The first two rows are the rms fluctuation, in meV/atom. The last is the
+change over the 100 fs: with the kernel's own `eta`, the invariant counts the
+heat the thermostat removes twice, and climbs by the same amount at every
+timestep. An earlier version of this page reported that as an unresolved,
+timestep-independent drift.
+
+For MTK NPT, H′ adds `P V + W |eps_dot|² / 2`, with `W = 3N kT pdamp²`. The
+NPT chain update moves `eta` by one `eta_dot dt/2` per half step, so there is
+no halving there. H′ is O(dt²) only
+while the thermostat is nearly idle: the NPT velocity kernel applies the drag
+`−(alpha eps_dot + eta_dot) v` explicitly inside the kick, which is first
+order. On equilibrated water at `tdamp` 100 fs, halving dt shrinks H′'s
+fluctuation 4.0× (0.0218 → 0.0054 meV/atom rms); a system heating fast enough
+to keep the thermostat busy gets about 1.8×. NVE, and the Nosé–Hoover NVT
+invariant, are the trustworthy conservation checks.
 
 ### How the atoms are split
 

@@ -1320,40 +1320,41 @@ class TestUnwrappedCoordinates:
         """
         import pathlib
 
-        from nvalchemiops.dynamics.integrators import (
-            langevin_baoab_finalize,
-            langevin_baoab_half_step,
-        )
+        from ase import units
 
-        from deepmd_lr.nvalchemi import Thermo, build_evaluator, read_structure
+        from deepmd_lr.nvalchemi import (
+            Langevin,
+            build_evaluator,
+            maxwell_boltzmann,
+            read_structure,
+        )
 
         root = pathlib.Path(__file__).resolve().parents[1]
         atoms = read_structure(root / "examples" / "06-md_nvalchemi" / "water_192.xyz")
         compress = os.environ.get("DEEPMD_LR_WATER_COMPRESS") == "1"
         ev = build_evaluator(os.environ["DEEPMD_LR_WATER_MODEL"], atoms,
                              devices=[DEVICE] * 2, compress=compress)
-        th = Thermo(ev, atoms.get_positions(), timestep=0.5, temperature=300.0)
-        th.maxwell_boltzmann(300.0, seed=1)
-        friction = th.scalar(0.05)
-        th.evaluate()
+        maxwell_boltzmann(atoms, temperature_K=300.0, seed=1)
+        md = Langevin(ev, atoms, 0.5 * units.fs, 300.0, friction=0.05, seed=0)
         cell = np.asarray(ev.cell)
         inverse = np.linalg.inv(cell)
         steps = int(os.environ.get("DEEPMD_LR_WATER_STEPS", 50_000))
-        worst, spread = 0.0, 0.0
-        for step in range(steps):
-            langevin_baoab_half_step(th.positions, th.velocities, th.forces,
-                                     th.masses, th.dt, th.kT, friction, step)
-            th.evaluate()
-            langevin_baoab_finalize(th.velocities, th.forces, th.masses, th.dt)
-            if (step + 1) % 500:
-                continue
-            x = th.positions.numpy()
-            assert np.isfinite(x).all(), f"blew up by step {step + 1}"
-            spread = max(spread, float((np.ptp(x, axis=0) - np.diag(cell)).max()))
+        seen = {"worst": 0.0, "spread": 0.0}
+
+        def check():
+            x = md.thermo.positions.numpy()
+            assert np.isfinite(x).all(), f"blew up by step {md.nsteps}"
+            seen["spread"] = max(seen["spread"],
+                                 float((np.ptp(x, axis=0) - np.diag(cell)).max()))
             wrapped = x - np.floor(x @ inverse) @ cell
             fresh = to_numpy(evaluate_partitioned(ev.model, wrapped, ev.atype, cell,
                                                   devices=[DEVICE]))
-            worst = max(worst, float(np.abs(th.forces.numpy() - fresh["force"]).max()))
+            seen["worst"] = max(seen["worst"], float(
+                np.abs(md.thermo.forces.numpy() - fresh["force"]).max()))
+
+        md.attach(check, 500, sync_atoms=False)
+        md.run(steps)
+        worst, spread = seen["worst"], seen["spread"]
         print(f"\n  {steps} steps: widest spread L + {spread:.1f} A, "
               f"worst force difference {worst:.2e} eV/A")
         assert spread > 12.0, "the run never reached the regime it guards"

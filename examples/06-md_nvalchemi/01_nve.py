@@ -1,21 +1,29 @@
 """NVE: velocity Verlet.
 
-The simplest loop, and the one worth running first on any new model: with no
-thermostat the total energy is conserved, so its drift is a direct test that
-the forces really are the gradient of the reported energy. A force that is not
-leaves a drift floor no timestep reduction removes.
+The simplest run, and the one worth doing first on any new model: with no
+thermostat the total energy is conserved, which directly tests that the forces
+are the gradient of the reported energy. Two numbers to read at the end:
+- the rms fluctuation of Etot, which falls about 4x when dt is halved (it is
+  O(dt^2));
+- the drift, which should be tiny: about 0.01 meV/atom/ps for the bundled
+  water box.
+A force that is not the energy's gradient leaves a drift no smaller timestep
+removes.
 
     python 01_nve.py --model ../../path/to/model.ckpt.pt
 """
 
 import argparse
 
-from nvalchemiops.dynamics.integrators import (
-    velocity_verlet_position_update,
-    velocity_verlet_velocity_finalize,
-)
+import numpy as np
+from ase import units
 
-from deepmd_lr.nvalchemi import Thermo, build_evaluator, read_structure
+from deepmd_lr.nvalchemi import (
+    VelocityVerlet,
+    build_evaluator,
+    maxwell_boltzmann,
+    read_structure,
+)
 
 
 def main():
@@ -32,33 +40,19 @@ def main():
 
     atoms = read_structure(a.structure, a.index)
     ev = build_evaluator(a.model, atoms)
-    th = Thermo(
-        ev, atoms.get_positions(), timestep=a.dt, temperature=a.temperature,
-        columns=("step", "time", "temp", "epot", "ekin", "etot"),
-        every=max(a.steps // 10, 1),
-    )
+    maxwell_boltzmann(atoms, temperature_K=a.temperature, seed=1)
+    md = VelocityVerlet(ev, atoms, a.dt * units.fs, logfile="-",
+                        loginterval=max(a.steps // 20, 1))
+    print(f"NVE  {len(atoms)} atoms  dt {a.dt} fs  {a.steps} steps")
+    md.run(a.steps)
 
-    print(f"NVE  {th.n_atoms} atoms  dt {a.dt} fs  {a.steps} steps")
-    th.evaluate()
-    for step in range(a.steps + 1):
-        th.log(step)
-        if step == a.steps:
-            break
-        # B-A: half-kick and drift, both inside one kernel.
-        velocity_verlet_position_update(
-            th.positions, th.velocities, th.forces, th.masses, th.dt
-        )
-        th.evaluate()
-        # B: the second half-kick, with the new forces.
-        velocity_verlet_velocity_finalize(
-            th.velocities, th.forces, th.masses, th.dt
-        )
-
-    print(f"\n  {th.performance()}")
-    print(f"  total-energy drift {th.drift('etot'):+.4f} meV/atom/ps")
-    print("  Halve dt and this should fall roughly 4x (it is O(dt^2)).")
-    print("  A floor that does not move means the forces are not the exact")
-    print("  gradient of the energy -- which no thermostat will hide.")
+    etot = np.array([r["Etot[eV]"] for r in md.rows]) * 1e3 / len(atoms)
+    print(f"\n  {md.performance()}")
+    print(f"  Etot fluctuation {etot.std():.4f} meV/atom rms, "
+          f"drift {md.drift('Etot[eV]'):+.4f} meV/atom/ps")
+    print("  Halve --dt: the fluctuation should fall ~4x. A drift that does not")
+    print("  shrink means the forces are not the exact gradient of the energy --")
+    print("  which no thermostat would hide.")
 
 
 if __name__ == "__main__":

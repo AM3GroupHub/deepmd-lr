@@ -137,7 +137,8 @@ ADAPTING TO A NEW SYSTEM (checklist)
        converge or broke a covalent bond between non-metal atoms. It aborts if
        it diverges: a model with no short-range repulsive wall can let the
        minimiser collapse atoms onto each other from a badly distorted start.
-       Pre-relax such a box with a classical force field instead.
+       Pre-relax such a box with a classical force field instead; for water,
+       docs/md.md ("Relaxing a packed box first") has a rigid-TIP3P recipe.
     5. For a net charge or a spin state the model was trained to condition on,
        pass --charge-spin Q MULTIPLICITY. Otherwise the model's default is used.
     6. For a multi-head checkpoint, pass --head BRANCH.
@@ -177,13 +178,13 @@ FOR AI AGENTS
     5. Production with --max-hours, resubmitting with --restart until done.
 
     Code map:
-    - VelocityVerlet, Langevin, NoseHooverChain, IsotropicMTK: one step each.
-    - relax(): the FIRE pre-relaxation.
-    - Logger, TrajectoryWriter, save_checkpoint() and load_checkpoint():
-      output and restarts.
-    - run_md() and benchmark(): the two top-level modes.
-    - New features belong in run_md(), after the evaluator is built, the same
-      way the existing options are handled.
+    - The MD itself is deepmd_lr.nvalchemi: VelocityVerlet, Langevin,
+      NoseHooverChainNVT, IsotropicMTKNPT, FIRE, maxwell_boltzmann. This script
+      turns the command line into those objects (build_md, output_settings)
+      and adds what a job needs around them.
+    - run_md(): a new run or a --restart; benchmark(): the GPU-count timing.
+    - New features belong in run_md(), after the MD object is built, e.g. as
+      an observer: md.attach(fn, interval).
 """
 
 from __future__ import annotations
@@ -192,7 +193,6 @@ import argparse
 import collections
 import datetime
 import gc
-import hashlib
 import json
 import math
 import os
@@ -207,48 +207,30 @@ from importlib import metadata
 import ase.io
 import numpy as np
 import torch
-import warp as wp
-from ase import Atoms, units
-from ase.calculators.singlepoint import SinglePointCalculator
-from ase.io.trajectory import Trajectory
-from nvalchemiops.dynamics.integrators import (
-    langevin_baoab_finalize,
-    langevin_baoab_half_step,
-    nhc_compute_chain_energy,
-    nhc_compute_masses,
-    nhc_position_update,
-    nhc_thermostat_chain_update,
-    nhc_velocity_half_step,
-    npt_barostat_half_step,
-    npt_cell_update,
-    npt_position_update,
-    npt_thermostat_half_step,
-    npt_velocity_half_step,
-    velocity_verlet_position_update,
-    velocity_verlet_velocity_finalize,
-)
-from nvalchemiops.dynamics.optimizers import fire2_step
+from ase import units
 
 from deepmd_lr.ase import load_model
-from deepmd_lr.nvalchemi import Thermo, build_evaluator, read_structure
+from deepmd_lr.nvalchemi import (
+    FIRE,
+    IsotropicMTKNPT,
+    Langevin,
+    MDInstabilityError,
+    NoseHooverChainNVT,
+    RelaxationError,
+    VelocityVerlet,
+    build_evaluator,
+    maxwell_boltzmann,
+    read_structure,
+)
 
-#: Bumped whenever the checkpoint layout changes.
-CHECKPOINT_VERSION = 1
 #: Settings a restart must share with the checkpoint it continues.
 PHYSICS_KEYS = ("ensemble", "thermostat", "dt", "temperature", "tau_t",
                 "pressure", "tau_p", "chain_length", "efield", "eps_inf",
                 "charge_spin")
-#: Elements whose mutual covalent bonds the relaxation check guards. Metals are
-#: left out on purpose: an ion's coordination shell may legitimately change.
-NONMETALS = {"H", "B", "C", "N", "O", "F", "Si", "P", "S", "Cl", "Se", "Br", "I"}
 
 
 class InputError(Exception):
     """A problem with the input that the user has to fix (exit code 1)."""
-
-
-class Unstable(Exception):
-    """The simulation left physical territory (exit code 2)."""
 
 
 # --------------------------------------------------------------------------
@@ -479,438 +461,53 @@ def make_evaluator(model, atoms, devices, a: argparse.Namespace):
         raise InputError(f"cannot build the evaluator: {exc}") from exc
 
 
-def fingerprint(model, symbols) -> dict:
-    """What identifies the system a checkpoint belongs to."""
+def md_class(a: argparse.Namespace):
+    if a.ensemble == "nve":
+        return VelocityVerlet
+    if a.ensemble == "npt":
+        return IsotropicMTKNPT
+    return Langevin if a.thermostat == "langevin" else NoseHooverChainNVT
+
+
+def max_temperature(a: argparse.Namespace) -> float | None:
+    if a.max_temperature is None:
+        return max(5.0 * a.temperature, 1500.0)
+    return a.max_temperature or None                     # 0 disables
+
+
+def output_settings(a: argparse.Namespace, out: pathlib.Path) -> dict:
+    """Where the MD object writes; a restart passes the same settings back."""
+    props = ["energy"]
+    props += ["forces"] if a.traj_forces else []
+    props += ["velocities"] if a.traj_velocities else []
+    props += ["charges"] if a.traj_charges else []
     return {
-        "n_atoms": len(symbols),
-        "symbols_sha1": hashlib.sha1(",".join(symbols).encode()).hexdigest(),
-        "type_map": list(model.get_type_map()),
-        "rcut": float(model.get_rcut()),
+        "logfile": out / "md.log",
+        "loginterval": a.log_every,
+        "trajectory": out / f"traj.{a.traj_format}" if a.traj_every > 0 else None,
+        "traj_interval": a.traj_every if a.traj_every > 0 else None,
+        "trajectory_properties": tuple(props),
+        "traj_wrapped": a.traj_wrapped,
+        "checkpoint": out / "checkpoint.npz",
+        "checkpoint_interval": a.checkpoint_every,
+        "max_temperature": max_temperature(a),
+        "echo_log": True,
     }
 
 
-# --------------------------------------------------------------------------
-# Integrators: each step is the kernels around exactly one force evaluation.
-# Every kernel takes the FULL timestep and applies its own factor 1/2.
-# --------------------------------------------------------------------------
-
-
-class Integrator:
-    name = "?"
-
-    def __init__(self, th: Thermo, evaluate):
-        self.th = th
-        self.evaluate = evaluate
-
-    def prepare(self) -> None:
-        """Called once after the first force evaluation."""
-
-    def step(self, index: int) -> None:
-        """Advance from step `index` to `index + 1`."""
-        raise NotImplementedError
-
-    def conserved(self) -> float | None:
-        """A conserved extended energy, where the ensemble has one."""
-        return None
-
-    def state(self) -> dict:
-        """Integrator variables for the checkpoint."""
-        return {}
-
-    def load_state(self, arrays: dict) -> None:
-        pass
-
-
-class VelocityVerlet(Integrator):
-    name = "NVE, velocity Verlet"
-
-    def step(self, index):
-        th = self.th
-        velocity_verlet_position_update(th.positions, th.velocities, th.forces,
-                                        th.masses, th.dt)
-        self.evaluate()
-        velocity_verlet_velocity_finalize(th.velocities, th.forces, th.masses,
-                                          th.dt)
-
-
-class Langevin(Integrator):
-    """BAOAB Langevin. The noise seed is `seed + step`, so a restart repeats
-    exactly the noise an uninterrupted run would have drawn."""
-
-    def __init__(self, th, evaluate, tau_t_fs, seed):
-        super().__init__(th, evaluate)
-        self.name = f"NVT, Langevin BAOAB, tau_t {tau_t_fs:g} fs"
-        self.friction = th.scalar(1.0 / (tau_t_fs * units.fs))
-        self.seed = int(seed)
-
-    def step(self, index):
-        th = self.th
-        langevin_baoab_half_step(th.positions, th.velocities, th.forces,
-                                 th.masses, th.dt, th.kT, self.friction,
-                                 (self.seed + index) % 2**31)
-        self.evaluate()
-        langevin_baoab_finalize(th.velocities, th.forces, th.masses, th.dt)
-
-
-class NoseHooverChain(Integrator):
-    """Nose-Hoover chain NVT (Martyna-Tuckerman splitting).
-
-    Conventions verified on water (bend ~1640, stretch ~3400 cm-1):
-    - The full dt goes to every kernel. Passing dt/2 to the velocity kick
-      halves every force.
-    - ndof = 3N - 3, since the centre of mass is fixed.
-    - total_scale is reset to 1 before each chain update.
-    - The conserved energy uses eta/2: the kernel advances eta at twice the
-      rate of eta_dot. eta never feeds back into the dynamics, so the
-      trajectory itself is right.
-    """
-
-    NLOOPS = 3          # Yoshida-Suzuki stages per chain update
-
-    def __init__(self, th, evaluate, tau_t_fs, chain_length):
-        super().__init__(th, evaluate)
-        self.name = (f"NVT, Nose-Hoover chain, tau_t {tau_t_fs:g} fs, "
-                     f"chain {chain_length}")
-        ndof = 3 * th.n_atoms - 3
-        self.ndof = th.scalar(float(ndof))                         # float64
-        ndof_i32 = wp.array(np.array([ndof]), dtype=wp.int32, device=th.device)
-        self.L = chain_length
-        self.eta = th.zeros(self.L)
-        self.eta_dot = th.zeros(self.L)
-        self.eta_mass = th.zeros(self.L)
-        nhc_compute_masses(ndof_i32, th.kT, th.scalar(tau_t_fs * units.fs),
-                           self.L, self.eta_mass)
-        self.ke2 = th.zeros(1)
-        self.total_scale = th.scalar(1.0)
-        self.step_scale = th.zeros(1)
-        self.dt_chain = th.zeros(1)
-        self.ke_chain = th.zeros(1)
-        self.pe_chain = th.zeros(1)
-
-    def _chain(self):
-        th = self.th
-        self.total_scale.fill_(1.0)
-        nhc_thermostat_chain_update(
-            th.velocities, th.masses, self.eta, self.eta_dot, self.eta_mass,
-            th.kT, th.dt, self.ndof, self.ke2, self.total_scale,
-            self.step_scale, self.dt_chain, nloops=self.NLOOPS)
-
-    def step(self, index):
-        th = self.th
-        self._chain()
-        nhc_velocity_half_step(th.velocities, th.forces, th.masses, th.dt)
-        nhc_position_update(th.positions, th.velocities, th.dt)
-        self.evaluate()
-        nhc_velocity_half_step(th.velocities, th.forces, th.masses, th.dt)
-        self._chain()
-
-    def conserved(self):
-        th = self.th
-        half_eta = wp.array(0.5 * self.eta.numpy(), dtype=wp.float64,
-                            device=th.device)
-        nhc_compute_chain_energy(half_eta, self.eta_dot, self.eta_mass, th.kT,
-                                 self.ndof, self.ke_chain, self.pe_chain)
-        return (th.total_energy + float(self.ke_chain.numpy()[0])
-                + float(self.pe_chain.numpy()[0]))
-
-    def state(self):
-        return {"nhc_eta": self.eta.numpy(), "nhc_eta_dot": self.eta_dot.numpy()}
-
-    def load_state(self, arrays):
-        self.eta.assign(arrays["nhc_eta"])
-        self.eta_dot.assign(arrays["nhc_eta_dot"])
-
-
-class IsotropicMTK(Integrator):
-    """Isotropic MTK NPT with a Nose-Hoover chain thermostat.
-
-    The step is the palindrome thermostat, barostat, kick | drift | kick,
-    barostat, thermostat. Three points are not in the kernel signatures:
-
-    - Fresh inputs. The kinetic energy and pressure are refreshed right before
-      each barostat/thermostat half-step, as LAMMPS' fix nh does. The barostat
-      must see the current state, never a value cached earlier in the step. An
-      earlier version reused the pressure from before the last kick, and
-      because the Thermo.pressure getter rewrote that cache, logging changed
-      the trajectory. With the refresh, the MTK conserved quantity is kept to
-      O(dt^2) as before: 0.0218 -> 0.0054 meV/atom rms from dt 0.5 to 0.25 fs.
-    - Degrees of freedom. The kernels compute N_f = 3 * (the count they are
-      given). The centre of mass is at rest and stays there (forces sum to
-      zero, and both drags scale velocities uniformly), so the moving degrees
-      of freedom are 3N - 3: the kernels get N - 1. That matches the masses
-      below and Thermo.temperature. Given N, they held the system 3N/(3N-3)
-      hot, which is 0.5 % at 192 atoms.
-    - The cell. After the barostat moves the cell, `th.set_cell()` pushes it
-      to the evaluator, which invalidates the partitioning. That is correct
-      and costs a repartition every step. Skipping it would leave ghost images
-      at stale offsets, giving quietly wrong forces.
-    """
-
-    def __init__(self, th, evaluate, pressure_gpa, tau_t_fs, tau_p_fs,
-                 chain_length):
-        super().__init__(th, evaluate)
-        self.name = (f"NPT, isotropic MTK, P {pressure_gpa:g} GPa, "
-                     f"tau_t {tau_t_fs:g} fs, tau_p {tau_p_fs:g} fs, "
-                     f"chain {chain_length}")
-        self.L = chain_length
-        kT = float(th.kT.numpy()[0])
-        ndof = 3 * th.n_atoms - 3
-        self.eta = th.zeros((1, self.L))
-        self.eta_dot = th.zeros((1, self.L))
-        q = np.full((1, self.L), kT * (tau_t_fs * units.fs) ** 2)
-        q[0, 0] *= ndof                          # Q_0 = ndof kT tau^2
-        self.th_mass = wp.array(q, dtype=wp.float64, device=th.device)
-        self.cell_v = th.zeros(1, dtype=wp.mat33d)
-        # W = (ndof + 3) kT tau_p^2
-        self.cell_mass = th.scalar((ndof + 3) * kT * (tau_p_fs * units.fs) ** 2)
-        self.target_p = th.scalar(pressure_gpa * units.GPa)
-        # N - 1, so that the kernels' N_f = 3 * count is 3N - 3.
-        self.dof_count = wp.array([th.n_atoms - 1], dtype=wp.int32,
-                                  device=th.device)
-
-    def _refresh(self):
-        """Kinetic energy and pressure of the current state, for the kernels."""
-        self.th.update_kinetic_energy()
-        self.th.update_pressure()
-
-    def _thermostat(self):
-        th = self.th
-        npt_thermostat_half_step(self.eta, self.eta_dot, th.ke_w, th.kT,
-                                 self.th_mass, self.dof_count, self.L, th.dt)
-
-    def _barostat(self):
-        th = self.th
-        npt_barostat_half_step(self.cell_v, th.press_w, self.target_p,
-                               th.volume_w, self.cell_mass, th.ke_w,
-                               self.dof_count, th.dt)
-
-    def _kick(self):
-        th = self.th
-        npt_velocity_half_step(th.velocities, th.masses, th.forces, self.cell_v,
-                               eta_dots=self.eta_dot, num_atoms=self.dof_count,
-                               dt=th.dt)
-
-    def step(self, index):
-        th = self.th
-        self._refresh()
-        self._thermostat()
-        self._barostat()
-        self._kick()
-        npt_position_update(th.positions, th.velocities, th.cell, self.cell_v,
-                            th.dt)
-        npt_cell_update(th.cell, self.cell_v, th.dt)
-        th.set_cell()                                # evaluator + volume
-        self.evaluate()
-        self._kick()
-        self._refresh()                              # after the kick
-        self._barostat()
-        self._thermostat()
-
-    def state(self):
-        return {"npt_eta": self.eta.numpy(), "npt_eta_dot": self.eta_dot.numpy(),
-                "npt_cell_v": self.cell_v.numpy()}
-
-    def load_state(self, arrays):
-        self.eta.assign(arrays["npt_eta"])
-        self.eta_dot.assign(arrays["npt_eta_dot"])
-        self.cell_v.assign(arrays["npt_cell_v"])
-
-
-def build_integrator(a, th, seed) -> Integrator:
-    if a.ensemble == "nve":
-        return VelocityVerlet(th, th.evaluate)
-    if a.ensemble == "nvt" and a.thermostat == "langevin":
-        return Langevin(th, th.evaluate, a.tau_t, seed)
-    if a.ensemble == "nvt":
-        return NoseHooverChain(th, th.evaluate, a.tau_t, a.chain_length)
-    return IsotropicMTK(th, th.evaluate, a.pressure, a.tau_t,
-                        a.tau_p, a.chain_length)
-
-
-# --------------------------------------------------------------------------
-# Relaxation
-# --------------------------------------------------------------------------
-
-
-def covalent_bonds(symbols, positions, cell) -> set:
-    """Bonded pairs among non-metal atoms (ASE covalent radii x 1.2)."""
-    from ase.neighborlist import natural_cutoffs, neighbor_list
-
-    atoms = Atoms(symbols, positions=positions, cell=cell, pbc=True)
-    atoms.wrap()
-    i, j = neighbor_list("ij", atoms, natural_cutoffs(atoms, mult=1.2))
-    sym = np.array(symbols)
-    keep = (i < j) & np.isin(sym[i], list(NONMETALS)) & np.isin(sym[j], list(NONMETALS))
-    return set(zip(i[keep].tolist(), j[keep].tolist(), strict=True))
-
-
-def relax(th: Thermo, a: argparse.Namespace, symbols) -> None:
-    """FIRE on the positions only; the cell never changes.
-
-    A freshly packed box can hold tens of eV of clashes. Released by MD, that
-    energy heats the system in the first few hundred fs and can push the model
-    into regions it never saw.
-
-    Aborts, whatever the flags, when it diverges: non-finite values, forces
-    growing tenfold, or more than 2 eV/atom released. Those mean atoms are
-    collapsing where the model has no repulsion. Refuses to go on (unless
-    --no-relax-checks) when:
-    - it did not converge;
-    - the energy rose (checked only without a field, since under a field FIRE
-      seeks zero total force, not minimum energy);
-    - a covalent bond between non-metal atoms broke or formed.
-    """
-    n, dev = th.n_atoms, th.device
-    vel = wp.zeros(n, dtype=wp.vec3d, device=dev)
-    batch = wp.zeros(n, dtype=wp.int32, device=dev)
-    alpha = wp.array([0.09], dtype=wp.float64, device=dev)
-    fire_dt = wp.array([0.01], dtype=wp.float64, device=dev)
-    n_inc = wp.zeros(1, dtype=wp.int32, device=dev)
-    scratch = [wp.zeros(1, dtype=wp.float64, device=dev) for _ in range(4)]
-
-    def fmax() -> float:
-        return float(np.linalg.norm(th.forces.numpy(), axis=1).max())
-
-    cell = np.asarray(th.evaluator.cell)
-    bonds0 = covalent_bonds(symbols, th.positions.numpy(), cell)
-    e0, f0 = th.energy, fmax()
-    k, diverged = 0, None
-    for k in range(1, a.relax_steps + 1):
-        fire2_step(th.positions, vel, th.forces, batch, alpha, fire_dt, n_inc,
-                   *scratch)
-        th.evaluate()
-        if not math.isfinite(th.energy):
-            break
-        if k % 10 == 0:
-            f = fmax()
-            if f < a.relax_fmax:
-                break
-            # A relaxation lowers the forces. Forces growing tenfold, or more
-            # than 2 eV/atom released, means atoms are collapsing into a region
-            # where the model has no repulsion.
-            if f > max(10.0 * f0, 50.0) or (e0 - th.energy) / n > 2.0:
-                diverged = (f"after {k} steps max|F| reached {f:.3g} eV/A and "
-                            f"the energy fell {(e0 - th.energy) / n:.3g} eV/atom")
-                break
-    f1 = fmax()
-    print(f"  FIRE relaxation: {k} steps, E {e0:.3f} -> {th.energy:.3f} eV "
-          f"({(th.energy - e0) / n * 1e3:+.2f} meV/atom), "
-          f"max|F| {f0:.3f} -> {f1:.3f} eV/A", flush=True)
-
-    if diverged or not (math.isfinite(th.energy) and math.isfinite(f1)):
-        # Never overridable: there is nothing physical to continue from.
-        raise Unstable(
-            "relaxation diverged (" + (diverged or "non-finite energy or forces")
-            + "): the model lacks short-range repulsion somewhere near this "
-            "structure and the minimiser fell in. Pre-relax the box with a "
-            "classical force field, then start from that structure")
-    problems = []
-    if f1 >= a.relax_fmax:
-        problems.append(f"not converged (max|F| {f1:.3f} >= {a.relax_fmax} "
-                        "eV/A; raise --relax-steps)")
-    if a.efield is None and th.energy > e0:
-        problems.append(f"energy rose ({e0:.3f} -> {th.energy:.3f} eV)")
-    bonds1 = covalent_bonds(symbols, th.positions.numpy(), cell)
-    if bonds1 != bonds0:
-        broken, formed = sorted(bonds0 - bonds1), sorted(bonds1 - bonds0)
-        problems.append(
-            f"covalent topology changed: {len(broken)} bond(s) broken, "
-            f"{len(formed)} formed, e.g. atoms {(broken or formed)[:3]}")
-    if problems and not a.no_relax_checks:
-        raise Unstable("relaxation rejected: " + "; ".join(problems) + ". "
-                       "A heavily clashing start is better pre-relaxed with a "
-                       "classical force field; --no-relax-checks overrides.")
-    for p in problems:
-        print(f"  warning: {p}", flush=True)
-
-
-# --------------------------------------------------------------------------
-# Output
-# --------------------------------------------------------------------------
-
-
-class Logger:
-    """The thermo table: one '#' header line, then whitespace-separated rows,
-    mirrored to stdout. numpy.loadtxt reads the file directly."""
-
-    def __init__(self, path: pathlib.Path, columns, append: bool):
-        fresh = not (append and path.exists() and path.stat().st_size > 0)
-        self.fh = open(path, "a" if append else "w")
-        self.columns = columns                  # [(name, width, format spec)]
-        header = "".join(f"{name:>{width}}" for name, width, _ in columns)
-        header = "#" + header[1:]
-        if fresh:
-            self.fh.write(header + "\n")
-            self.fh.flush()
-        print(header, flush=True)
-
-    def write(self, row: dict) -> None:
-        line = "".join(f"{row[name]:>{width}{spec}}"
-                       for name, width, spec in self.columns)
-        print(line, flush=True)
-        self.fh.write(line + "\n")
-        self.fh.flush()
-
-    def tell(self) -> int:
-        return self.fh.tell()
-
-    def close(self) -> None:
-        self.fh.close()
-
-
-def log_columns(a: argparse.Namespace):
-    cols = [("step", 10, "d"), ("time[ps]", 12, ".4f"), ("T[K]", 10, ".2f"),
-            ("Epot[eV]", 18, ".6f"), ("Ekin[eV]", 16, ".6f"),
-            ("Etot[eV]", 18, ".6f")]
-    if a.ensemble == "nvt" and a.thermostat == "nhc":
-        cols.append(("Econs[eV]", 18, ".6f"))
-    if a.ensemble == "npt":
-        cols += [("P[GPa]", 12, ".5f"), ("V[A^3]", 14, ".3f")]
-    cols.append(("ms/step", 10, ".1f"))
-    return cols
-
-
-class TrajectoryWriter:
-    """Appends frames as extxyz (one open handle) or ASE .traj."""
-
-    def __init__(self, path: pathlib.Path, a: argparse.Namespace, symbols,
-                 append: bool):
-        self.a = a
-        self.symbols = symbols
-        self.path = path
-        if a.traj_format == "traj":
-            self.traj, self.fh = Trajectory(str(path), "a" if append else "w"), None
-        else:
-            self.traj, self.fh = None, open(path, "a" if append else "w")
-
-    def write(self, th: Thermo, step: int) -> None:
-        a, ev = self.a, th.evaluator
-        atoms = Atoms(self.symbols, positions=th.positions.numpy(),
-                      cell=np.asarray(ev.cell), pbc=True)
-        if a.traj_wrapped:
-            atoms.wrap()
-        if a.traj_velocities:
-            atoms.set_velocities(th.velocities.numpy())
-        results = {"energy": th.energy}
-        if a.traj_forces:
-            results["forces"] = th.forces.numpy().copy()
-        if a.traj_charges:
-            results["charges"] = np.asarray(ev.results["charge"]).reshape(-1).copy()
-        atoms.calc = SinglePointCalculator(atoms, **results)
-        atoms.info["step"] = int(step)
-        atoms.info["time_ps"] = step * a.dt / 1000.0
-        if self.fh is not None:
-            ase.io.write(self.fh, atoms, format="extxyz")
-            self.fh.flush()
-        else:
-            self.traj.write(atoms)
-
-    def tell(self) -> int | None:
-        """Bytes written so far (extxyz only), recorded in each checkpoint."""
-        return self.fh.tell() if self.fh is not None else None
-
-    def close(self) -> None:
-        (self.fh or self.traj).close()
+def build_md(a: argparse.Namespace, ev, atoms, seed: int, io: dict):
+    """The command line's units (fs, K, GPa) turned into ASE's."""
+    dt, cls = a.dt * units.fs, md_class(a)
+    if cls is VelocityVerlet:
+        return cls(ev, atoms, dt, **io)
+    if cls is Langevin:
+        return cls(ev, atoms, dt, a.temperature, 1.0 / (a.tau_t * units.fs),
+                   seed=seed, **io)
+    if cls is NoseHooverChainNVT:
+        return cls(ev, atoms, dt, a.temperature, a.tau_t * units.fs,
+                   tchain=a.chain_length, **io)
+    return cls(ev, atoms, dt, a.temperature, a.pressure * units.GPa,
+               a.tau_t * units.fs, a.tau_p * units.fs, tchain=a.chain_length, **io)
 
 
 def physics_of(a: argparse.Namespace) -> dict:
@@ -929,64 +526,31 @@ def physics_of(a: argparse.Namespace) -> dict:
     return d
 
 
-def save_checkpoint(path: pathlib.Path, th: Thermo, integ: Integrator,
-                    step: int, seed: int, a, fp, logger, traj) -> None:
-    """Atomic: written to a temporary file, then renamed over the old one."""
-    meta = {
-        "format": "deepmd-lr examples/07-multi-gpu-md/run_md.py checkpoint",
-        "version": CHECKPOINT_VERSION,
-        "step": int(step),
-        "seed": int(seed),
-        "physics": physics_of(a),
-        "fingerprint": fp,
-        "log_bytes": logger.tell(),
-        "traj_bytes": traj.tell() if traj is not None else None,
-        "traj_file": traj.path.name if traj is not None else None,
-    }
-    arrays = {
-        "positions": th.positions.numpy(),
-        "velocities": th.velocities.numpy(),
-        "cell": np.asarray(th.evaluator.cell, dtype=np.float64),
-        **integ.state(),
-    }
-    tmp = path.with_name("." + path.stem + ".tmp.npz")
-    np.savez(tmp, meta=np.array(json.dumps(meta)), **arrays)
-    os.replace(tmp, path)
-
-
-def load_checkpoint(path: pathlib.Path, a, fp):
+def checkpoint_meta(path: pathlib.Path) -> dict:
     with np.load(path, allow_pickle=False) as z:
         meta = json.loads(str(z["meta"]))
-        arrays = {k: z[k] for k in z.files if k != "meta"}
-    if meta.get("version") != CHECKPOINT_VERSION:
-        raise InputError(f"{path} has checkpoint version {meta.get('version')}, "
-                         f"this script writes {CHECKPOINT_VERSION}")
-    if meta["fingerprint"] != fp:
+    if meta.get("format", "").startswith("deepmd-lr examples/07"):
         raise InputError(
-            f"{path} belongs to a different system or model: checkpoint "
-            f"{meta['fingerprint']} vs now {fp}. Use the same --structure, "
-            "--repeat and --model as the run being continued")
+            f"{path} was written by an older run_md.py (before the MD classes); "
+            "it cannot be continued. Start a new run from <out>/final.extxyz or "
+            "the last trajectory frame with --keep-velocities")
+    return meta
+
+
+def refuse_changed_physics(meta: dict, a: argparse.Namespace) -> None:
+    old = meta.get("metadata", {}).get("cli_physics")
+    if old is None:
+        raise InputError("the checkpoint was not written by run_md.py; restore it "
+                         "with the MD class's from_checkpoint instead")
     now = physics_of(a)
-    diff = [f"{k}: {meta['physics'].get(k)!r} -> {v!r}" for k, v in now.items()
-            if meta["physics"].get(k) != v]
-    diff += [f"{k}: {v!r} -> (unset)" for k, v in meta["physics"].items()
-             if k not in now]
+    diff = [f"{k}: {old.get(k)!r} -> {v!r}" for k, v in now.items() if old.get(k) != v]
+    diff += [f"{k}: {v!r} -> (unset)" for k, v in old.items() if k not in now]
     if diff:
         raise InputError(
             "a restart must keep the physics of the run it continues; changed: "
             + "; ".join(diff) + ". To change them, start a new run from "
             "<out>/final.extxyz (or the last trajectory frame) with "
             "--keep-velocities and a new --out")
-    return meta, arrays
-
-
-def trim(path: pathlib.Path, nbytes) -> None:
-    """Cut a file back to its size at the checkpoint (after a hard kill)."""
-    if nbytes is not None and path.exists() and path.stat().st_size > nbytes:
-        print(f"  trimming {path.name} back to the checkpoint "
-              f"({path.stat().st_size - nbytes} bytes written after it)",
-              flush=True)
-        os.truncate(path, nbytes)
 
 
 def environment(devices) -> dict:
@@ -1030,12 +594,15 @@ def report_charges(ev, symbols, a) -> None:
 
 
 class StopFlag:
-    """SIGTERM/SIGUSR1/SIGINT ask for a clean stop at the end of the current
-    step, so the checkpoint is never taken halfway through a step. A second
-    SIGINT quits immediately."""
+    """SIGTERM/SIGUSR1/SIGINT ask the MD object to stop at the end of the
+    current step, so the checkpoint is never taken halfway through a step. A
+    second SIGINT quits immediately."""
+
+    SIGNALS = (signal.SIGTERM, signal.SIGUSR1, signal.SIGINT)
 
     def __init__(self):
         self.reason = None
+        self.md = None
 
     def __call__(self, signum, frame):
         if self.reason is not None and signum == signal.SIGINT:
@@ -1043,8 +610,8 @@ class StopFlag:
         self.reason = signal.Signals(signum).name
         print(f"\n  {self.reason} received: stopping after this step "
               "(send SIGINT again to quit at once)", flush=True)
-
-    SIGNALS = (signal.SIGTERM, signal.SIGUSR1, signal.SIGINT)
+        if self.md is not None:
+            self.md.stop()
 
     def install(self) -> None:
         self._previous = {sig: signal.signal(sig, self) for sig in self.SIGNALS}
@@ -1062,7 +629,6 @@ class StopFlag:
 def run_md(a: argparse.Namespace) -> int:
     out = pathlib.Path(a.out)
     ckpt_path, log_path = out / "checkpoint.npz", out / "md.log"
-    traj_path = out / f"traj.{a.traj_format}"
     if a.restart and not ckpt_path.exists():
         raise InputError(f"--restart: {ckpt_path} does not exist")
     if not a.restart and not a.overwrite and (log_path.exists() or ckpt_path.exists()):
@@ -1080,46 +646,24 @@ def run_md(a: argparse.Namespace) -> int:
     atoms, model = load_system(a, devices[0])
     symbols = atoms.get_chemical_symbols()
     n = len(atoms)
-    fp = fingerprint(model, symbols)
-
-    meta = arrays = None
+    meta = None
     if a.restart:
-        meta, arrays = load_checkpoint(ckpt_path, a, fp)
-        start, seed = int(meta["step"]), int(meta["seed"])
-        if start >= a.steps:
-            print(f"{out}: already at step {start} >= --steps {a.steps}; "
+        meta = checkpoint_meta(ckpt_path)
+        refuse_changed_physics(meta, a)
+        if meta["nsteps"] >= a.steps:
+            print(f"{out}: already at step {meta['nsteps']} >= --steps {a.steps}; "
                   "nothing to do (raise --steps to extend the run)")
             return 0
-        if a.seed is not None and a.seed != seed:
-            print(f"note: --seed ignored on restart; the run keeps seed {seed}")
-        atoms.set_cell(arrays["cell"], scale_atoms=False)
-        atoms.set_positions(arrays["positions"])
-        trim(log_path, meta["log_bytes"])
-        if meta.get("traj_file") == traj_path.name:
-            trim(traj_path, meta["traj_bytes"])
-    else:
-        start = 0
-        seed = a.seed
-        if seed is None:
-            seed = int.from_bytes(os.urandom(4), "little") % 2**31
+    seed = a.seed
+    if seed is None:
+        seed = int.from_bytes(os.urandom(4), "little") % 2**31
 
-    velocities = None
-    if a.restart:
-        velocities = arrays["velocities"]
-    elif a.keep_velocities:
-        velocities = atoms.get_velocities()
-        if velocities is None or not np.any(velocities):
-            print("note: the structure file has no velocities; drawing them at "
-                  f"{a.temperature} K instead", flush=True)
-            velocities = None
-
-    integ_name = {"nve": "NVE", "nvt": f"NVT ({a.thermostat})",
-                  "npt": "NPT (MTK)"}[a.ensemble]
     counts = sorted(collections.Counter(symbols).items())
     comp = " ".join(f"{el} {c}" for el, c in counts)
     cellpar = atoms.cell.cellpar()
-    print(f"deepmd-lr MD | {integ_name} | T {a.temperature:g} K | dt {a.dt:g} fs | "
-          f"steps {start} -> {a.steps}", flush=True)
+    print(f"deepmd-lr MD | {md_class(a).__name__} | T {a.temperature:g} K | "
+          f"dt {a.dt:g} fs | steps {meta['nsteps'] if meta else 0} -> {a.steps}",
+          flush=True)
     print(f"  system   {n} atoms ({comp}); cell {cellpar[0]:.3f} {cellpar[1]:.3f} "
           f"{cellpar[2]:.3f} A, {cellpar[3]:.1f} {cellpar[4]:.1f} {cellpar[5]:.1f} deg",
           flush=True)
@@ -1133,35 +677,38 @@ def run_md(a: argparse.Namespace) -> int:
               "(especially with --compress); --benchmark measures it", flush=True)
 
     ev = make_evaluator(model, atoms, devices, a)
-    if velocities is not None and not a.restart:
-        # Every temperature and thermostat here counts 3N - 3 degrees of
-        # freedom, which assumes the centre of mass is at rest. Kept
-        # velocities (from a Langevin run, say) need not be.
-        m = ev.masses()
-        velocities = velocities - (m[:, None] * velocities).sum(0) / m.sum()
-    th = Thermo(ev, atoms.get_positions(),
-                velocities=np.zeros((n, 3)) if velocities is None else velocities,
-                timestep=a.dt, temperature=a.temperature)
-    integ = build_integrator(a, th, seed)
-    if a.restart:
-        integ.load_state(arrays)
-    print(f"  ensemble {integ.name}; seed {seed}", flush=True)
+    io = output_settings(a, out)
+    try:
+        if a.restart:
+            md = md_class(a).from_checkpoint(ev, atoms, ckpt_path, **io)
+            if a.seed is not None and getattr(md, "seed", a.seed) != a.seed:
+                print(f"note: --seed ignored on restart; the run keeps seed {md.seed}")
+        else:
+            kept = atoms.get_velocities() if a.keep_velocities else None
+            if kept is not None and not np.any(kept):
+                print("note: the structure file has no velocities; drawing them at "
+                      f"{a.temperature} K instead", flush=True)
+                kept = None
+            if a.relax_steps > 0:
+                FIRE(ev, atoms, logfile="-", loginterval=max(1, a.relax_steps // 10),
+                     check=not a.no_relax_checks).run(fmax=a.relax_fmax,
+                                                      steps=a.relax_steps)
+            if kept is not None:
+                atoms.set_velocities(kept)
+            else:
+                maxwell_boltzmann(atoms, a.temperature, seed=seed)
+            md = build_md(a, ev, atoms, seed, io)
+            md.metadata["cli_physics"] = physics_of(a)
+    except ValueError as exc:
+        raise InputError(str(exc)) from exc
+    seed = getattr(md, "seed", seed)
+    print(f"  ensemble {type(md).__name__}; seed {seed}", flush=True)
 
     t0 = time.perf_counter()
-    th.evaluate()
+    md.thermo.evaluate()
     print(f"  first force call {time.perf_counter() - t0:.1f} s (kernel "
           f"compilation, memory probe); skin {ev.skin:.2f} A", flush=True)
     report_charges(ev, symbols, a)
-    if not a.restart:
-        if a.relax_steps > 0:
-            relax(th, a, symbols)
-        if velocities is None:
-            th.maxwell_boltzmann(a.temperature, seed=seed)
-    integ.prepare()
-
-    max_t = a.max_temperature
-    if max_t is None:
-        max_t = max(5.0 * a.temperature, 1500.0)
 
     run_json = out / "run.json"
     record = (json.loads(run_json.read_text())
@@ -1172,7 +719,7 @@ def run_md(a: argparse.Namespace) -> int:
         "arguments": vars(a),
         "devices": devices,
         "seed": seed,
-        "start_step": start,
+        "start_step": md.nsteps,
         "n_atoms": n,
         "composition": dict(collections.Counter(symbols)),
         "environment": environment(devices),
@@ -1181,106 +728,57 @@ def run_md(a: argparse.Namespace) -> int:
     record["segments"].append(segment)
     run_json.write_text(json.dumps(record, indent=2, default=str))
 
-    logger = Logger(log_path, log_columns(a), append=a.restart)
-    traj = (TrajectoryWriter(traj_path, a, symbols, append=a.restart)
-            if a.traj_every > 0 else None)
-    clock = [(start, time.perf_counter())]
-    rows = []
-
-    def log(step: int) -> None:
-        now = time.perf_counter()
-        s_prev, t_prev = clock[-1]
-        row = {"step": step, "time[ps]": step * a.dt / 1000.0,
-               "T[K]": th.temperature, "Epot[eV]": th.energy,
-               "Ekin[eV]": th.kinetic_energy}
-        row["Etot[eV]"] = row["Epot[eV]"] + row["Ekin[eV]"]
-        econs = integ.conserved()
-        if econs is not None:
-            row["Econs[eV]"] = econs
-        if a.ensemble == "npt":
-            row["P[GPa]"] = th.pressure / units.GPa
-            row["V[A^3]"] = th.volume
-        row["ms/step"] = ((now - t_prev) / (step - s_prev) * 1e3
-                          if step > s_prev else float("nan"))
-        clock.append((step, now))
-        logger.write(row)
-        rows.append(row)
-        if max_t > 0 and not row["T[K]"] <= max_t:          # NaN-safe
-            raise Unstable(f"temperature {row['T[K]']:.0f} K exceeds "
-                           f"--max-temperature {max_t:g} K at step {step}")
-
     stop = StopFlag()
+    stop.md = md
     stop.install()
     deadline = time.monotonic() + a.max_hours * 3600 if a.max_hours > 0 else None
-    status = "finished"
-    step = start
+
+    def wall_time():
+        if deadline and time.monotonic() > deadline and stop.reason is None:
+            stop.reason = "wall-time budget"
+            md.stop()
+
+    md.attach(wall_time, 1, sync_atoms=False)
     try:
-        if not a.restart:
-            log(0)
-            if traj is not None:
-                traj.write(th, 0)
-        while step < a.steps:
-            integ.step(step)
-            step += 1
-            if not math.isfinite(th.energy):
-                raise Unstable(f"non-finite energy at step {step}")
-            if step % a.log_every == 0 or step == a.steps:
-                log(step)
-            if traj is not None and step % a.traj_every == 0:
-                traj.write(th, step)
-            saved = step % a.checkpoint_every == 0 or step == a.steps
-            if saved:
-                save_checkpoint(ckpt_path, th, integ, step, seed, a, fp, logger, traj)
-            reason = stop.reason or (
-                "wall-time budget" if deadline and time.monotonic() > deadline
-                else None)
-            if reason and step < a.steps:
-                if not saved:
-                    save_checkpoint(ckpt_path, th, integ, step, seed, a, fp,
-                                    logger, traj)
-                status = f"stopped at step {step} ({reason}); continue with --restart"
-                break
-    except Unstable as exc:
-        bad = Atoms(symbols, positions=th.positions.numpy(),
-                    cell=np.asarray(ev.cell), pbc=True)
-        ase.io.write(out / "blowup.extxyz", bad)
+        md.run(a.steps - md.nsteps)
+    except MDInstabilityError as exc:
+        ase.io.write(out / "blowup.extxyz", md.atoms)
         print(f"\n*** UNSTABLE: {exc}\n"
               f"    last configuration: {out / 'blowup.extxyz'}\n"
               "    Usual causes: timestep too large, an unrelaxed start "
               "(--relax-steps), a thermostat too weak for a field, or a "
               "structure outside the model's training data.", flush=True)
-        segment.update(status=f"unstable: {exc}", end_step=step)
+        segment.update(status=f"unstable: {exc}", end_step=md.nsteps)
         run_json.write_text(json.dumps(record, indent=2, default=str))
         return 2
     finally:
         stop.restore()
-        logger.close()
-        if traj is not None:
-            traj.close()
+    if md.nsteps >= a.steps:
+        md.save_checkpoint()
+        status = "finished"
+    else:
+        status = (f"stopped at step {md.nsteps} ({stop.reason}); "
+                  "continue with --restart")
+    md.close()
+    ase.io.write(out / "final.extxyz", md.atoms)
 
-    final = Atoms(symbols, positions=th.positions.numpy(),
-                  cell=np.asarray(ev.cell), pbc=True)
-    final.set_velocities(th.velocities.numpy())
-    ase.io.write(out / "final.extxyz", final)
-
-    summary = summarize(th, ev, a, rows, clock, n, devices)
+    summary = summarize(md, ev, a, n, devices)
     print(f"\n{status}\n" + "\n".join(f"  {k}: {v}" for k, v in summary.items()),
           flush=True)
-    segment.update(status=status, end_step=step, summary=summary)
+    segment.update(status=status, end_step=md.nsteps, summary=summary)
     run_json.write_text(json.dumps(record, indent=2, default=str))
     return 0
 
 
-def summarize(th, ev, a, rows, clock, n, devices) -> dict:
+def summarize(md, ev, a, n, devices) -> dict:
     s = {}
-    if len(clock) >= 3:               # drop the first interval (compilation)
-        (s1, t1), (s2, t2) = clock[1], clock[-1]
-        if s2 > s1:
-            ms = (t2 - t1) / (s2 - s1) * 1e3
-            s["speed"] = (f"{ms:.1f} ms/step = {a.dt * 86.4 / ms:.3f} ns/day "
-                          f"({n} atoms on {len(devices)} device(s))")
+    if math.isfinite(md.seconds_per_step):
+        s["speed"] = (f"{md.seconds_per_step * 1e3:.1f} ms/step = "
+                      f"{md.ns_per_day:.3f} ns/day ({n} atoms on {len(devices)} "
+                      "device(s))")
     s["halo"] = (f"skin {ev.skin:.2f} A, {ev.rebuild_count} rebuilds, "
                  f"{ev.skin_backoffs} out-of-memory backoffs")
+    rows = md.rows
     if len(rows) >= 2:
         half = rows[len(rows) // 2:]
         s["mean T (second half)"] = f"{np.mean([r['T[K]'] for r in half]):.1f} K"
@@ -1289,21 +787,21 @@ def summarize(th, ev, a, rows, clock, n, devices) -> dict:
             v_mean = np.mean([r["V[A^3]"] for r in half])
             s["mean P (second half)"] = f"{p_mean:+.5f} GPa"
             s["mean V (second half)"] = f"{v_mean:.2f} A^3"
-        key = {"nve": "Etot[eV]"}.get(a.ensemble,
-                                      "Econs[eV]" if "Econs[eV]" in rows[0] else None)
+        key = "Etot[eV]" if a.ensemble == "nve" else (
+            "Econs[eV]" if "Econs[eV]" in rows[0] else None)
         if key is not None:
-            t = np.array([r["time[ps]"] for r in rows])
-            e = np.array([r[key] for r in rows]) * 1e3 / n
-            if np.ptp(t) > 0:
+            span = rows[-1]["time[ps]"] - rows[0]["time[ps]"]
+            if span > 0:
                 # A fit over a short stretch mostly measures the fluctuation:
                 # 4 rows over 0.15 ps read +0.43 where 0.5 ps gave +0.0095.
-                short = np.ptp(t) < 0.5 or len(rows) < 20
+                short = span < 0.5 or len(rows) < 20
                 s[f"{key.split('[')[0]} drift"] = (
-                    f"{np.polyfit(t, e, 1)[0]:+.4f} meV/atom/ps over "
-                    f"{np.ptp(t):.3g} ps, {len(rows)} log rows"
+                    f"{md.drift(key):+.4f} meV/atom/ps over {span:.3g} ps, "
+                    f"{len(rows)} log rows"
                     + ("; too short to judge: use >= 0.5 ps and >= 20 rows"
                        if short else ""))
             if a.ensemble == "nve":
+                e = np.array([r[key] for r in rows]) * 1e3 / n
                 s["Etot fluctuation"] = (f"{np.std(e):.4f} meV/atom rms (falls "
                                          "~4x when dt is halved)")
     return s
@@ -1313,26 +811,19 @@ def _time_devices(a: argparse.Namespace, devices: list[str]):
     """ms/step for one device list, or NaN. Everything it builds is local, so
     it is all freed on return, before the next device count is built."""
     atoms, model = load_system(a, devices[0])
-    n = len(atoms)
     ev = make_evaluator(model, atoms, devices, a)
-    th = Thermo(ev, atoms.get_positions(), velocities=np.zeros((n, 3)),
-                timestep=a.dt, temperature=a.temperature)
-    th.maxwell_boltzmann(a.temperature, seed=1)
-    integ = build_integrator(a, th, seed=1)
-    th.evaluate()
-    integ.prepare()
-    warm = max(10, a.benchmark_steps // 5)       # compilation, memory probe
-    for i in range(warm):
-        integ.step(i)
+    maxwell_boltzmann(atoms, a.temperature, seed=1)
+    md = build_md(a, ev, atoms, seed=1, io={})
+    md.thermo.evaluate()
+    md.run(max(10, a.benchmark_steps // 5))       # compilation, memory probe
     for d in set(devices):
         torch.cuda.synchronize(d)
     t0 = time.perf_counter()
-    for i in range(warm, warm + a.benchmark_steps):
-        integ.step(i)
+    md.run(a.benchmark_steps)
     for d in set(devices):
         torch.cuda.synchronize(d)
     ms = (time.perf_counter() - t0) / a.benchmark_steps * 1e3
-    return (ms if math.isfinite(th.energy) else float("nan")), ev.skin
+    return (ms if math.isfinite(md.thermo.energy) else float("nan")), ev.skin
 
 
 def benchmark(a: argparse.Namespace) -> int:
@@ -1349,6 +840,8 @@ def benchmark(a: argparse.Namespace) -> int:
             note = "" if math.isfinite(ms) else "  (UNSTABLE: non-finite energy)"
         except torch.cuda.OutOfMemoryError:
             ms, skin, note = float("nan"), float("nan"), "  (out of memory)"
+        except MDInstabilityError as exc:
+            ms, skin, note = float("nan"), float("nan"), f"  (UNSTABLE: {exc})"
         gc.collect()
         torch.cuda.empty_cache()
         results.append((count, ms, skin))
@@ -1381,7 +874,7 @@ def main(argv=None) -> int:
     except InputError as exc:
         print(f"error: {exc}", file=sys.stderr, flush=True)
         return 1
-    except Unstable as exc:            # a rejected relaxation
+    except RelaxationError as exc:
         print(f"error: {exc}", file=sys.stderr, flush=True)
         return 2
 
