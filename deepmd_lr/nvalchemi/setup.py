@@ -33,7 +33,9 @@ def read_structure(path: Any, index: int = -1) -> Any:
     if volume < 1e-8:
         raise ValueError(
             f"{path} has no cell (volume {volume:.2e} A^3). Periodic MD needs "
-            "one -- set it in the file, or pad a slab with vacuum."
+            "one; set it in the file. Molecules, clusters and slabs run through "
+            "the ASE calculator instead: deepmd_lr.ase.LongRangeCalculator, "
+            "with long_range={'method': 'isolated'} for a system with no cell."
         )
     if not atoms.pbc.all():
         atoms.pbc = True                     # a cell implies periodicity

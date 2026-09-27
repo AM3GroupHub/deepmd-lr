@@ -70,3 +70,30 @@ Two other things behave differently without a cell, both deliberately:
 - **Stress is not reported.** Force per unit area needs a volume to divide by,
   and there is none. `LongRangeCalculator` simply omits it.
 
+## Running MD
+
+Through the ASE calculator, with any ASE integrator. The GPU MD classes in
+`deepmd_lr.nvalchemi` are for 3D-periodic cells and refuse anything else.
+
+```python
+from ase import units
+from ase.md.verlet import VelocityVerlet
+from deepmd_lr.ase import LongRangeCalculator
+
+atoms.calc = LongRangeCalculator("model.ckpt.pt")   # trained with method "isolated"
+VelocityVerlet(atoms, 0.25 * units.fs).run(2000)
+```
+
+The term holds no weights, so a model trained on periodic cells can be asked
+for an isolated system by swapping the term at load; `alpha` is inherited
+([same-as](same-as.md)):
+
+```python
+LongRangeCalculator("bulk.ckpt.pt", long_range={"method": "isolated"})
+```
+
+That makes the electrostatics exact for the cluster. Whether the short-range
+part transfers is a question of training data: a model trained on bulk has
+never seen a surface. Slabs run the same way, with `slab_correction` and `pbc`
+in `long_range` ([example 03](../examples/03-slab)).
+

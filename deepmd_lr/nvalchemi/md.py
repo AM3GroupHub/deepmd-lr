@@ -189,7 +189,8 @@ def _check_atoms(evaluator: Any, atoms: Atoms) -> None:
     if not atoms.pbc.all():
         raise ValueError(
             "the partitioned evaluator needs periodicity along all three "
-            f"axes; atoms.pbc is {atoms.pbc.tolist()}"
+            f"axes; atoms.pbc is {atoms.pbc.tolist()}. Molecules, clusters and "
+            "slabs run through the ASE calculator, deepmd_lr.ase.LongRangeCalculator"
         )
     if not np.allclose(atoms.cell.array, evaluator.cell, rtol=0, atol=1e-9):
         raise ValueError(

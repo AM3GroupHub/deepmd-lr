@@ -53,6 +53,7 @@ from deepmd_lr.compress import (
 )
 from deepmd_lr.nvalchemi.driver import (
     _to_host,
+    check_long_range_boundary,
     device_replicas,
     evaluate_partitioned,
 )
@@ -278,6 +279,9 @@ class DistributedEvaluator:
                 f"memory_headroom must be in (0, 1], got {memory_headroom}"
             )
 
+        # Partitions are built 3D-periodic, so the term must be too. Checked
+        # here as well as per call, to fail before the memory probe.
+        check_long_range_boundary(model, (True, True, True))
         self.model = model
         self.devices = list(devices)
         self.repartition_every = repartition_every

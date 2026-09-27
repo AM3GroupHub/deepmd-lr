@@ -361,6 +361,31 @@ def partition_graph(
     return graph, node_type.reshape(-1), node_coord
 
 
+def check_long_range_boundary(model: Any, pbc) -> None:
+    """Refuse a long-range term whose boundary is not the system's.
+
+    The check :class:`~deepmd_lr.ase.LongRangeCalculator` makes. Without it the
+    term simply runs: an ``isolated`` term on a periodic cell sums no images,
+    and a slab term corrects a cell that is periodic along z. On the 192-atom
+    water box that was 1.1 eV and 0.03 eV off, with nothing raised.
+    """
+    if not getattr(model, "has_long_range", False):
+        return
+    term = model.long_range_energy
+    expected = (
+        tuple(bool(p) for p in term.pbc) if term.needs_cell else (False, False, False)
+    )
+    have = tuple(bool(p) for p in np.broadcast_to(np.asarray(pbc, dtype=bool), (3,)))
+    if have != expected:
+        method = getattr(term, "method", getattr(term, "METHOD", "?"))
+        raise ValueError(
+            f"this model's long-range term ('{method}', pbc {list(expected)}) does "
+            f"not match the system's pbc {list(have)}. Partitioned MD is for "
+            "3D-periodic cells; molecules, clusters and slabs run through the "
+            "ASE calculator, deepmd_lr.ase.LongRangeCalculator"
+        )
+
+
 def evaluate_partitioned(
     model: Any,
     coord: np.ndarray,
@@ -419,6 +444,7 @@ def evaluate_partitioned(
         -- the last is what :func:`_charge_response_force` backpropagates
         through each partition's charge head.
     """
+    check_long_range_boundary(model, pbc)
     rcut = float(model.get_rcut())
     coord_np = (
         None if isinstance(coord, torch.Tensor) else np.asarray(coord, dtype=np.float64)

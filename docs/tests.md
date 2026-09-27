@@ -63,7 +63,8 @@ the model first.
   coordinates), the skin rules and memory probe, the device gather, the
   gathered long-range term and virial, and `DistributedEvaluator`, whose
   reused partitions (across cell changes) and cached pair lists must match a
-  fresh evaluation at every call.
+  fresh evaluation at every call; a long-range term that is not 3D-periodic
+  (`isolated`, slab) is refused.
 - `test_thermo.py` — `Thermo`'s measurements, warp aliasing, cell sync, and
   the guards that make one evaluator safe to share (`fresh`,
   `cell_is_current`, `set_state`).

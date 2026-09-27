@@ -153,6 +153,10 @@ it between stages is safe by construction:
   step (`Thermo.cell_is_current`).
 - **Atoms.** `atoms` must match the evaluator's atom order and cell. ASE
   constraints and non-periodic axes are refused rather than ignored.
+- **Boundary.** Partitions are 3D-periodic, so the model's long-range term
+  must be too: an `isolated` or slab term is refused, as the ASE calculator
+  refuses a mismatch. Molecules, clusters and slabs run through the ASE
+  calculator ([non-periodic](non-periodic.md#running-md)).
 - **Virial.** `set_compute_virial` switches it on for the stage that needs
   it; it is refused under a field.
 

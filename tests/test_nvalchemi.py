@@ -1095,6 +1095,30 @@ class TestDistributedEvaluator:
         assert drift < 1.0, f"drift {drift:.4f} meV/atom over 20 steps"
 
 
+class TestLongRangeBoundary:
+    """A long-range term whose boundary is not the system's is refused, as the
+    ASE calculator refuses it. Before the check, the partitioned path ran an
+    ``isolated`` term on the periodic water box 1.1 eV off and a slab term
+    0.03 eV off, and raised nothing."""
+
+    @pytest.mark.parametrize(
+        "settings",
+        [
+            {"method": "isolated"},
+            {"method": "pme", "slab_correction": True, "pbc": [True, True, False]},
+        ],
+        ids=["isolated", "slab"],
+    )
+    def test_a_term_that_is_not_3d_periodic_is_refused(self, system, settings):
+        coord, atype, cell, *_ = system
+        model = build()
+        model.set_long_range(settings)
+        with pytest.raises(ValueError, match="ASE calculator"):
+            DistributedEvaluator(model, atype, cell, devices=[DEVICE])
+        with pytest.raises(ValueError, match="does not match the system's pbc"):
+            evaluate_partitioned(model, coord, atype, cell, n_partitions=1)
+
+
 class TestBackboneCapture:
     """The charge head reuses the energy head's descriptor pass.
 
