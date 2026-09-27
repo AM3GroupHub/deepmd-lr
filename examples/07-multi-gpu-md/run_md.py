@@ -139,6 +139,11 @@ ADAPTING TO A NEW SYSTEM (checklist)
        minimiser collapse atoms onto each other from a badly distorted start.
        Pre-relax such a box with a classical force field instead; for water,
        docs/md.md ("Relaxing a packed box first") has a rigid-TIP3P recipe.
+       To relax the cell as well, toward --pressure, add --relax-cell:
+       isotropic keeps the shape (the choice for a liquid, which has no shear
+       stiffness), orthorhombic moves the three lengths of a diagonal cell,
+       full moves all nine entries (crystals). It converges when the stress is
+       within --relax-smax GPa of the target as well.
     5. For a net charge or a spin state the model was trained to condition on,
        pass --charge-spin Q MULTIPLICITY. Otherwise the model's default is used.
     6. For a multi-head checkpoint, pass --head BRANCH.
@@ -182,7 +187,9 @@ FOR AI AGENTS
       NoseHooverChainNVT, IsotropicMTKNPT, FIRE2, maxwell_boltzmann. This script
       turns the command line into those objects (build_md, output_settings)
       and adds what a job needs around them.
-    - run_md(): a new run or a --restart; benchmark(): the GPU-count timing.
+    - run_md(): a new run or a --restart; pre_relax(): the FIRE2 stage before
+      the MD, with the cell under --relax-cell; benchmark(): the GPU-count
+      timing.
     - New features belong in run_md(), after the MD object is built, e.g. as
       an observer: md.attach(fn, interval).
 """
@@ -294,7 +301,8 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="thermostat time constant, fs (Langevin friction = "
                         "1/tau_t)")
     g.add_argument("--pressure", type=float, default=1e-4,
-                   help="NPT target pressure, GPa (1 bar = 1e-4 GPa)")
+                   help="target pressure of NPT and of --relax-cell, GPa "
+                        "(1 bar = 1e-4 GPa)")
     g.add_argument("--tau-p", type=float, default=1000.0,
                    help="NPT barostat time constant, fs")
     g.add_argument("--chain-length", type=int, default=3,
@@ -318,10 +326,20 @@ def parse_args(argv=None) -> argparse.Namespace:
                         "(e.g. a previous final.extxyz) instead of drawing "
                         "them; any centre-of-mass drift is removed")
     g.add_argument("--relax-steps", type=int, default=0,
-                   help="FIRE2 relaxation of positions (cell fixed) before MD; "
-                        "0 = off. Recommended for freshly built boxes")
+                   help="FIRE2 relaxation before MD, of the positions (and with "
+                        "--relax-cell the cell); 0 = off. Recommended for "
+                        "freshly built boxes")
     g.add_argument("--relax-fmax", type=float, default=0.05,
                    help="FIRE2 convergence criterion, eV/A")
+    g.add_argument("--relax-cell", choices=("isotropic", "orthorhombic", "full"),
+                   default=None,
+                   help="also relax the cell, toward --pressure: isotropic "
+                        "keeps the shape (liquids), orthorhombic moves the "
+                        "three lengths of a diagonal cell, full all nine "
+                        "entries (crystals)")
+    g.add_argument("--relax-smax", type=float, default=0.01,
+                   help="with --relax-cell, how close the stress must come to "
+                        "--pressure, GPa")
     g.add_argument("--no-relax-checks", action="store_true",
                    help="continue even if the relaxation did not converge or "
                         "changed covalent bonds")
@@ -372,6 +390,15 @@ def check_args(a: argparse.Namespace) -> None:
             "the virial NPT needs, and under a field NVE conserves nothing")
     if a.ensemble == "npt" and a.chain_length < 2:
         raise InputError("--ensemble npt needs --chain-length >= 2")
+    if a.relax_cell is not None:
+        if a.relax_steps < 1:
+            raise InputError("--relax-cell relaxes during --relax-steps; set that "
+                             "as well")
+        if a.efield is not None:
+            raise InputError("--relax-cell needs the virial, which the evaluator "
+                             "refuses under --efield")
+        if a.relax_smax <= 0:
+            raise InputError("--relax-smax must be positive")
     if not 1 <= a.chain_length <= 8:
         raise InputError("--chain-length must be between 1 and 8")
     for name in ("steps", "log_every", "checkpoint_every", "gpus",
@@ -690,9 +717,7 @@ def run_md(a: argparse.Namespace) -> int:
                       f"{a.temperature} K instead", flush=True)
                 kept = None
             if a.relax_steps > 0:
-                FIRE2(ev, atoms, logfile="-", loginterval=max(1, a.relax_steps // 10),
-                      check=not a.no_relax_checks).run(fmax=a.relax_fmax,
-                                                       steps=a.relax_steps)
+                pre_relax(a, ev, atoms)
             if kept is not None:
                 atoms.set_velocities(kept)
             else:
@@ -768,6 +793,33 @@ def run_md(a: argparse.Namespace) -> int:
     segment.update(status=status, end_step=md.nsteps, summary=summary)
     run_json.write_text(json.dumps(record, indent=2, default=str))
     return 0
+
+
+def _cell_text(atoms) -> str:
+    c = atoms.cell.cellpar()
+    return (" ".join(f"{x:.3f}" for x in c[:3]) + " A, "
+            + " ".join(f"{x:.1f}" for x in c[3:]) + " deg")
+
+
+def pre_relax(a: argparse.Namespace, ev, atoms) -> None:
+    """FIRE2 before the MD: the positions, and with --relax-cell the cell.
+
+    The virial is switched on for this stage only; an NVT or NVE run after it
+    does not pay for it.
+    """
+    cell = a.relax_cell
+    before, v0 = _cell_text(atoms), atoms.get_volume()
+    if cell is not None:
+        ev.set_compute_virial(True)
+    FIRE2(ev, atoms, relax_cell=cell,
+          pressure_au=a.pressure * units.GPa if cell is not None else 0.0,
+          logfile="-", loginterval=max(1, a.relax_steps // 10),
+          check=not a.no_relax_checks).run(fmax=a.relax_fmax, steps=a.relax_steps,
+                                           smax=a.relax_smax * units.GPa)
+    if cell is not None:
+        ev.set_compute_virial(a.ensemble == "npt")
+        print(f"  cell ({cell}): {before} -> {_cell_text(atoms)}; "
+              f"volume {100 * (atoms.get_volume() / v0 - 1):+.2f} %", flush=True)
 
 
 def summarize(md, ev, a, n, devices) -> dict:

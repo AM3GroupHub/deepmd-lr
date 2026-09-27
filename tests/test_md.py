@@ -12,11 +12,13 @@ The float64 fixture model runs on the GPU. What is pinned:
 - **Physics.** Each class keeps its promise: NVE and MTK conservation, the
   Nose-Hoover eta/2 quirk, and 3N - 3 degrees of freedom.
 - **FIRE and FIRE2.** Each drives its own kernel, under ASE's names, and
-  both refuse a bad relaxation.
+  both refuse a bad relaxation. With `relax_cell` the cell force is the
+  enthalpy gradient, and the cell reaches the target pressure.
 """
 
 import json
 import math
+import os
 
 import ase.io
 import numpy as np
@@ -987,6 +989,209 @@ class TestFIREKernels:
         assert opt.nsteps == 40
         np.testing.assert_allclose(opt.thermo.positions.numpy(), want, atol=1e-10)
         assert float(opt._dt.numpy()[0]) == pytest.approx(dts[-1], rel=1e-12)
+
+
+class _CellOnly:
+    """A real evaluator with the atomic forces held at zero and a spring on
+    each cell length. The fixture has no stable volume -- its pressure rises
+    with volume -- so the springs supply the stiffness. With no forces of
+    their own the atoms move only with the cell, which pins that ride
+    exactly: the positions stay the fractional coordinates times the cell."""
+
+    def __init__(self, ev, k, h_ref):
+        self._ev, self._k, self._h_ref = ev, k, np.diag(h_ref).copy()
+        self._v_ref = abs(np.linalg.det(h_ref))
+
+    def __getattr__(self, name):
+        return getattr(self._ev, name)
+
+    def _stretch(self):
+        return np.diag(self._ev.cell) / self._h_ref - 1.0
+
+    def __call__(self, positions):
+        energy, forces = self._ev(positions)
+        forces.zero_()
+        spring = 0.5 * self._k * self._v_ref * float(np.sum(self._stretch() ** 2))
+        return energy + spring, forces
+
+    @property
+    def virial(self):
+        u = self._stretch()
+        return self._ev.virial - np.diag(self._k * self._v_ref * u * (1.0 + u))
+
+
+def _cell_only(model, strain):
+    atoms = make_atoms(model)
+    h_ref = atoms.cell.array.copy()
+    atoms.set_cell(h_ref @ strain, scale_atoms=True)
+    ev = _CellOnly(make_ev(model, atoms, compute_virial=True), 5.0 * units.GPa, h_ref)
+    return atoms, ev
+
+
+STRAINS = {"isotropic": np.eye(3) * 1.03, "orthorhombic": np.diag([1.03, 0.98, 1.0])}
+
+
+class TestCellRelaxation:
+    def test_the_cell_force_is_the_enthalpy_gradient(self, model):
+        """Finite differences of E + P V over the nine cell entries, at fixed
+        fractional coordinates, on a sheared cell. nvalchemiops'
+        stress_to_cell_force is written for column cells and misses the
+        shear entries of ASE's row cell by far more."""
+        from nvalchemiops.dynamics.utils import stress_to_cell_force
+
+        atoms = make_atoms(model)
+        h = atoms.cell.array.copy()
+        h[1, 0], h[2, 0], h[2, 1] = 1.1, -0.7, 0.9
+        atoms.set_cell(h, scale_atoms=True)
+        frac = atoms.get_scaled_positions(wrap=False)
+        ev = make_ev(model, atoms, compute_virial=True)
+        p = 0.3 * units.GPa
+        opt = FIRE2(ev, atoms, relax_cell="full", pressure_au=p, logfile=None)
+        opt.thermo.evaluate()
+        got = opt._cell_force(h)
+        sigma = ev.stress + p * np.eye(3)
+        device = opt.thermo.device
+        cell_force = wp.zeros(1, dtype=wp.mat33d, device=device)
+        stress_to_cell_force(
+            wp.array(sigma.reshape(1, 3, 3), dtype=wp.mat33d, device=device),
+            wp.array(h.reshape(1, 3, 3), dtype=wp.mat33d, device=device),
+            wp.array([ev.volume], dtype=wp.float64, device=device),
+            cell_force,
+            keep_aligned=False,
+        )
+        column_cells = cell_force.numpy()[0]
+
+        def enthalpy(cell):
+            ev.set_cell(cell)
+            return ev(frac @ cell)[0] + p * abs(np.linalg.det(cell))
+
+        d, fd = 1e-4, np.zeros((3, 3))
+        for i in range(3):
+            for j in range(3):
+                step = np.zeros((3, 3))
+                step[i, j] = d
+                fd[i, j] = -(enthalpy(h + step) - enthalpy(h - step)) / (2 * d)
+        error = np.abs(got - fd).max()
+        assert error < 1e-6 * np.abs(fd).max()
+        assert np.abs(column_cells - fd).max() > 1e3 * error
+
+    @OPTIMIZERS
+    @pytest.mark.parametrize("mode", list(STRAINS))
+    def test_the_cell_relaxes_to_the_target_pressure(self, model, relax, mode):
+        atoms, ev = _cell_only(model, STRAINS[mode])
+        h0, frac = atoms.cell.array.copy(), atoms.get_scaled_positions(wrap=False)
+        opt = relax(
+            ev,
+            atoms,
+            relax_cell=mode,
+            pressure_au=0.05 * units.GPa,
+            logfile=None,
+            check=False,
+        )
+        assert opt.run(fmax=0.05, steps=3000, smax=1e-4 * units.GPa)
+        assert opt.stress_residual() < 1e-4 * units.GPa
+        h = atoms.cell.array
+        np.testing.assert_array_equal(h, ev.cell)
+        np.testing.assert_allclose(atoms.positions, frac @ h, atol=1e-10)
+        assert np.all(h == np.diag(np.diag(h)))  # no angle moved
+        ratios = np.diag(h) / np.diag(h0)
+        assert (
+            np.ptp(ratios) > 1e-3 if mode == "orthorhombic" else np.ptp(ratios) < 1e-12
+        )
+        assert np.all(np.abs(ratios - 1.0) > 1e-3)  # it did move
+
+    def test_both_algorithms_find_the_same_cell(self, model):
+        cells = []
+        for relax in (FIRE, FIRE2):
+            atoms, ev = _cell_only(model, STRAINS["orthorhombic"])
+            relax(ev, atoms, relax_cell="orthorhombic", logfile=None, check=False).run(
+                fmax=0.05, steps=3000, smax=1e-5 * units.GPa
+            )
+            cells.append(atoms.cell.array)
+        np.testing.assert_allclose(cells[0], cells[1], rtol=1e-5)
+
+    def test_refusals(self, model):
+        atoms = make_atoms(model)
+        with pytest.raises(ValueError, match="virial"):
+            FIRE2(make_ev(model, atoms), atoms, relax_cell="isotropic", logfile=None)
+        ev = make_ev(model, atoms, compute_virial=True)
+        with pytest.raises(ValueError, match="relax_cell must be"):
+            FIRE2(ev, atoms, relax_cell="cubic", logfile=None)
+        with pytest.raises(ValueError, match="pressure_au"):
+            FIRE2(ev, atoms, pressure_au=1e-3, logfile=None)
+        with pytest.raises(ValueError, match="fixed"):
+            FIRE2(ev, atoms, logfile=None).stress_residual()
+        sheared = atoms.copy()
+        h = sheared.cell.array.copy()
+        h[1, 0] = 1.0
+        sheared.set_cell(h, scale_atoms=True)
+        with pytest.raises(ValueError, match="diagonal"):
+            FIRE2(
+                make_ev(model, sheared, compute_virial=True),
+                sheared,
+                relax_cell="orthorhombic",
+                logfile=None,
+            )
+
+    def test_the_log_and_the_trajectory_follow_the_cell(self, model, tmp_path):
+        atoms, ev = _cell_only(model, STRAINS["isotropic"])
+        opt = FIRE2(
+            ev,
+            atoms,
+            relax_cell="isotropic",
+            logfile=tmp_path / "relax.log",
+            loginterval=10,
+            trajectory=tmp_path / "relax.extxyz",
+            check=False,
+        )
+        opt.run(fmax=0.05, steps=40, smax=1e-9)
+        opt.close()
+        header = (tmp_path / "relax.log").read_text().splitlines()[0].split()
+        assert header[-3:] == ["P[GPa]", "dS[GPa]", "V[A^3]"]
+        rows = np.loadtxt(tmp_path / "relax.log")
+        frames = list(ase.io.iread(tmp_path / "relax.extxyz"))
+        np.testing.assert_allclose(frames[-1].cell.array, ev.cell)
+        assert frames[0].get_volume() > frames[-1].get_volume()
+        np.testing.assert_allclose(  # the log prints three decimals
+            rows[:, -1], [f.get_volume() for f in frames], atol=5e-4
+        )
+
+    def test_an_older_md_object_refuses_the_relaxed_cell(self, model):
+        atoms = make_atoms(model)
+        ev = make_ev(model, atoms, compute_virial=True)
+        md = Langevin(ev, atoms.copy(), DT, T0, FRICTION, seed=1)
+        FIRE2(ev, atoms, relax_cell="isotropic", logfile=None, check=False).run(
+            fmax=1e-9, steps=5
+        )
+        with pytest.raises(RuntimeError, match="cell has changed"):
+            md.run(1)
+        Langevin(ev, atoms, DT, T0, FRICTION, seed=1).run(2)  # atoms carries it
+
+
+@pytest.mark.skipif(
+    "DEEPMD_LR_WATER_MODEL" not in os.environ,
+    reason="needs a trained water checkpoint in DEEPMD_LR_WATER_MODEL",
+)
+@pytest.mark.parametrize("mode", ["isotropic", "orthorhombic", "full"])
+def test_water_relaxes_its_cell(mode):
+    """A water box stretched by 4% comes back to zero stress in every mode."""
+    import pathlib
+
+    from deepmd_lr.nvalchemi import build_evaluator, read_structure
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    atoms = read_structure(root / "examples" / "06-md_nvalchemi" / "water_192.xyz")
+    strain = np.diag([1.04, 0.96, 1.0]) if mode == "orthorhombic" else 1.04 * np.eye(3)
+    atoms.set_cell(atoms.cell.array @ strain, scale_atoms=True)
+    ev = build_evaluator(
+        os.environ["DEEPMD_LR_WATER_MODEL"],
+        atoms,
+        compute_virial=True,
+        compress=os.environ.get("DEEPMD_LR_WATER_COMPRESS") == "1",
+    )
+    opt = FIRE2(ev, atoms, relax_cell=mode, logfile=None)
+    assert opt.run(fmax=0.05, steps=3000)
+    assert opt.stress_residual() < 0.01 * units.GPa
 
 
 class TestDipoleCurrent:

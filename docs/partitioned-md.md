@@ -66,8 +66,8 @@ npt.run(20_000)
 | `Langevin` | NVT, BAOAB; `fixcm=True` keeps the centre of mass at rest | none |
 | `NoseHooverChainNVT` | NVT, Nosé–Hoover chain | Etot + the chain energy |
 | `IsotropicMTKNPT` | NPT, MTK, isotropic cell | the MTK H′ |
-| `FIRE` | relaxes the positions, classic FIRE with ASE's defaults; the cell is fixed | — |
-| `FIRE2` | relaxes the positions, FIRE 2.0 with nvalchemiops' more cautious defaults | — |
+| `FIRE` | relaxes the positions, and the cell with `relax_cell`; classic FIRE with ASE's defaults | — |
+| `FIRE2` | the same with FIRE 2.0 and nvalchemiops' more cautious defaults | — |
 
 `FIRE` and `FIRE2` are ASE's two relaxations, each on its nvalchemiops kernel,
 with ASE's parameter names and, as in ASE, unit masses. FIRE caps each atom's
@@ -76,6 +76,54 @@ back after an uphill step, and scales the whole step so that no atom moves
 more than `maxstep`. On water, from an MD snapshot, `FIRE` reached 0.05 eV/Å
 in 199 steps and `FIRE2` in 380; from a TIP3P-relaxed packed box, in 149 and
 160.
+
+### Relaxing the cell
+
+`relax_cell` chooses what else may move. The target is `pressure_au` (eV/Å³),
+and `run(smax=...)` sets how close the stress must come to it; the default is
+0.01 GPa.
+
+| `relax_cell` | the cell | for |
+|---|---|---|
+| `None` (default) | fixed | — |
+| `"isotropic"` | scales uniformly, keeping its shape | liquids, which have no shear stiffness: `"full"` lets their cell shear |
+| `"orthorhombic"` | the three lengths of a diagonal cell move independently | orthorhombic crystals |
+| `"full"` | all nine entries move | crystals of any symmetry |
+
+```python
+ev.set_compute_virial(True)                     # the stress drives the cell
+FIRE2(ev, atoms, relax_cell="isotropic", pressure_au=1e-4 * units.GPa).run(fmax=0.05)
+```
+
+It follows nvalchemiops' variable-cell FIRE example (`07_fire_variable_cell`):
+the cell's rows join the atoms in one extended array, which the FIRE kernel
+steps like any other degrees of freedom. Three things differ, and each was
+measured:
+
+- **The cell force** is −∂(E + PV)/∂H = −V H⁻ᵀ (σ + P) for the rows of ASE's
+  cell. nvalchemiops' `stress_to_cell_force` computes −V σ H⁻ᵀ, the gradient
+  for a cell whose columns are the lattice vectors. The two agree for a
+  diagonal cell only. On a sheared water cell, this one matched the
+  finite-difference gradient to 2e-3 eV/Å and nvalchemiops' was 0.70 eV/Å off.
+  With no alignment step, the structure is never rotated either.
+- **The atoms ride the cell affinely** before their own step, as nvalchemiops'
+  FIRE2 variable-cell step does; in the example they stand still while the cell
+  moves.
+- **The cell force is not divided by the atom count.** That makes the cell
+  about as heavy as one atom, as the example's cell mass does.
+
+On water stretched by 4%, the undivided force converged fastest for both
+algorithms, at 192 and at 12,288 atoms alike (to 0.05 eV/Å and 0.01 GPa):
+
+| steps | isotropic | orthorhombic | full |
+|---|---:|---:|---:|
+| `FIRE2` | 390 | 440 | 390 |
+| `FIRE` | 750 | 610 | 740 |
+| `FIRE2`, cell force ÷ N | 1000 | 1480 | 1570 |
+
+The new cell goes to the evaluator every step, which repartitions, as NPT
+does. An MD object built before the relaxation then refuses to step, because
+the cell it knew has moved. Build it from the relaxed `atoms`.
 
 The units are exactly ASE's: `timestep` in ASE time (`0.5 * units.fs`),
 `friction` in 1/ASE time, `tdamp` and `pdamp` in ASE time, `pressure_au` in

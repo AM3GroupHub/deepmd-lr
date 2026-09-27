@@ -12,7 +12,7 @@ a production run needs around them:
 
 - restarts across walltime-limited jobs, and a clean stop on SIGTERM;
 - measuring how many GPUs are worth using;
-- an optional pre-relaxation;
+- an optional pre-relaxation, of the cell too (`--relax-cell`);
 - a trajectory, a thermo log, the final structure and a record of the run.
 
 The full manual is the script's docstring, and `python run_md.py --help`
@@ -57,6 +57,7 @@ A40s is covered by the library's own multi-GPU validation.
 | NPT: logging every step vs every 200, 200 steps | identical within GPU noise (1.1e-6 Å, cell 3e-10 Å). Before the fix they were 1.0e-4 Å apart: reading the pressure for the log rewrote the barostat's input |
 | NPT, MTK conserved quantity H′, dt 0.5 → 0.25 fs | rms 0.0217 → 0.0054 meV/atom (O(dt²)); thermostat and reported temperature both count 3N − 3 degrees of freedom |
 | FIRE2 pre-relaxation | from an MD snapshot: 380 steps to 0.038 eV/Å, bonds intact. A packed box with 1.56 Å O–O contacts made the minimiser collapse atoms, since the model has no short-range wall there; the script exits 2 with that diagnosis. After a rigid-TIP3P pre-relaxation ([recipe](../../docs/md.md#relaxing-a-packed-box-first)) it converges in 160 steps |
+| cell pre-relaxation (`--relax-cell isotropic --pressure 0`) | water stretched by 4%: P −5.52 → −0.003 GPa in 390 steps, cell 12.926 → 12.220 Å (volume −15.5 %), then the MD runs as usual |
 | blow-up (dt 8 fs) | stopped at the next log row with exit code 2 and `blowup.extxyz` written |
 
 `tests/test_run_md.py` pins the essentials on the test fixture model, and

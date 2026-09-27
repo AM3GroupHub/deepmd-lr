@@ -7,6 +7,7 @@ so these tests pin the plumbing rather than the physics:
 - a restart reproduces an uninterrupted run;
 - two partitions match one;
 - unwrapped input is folded before it reaches the evaluator;
+- --relax-cell relaxes the cell before the MD;
 - bad input exits with code 1 and a message, and instability with code 2.
 """
 
@@ -157,6 +158,18 @@ def test_unwrapped_input_is_folded(inputs, tmp_path):
     e2, f2 = _step0(tmp_path / "shifted")
     assert e2 == pytest.approx(e1, abs=1e-8)
     np.testing.assert_allclose(f2, f1, atol=1e-8)
+
+
+def test_relax_cell_changes_the_cell_and_keeps_its_shape(inputs, tmp_path, capsys):
+    out = tmp_path / "cell"
+    assert run(inputs, out, "--steps", "2", "--relax-steps", "20",
+               "--relax-cell", "isotropic", "--no-relax-checks") == 0
+    assert "cell (isotropic):" in capsys.readouterr().out
+    start, final = ase.io.read(inputs[1]), ase.io.read(out / "final.extxyz")
+    ratio = np.diag(final.cell.array) / np.diag(start.cell.array)
+    assert np.ptp(ratio) < 1e-12 and abs(ratio[0] - 1.0) > 1e-4
+    assert run(inputs, tmp_path / "c2", "--relax-cell", "full") == 1
+    assert "--relax-cell relaxes during --relax-steps" in capsys.readouterr().err
 
 
 def test_bad_input_exits_1_with_a_message(inputs, tmp_path, capsys):

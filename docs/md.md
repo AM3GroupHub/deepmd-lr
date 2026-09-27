@@ -98,7 +98,11 @@ Each of these has cost a run.
   a warning when it was large), and Langevin's `fixcm` keeps it at rest. A
   custom loop has to do the same, or the drift's kinetic energy reads as heat.
 - **NPT needs the virial and repartitions every step.** Reach the density
-  with NPT, then produce with NVT. NPT under a field is refused.
+  with NPT, then produce with NVT. NPT under a field is refused. A cell
+  relaxation (`FIRE2(..., relax_cell="isotropic")`) reaches the zero-kelvin
+  density far faster, and needs the virial too.
+- **Relax a liquid's cell isotropically.** A liquid has no shear stiffness, so
+  `relax_cell="full"` lets its cell shear; keep that for crystals.
 - **An MD object built before an NPT stage refuses to step** once that stage
   has moved the shared evaluator's cell. Build a new one from the stage's
   `atoms`.
