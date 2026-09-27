@@ -3,7 +3,7 @@
 Short runs of the float64 fixture model through the script's `main()`, all on
 one GPU; "two partitions" means that GPU twice. The fixture has random weights,
 so these tests pin the plumbing rather than the physics:
-- every ensemble runs and writes its files;
+- every ensemble runs and writes its files, NPH and full-cell NPT included;
 - a restart reproduces an uninterrupted run;
 - two partitions match one;
 - unwrapped input is folded before it reaches the evaluator;
@@ -68,7 +68,10 @@ ENSEMBLES = {
     "nve": ["--ensemble", "nve"],
     "langevin": ["--ensemble", "nvt", "--thermostat", "langevin"],
     "nhc": ["--ensemble", "nvt", "--thermostat", "nhc"],
+    "rescale": ["--ensemble", "nvt", "--thermostat", "rescale"],
     "npt": ["--ensemble", "npt"],
+    "npt_full": ["--ensemble", "npt", "--barostat", "full"],
+    "nph": ["--ensemble", "nph"],
 }
 
 
@@ -90,10 +93,10 @@ def test_each_ensemble_runs_and_writes_its_files(inputs, tmp_path, ensemble):
     assert segment["status"] == "finished"
 
 
-@pytest.mark.parametrize("ensemble", ["langevin", "npt"])
+@pytest.mark.parametrize("ensemble", ["langevin", "npt", "nph"])
 def test_restart_reproduces_an_uninterrupted_run(inputs, tmp_path, ensemble):
-    """Langevin replays its noise from the step number; NPT restores the cell
-    and its velocity. Either way, 6 + 6 steps must equal 12."""
+    """Langevin replays its noise from the step number; NPT and NPH restore the
+    cell and its velocity. Either way, 6 + 6 steps must equal 12."""
     common = [*ENSEMBLES[ensemble], "--log-every", "3", "--traj-every", "3",
               "--checkpoint-every", "6"]
     assert run(inputs, tmp_path / "a", *common, "--steps", "12") == 0
@@ -188,6 +191,12 @@ def test_bad_input_exits_1_with_a_message(inputs, tmp_path, capsys):
     assert run(inputs, tmp_path / "e", "--ensemble", "npt",
                "--efield", "0.1", "0", "0") == 1
     assert "--efield needs --ensemble nvt" in capsys.readouterr().err
+    assert run(inputs, tmp_path / "b", "--barostat", "full") == 1
+    assert "--barostat applies to --ensemble npt or nph" in capsys.readouterr().err
+    assert run(inputs, tmp_path / "b2", "--ensemble", "npt", "--steps", "2") == 0
+    assert run(inputs, tmp_path / "b2", "--ensemble", "npt", "--barostat", "full",
+               "--steps", "4", "--restart") == 1       # the cell mode changed
+    assert "barostat: 'isotropic' -> 'full'" in capsys.readouterr().err
 
     _, xyz = inputs
     atoms = ase.io.read(xyz)

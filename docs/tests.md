@@ -68,13 +68,15 @@ the model first.
 - `test_md.py` — the MD classes, `FIRE` and `FIRE2`: each integrator and each
   relaxation against a hand-written kernel loop, one evaluator carrying a
   whole workflow, `atoms` kept in step both ways, run semantics and
-  observers, checkpoints, the log, conservation (NVE and NPT as dt², the
-  Nosé–Hoover invariant), the relaxations' refusals, the cell relaxation
+  observers, checkpoints, the log, conservation (NVE, NPT and NPH as dt² in
+  every cell mode, the Nosé–Hoover invariant), the barostats' cell handed to
+  the kernels transposed, the relaxations' refusals, the cell relaxation
   (its force against finite differences of the enthalpy, every mode reaching
   the target pressure), and the dipole current.
 - `test_run_md.py` — the production MD driver in `examples/07-multi-gpu-md`,
-  which delegates to those classes: every ensemble, restarts, partitions,
-  unwrapped input, `--relax-cell`, exit codes.
+  which delegates to those classes: every ensemble (NPH, full-cell NPT and
+  velocity rescaling included), restarts, partitions, unwrapped input,
+  `--relax-cell`, exit codes.
 - `test_compress.py`, `test_compress_arguments.py`,
   `test_compress_atomic_state.py`, `test_compress_required.py` — compressed
   DPA4C inference: every refusal, the graph-lower guard, argument validation,

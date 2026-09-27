@@ -11,6 +11,9 @@ The float64 fixture model runs on the GPU. What is pinned:
   checkpoints.
 - **Physics.** Each class keeps its promise: NVE and MTK conservation, the
   Nose-Hoover eta/2 quirk, and 3N - 3 degrees of freedom.
+- **Barostats.** NPT and NPH in every cell mode: the kernels get the cell
+  transposed, the enthalpy is conserved as dt^2, and each mode moves only
+  what it may.
 - **FIRE and FIRE2.** Each drives its own kernel, under ASE's names, and
   both refuse a bad relaxation. With `relax_cell` the cell force is the
   enthalpy gradient, and the cell reaches the target pressure.
@@ -35,25 +38,35 @@ from nvalchemiops.dynamics.integrators import (
     nhc_position_update,
     nhc_thermostat_chain_update,
     nhc_velocity_half_step,
+    nph_barostat_half_step,
+    nph_cell_update,
+    nph_position_update,
+    nph_velocity_half_step,
     npt_barostat_half_step,
     npt_cell_update,
     npt_position_update,
     npt_thermostat_half_step,
     npt_velocity_half_step,
+    velocity_rescale,
     velocity_verlet_position_update,
     velocity_verlet_velocity_finalize,
 )
+from nvalchemiops.dynamics.integrators.npt import vec9d
 
 from deepmd_lr.nvalchemi import (
     FIRE,
     FIRE2,
+    MTKNPH,
+    MTKNPT,
     DistributedEvaluator,
+    IsotropicMTKNPH,
     IsotropicMTKNPT,
     Langevin,
     MDInstabilityError,
     NoseHooverChainNVT,
     RelaxationError,
     Thermo,
+    VelocityRescaling,
     VelocityVerlet,
     maxwell_boltzmann,
 )
@@ -129,6 +142,21 @@ def loop_vv(ev, atoms, steps):
     return th
 
 
+def loop_rescale(ev, atoms, steps, temperature, tolerance, interval):
+    th = _thermo(ev, atoms)
+    dt, scale = th.scalar(DT), th.scalar(1.0)
+    for k in range(1, steps + 1):
+        velocity_verlet_position_update(
+            th.positions, th.velocities, th.forces, th.masses, dt
+        )
+        th.evaluate()
+        velocity_verlet_velocity_finalize(th.velocities, th.forces, th.masses, dt)
+        if k % interval == 0 and abs(th.temperature - temperature) > tolerance:
+            scale.fill_(math.sqrt(temperature / th.temperature))
+            velocity_rescale(th.velocities, scale)
+    return th
+
+
 def loop_langevin(ev, atoms, steps, friction, seed):
     th = _thermo(ev, atoms)
     dt, kT, fr = th.scalar(DT), th.scalar(units.kB * T0), th.scalar(friction)
@@ -188,7 +216,33 @@ def loop_nhc(ev, atoms, steps, tdamp, chain=3):
     return th
 
 
-def loop_npt(ev, atoms, steps, pressure, tdamp, pdamp, chain=3):
+#: The kernels' name for each cell mode, and the dtype of its target.
+KERNEL_MODES = {
+    "isotropic": "isotropic",
+    "orthorhombic": "anisotropic",
+    "full": "triclinic",
+}
+
+
+def _target(th, pressure, mode):
+    if mode == "isotropic":
+        return th.scalar(pressure)
+    if mode == "orthorhombic":
+        return wp.array([[pressure] * 3], dtype=wp.vec3d, device=th.device)
+    return wp.array([(pressure * np.eye(3)).reshape(9)], dtype=vec9d, device=th.device)
+
+
+def _column_cell(th):
+    """The kernels read a cell's columns as its lattice vectors; ASE's are
+    its rows, so they get the transpose."""
+    return wp.array(
+        np.asarray(th.evaluator.cell).T.reshape(1, 3, 3).copy(),
+        dtype=wp.mat33d,
+        device=th.device,
+    )
+
+
+def loop_npt(ev, atoms, steps, pressure, tdamp, pdamp, chain=3, mode="isotropic"):
     th = _thermo(ev, atoms)
     dt, kT = th.scalar(DT), th.scalar(units.kB * T0)
     ndof = 3 * th.n_atoms - 3
@@ -198,8 +252,9 @@ def loop_npt(ev, atoms, steps, pressure, tdamp, pdamp, chain=3):
     th_mass = wp.array(q, dtype=wp.float64, device=th.device)
     cell_v = th.zeros(1, dtype=wp.mat33d)
     cell_mass = th.scalar(3 * th.n_atoms * units.kB * T0 * pdamp**2)
-    target = th.scalar(pressure)
+    target = _target(th, pressure, mode)
     count = wp.array([th.n_atoms - 1], dtype=wp.int32, device=th.device)
+    h = _column_cell(th)
     for _ in range(steps):
         th.update_kinetic_energy()
         th.update_pressure()
@@ -215,10 +270,11 @@ def loop_npt(ev, atoms, steps, pressure, tdamp, pdamp, chain=3):
             eta_dots=eta_dot,
             num_atoms=count,
             dt=dt,
+            mode=KERNEL_MODES[mode],
         )
-        npt_position_update(th.positions, th.velocities, th.cell, cell_v, dt)
-        npt_cell_update(th.cell, cell_v, dt)
-        th.set_cell()
+        npt_position_update(th.positions, th.velocities, h, cell_v, dt)
+        npt_cell_update(h, cell_v, dt)
+        th.set_cell(h.numpy()[0].T)
         th.evaluate()
         npt_velocity_half_step(
             th.velocities,
@@ -228,6 +284,7 @@ def loop_npt(ev, atoms, steps, pressure, tdamp, pdamp, chain=3):
             eta_dots=eta_dot,
             num_atoms=count,
             dt=dt,
+            mode=KERNEL_MODES[mode],
         )
         th.update_kinetic_energy()
         th.update_pressure()
@@ -241,10 +298,59 @@ def loop_npt(ev, atoms, steps, pressure, tdamp, pdamp, chain=3):
 FRICTION = 0.01 / units.fs
 TDAMP, PDAMP, PRESSURE = 100 * units.fs, 1000 * units.fs, 1e-4 * units.GPa
 
+
+def loop_nph(ev, atoms, steps, pressure, pdamp, mode):
+    """NPH by hand: nvalchemiops' ``run_nph_step`` order, with the kinetic
+    energy and pressure refreshed before each barostat half-step."""
+    th = _thermo(ev, atoms)
+    dt = th.scalar(DT)
+    cell_v = th.zeros(1, dtype=wp.mat33d)
+    cell_mass = th.scalar(3 * th.n_atoms * units.kB * T0 * pdamp**2)
+    target = _target(th, pressure, mode)
+    count = wp.array([th.n_atoms - 1], dtype=wp.int32, device=th.device)
+    h = _column_cell(th)
+
+    def barostat():
+        th.update_kinetic_energy()
+        th.update_pressure()
+        nph_barostat_half_step(
+            cell_v, th.press_w, target, th.volume_w, cell_mass, th.ke_w, count, dt
+        )
+
+    def kick():
+        nph_velocity_half_step(
+            th.velocities,
+            th.masses,
+            th.forces,
+            cell_v,
+            num_atoms=count,
+            dt=dt,
+            mode=KERNEL_MODES[mode],
+        )
+
+    for _ in range(steps):
+        barostat()
+        kick()
+        nph_position_update(th.positions, th.velocities, h, cell_v, dt)
+        nph_cell_update(h, cell_v, dt)
+        th.set_cell(h.numpy()[0].T)
+        th.evaluate()
+        kick()
+        barostat()
+    return th
+
+
 CASES = {
     "vv": (
         lambda ev, a, **kw: VelocityVerlet(ev, a, DT, **kw),
         lambda ev, a, n: loop_vv(ev, a, n),
+        {},
+    ),
+    "rescale": (
+        lambda ev, a, **kw: VelocityRescaling(
+            ev, a, DT, T0, interval=2, tolerance=5.0, **kw
+        ),
+        lambda ev, a, n: loop_rescale(ev, a, n, T0, 5.0, 2),
         {},
     ),
     "langevin": (
@@ -264,6 +370,30 @@ CASES = {
             ev, a, DT, T0, PRESSURE, TDAMP, PDAMP, **kw
         ),
         lambda ev, a, n: loop_npt(ev, a, n, PRESSURE, TDAMP, PDAMP),
+        {"compute_virial": True},
+    ),
+    "npt_full": (
+        lambda ev, a, **kw: MTKNPT(ev, a, DT, T0, PRESSURE, TDAMP, PDAMP, **kw),
+        lambda ev, a, n: loop_npt(ev, a, n, PRESSURE, TDAMP, PDAMP, mode="full"),
+        {"compute_virial": True},
+    ),
+    "nph": (
+        lambda ev, a, **kw: IsotropicMTKNPH(
+            ev, a, DT, PRESSURE, PDAMP, temperature_K=T0, **kw
+        ),
+        lambda ev, a, n: loop_nph(ev, a, n, PRESSURE, PDAMP, "isotropic"),
+        {"compute_virial": True},
+    ),
+    "nph_orthorhombic": (
+        lambda ev, a, **kw: MTKNPH(
+            ev, a, DT, PRESSURE, PDAMP, cell="orthorhombic", temperature_K=T0, **kw
+        ),
+        lambda ev, a, n: loop_nph(ev, a, n, PRESSURE, PDAMP, "orthorhombic"),
+        {"compute_virial": True},
+    ),
+    "nph_full": (
+        lambda ev, a, **kw: MTKNPH(ev, a, DT, PRESSURE, PDAMP, temperature_K=T0, **kw),
+        lambda ev, a, n: loop_nph(ev, a, n, PRESSURE, PDAMP, "full"),
         {"compute_virial": True},
     ),
 }
@@ -716,6 +846,31 @@ class TestPhysics:
         ev.set_compute_virial(True)
         IsotropicMTKNPT(ev, atoms, DT, T0, PRESSURE, TDAMP, PDAMP).run(2)
 
+    def test_velocity_rescaling_holds_its_window(self, model):
+        """A hot start is pulled into the window at the first step it may be,
+        and is inside it at every step that may rescale; between those, with
+        an interval, it may stray."""
+        for interval in (1, 5):
+            atoms = make_atoms(model, temperature=2 * T0)
+            md = VelocityRescaling(
+                make_ev(model, atoms), atoms, DT, T0, interval=interval, tolerance=10.0
+            )
+            seen = []
+            md.attach(
+                lambda md=md, seen=seen: seen.append(
+                    (md.nsteps, md.thermo.temperature)
+                ),
+                1,
+                sync_atoms=False,
+            )
+            md.run(20)
+            assert md.rescales >= 1
+            for step, t in seen:  # at every step it may rescale on
+                if step and step % interval == 0:
+                    assert abs(t - T0) <= 10.0 + 1e-9
+            assert abs(dict(seen)[interval] - T0) < 1e-9  # the first rescale
+            assert abs(dict(seen)[0] - T0) > 10.0  # observers see step 0 too
+
     def test_langevin_fixcm_keeps_the_centre_of_mass_at_rest(self, model):
         atoms = make_atoms(model)
         md = Langevin(make_ev(model, atoms), atoms, DT, T0, 1.0 / units.fs, seed=4)
@@ -723,20 +878,14 @@ class TestPhysics:
         v, m = md.thermo.velocities.numpy(), atoms.get_masses()
         assert np.abs((m[:, None] * v).sum(axis=0)).max() < 1e-12
 
-    def test_logging_does_not_change_an_npt_trajectory(self, model, tmp_path):
+    @pytest.mark.parametrize("case", ["npt", "nph_full"])
+    def test_logging_does_not_change_a_barostat_trajectory(self, model, tmp_path, case):
+        make, _loop, ev_kw = CASES[case]
         atoms = make_atoms(model)
         runs = []
         for log in (None, tmp_path / "every-step.log"):
-            md = IsotropicMTKNPT(
-                make_ev(model, atoms, compute_virial=True),
-                atoms.copy(),
-                DT,
-                T0,
-                PRESSURE,
-                TDAMP,
-                PDAMP,
-                logfile=log,
-                loginterval=1,
+            md = make(
+                make_ev(model, atoms, **ev_kw), atoms.copy(), logfile=log, loginterval=1
             )
             md.run(20)
             runs.append((md.thermo.positions.numpy(), md.cell_v.numpy()))
@@ -759,6 +908,135 @@ class TestPhysics:
         else:
             md._chain()
         assert abs(md.eta_dot.numpy().reshape(-1)[0]) < 1e-12
+
+
+def _sheared(atoms):
+    h = atoms.cell.array.copy()
+    h[1, 0], h[2, 0], h[2, 1] = 1.1, -0.7, 0.9
+    atoms.set_cell(h, scale_atoms=True)
+    return atoms
+
+
+class TestBarostats:
+    def test_the_kernels_get_the_cell_transposed(self, model):
+        """nvalchemiops' cell update is h + dt eps_dot h, reading the columns
+        of h as the lattice vectors. On ASE's rows that has to become
+        H (1 + dt eps_dot); applied to the rows as they are, it would give
+        (1 + dt eps_dot) H, another cell on a sheared one."""
+        atoms = _sheared(make_atoms(model))
+        md = MTKNPH(
+            make_ev(model, atoms, compute_virial=True),
+            atoms,
+            DT,
+            PRESSURE,
+            PDAMP,
+            temperature_K=T0,
+        )
+        e = np.array([[1.0, 0.4, -0.2], [0.4, -0.5, 0.3], [-0.2, 0.3, 0.8]]) * 1e-2
+        md.cell_v.assign(e.reshape(1, 3, 3))
+        h0 = np.array(md.evaluator.cell)
+        x0, v0 = md.thermo.positions.numpy(), md.thermo.velocities.numpy()
+        md._drift()
+        one = np.eye(3) + DT * e
+        np.testing.assert_allclose(md.evaluator.cell, h0 @ one, atol=1e-12)
+        assert np.abs(one @ h0 - h0 @ one).max() > 1e-4
+        np.testing.assert_allclose(
+            md.thermo.positions.numpy(), x0 + DT * (v0 + x0 @ e), atol=1e-12
+        )
+
+    @pytest.mark.parametrize(
+        "ensemble, cell",
+        [
+            ("nph", "isotropic"),
+            ("nph", "orthorhombic"),
+            ("nph", "full"),
+            ("npt", "orthorhombic"),
+            ("npt", "full"),
+        ],
+    )
+    def test_the_conserved_quantity_scales_as_dt_squared(self, model, ensemble, cell):
+        """NPH has no thermostat, so none of NPT's first-order drag; NPT's
+        thermostat is left idle, as in test_npt_conserved_quantity_scales_as_
+        dt_squared. nvalchemiops moves the cell by a first-order Euler step,
+        whose error grows with eps_dot^2; a 1 ps pdamp keeps it below the
+        dt^2 part (at 200 fs the ratio falls to ~2.5)."""
+        atoms = make_atoms(model)
+
+        def md(dt):
+            ev = make_ev(model, atoms, compute_virial=True)
+            if ensemble == "nph":
+                return MTKNPH(
+                    ev, atoms.copy(), dt, PRESSURE, PDAMP, cell=cell, temperature_K=T0
+                )
+            return MTKNPT(
+                ev, atoms.copy(), dt, T0, PRESSURE, 1e6 * units.fs, PDAMP, cell=cell
+            )
+
+        big = _fluctuation(md(0.2 * units.fs), 100, 5)
+        small = _fluctuation(md(0.1 * units.fs), 200, 10)
+        assert 3.0 < big / small < 5.0
+
+    def test_each_mode_moves_only_what_it_may(self, model):
+        for cell in ("isotropic", "orthorhombic", "full"):
+            atoms = make_atoms(model)
+            h0 = atoms.cell.array.copy()
+            MTKNPH(
+                make_ev(model, atoms, compute_virial=True),
+                atoms,
+                DT,
+                PRESSURE,
+                200 * units.fs,
+                cell=cell,
+                temperature_K=T0,
+            ).run(40)
+            h = atoms.cell.array
+            ratios = np.diag(h) / np.diag(h0)
+            off = h - np.diag(np.diag(h))
+            assert np.all(np.abs(ratios - 1.0) > 1e-6)
+            if cell == "isotropic":
+                assert np.ptp(ratios) < 1e-12 and not off.any()
+            elif cell == "orthorhombic":
+                assert np.ptp(ratios) > 1e-6 and not off.any()
+            else:
+                strain = np.linalg.solve(h0, h)
+                assert np.abs(off).max() > 1e-6
+                # no rotation: the deformation stays symmetric
+                assert np.abs(strain - strain.T).max() < 1e-3 * np.abs(strain - 1).max()
+
+    def test_nph_takes_its_barostat_mass_from_the_starting_temperature(self, model):
+        atoms = make_atoms(model)
+        md = MTKNPH(
+            make_ev(model, atoms, compute_virial=True), atoms, DT, PRESSURE, PDAMP
+        )
+        assert md._barostat_T == pytest.approx(md.thermo.temperature, rel=1e-12)
+        assert md._params()["temperature_K"] == md._barostat_T  # restored as is
+        still = make_atoms(model)
+        still.set_momenta(np.zeros((len(still), 3)))
+        ev = make_ev(model, still, compute_virial=True)
+        with pytest.raises(ValueError, match="temperature"):
+            MTKNPH(ev, still, DT, PRESSURE, PDAMP)
+        MTKNPH(ev, still, DT, PRESSURE, PDAMP, temperature_K=T0).run(2)
+
+    def test_refusals(self, model):
+        atoms = make_atoms(model)
+        with pytest.raises(ValueError, match="virial"):
+            MTKNPH(make_ev(model, atoms), atoms, DT, PRESSURE, PDAMP, temperature_K=T0)
+        ev = make_ev(model, atoms, compute_virial=True)
+        with pytest.raises(ValueError, match="cell must be"):
+            MTKNPT(ev, atoms, DT, T0, PRESSURE, TDAMP, PDAMP, cell="cubic")
+        with pytest.raises(ValueError, match="pdamp"):
+            MTKNPH(ev, atoms, DT, PRESSURE, 0.0, temperature_K=T0)
+        sheared = _sheared(make_atoms(model))
+        with pytest.raises(ValueError, match="sheared"):
+            MTKNPH(
+                make_ev(model, sheared, compute_virial=True),
+                sheared,
+                DT,
+                PRESSURE,
+                PDAMP,
+                cell="orthorhombic",
+                temperature_K=T0,
+            )
 
 
 # --- FIRE ---------------------------------------------------------------------------

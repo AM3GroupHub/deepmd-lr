@@ -65,7 +65,11 @@ npt.run(20_000)
 | `VelocityVerlet` | NVE | Etot |
 | `Langevin` | NVT, BAOAB; `fixcm=True` keeps the centre of mass at rest | none |
 | `NoseHooverChainNVT` | NVT, Nosé–Hoover chain | Etot + the chain energy |
-| `IsotropicMTKNPT` | NPT, MTK, isotropic cell | the MTK H′ |
+| `VelocityRescaling` | velocity Verlet, rescaled to the target whenever the temperature leaves a window; equilibration only | none |
+| `MTKNPT` | NPT, MTK barostat + Nosé–Hoover chain; `cell="full"` (default), `"orthorhombic"` or `"isotropic"` | the MTK H′ |
+| `IsotropicMTKNPT` | `MTKNPT` with an isotropic cell, under ASE's name | the MTK H′ |
+| `MTKNPH` | NPH, the MTK barostat alone; `cell` as for `MTKNPT` | the enthalpy H′ |
+| `IsotropicMTKNPH` | `MTKNPH` with an isotropic cell | the enthalpy H′ |
 | `FIRE` | relaxes the positions, and the cell with `relax_cell`; classic FIRE with ASE's defaults | — |
 | `FIRE2` | the same with FIRE 2.0 and nvalchemiops' more cautious defaults | — |
 
@@ -210,7 +214,7 @@ for _ in range(steps):
 ```
 
 Available kernels: velocity Verlet (NVE), Langevin BAOAB, Nosé–Hoover chain,
-NPT and NPH (MTK), and velocity rescaling.
+NPT and NPH (MTK), and velocity rescaling. Each has a class above.
 
 The classes handle these conventions. None can be guessed from the
 signatures, and all were found by running into them:
@@ -275,13 +279,34 @@ timestep-independent drift.
 
 For MTK NPT, H′ adds `P V + W |eps_dot|² / 2`, with `W = 3N kT pdamp²`. The
 NPT chain update moves `eta` by one `eta_dot dt/2` per half step, so there is
-no halving there. H′ is O(dt²) only
-while the thermostat is nearly idle: the NPT velocity kernel applies the drag
-`−(alpha eps_dot + eta_dot) v` explicitly inside the kick, which is first
-order. On equilibrated water at `tdamp` 100 fs, halving dt shrinks H′'s
-fluctuation 4.0× (0.0218 → 0.0054 meV/atom rms); a system heating fast enough
-to keep the thermostat busy gets about 1.8×. NVE, and the Nosé–Hoover NVT
-invariant, are the trustworthy conservation checks.
+no halving there. H′ is O(dt²) only while the thermostat is nearly idle. The
+NPT velocity kernel applies the drag `−(alpha eps_dot + eta_dot) v`
+explicitly inside the kick, which is first order. On equilibrated water at
+`tdamp` 100 fs, halving dt shrinks H′'s fluctuation 4.0× (0.0218 → 0.0054
+meV/atom rms); a system heating fast enough to keep the thermostat busy gets
+about 1.8×.
+
+NPH conserves `Epot + Ekin + P V + W |eps_dot|² / 2`, the enthalpy, with no
+thermostat term to be first order. Its barostat mass still needs a
+temperature: the atoms' own at the start, unless `temperature_K` is given.
+Measured on water, 0.5 ps from an equilibrated snapshot, rms in meV/atom:
+
+| dt 0.5 → 0.25 fs | isotropic | orthorhombic | full |
+|---|---:|---:|---:|
+| NPH | 0.0218 → 0.0054 (4.05×) | 0.0207 → 0.0055 (3.74×) | 0.0202 → 0.0054 (3.71×) |
+| NPT, `tdamp` 100 fs | 0.0218 → 0.0054 (4.0×) | 0.0216 → 0.0051 (4.21×) | 0.0206 → 0.0052 (3.94×) |
+
+nvalchemiops moves the cell by a first-order step, `h + dt eps_dot h`, rather
+than `exp(dt eps_dot) h`. Its error grows with the strain rate squared, so a
+stiff barostat exposes it: on the test fixture, NPH's ratio fell from 3.8 at
+`pdamp` 1 ps to 2.5 at 200 fs. Its cell update also reads the columns of `h`
+as the lattice vectors, where ASE's are rows, so the classes hand the kernels
+the transpose. With the rows passed as they are, NPH on a sheared cell kept an
+error that did not shrink with dt: a ratio of 1.07, and ten times the
+fluctuation.
+
+NVE, the Nosé–Hoover NVT invariant, and NPH's enthalpy are the trustworthy
+conservation checks.
 
 ### How the atoms are split
 

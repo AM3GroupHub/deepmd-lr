@@ -1,4 +1,4 @@
-"""NVT: velocity rescaling, as an observer.
+"""NVT: velocity rescaling.
 
 The bluntest thermostat there is -- multiply every velocity by
 `sqrt(T_target / T_now)`. It samples no correct ensemble and destroys the
@@ -6,11 +6,12 @@ dynamics, so never use it for production. It is genuinely useful for one
 thing: dragging a badly prepared structure to temperature before handing it to
 a real thermostat.
 
-It is also the smallest example of an observer that *changes* the run. An
-observer attached with `md.attach(fn, interval)` sees `atoms` synced from the
-GPU; whatever it writes back into `atoms` (here, the momenta) is uploaded
-before the next step. The policy is yours -- here, rescale only when the
-temperature strays by more than a tolerance.
+`VelocityRescaling` is velocity Verlet plus nvalchemiops' `velocity_rescale`
+kernel, applied only when the temperature strays from the target by more than
+`tolerance` (as LAMMPS' fix temp/rescale does), and only every `interval`
+steps. A policy of your own fits an observer: `md.attach(fn, interval)` sees
+`atoms` synced from the GPU, and what it writes back into `atoms` -- new
+momenta, say -- is uploaded before the next step.
 
     python 04_nvt_rescale.py --model ../../path/to/model.ckpt.pt
 """
@@ -21,7 +22,7 @@ import numpy as np
 from ase import units
 
 from deepmd_lr.nvalchemi import (
-    VelocityVerlet,
+    VelocityRescaling,
     build_evaluator,
     maxwell_boltzmann,
     read_structure,
@@ -43,19 +44,10 @@ def main():
     atoms = read_structure(a.structure, a.index)
     ev = build_evaluator(a.model, atoms)
     maxwell_boltzmann(atoms, temperature_K=a.temperature, seed=1)
-    rescales = [0]
-    md = VelocityVerlet(ev, atoms, a.dt * units.fs, logfile="-",
-                        loginterval=max(a.steps // 20, 1),
-                        extra_columns={"rescaled": lambda m: rescales[0]})
-
-    def rescale():
-        temperature = md.thermo.temperature
-        if abs(temperature - a.temperature) > a.tolerance and temperature > 0:
-            atoms.set_momenta(atoms.get_momenta()
-                              * np.sqrt(a.temperature / temperature))
-            rescales[0] += 1
-
-    md.attach(rescale, 1)
+    md = VelocityRescaling(ev, atoms, a.dt * units.fs, a.temperature,
+                           tolerance=a.tolerance, logfile="-",
+                           loginterval=max(a.steps // 20, 1),
+                           extra_columns={"rescaled": lambda m: m.rescales})
     print(f"velocity rescaling  {len(atoms)} atoms  dt {a.dt} fs  "
           f"T {a.temperature} K  tolerance {a.tolerance} K")
     md.run(a.steps)
@@ -63,7 +55,7 @@ def main():
     half = md.rows[len(md.rows) // 2:]
     print(f"\n  {md.performance()}")
     print(f"  mean T over the second half: "
-          f"{np.mean([r['T[K]'] for r in half]):.1f} K   ({rescales[0]} rescalings)")
+          f"{np.mean([r['T[K]'] for r in half]):.1f} K   ({md.rescales} rescalings)")
     print("  Use this to equilibrate, then switch to Langevin or Nose-Hoover")
     print("  before collecting anything you intend to report.")
 

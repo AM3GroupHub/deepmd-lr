@@ -1,10 +1,11 @@
 # 6 — MD with nvalchemiops
 
-Seven short scripts: one per ensemble, plus a custom loop. The MD classes in
+Eight short scripts: one per ensemble, plus a custom loop. The MD classes in
 `deepmd_lr.nvalchemi` do the stepping, ASE-style -- parameters in `__init__`,
 then `run(steps)` -- so each script is mostly the physics worth knowing about
-its ensemble. [`07_custom_loop.py`](07_custom_loop.py) drives the kernels by
-hand, for integrators the classes do not provide. For production runs --
+its ensemble. Between them the classes cover every integrator nvalchemiops
+ships. [`07_custom_loop.py`](07_custom_loop.py) drives the kernels by hand,
+for an integrator of your own. For production runs --
 restarts, several GPUs, a trajectory -- use the driver in
 [07](../07-multi-gpu-md).
 
@@ -40,10 +41,11 @@ treated as a molecule in vacuum.
 | [`01_nve.py`](01_nve.py) | NVE | — | **checking the model first.** Energy conservation tests that forces are the gradient of the energy |
 | [`02_nvt_langevin.py`](02_nvt_langevin.py) | NVT | Langevin, BAOAB | canonical sampling when dynamics do not matter |
 | [`03_nvt_nose_hoover.py`](03_nvt_nose_hoover.py) | NVT | Nosé–Hoover chain | transport, spectra — anything where dynamics matter |
-| [`04_nvt_rescale.py`](04_nvt_rescale.py) | — | velocity rescaling, as an observer | equilibration only, never production |
-| [`05_npt_mtk.py`](05_npt_mtk.py) | NPT | MTK, isotropic | equilibrating density; needs the virial |
+| [`04_nvt_rescale.py`](04_nvt_rescale.py) | — | velocity rescaling | equilibration only, never production |
+| [`05_npt_mtk.py`](05_npt_mtk.py) | NPT | MTK + Nosé–Hoover chain; `--cell` isotropic, orthorhombic or full | equilibrating density; needs the virial |
 | [`06_nvt_efield.py`](06_nvt_efield.py) | NVT | Langevin | response to an external electric field |
 | [`07_custom_loop.py`](07_custom_loop.py) | NVT | your own | a raw kernel loop on a `Thermo`, and an integrator written as a subclass |
+| [`08_nph_mtk.py`](08_nph_mtk.py) | NPH | MTK alone; `--cell` as for NPT | constant enthalpy: the check that the barostat is integrated right |
 
 ```python
 from ase import units
@@ -161,8 +163,8 @@ affected.
 ## NPT moves the cell, and the evaluator has to be told
 
 `DistributedEvaluator` partitions the atoms against its cell, and NPT moves
-the cell every step. So after the barostat runs, `IsotropicMTKNPT` pushes the
-new cell to the evaluator (`Thermo.set_cell`), which invalidates the
+the cell every step. So after the barostat runs, the NPT and NPH classes push
+the new cell to the evaluator (`Thermo.set_cell`), which invalidates the
 partitioning.
 
 This is **correctness, not caching**. The Verlet criterion that decides when to
@@ -172,13 +174,27 @@ be quietly wrong with nothing raising. It re-runs `partition_system` only;
 the model is never copied again. The price is a repartition every step: reach
 the density with NPT, then produce with NVT.
 
-NPT needs the virial, since the barostat is driven by the pressure tensor. It
+The barostat needs the virial, since it is driven by the pressure tensor. It
 costs a strain leaf per partition and an extra target in the charge-response
 backward. Build the evaluator with `compute_virial=True`, or call
 `ev.set_compute_virial(True)` on one that already ran FIRE or NVT.
 
-**NPH** is not a class. Write it with the `nph_*` kernels, following the
-custom loop in `07`.
+The cell may do one of three things:
+
+| `cell=` | the cell | classes |
+|---|---|---|
+| `"isotropic"` | scales uniformly | `IsotropicMTKNPT`, `IsotropicMTKNPH`, or either `MTK` class |
+| `"orthorhombic"` | the three lengths of a diagonal cell move independently | `MTKNPT`, `MTKNPH` |
+| `"full"` (the `MTK` classes' default, as in ASE) | the whole cell fluctuates, without rotating | `MTKNPT`, `MTKNPH` |
+
+A liquid has no shear stiffness, so `"full"` lets its cell shear; keep
+`"isotropic"` for water.
+
+nvalchemiops' cell update, `h + dt eps_dot h`, reads the columns of `h` as the
+lattice vectors, where ASE's cell has them as rows, so the classes hand the
+kernels the transpose. An isotropic barostat is indifferent to the
+convention; the others are not. On a sheared cell, the untransposed cell broke
+NPH's conservation outright: its error was the same at every timestep.
 
 ## Running under a field
 

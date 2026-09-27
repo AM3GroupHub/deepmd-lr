@@ -2,12 +2,13 @@
 
 `run_md.py` is a ready-to-use MD driver, where the scripts in
 [06](../06-md_nvalchemi) each teach a single ensemble. One command runs NVE,
-NVT (Langevin or Nose-Hoover chain) or isotropic NPT for any 3D-periodic
+NVT (Langevin, Nose-Hoover chain or velocity rescaling), NPT or NPH (with an
+isotropic, orthorhombic or full cell, `--barostat`) for any 3D-periodic
 system, spread over as many GPUs as you give it.
 
 The stepping is the library's own MD classes (`VelocityVerlet`, `Langevin`,
-`NoseHooverChainNVT`, `IsotropicMTKNPT` and `FIRE2` from
-`deepmd_lr.nvalchemi`), all on one evaluator built once. The script adds what
+`NoseHooverChainNVT`, `VelocityRescaling`, `MTKNPT`, `MTKNPH` and `FIRE2`
+from `deepmd_lr.nvalchemi`), all on one evaluator built once. The script adds what
 a production run needs around them:
 
 - restarts across walltime-limited jobs, and a clean stop on SIGTERM;
@@ -55,6 +56,8 @@ A40s is covered by the library's own multi-GPU validation.
 | SIGTERM mid-run; SIGKILL between checkpoints | clean stop, checkpoint, exit 0; after the kill, `--restart` trims the log and trajectory back to the checkpoint, with no duplicate steps |
 | Nose-Hoover NVT, 1 ps, 300 K | ⟨T⟩ 303.6 K over the second half; Econs drift −0.032 meV/atom/ps |
 | NPT: logging every step vs every 200, 200 steps | identical within GPU noise (1.1e-6 Å, cell 3e-10 Å). Before the fix they were 1.0e-4 Å apart: reading the pressure for the log rewrote the barostat's input |
+| NPH (`--ensemble nph`), enthalpy, dt 0.5 → 0.25 fs, 0.5 ps each | rms 0.0218 → 0.0054 meV/atom isotropic (4.05x), 0.0207 → 0.0055 orthorhombic (3.74x), 0.0202 → 0.0054 full (3.71x) |
+| NPT with `--barostat orthorhombic` / `full`, H′, dt 0.5 → 0.25 fs | rms 0.0216 → 0.0051 (4.21x) / 0.0206 → 0.0052 meV/atom (3.94x) |
 | NPT, MTK conserved quantity H′, dt 0.5 → 0.25 fs | rms 0.0217 → 0.0054 meV/atom (O(dt²)); thermostat and reported temperature both count 3N − 3 degrees of freedom |
 | FIRE2 pre-relaxation | from an MD snapshot: 380 steps to 0.038 eV/Å, bonds intact. A packed box with 1.56 Å O–O contacts made the minimiser collapse atoms, since the model has no short-range wall there; the script exits 2 with that diagnosis. After a rigid-TIP3P pre-relaxation ([recipe](../../docs/md.md#relaxing-a-packed-box-first)) it converges in 160 steps |
 | cell pre-relaxation (`--relax-cell isotropic --pressure 0`) | water stretched by 4%: P −5.52 → −0.003 GPa in 390 steps, cell 12.926 → 12.220 Å (volume −15.5 %), then the MD runs as usual |

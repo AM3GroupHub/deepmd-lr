@@ -73,11 +73,15 @@ from ase.calculators.singlepoint import SinglePointCalculator
 from deepmd_lr.nvalchemi.thermo import Thermo
 
 __all__ = [
+    "IsotropicMTKNPH",
     "IsotropicMTKNPT",
     "Langevin",
     "MDInstabilityError",
+    "MTKNPH",
+    "MTKNPT",
     "MolecularDynamics",
     "NoseHooverChainNVT",
+    "VelocityRescaling",
     "VelocityVerlet",
     "maxwell_boltzmann",
 ]
@@ -118,8 +122,12 @@ def _kernels() -> types.SimpleNamespace:
                 "npt_velocity_half_step",
                 "npt_position_update",
                 "npt_cell_update",
+                "nph_barostat_half_step",
+                "nph_velocity_half_step",
+                "velocity_rescale",
             )
-        }
+        },
+        vec9d=k.npt.vec9d,
     )
 
 
@@ -932,6 +940,63 @@ class VelocityVerlet(MolecularDynamics):
         return self.thermo.total_energy
 
 
+class VelocityRescaling(VelocityVerlet):
+    """Velocity rescaling, nvalchemiops' simplest thermostat: velocity Verlet,
+    and every ``interval`` steps the velocities are scaled by
+    sqrt(T_target / T) once the temperature has left the window
+    ``temperature_K +- tolerance``, as LAMMPS' fix temp/rescale does.
+
+    It samples no ensemble and disturbs the dynamics at every rescale: use it
+    to drag a structure to temperature, then hand it to :class:`Langevin` or
+    :class:`NoseHooverChainNVT`. :attr:`rescales` counts the rescales.
+    """
+
+    def __init__(
+        self,
+        evaluator: Any,
+        atoms: Atoms,
+        timestep: float,
+        temperature_K: float,
+        *,
+        interval: int = 1,
+        tolerance: float = 0.0,
+        **kwargs: Any,
+    ) -> None:
+        if not temperature_K > 0:
+            raise ValueError("temperature_K must be positive")
+        if int(interval) < 1 or not tolerance >= 0:
+            raise ValueError("interval must be at least 1 and tolerance >= 0")
+        super().__init__(evaluator, atoms, timestep, **kwargs)
+        self.temperature_K = float(temperature_K)
+        self.interval, self.tolerance = int(interval), float(tolerance)
+        self.rescales = 0
+        self._scale = self.thermo.scalar(1.0)
+
+    def set_temperature(self, temperature_K: float) -> None:
+        """Change the target temperature in place."""
+        self.temperature_K = float(temperature_K)
+
+    def step(self) -> None:
+        super().step()
+        if (self.nsteps + 1) % self.interval:  # the step being taken
+            return
+        t = self.thermo.temperature  # a host read, every interval only
+        if t > 0 and abs(t - self.temperature_K) > self.tolerance:
+            self._scale.fill_(math.sqrt(self.temperature_K / t))
+            _kernels().velocity_rescale(self.thermo.velocities, self._scale)
+            self.rescales += 1
+
+    def conserved_energy(self) -> None:
+        return None
+
+    def _params(self) -> dict:
+        return {
+            "temperature_K": self.temperature_K,
+            "interval": self.interval,
+            "tolerance": self.tolerance,
+        }
+
+
 class Langevin(MolecularDynamics):
     """NVT, BAOAB Langevin.
 
@@ -1125,24 +1190,161 @@ class NoseHooverChainNVT(MolecularDynamics):
         self.eta_dot.assign(arrays["eta_dot"])
 
 
-class IsotropicMTKNPT(MolecularDynamics):
-    """NPT, isotropic Martyna-Tobias-Klein with a Nose-Hoover chain thermostat.
+#: What a barostat lets the cell do, and nvalchemiops' name for each mode.
+_BAROSTAT_MODES = {
+    "isotropic": "isotropic",
+    "orthorhombic": "anisotropic",
+    "full": "triclinic",
+}
 
-    The step is a palindrome: thermostat, barostat, kick | drift | kick,
-    barostat, thermostat.
+
+class _MTKBarostat(MolecularDynamics):
+    """The Martyna-Tobias-Klein barostat that NPT and NPH share.
+
     - **Fresh inputs.** The kinetic energy and pressure are refreshed right
-      before each barostat/thermostat half-step, after the second kick too,
-      as LAMMPS' fix nh does. The MTK conserved quantity is then kept to
-      O(dt^2).
+      before each barostat half-step, after the second kick too, as LAMMPS'
+      fix nh does. (nvalchemiops' ``run_nph_step`` reuses the pressure it
+      measured before that kick.)
     - **Degrees of freedom.** The kernels compute N_f = 3 * (the count they
       are given). The centre of mass is at rest and stays there, so they get
       N - 1, which gives 3N - 3, matching the masses and the temperature.
-    - **The cell.** After the barostat moves it, ``Thermo.set_cell`` pushes it
-      to the evaluator, which repartitions: correct, and a cost paid every
-      step.
+    - **The cell.** ``cell`` picks what fluctuates: ``"isotropic"`` scales the
+      cell uniformly, ``"orthorhombic"`` moves the three lengths of a diagonal
+      cell independently, ``"full"`` moves all nine entries. The strain rate is
+      driven by the pressure tensor, which is symmetric, so the cell never
+      rotates. After each move ``Thermo.set_cell`` pushes the cell to the
+      evaluator, which repartitions: correct, and a cost paid every step.
+    - **Conventions.** nvalchemiops' cell update, h + dt eps_dot h, reads the
+      columns of h as the lattice vectors, where ASE's cell has them as rows,
+      so the kernels get the transpose. For an isotropic eps_dot the two
+      agree; for any other they would part on a sheared cell.
+    - **Pressure** is hydrostatic: ``pressure_au`` (eV/A^3) on every axis.
+
+    The conserved quantity is H' = Epot + Ekin + P V + W |eps_dot|^2 / 2, plus
+    the thermostat's energy under NPT, with W = 3N kT pdamp^2.
 
     Needs the virial: build the evaluator with ``compute_virial=True``, or
     call ``evaluator.set_compute_virial(True)`` first.
+    """
+
+    _EXTRA_BUILTIN = ("Econs[eV]", "P[GPa]", "V[A^3]")
+
+    def __init__(
+        self,
+        evaluator: Any,
+        atoms: Atoms,
+        timestep: float,
+        pressure_au: float,
+        pdamp: float,
+        *,
+        cell: str,
+        barostat_temperature_K: float | None,
+        **kwargs: Any,
+    ) -> None:
+        _check_evaluator(evaluator)
+        name = type(self).__name__
+        if not evaluator.compute_virial:
+            raise ValueError(
+                f"{name} needs the virial: build the evaluator with "
+                "compute_virial=True or call evaluator.set_compute_virial(True)"
+            )
+        if cell not in _BAROSTAT_MODES:
+            raise ValueError(
+                f"cell must be one of {', '.join(_BAROSTAT_MODES)}; got {cell!r}"
+            )
+        h = np.asarray(evaluator.cell, dtype=np.float64)
+        if cell == "orthorhombic" and np.any(h != np.diag(np.diag(h))):
+            raise ValueError(
+                "cell='orthorhombic' moves the three lengths of a diagonal cell, "
+                "and this cell is sheared; use 'full'"
+            )
+        if not pdamp > 0:
+            raise ValueError("pdamp must be positive")
+        super().__init__(evaluator, atoms, timestep, **kwargs)
+        import warp as wp
+
+        th = self.thermo
+        self.cell_mode = cell
+        self.pressure_au, self.pdamp = float(pressure_au), float(pdamp)
+        t = (
+            th.temperature
+            if barostat_temperature_K is None
+            else float(barostat_temperature_K)
+        )
+        if not t > 0:
+            raise ValueError(
+                f"{name} needs a temperature for the barostat mass: give atoms "
+                "velocities (maxwell_boltzmann) or pass temperature_K"
+            )
+        self._barostat_T = t
+        self._w = 3 * th.n_atoms * units.kB * t * self.pdamp**2  # (N_f + 3) kT pdamp^2
+        self.cell_mass = th.scalar(self._w)
+        self.cell_v = th.zeros(1, dtype=wp.mat33d)
+        # N - 1, so the kernels' N_f = 3 * count is 3N - 3.
+        self.dof_count = wp.array([th.n_atoms - 1], dtype=wp.int32, device=th.device)
+        p = self.pressure_au
+        if cell == "isotropic":
+            self.target_p = th.scalar(p)
+        elif cell == "orthorhombic":
+            self.target_p = wp.array([[p, p, p]], dtype=wp.vec3d, device=th.device)
+        else:
+            self.target_p = wp.array(
+                [(p * np.eye(3)).reshape(9)], dtype=_kernels().vec9d, device=th.device
+            )
+        self._velocity_mode = _BAROSTAT_MODES[cell]
+        # The kernels' cell: ASE's, transposed (lattice vectors as columns).
+        self._h = wp.array(
+            h.T.reshape(1, 3, 3).copy(), dtype=wp.mat33d, device=th.device
+        )
+
+    def _refresh(self) -> None:
+        self.thermo.update_kinetic_energy()
+        self.thermo.update_pressure()
+
+    def _drift(self) -> None:
+        """Positions, then the cell, then the evaluator."""
+        k, th = _kernels(), self.thermo
+        k.npt_position_update(
+            th.positions, th.velocities, self._h, self.cell_v, self.dt
+        )
+        k.npt_cell_update(self._h, self.cell_v, self.dt)
+        th.set_cell(self._h.numpy()[0].T)  # evaluator, volume, host copy
+
+    def _barostat_energy(self) -> float:
+        """P V + W |eps_dot|^2 / 2."""
+        eps = self.cell_v.numpy()[0]
+        return self.pressure_au * self.thermo.volume + 0.5 * self._w * float(
+            (eps**2).sum()
+        )
+
+    def _builtin_extras(self) -> dict:
+        return {
+            "Econs[eV]": self.conserved_energy(),
+            "P[GPa]": self.thermo.pressure / units.GPa,
+            "V[A^3]": self.thermo.volume,
+        }
+
+    def _params(self) -> dict:
+        return {
+            "pressure_au": self.pressure_au,
+            "pdamp": self.pdamp,
+            "cell": self.cell_mode,
+        }
+
+    def _state(self) -> dict:
+        return {"cell_v": self.cell_v.numpy()}
+
+    def _load_state(self, arrays: Mapping[str, np.ndarray]) -> None:
+        self.cell_v.assign(arrays["cell_v"])
+
+
+class MTKNPT(_MTKBarostat):
+    """NPT: the MTK barostat with a Nose-Hoover chain thermostat, as ASE's
+    ``MTKNPT``. By default the whole cell fluctuates (``cell="full"``); see
+    :class:`IsotropicMTKNPT` for the isotropic form.
+
+    The step is a palindrome: thermostat, barostat, kick | drift | kick,
+    barostat, thermostat. The barostat itself is not thermostatted.
 
     **How well H' is conserved.** nvalchemiops' velocity kernel applies the
     drag -(alpha eps_dot + eta_dot) v explicitly inside the kick, which is
@@ -1151,10 +1353,9 @@ class IsotropicMTKNPT(MolecularDynamics):
     equilibrium or with weak coupling the O(dt^2) part dominates: equilibrated
     water at tdamp 100 fs gave 0.0218 -> 0.0054 meV/atom rms from dt 0.5 to
     0.25 fs. :class:`NoseHooverChainNVT` applies its scaling exactly and is
-    O(dt^2) at any coupling.
+    O(dt^2) at any coupling; :class:`MTKNPH`, with no thermostat, has no such
+    term.
     """
-
-    _EXTRA_BUILTIN = ("Econs[eV]", "P[GPa]", "V[A^3]")
 
     def __init__(
         self,
@@ -1166,28 +1367,32 @@ class IsotropicMTKNPT(MolecularDynamics):
         tdamp: float,
         pdamp: float,
         *,
+        cell: str = "full",
         tchain: int = 3,
         tloop: int = 1,
         **kwargs: Any,
     ) -> None:
-        _check_evaluator(evaluator)
-        if not evaluator.compute_virial:
-            raise ValueError(
-                "NPT needs the virial: build the evaluator with "
-                "compute_virial=True or call evaluator.set_compute_virial(True)"
-            )
         if int(tchain) < 2:
             raise ValueError("tchain must be at least 2 (the NPT kernels index [1])")
         if int(tloop) != 1:
             raise ValueError("only tloop=1 is supported")
-        if not temperature_K > 0 or not tdamp > 0 or not pdamp > 0:
-            raise ValueError("temperature_K, tdamp and pdamp must be positive")
-        super().__init__(evaluator, atoms, timestep, **kwargs)
+        if not temperature_K > 0 or not tdamp > 0:
+            raise ValueError("temperature_K and tdamp must be positive")
+        super().__init__(
+            evaluator,
+            atoms,
+            timestep,
+            pressure_au,
+            pdamp,
+            cell=cell,
+            barostat_temperature_K=temperature_K,
+            **kwargs,
+        )
         import warp as wp
 
         th = self.thermo
-        self.temperature_K, self.pressure_au = float(temperature_K), float(pressure_au)
-        self.tdamp, self.pdamp = float(tdamp), float(pdamp)
+        self.temperature_K = float(temperature_K)
+        self.tdamp = float(tdamp)
         self.tchain, self.tloop = int(tchain), 1
         kT = units.kB * self.temperature_K
         self.kT = th.scalar(kT)
@@ -1197,16 +1402,6 @@ class IsotropicMTKNPT(MolecularDynamics):
         q[0, 0] *= self._nf  # Q_0 = N_f kT tdamp^2
         self._q = q[0].copy()
         self.th_mass = wp.array(q, dtype=wp.float64, device=th.device)
-        self.cell_v = th.zeros(1, dtype=wp.mat33d)
-        self._w = 3 * th.n_atoms * kT * self.pdamp**2  # W = (N_f + 3) kT pdamp^2
-        self.cell_mass = th.scalar(self._w)
-        self.target_p = th.scalar(self.pressure_au)
-        # N - 1, so the kernels' N_f = 3 * count is 3N - 3.
-        self.dof_count = wp.array([th.n_atoms - 1], dtype=wp.int32, device=th.device)
-
-    def _refresh(self) -> None:
-        self.thermo.update_kinetic_energy()
-        self.thermo.update_pressure()
 
     def _thermostat(self) -> None:
         th = self.thermo
@@ -1244,20 +1439,16 @@ class IsotropicMTKNPT(MolecularDynamics):
             eta_dots=self.eta_dot,
             num_atoms=self.dof_count,
             dt=self.dt,
+            mode=self._velocity_mode,
         )
 
     def step(self) -> None:
-        k, th = _kernels(), self.thermo
         self._refresh()
         self._thermostat()
         self._barostat()
         self._kick()
-        k.npt_position_update(
-            th.positions, th.velocities, th.cell, self.cell_v, self.dt
-        )
-        k.npt_cell_update(th.cell, self.cell_v, self.dt)
-        th.set_cell()  # evaluator, volume, host copy
-        th.evaluate()
+        self._drift()
+        self.thermo.evaluate()
         self._kick()
         self._refresh()  # after the kick
         self._barostat()
@@ -1266,47 +1457,180 @@ class IsotropicMTKNPT(MolecularDynamics):
     def conserved_energy(self) -> float:
         """MTK H' = Epot + Ekin + P V + W|eps_dot|^2/2 + sum Q eta_dot^2/2
         + N_f kT eta_1 + kT sum_{k>1} eta_k."""
-        th = self.thermo
         kT = units.kB * self.temperature_K
-        eps = self.cell_v.numpy()[0]
         eta, eta_dot = self.eta.numpy()[0], self.eta_dot.numpy()[0]
         chain = (
             0.5 * float((self._q * eta_dot**2).sum())
             + self._nf * kT * eta[0]
             + kT * float(eta[1:].sum())
         )
-        return (
-            th.total_energy
-            + self.pressure_au * th.volume
-            + 0.5 * self._w * float((eps**2).sum())
-            + chain
-        )
-
-    def _builtin_extras(self) -> dict:
-        return {
-            "Econs[eV]": self.conserved_energy(),
-            "P[GPa]": self.thermo.pressure / units.GPa,
-            "V[A^3]": self.thermo.volume,
-        }
+        return self.thermo.total_energy + self._barostat_energy() + chain
 
     def _params(self) -> dict:
         return {
+            **super()._params(),
             "temperature_K": self.temperature_K,
-            "pressure_au": self.pressure_au,
             "tdamp": self.tdamp,
-            "pdamp": self.pdamp,
             "tchain": self.tchain,
             "tloop": self.tloop,
         }
 
     def _state(self) -> dict:
         return {
+            **super()._state(),
             "eta": self.eta.numpy(),
             "eta_dot": self.eta_dot.numpy(),
-            "cell_v": self.cell_v.numpy(),
         }
 
     def _load_state(self, arrays: Mapping[str, np.ndarray]) -> None:
+        super()._load_state(arrays)
         self.eta.assign(arrays["eta"])
         self.eta_dot.assign(arrays["eta_dot"])
-        self.cell_v.assign(arrays["cell_v"])
+
+
+class IsotropicMTKNPT(MTKNPT):
+    """NPT with isotropic cell fluctuations, as ASE's ``IsotropicMTKNPT``:
+    :class:`MTKNPT` with ``cell="isotropic"``."""
+
+    def __init__(
+        self,
+        evaluator: Any,
+        atoms: Atoms,
+        timestep: float,
+        temperature_K: float,
+        pressure_au: float,
+        tdamp: float,
+        pdamp: float,
+        *,
+        tchain: int = 3,
+        tloop: int = 1,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(
+            evaluator,
+            atoms,
+            timestep,
+            temperature_K,
+            pressure_au,
+            tdamp,
+            pdamp,
+            cell="isotropic",
+            tchain=tchain,
+            tloop=tloop,
+            **kwargs,
+        )
+
+    def _params(self) -> dict:
+        params = super()._params()
+        del params["cell"]
+        return params
+
+
+class MTKNPH(_MTKBarostat):
+    """NPH: the MTK barostat alone, with no thermostat. The enthalpy
+    H' = Epot + Ekin + P V + W |eps_dot|^2 / 2 is conserved; the temperature
+    goes where the dynamics take it.
+
+    The step is barostat, kick | drift | kick, barostat. By default the whole
+    cell fluctuates (``cell="full"``); see :class:`IsotropicMTKNPH`.
+
+    ``temperature_K`` sets only the barostat mass, W = 3N kT pdamp^2; it
+    defaults to the atoms' temperature at the start, as LAMMPS' fix nph does.
+    """
+
+    def __init__(
+        self,
+        evaluator: Any,
+        atoms: Atoms,
+        timestep: float,
+        pressure_au: float,
+        pdamp: float,
+        *,
+        cell: str = "full",
+        temperature_K: float | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(
+            evaluator,
+            atoms,
+            timestep,
+            pressure_au,
+            pdamp,
+            cell=cell,
+            barostat_temperature_K=temperature_K,
+            **kwargs,
+        )
+
+    def _barostat(self) -> None:
+        th = self.thermo
+        _kernels().nph_barostat_half_step(
+            self.cell_v,
+            th.press_w,
+            self.target_p,
+            th.volume_w,
+            self.cell_mass,
+            th.ke_w,
+            self.dof_count,
+            self.dt,
+        )
+
+    def _kick(self) -> None:
+        th = self.thermo
+        _kernels().nph_velocity_half_step(
+            th.velocities,
+            th.masses,
+            th.forces,
+            self.cell_v,
+            num_atoms=self.dof_count,
+            dt=self.dt,
+            mode=self._velocity_mode,
+        )
+
+    def step(self) -> None:
+        self._refresh()
+        self._barostat()
+        self._kick()
+        self._drift()
+        self.thermo.evaluate()
+        self._kick()
+        self._refresh()  # after the kick
+        self._barostat()
+
+    def conserved_energy(self) -> float:
+        """MTK H' = Epot + Ekin + P V + W |eps_dot|^2 / 2."""
+        return self.thermo.total_energy + self._barostat_energy()
+
+    def _params(self) -> dict:
+        return {**super()._params(), "temperature_K": self._barostat_T}
+
+
+class IsotropicMTKNPH(MTKNPH):
+    """NPH with isotropic cell fluctuations: :class:`MTKNPH` with
+    ``cell="isotropic"``."""
+
+    def __init__(
+        self,
+        evaluator: Any,
+        atoms: Atoms,
+        timestep: float,
+        pressure_au: float,
+        pdamp: float,
+        *,
+        temperature_K: float | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(
+            evaluator,
+            atoms,
+            timestep,
+            pressure_au,
+            pdamp,
+            cell="isotropic",
+            temperature_K=temperature_K,
+            **kwargs,
+        )
+
+    def _params(self) -> dict:
+        params = super()._params()
+        del params["cell"]
+        return params

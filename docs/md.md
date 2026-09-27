@@ -60,9 +60,11 @@ NoseHooverChainNVT(ev, atoms, 0.5 * units.fs, temperature_K=300,
                    loginterval=100).run(20_000)
 ```
 
-`VelocityVerlet`, `Langevin`, `NoseHooverChainNVT`, `IsotropicMTKNPT`, and
-the relaxations `FIRE` and `FIRE2`, share that one evaluator, so a relaxation
-and several MD stages run on one copy of the model. [Partitioned MD](partitioned-md.md#the-md-classes)
+`VelocityVerlet` (NVE); `Langevin`, `NoseHooverChainNVT` and
+`VelocityRescaling` (NVT); `MTKNPT` and `IsotropicMTKNPT` (NPT); `MTKNPH` and
+`IsotropicMTKNPH` (NPH); and the relaxations `FIRE` and `FIRE2` share that one
+evaluator, so a relaxation and several MD stages run on one copy of the
+model. Between them they cover every integrator nvalchemiops ships. [Partitioned MD](partitioned-md.md#the-md-classes)
 covers the API and what each piece owns.
 [Example 06](../examples/06-md_nvalchemi) has a script per ensemble, and
 [example 07](../examples/07-multi-gpu-md) is a production driver.

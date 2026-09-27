@@ -1,10 +1,15 @@
-"""NPT: Martyna-Tobias-Klein, isotropic cell.
+"""NPT: Martyna-Tobias-Klein, with a Nose-Hoover chain thermostat.
 
 The ensemble that asks most of the model: the barostat is driven by the
 pressure tensor, which needs the **virial**, so the evaluator must compute it
 -- `compute_virial=True` here, or `evaluator.set_compute_virial(True)` on an
 evaluator that ran FIRE or NVT first. It costs a strain leaf per partition and
 an extra target in the charge-response backward.
+
+`--cell` picks what the cell may do: `isotropic` (the default here) scales it
+uniformly, `orthorhombic` moves the three lengths of a diagonal cell, `full`
+lets all of it fluctuate. A liquid has no shear stiffness, so keep isotropic
+for water; `full` is for crystals.
 
 What the class does that a hand-written loop has to get right (see
 `07_custom_loop.py` for the loop itself):
@@ -14,6 +19,9 @@ What the class does that a hand-written loop has to get right (see
 - **Fresh inputs.** The kinetic energy and pressure are refreshed right before
   every barostat/thermostat half-step.
 - **Degrees of freedom.** The kernels count 3N - 3.
+- **The convention.** nvalchemiops' cell update reads the columns of a cell
+  as its lattice vectors, where ASE's are rows, so the kernels get the cell
+  transposed. Only an isotropic barostat is indifferent to that.
 
 The log's `Econs` is the MTK conserved quantity. It is second order in dt
 while the thermostat is near equilibrium; nvalchemiops applies the thermostat
@@ -29,7 +37,7 @@ import numpy as np
 from ase import units
 
 from deepmd_lr.nvalchemi import (
-    IsotropicMTKNPT,
+    MTKNPT,
     build_evaluator,
     maxwell_boltzmann,
     read_structure,
@@ -46,6 +54,8 @@ def main():
     ap.add_argument("--tau-t", type=float, default=100.0, help="fs")
     ap.add_argument("--tau-p", type=float, default=1000.0, help="fs")
     ap.add_argument("--chain-length", type=int, default=3)
+    ap.add_argument("--cell", choices=("isotropic", "orthorhombic", "full"),
+                    default="isotropic")
     ap.add_argument("--structure", default="water_192.xyz")
     ap.add_argument("--index", type=int, default=-1)
     a = ap.parse_args()
@@ -53,13 +63,13 @@ def main():
     atoms = read_structure(a.structure, a.index)
     ev = build_evaluator(a.model, atoms, compute_virial=True)
     maxwell_boltzmann(atoms, temperature_K=a.temperature, seed=1)
-    md = IsotropicMTKNPT(ev, atoms, a.dt * units.fs, temperature_K=a.temperature,
-                         pressure_au=a.pressure * units.GPa,
-                         tdamp=a.tau_t * units.fs, pdamp=a.tau_p * units.fs,
-                         tchain=a.chain_length, logfile="-",
-                         loginterval=max(a.steps // 20, 1))
-    print(f"NPT (MTK)  {len(atoms)} atoms  dt {a.dt} fs  T {a.temperature} K  "
-          f"P {a.pressure} GPa  tau_T {a.tau_t} fs  tau_P {a.tau_p} fs")
+    md = MTKNPT(ev, atoms, a.dt * units.fs, temperature_K=a.temperature,
+                pressure_au=a.pressure * units.GPa, tdamp=a.tau_t * units.fs,
+                pdamp=a.tau_p * units.fs, cell=a.cell, tchain=a.chain_length,
+                logfile="-", loginterval=max(a.steps // 20, 1))
+    print(f"NPT (MTK, {a.cell} cell)  {len(atoms)} atoms  dt {a.dt} fs  "
+          f"T {a.temperature} K  P {a.pressure} GPa  tau_T {a.tau_t} fs  "
+          f"tau_P {a.tau_p} fs")
     md.run(a.steps)
 
     half = md.rows[len(md.rows) // 2:]

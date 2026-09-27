@@ -149,9 +149,11 @@ Langevin(ev, atoms, 0.5 * units.fs, temperature_K=300, friction=0.01 / units.fs,
          logfile="md.log", loginterval=100).run(10000)
 ```
 
-`VelocityVerlet`, `NoseHooverChainNVT` and `IsotropicMTKNPT` work the same
-way, with a trajectory, observers and checkpoints, and `FIRE` is the classic
-relaxation beside `FIRE2`.
+Every ensemble nvalchemiops provides has a class that works the same way,
+with a trajectory, observers and checkpoints: `VelocityVerlet` (NVE),
+`Langevin`, `NoseHooverChainNVT` and `VelocityRescaling` (NVT), `MTKNPT` and
+`MTKNPH` in isotropic, orthorhombic or full-cell modes (NPT, NPH). `FIRE` is
+the classic relaxation beside `FIRE2`, and both can relax the cell.
 `examples/06-md_nvalchemi` has a script per ensemble, and
 `examples/07-multi-gpu-md/run_md.py` is a ready-made driver for production
 runs ([partitioned MD](docs/partitioned-md.md)). A field run, Born effective

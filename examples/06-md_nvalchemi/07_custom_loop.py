@@ -1,7 +1,8 @@
 """Your own integrator: a kernel-level loop, and the same idea as a class.
 
-The classes cover NVE, Langevin, Nose-Hoover and isotropic NPT. For anything
-else you drive nvalchemiops' kernels yourself, in one of two ways:
+The classes cover every integrator nvalchemiops ships: NVE, Langevin,
+Nose-Hoover, velocity rescaling, and MTK NPT and NPH in each cell mode. For
+anything else you drive the kernels yourself, in one of two ways:
 
 1. **A raw loop on a `Thermo`.** Thermo holds the device state (positions,
    velocities, masses, the forces view, the cell) and the measurements. It

@@ -69,11 +69,21 @@ ENSEMBLES (--ensemble)
          It is robust and stochastic: use it for equilibration and structure.
          --thermostat nhc uses a Nose-Hoover chain. It is deterministic: use it
          for dynamics (diffusion, spectra). The log gains Econs, the extended
-         energy that should stay flat.
-    npt  Isotropic MTK barostat with a Nose-Hoover chain thermostat. It needs
-         the virial, which the script requests. The cell moves every step and
-         that forces a repartition every step, so NPT is slower than NVT;
-         equilibrate the density with it, then produce in NVT.
+         energy that should stay flat. --thermostat rescale scales the
+         velocities to --temperature whenever it strays by more than
+         --rescale-window; it samples no ensemble, so use it only to bring a
+         structure to temperature.
+    npt  MTK barostat with a Nose-Hoover chain thermostat. It needs the virial,
+         which the script requests. --barostat picks what the cell may do:
+         isotropic (the default) scales it uniformly; orthorhombic moves the
+         three lengths of a diagonal cell; full lets the whole cell fluctuate.
+         A liquid has no shear stiffness, so keep isotropic for it. The cell
+         moves every step and that forces a repartition every step, so NPT is
+         slower than NVT; equilibrate the density with it, then produce in NVT.
+    nph  The MTK barostat alone: constant enthalpy and pressure, no
+         thermostat, so the temperature goes where the dynamics take it. The
+         log's Econs, the enthalpy, should stay flat. --barostat as for npt;
+         the barostat mass uses --temperature.
 
     Typical values:
     - timestep: 0.5 fs with hydrogen; 1-2 fs without light atoms.
@@ -87,8 +97,9 @@ UNITS
 OUTPUT FILES (in --out)
     md.log          The thermo table: a '#' header, then one row every
                     --log-every steps. Columns: step, time[ps], T[K],
-                    Epot/Ekin/Etot[eV]; Econs[eV] for nhc; P[GPa] and V[A^3]
-                    for npt; ms/step. Read it with numpy.loadtxt.
+                    Epot/Ekin/Etot[eV]; Econs[eV] for nhc, npt and nph; P[GPa]
+                    and V[A^3] for npt and nph; ms/step. Read it with
+                    numpy.loadtxt.
     traj.extxyz     One frame every --traj-every steps, with energy, step and
                     time_ps in the comment line. Positions are UNWRAPPED, which
                     diffusion analysis needs; --traj-wrapped wraps them.
@@ -184,7 +195,8 @@ FOR AI AGENTS
 
     Code map:
     - The MD itself is deepmd_lr.nvalchemi: VelocityVerlet, Langevin,
-      NoseHooverChainNVT, IsotropicMTKNPT, FIRE2, maxwell_boltzmann. This script
+      NoseHooverChainNVT, VelocityRescaling, MTKNPT, MTKNPH, FIRE2,
+      maxwell_boltzmann. This script
       turns the command line into those objects (build_md, output_settings)
       and adds what a job needs around them.
     - run_md(): a new run or a --restart; pre_relax(): the FIRE2 stage before
@@ -219,11 +231,13 @@ from ase import units
 from deepmd_lr.ase import load_model
 from deepmd_lr.nvalchemi import (
     FIRE2,
-    IsotropicMTKNPT,
+    MTKNPH,
+    MTKNPT,
     Langevin,
     MDInstabilityError,
     NoseHooverChainNVT,
     RelaxationError,
+    VelocityRescaling,
     VelocityVerlet,
     build_evaluator,
     maxwell_boltzmann,
@@ -232,8 +246,9 @@ from deepmd_lr.nvalchemi import (
 
 #: Settings a restart must share with the checkpoint it continues.
 PHYSICS_KEYS = ("ensemble", "thermostat", "dt", "temperature", "tau_t",
-                "pressure", "tau_p", "chain_length", "efield", "eps_inf",
-                "charge_spin")
+                "rescale_window", "pressure", "tau_p", "barostat",
+                "chain_length", "efield", "eps_inf", "charge_spin")
+BAROSTATS = ("npt", "nph")
 
 
 class InputError(Exception):
@@ -290,10 +305,13 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="fraction of free GPU memory the auto skin may plan for")
 
     g = ap.add_argument_group("ensemble")
-    g.add_argument("--ensemble", choices=("nve", "nvt", "npt"), default="nvt",
+    g.add_argument("--ensemble", choices=("nve", "nvt", "npt", "nph"), default="nvt",
                    help="see ENSEMBLES above")
-    g.add_argument("--thermostat", choices=("langevin", "nhc"), default="langevin",
-                   help="NVT thermostat")
+    g.add_argument("--thermostat", choices=("langevin", "nhc", "rescale"),
+                   default="langevin", help="NVT thermostat")
+    g.add_argument("--rescale-window", type=float, default=10.0,
+                   help="with --thermostat rescale: rescale when |T - target| "
+                        "exceeds this, K")
     g.add_argument("--temperature", type=float, default=300.0,
                    help="K; thermostat target, and the temperature of the "
                         "initial velocities")
@@ -301,10 +319,15 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="thermostat time constant, fs (Langevin friction = "
                         "1/tau_t)")
     g.add_argument("--pressure", type=float, default=1e-4,
-                   help="target pressure of NPT and of --relax-cell, GPa "
+                   help="target pressure of npt, nph and --relax-cell, GPa "
                         "(1 bar = 1e-4 GPa)")
     g.add_argument("--tau-p", type=float, default=1000.0,
-                   help="NPT barostat time constant, fs")
+                   help="barostat time constant of npt and nph, fs")
+    g.add_argument("--barostat", choices=("isotropic", "orthorhombic", "full"),
+                   default=None,
+                   help="what the cell may do under npt and nph: isotropic "
+                        "(default) scales it, orthorhombic moves the three "
+                        "lengths of a diagonal cell, full the whole cell")
     g.add_argument("--chain-length", type=int, default=3,
                    help="Nose-Hoover chain length (nhc and npt)")
     g.add_argument("--efield", type=float, nargs=3, default=None,
@@ -390,6 +413,12 @@ def check_args(a: argparse.Namespace) -> None:
             "the virial NPT needs, and under a field NVE conserves nothing")
     if a.ensemble == "npt" and a.chain_length < 2:
         raise InputError("--ensemble npt needs --chain-length >= 2")
+    if a.rescale_window < 0:
+        raise InputError("--rescale-window must be >= 0")
+    if a.barostat is not None and a.ensemble not in BAROSTATS:
+        raise InputError("--barostat applies to --ensemble npt or nph")
+    if a.barostat is None and a.ensemble in BAROSTATS:
+        a.barostat = "isotropic"
     if a.relax_cell is not None:
         if a.relax_steps < 1:
             raise InputError("--relax-cell relaxes during --relax-steps; set that "
@@ -473,7 +502,7 @@ def make_evaluator(model, atoms, devices, a: argparse.Namespace):
         "devices": devices,
         "skin": "auto" if a.skin == "auto" else float(a.skin),
         "memory_headroom": a.memory_headroom,
-        "compute_virial": a.ensemble == "npt",   # the barostat needs the virial
+        "compute_virial": a.ensemble in BAROSTATS,   # the barostat needs it
         "eps_inf": a.eps_inf,
     }
     if a.efield is not None:
@@ -492,8 +521,11 @@ def md_class(a: argparse.Namespace):
     if a.ensemble == "nve":
         return VelocityVerlet
     if a.ensemble == "npt":
-        return IsotropicMTKNPT
-    return Langevin if a.thermostat == "langevin" else NoseHooverChainNVT
+        return MTKNPT
+    if a.ensemble == "nph":
+        return MTKNPH
+    return {"langevin": Langevin, "nhc": NoseHooverChainNVT,
+            "rescale": VelocityRescaling}[a.thermostat]
 
 
 def max_temperature(a: argparse.Namespace) -> float | None:
@@ -533,8 +565,14 @@ def build_md(a: argparse.Namespace, ev, atoms, seed: int, io: dict):
     if cls is NoseHooverChainNVT:
         return cls(ev, atoms, dt, a.temperature, a.tau_t * units.fs,
                    tchain=a.chain_length, **io)
+    if cls is VelocityRescaling:
+        return cls(ev, atoms, dt, a.temperature, tolerance=a.rescale_window, **io)
+    if cls is MTKNPH:
+        return cls(ev, atoms, dt, a.pressure * units.GPa, a.tau_p * units.fs,
+                   cell=a.barostat, temperature_K=a.temperature, **io)
     return cls(ev, atoms, dt, a.temperature, a.pressure * units.GPa,
-               a.tau_t * units.fs, a.tau_p * units.fs, tchain=a.chain_length, **io)
+               a.tau_t * units.fs, a.tau_p * units.fs, cell=a.barostat,
+               tchain=a.chain_length, **io)
 
 
 def physics_of(a: argparse.Namespace) -> dict:
@@ -542,14 +580,22 @@ def physics_of(a: argparse.Namespace) -> dict:
     d = {k: getattr(a, k) for k in PHYSICS_KEYS}
     if a.ensemble != "nvt":
         d.pop("thermostat")
-    if a.ensemble != "npt":
-        d.pop("pressure")
-        d.pop("tau_p")
+    if a.ensemble not in BAROSTATS:
+        for k in ("pressure", "tau_p", "barostat"):
+            d.pop(k)
     if a.ensemble == "nve":
         for k in ("temperature", "tau_t", "chain_length"):
             d.pop(k)
+    if a.ensemble == "nph":
+        for k in ("tau_t", "chain_length"):
+            d.pop(k)
     if a.ensemble == "nvt" and a.thermostat == "langevin":
         d.pop("chain_length")
+    if a.ensemble == "nvt" and a.thermostat == "rescale":
+        for k in ("tau_t", "chain_length"):
+            d.pop(k)
+    if a.ensemble != "nvt" or a.thermostat != "rescale":
+        d.pop("rescale_window")
     return d
 
 
@@ -817,7 +863,7 @@ def pre_relax(a: argparse.Namespace, ev, atoms) -> None:
           check=not a.no_relax_checks).run(fmax=a.relax_fmax, steps=a.relax_steps,
                                            smax=a.relax_smax * units.GPa)
     if cell is not None:
-        ev.set_compute_virial(a.ensemble == "npt")
+        ev.set_compute_virial(a.ensemble in BAROSTATS)
         print(f"  cell ({cell}): {before} -> {_cell_text(atoms)}; "
               f"volume {100 * (atoms.get_volume() / v0 - 1):+.2f} %", flush=True)
 
@@ -834,7 +880,7 @@ def summarize(md, ev, a, n, devices) -> dict:
     if len(rows) >= 2:
         half = rows[len(rows) // 2:]
         s["mean T (second half)"] = f"{np.mean([r['T[K]'] for r in half]):.1f} K"
-        if a.ensemble == "npt":
+        if a.ensemble in BAROSTATS:
             p_mean = np.mean([r["P[GPa]"] for r in half])
             v_mean = np.mean([r["V[A^3]"] for r in half])
             s["mean P (second half)"] = f"{p_mean:+.5f} GPa"
