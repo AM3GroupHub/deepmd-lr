@@ -36,12 +36,12 @@ import argparse
 import numpy as np
 import torch
 from ase import units
+from ase.md.velocitydistribution import Stationary, thermalize_momenta
 from scipy.spatial import cKDTree
 
 from deepmd_lr.nvalchemi import (
     Langevin,
     build_evaluator,
-    maxwell_boltzmann,
     read_structure,
 )
 
@@ -91,7 +91,9 @@ def main():
 
     atoms = read_structure(a.structure, a.index).repeat(a.repeat)
     ev = build_evaluator(a.model, atoms, devices=devices, efield=[a.efield, 0.0, 0.0])
-    maxwell_boltzmann(atoms, temperature_K=a.temperature, seed=a.seed)
+    thermalize_momenta(atoms, temperature_K=a.temperature,
+                       rng=np.random.default_rng(a.seed))
+    Stationary(atoms)
     sym = np.array(atoms.get_chemical_symbols())
     oxy, hyd = np.where(sym == "O")[0], np.where(sym == "H")[0]
     lengths = np.diag(np.asarray(atoms.get_cell()))

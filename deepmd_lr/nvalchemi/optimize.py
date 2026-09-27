@@ -5,7 +5,8 @@
 
     ev = build_evaluator("model.ckpt.pt", atoms, devices=["cuda:0"])
     FIRE2(ev, atoms).run(fmax=0.05, steps=2000)   # RelaxationError if it went wrong
-    maxwell_boltzmann(atoms, temperature_K=300, seed=7)
+    thermalize_momenta(atoms, temperature_K=300)  # ase.md.velocitydistribution
+    Stationary(atoms)
     Langevin(ev, atoms, 0.5 * units.fs, temperature_K=300,
              friction=0.01 / units.fs).run(10_000)  # same evaluator, no second copy
 

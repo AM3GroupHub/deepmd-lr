@@ -49,11 +49,13 @@ treated as a molecule in vacuum.
 
 ```python
 from ase import units
-from deepmd_lr.nvalchemi import Langevin, build_evaluator, maxwell_boltzmann, read_structure
+from ase.md.velocitydistribution import Stationary, thermalize_momenta
+from deepmd_lr.nvalchemi import Langevin, build_evaluator, read_structure
 
 atoms = read_structure("water_192.xyz")
 ev = build_evaluator("model.ckpt.pt", atoms)       # built once, shared
-maxwell_boltzmann(atoms, temperature_K=300, seed=1)
+thermalize_momenta(atoms, temperature_K=300)
+Stationary(atoms)
 md = Langevin(ev, atoms, 0.5 * units.fs, temperature_K=300, friction=0.1,
               logfile="-", loginterval=50)
 md.run(1000)

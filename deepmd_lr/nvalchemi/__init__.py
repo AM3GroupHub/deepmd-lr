@@ -38,7 +38,6 @@ from deepmd_lr.nvalchemi.md import (
     NoseHooverChainNVT,
     VelocityRescaling,
     VelocityVerlet,
-    maxwell_boltzmann,
 )
 from deepmd_lr.nvalchemi.optimize import (
     FIRE,
@@ -78,7 +77,6 @@ __all__ = [
     "build_evaluator",
     "device_replicas",
     "evaluate_partitioned",
-    "maxwell_boltzmann",
     "partition_graph",
     "partition_system",
     "read_structure",

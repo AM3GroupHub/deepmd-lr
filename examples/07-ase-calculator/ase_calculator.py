@@ -26,15 +26,8 @@ from ase import units
 from ase.constraints import FixCom
 from ase.io import read
 from ase.md.langevin import Langevin
-from ase.md.velocitydistribution import Stationary
+from ase.md.velocitydistribution import Stationary, thermalize_momenta
 from ase.optimize import FIRE
-
-try:  # ASE >= 3.29; the older name still works there, with a warning
-    from ase.md.velocitydistribution import thermalize_momenta
-except ImportError:
-    from ase.md.velocitydistribution import (
-        MaxwellBoltzmannDistribution as thermalize_momenta,
-    )
 
 from deepmd_lr.ase import LongRangeCalculator
 

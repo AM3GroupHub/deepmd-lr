@@ -20,11 +20,11 @@ import argparse
 
 import numpy as np
 from ase import units
+from ase.md.velocitydistribution import Stationary, thermalize_momenta
 
 from deepmd_lr.nvalchemi import (
     NoseHooverChainNVT,
     build_evaluator,
-    maxwell_boltzmann,
     read_structure,
 )
 
@@ -44,7 +44,8 @@ def main():
 
     atoms = read_structure(a.structure, a.index)
     ev = build_evaluator(a.model, atoms)
-    maxwell_boltzmann(atoms, temperature_K=a.temperature, seed=1)
+    thermalize_momenta(atoms, temperature_K=a.temperature, rng=np.random.default_rng(1))
+    Stationary(atoms)
     md = NoseHooverChainNVT(ev, atoms, a.dt * units.fs, temperature_K=a.temperature,
                             tdamp=a.tau * units.fs, tchain=a.chain_length,
                             logfile="-", loginterval=max(a.steps // 20, 1))

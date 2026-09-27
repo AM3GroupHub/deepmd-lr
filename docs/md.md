@@ -50,11 +50,13 @@ nvalchemiops kernels:
 
 ```python
 from ase import units
-from deepmd_lr.nvalchemi import FIRE2, NoseHooverChainNVT, build_evaluator, maxwell_boltzmann
+from ase.md.velocitydistribution import Stationary, thermalize_momenta
+from deepmd_lr.nvalchemi import FIRE2, NoseHooverChainNVT, build_evaluator
 
 ev = build_evaluator("run_joint/model.ckpt.pt", atoms, devices=["cuda:0"])
 FIRE2(ev, atoms).run(fmax=0.05)
-maxwell_boltzmann(atoms, temperature_K=300, seed=7)
+thermalize_momenta(atoms, temperature_K=300)
+Stationary(atoms)
 NoseHooverChainNVT(ev, atoms, 0.5 * units.fs, temperature_K=300,
                    tdamp=100 * units.fs, logfile="md.log",
                    loginterval=100).run(20_000)

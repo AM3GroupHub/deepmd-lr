@@ -23,6 +23,7 @@ import math
 
 import numpy as np
 from ase import units
+from ase.md.velocitydistribution import Stationary, thermalize_momenta
 from nvalchemiops.dynamics.integrators import (
     velocity_rescale,
     velocity_verlet_position_update,
@@ -32,7 +33,6 @@ from nvalchemiops.dynamics.integrators import (
 from deepmd_lr.nvalchemi import (
     MolecularDynamics,
     build_evaluator,
-    maxwell_boltzmann,
     read_structure,
 )
 
@@ -77,7 +77,9 @@ def main():
 
     atoms = read_structure(a.structure, a.index)
     ev = build_evaluator(a.model, atoms)
-    maxwell_boltzmann(atoms, temperature_K=a.start_temperature, seed=1)
+    thermalize_momenta(atoms, temperature_K=a.start_temperature,
+                       rng=np.random.default_rng(1))
+    Stationary(atoms)
     md = Berendsen(ev, atoms, a.dt * units.fs, a.temperature, a.tau * units.fs,
                    logfile="-", loginterval=max(a.steps // 20, 1))
     print(f"Berendsen  {len(atoms)} atoms  {a.start_temperature:g} -> "

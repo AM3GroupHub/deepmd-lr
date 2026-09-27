@@ -11,6 +11,8 @@ import numpy as np
 import pytest
 import torch
 import warp as wp
+from ase import Atoms
+from ase.md.velocitydistribution import Stationary, thermalize_momenta
 from ase.units import kB
 
 from deepmd_lr.nvalchemi import DistributedEvaluator, Thermo
@@ -33,10 +35,12 @@ def setup(n_mol=8, **kwargs):
 
 
 def make_thermo(ev, positions, temperature=300.0):
-    """Thermo no longer has a setpoint: velocities are drawn explicitly."""
-    th = Thermo(ev, positions)
-    th.maxwell_boltzmann(temperature)
-    return th
+    """Thermo has no setpoint: velocities are drawn by ASE, as a user draws them."""
+    atoms = Atoms(numbers=np.ones(len(positions), dtype=int), positions=positions)
+    atoms.set_masses(ev.masses())
+    thermalize_momenta(atoms, temperature_K=temperature, rng=np.random.default_rng(0))
+    Stationary(atoms)
+    return Thermo(ev, positions, velocities=atoms.get_velocities())
 
 
 class TestMeasurements:
@@ -188,13 +192,6 @@ class TestCell:
 
 
 class TestSetup:
-    def test_maxwell_boltzmann_reaches_the_target_without_drift(self):
-        ev, pos = setup(n_mol=64)
-        th = make_thermo(ev, pos)
-        assert th.temperature == pytest.approx(300.0, rel=0.25)
-        v, m = th.velocities.numpy(), th.masses.numpy()
-        assert np.abs((m[:, None] * v).sum(axis=0)).max() < 1e-10
-
     def test_atoms_snapshot_round_trips(self):
         ev, pos = setup()
         th = make_thermo(ev, pos)

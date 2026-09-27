@@ -30,6 +30,7 @@ import torch
 import warp as wp
 from ase import Atoms, units
 from ase.constraints import FixAtoms
+from ase.md.velocitydistribution import Stationary, thermalize_momenta
 from nvalchemiops.dynamics.integrators import (
     langevin_baoab_finalize,
     langevin_baoab_half_step,
@@ -68,7 +69,6 @@ from deepmd_lr.nvalchemi import (
     Thermo,
     VelocityRescaling,
     VelocityVerlet,
-    maxwell_boltzmann,
 )
 from deepmd_lr.nvalchemi import optimize as optimize_module
 
@@ -98,7 +98,9 @@ def make_atoms(model, seed=0, temperature=T0):
         cell=cell[0].cpu().numpy(),
         pbc=True,
     )
-    maxwell_boltzmann(atoms, temperature_K=temperature, seed=seed + 1)
+    thermalize_momenta(atoms, temperature_K=temperature,
+                       rng=np.random.default_rng(seed + 1))
+    Stationary(atoms)
     return atoms
 
 
@@ -436,7 +438,8 @@ class TestOwnership:
             FIRE2(evaluators[0], atoms, logfile=None, check=False).run(
                 fmax=1.0, steps=30
             )
-            maxwell_boltzmann(atoms, temperature_K=T0, seed=3)
+            thermalize_momenta(atoms, temperature_K=T0, rng=np.random.default_rng(3))
+            Stationary(atoms)
             Langevin(evaluators[1], atoms, DT, T0, FRICTION, seed=5).run(5)
             IsotropicMTKNPT(evaluators[2], atoms, DT, T0, PRESSURE, TDAMP, PDAMP).run(5)
             return atoms

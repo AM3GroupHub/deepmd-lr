@@ -4,10 +4,12 @@
 .. code-block:: python
 
     from ase import units
-    from deepmd_lr.nvalchemi import Langevin, build_evaluator, maxwell_boltzmann
+    from ase.md.velocitydistribution import Stationary, thermalize_momenta
+    from deepmd_lr.nvalchemi import Langevin, build_evaluator
 
     ev = build_evaluator("model.ckpt.pt", atoms, devices=["cuda:0", "cuda:1"])
-    maxwell_boltzmann(atoms, temperature_K=300, seed=7)
+    thermalize_momenta(atoms, temperature_K=300)
+    Stationary(atoms)
     md = Langevin(ev, atoms, 0.5 * units.fs, temperature_K=300,
                   friction=0.01 / units.fs, logfile="md.log", loginterval=100)
     md.run(10_000)
@@ -83,7 +85,6 @@ __all__ = [
     "NoseHooverChainNVT",
     "VelocityRescaling",
     "VelocityVerlet",
-    "maxwell_boltzmann",
 ]
 
 #: Bumped whenever the checkpoint layout changes.
@@ -326,30 +327,6 @@ def _fingerprint(evaluator: Any, masses: np.ndarray) -> dict:
         ),
         "compute_virial": bool(evaluator.compute_virial),
     }
-
-
-def maxwell_boltzmann(
-    atoms: Atoms, temperature_K: float, *, seed: int | None = None, exact: bool = False
-) -> None:
-    """Draw Maxwell-Boltzmann velocities into ``atoms``, centre of mass at rest.
-
-    On the host, from ``numpy.random.default_rng(seed)``, using
-    ``atoms.get_masses()`` (isotopes respected). ``exact=True`` rescales to hit
-    ``temperature_K`` exactly with ``3N - 3`` degrees of freedom, the count
-    every thermostat and temperature here uses.
-    """
-    rng = np.random.default_rng(seed)
-    masses = atoms.get_masses()
-    v = (
-        rng.standard_normal((len(atoms), 3))
-        * np.sqrt(units.kB * float(temperature_K) / masses)[:, None]
-    )
-    v -= (masses[:, None] * v).sum(axis=0) / masses.sum()
-    if exact and len(atoms) > 1:
-        now = (masses[:, None] * v**2).sum() / ((3 * len(atoms) - 3) * units.kB)
-        if now > 0:
-            v *= math.sqrt(float(temperature_K) / now)
-    atoms.set_velocities(v)
 
 
 # ----------------------------------------------------------------------------
@@ -1275,7 +1252,7 @@ class _MTKBarostat(MolecularDynamics):
         if not t > 0:
             raise ValueError(
                 f"{name} needs a temperature for the barostat mass: give atoms "
-                "velocities (maxwell_boltzmann) or pass temperature_K"
+                "velocities (ASE's thermalize_momenta) or pass temperature_K"
             )
         self._barostat_T = t
         self._w = 3 * th.n_atoms * units.kB * t * self.pdamp**2  # (N_f + 3) kT pdamp^2

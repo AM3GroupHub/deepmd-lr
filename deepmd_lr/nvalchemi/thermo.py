@@ -39,7 +39,6 @@ from ase.units import kB
 from nvalchemiops.dynamics.utils import (
     compute_kinetic_energy,
     compute_temperature,
-    initialize_velocities,
     remove_com_motion,
 )
 
@@ -48,7 +47,7 @@ __all__ = ["Thermo"]
 #: Keywords the constructor used to take, and where each went.
 _MOVED = {
     "timestep": "the integrator's `timestep` (deepmd_lr.nvalchemi.md)",
-    "temperature": "the integrator's `temperature_K`, or maxwell_boltzmann()",
+    "temperature": "the integrator's `temperature_K`, or ASE's thermalize_momenta()",
     "columns": "the integrator's `logfile`/`extra_columns`",
     "every": "the integrator's `loginterval`",
     "file": "the integrator's `logfile`",
@@ -272,8 +271,8 @@ class Thermo:
         """Instantaneous temperature in kelvin.
 
         nvalchemiops divides by ``3N - 3``, i.e. it assumes the centre-of-mass
-        motion was removed -- which :meth:`maxwell_boltzmann`,
-        :meth:`remove_com_motion` and the MD classes all do.
+        motion was removed -- which :meth:`remove_com_motion` and the MD
+        classes do.
         """
         compute_kinetic_energy(self.velocities, self.masses, self._ke_probe)
         compute_temperature(self._ke_probe, self._temp_w, self.natoms)
@@ -370,20 +369,6 @@ class Thermo:
         return self._ke_w
 
     # --- setup -------------------------------------------------------------
-
-    def maxwell_boltzmann(self, temperature: float, seed: int = 0) -> None:
-        """Draw velocities from Maxwell-Boltzmann at ``temperature`` (K).
-
-        Through nvalchemiops, so the draw happens on the device, with the
-        centre-of-mass motion removed. Like ASE's equivalent it does not
-        rescale to hit the target exactly -- the instantaneous temperature
-        fluctuates about it.
-        """
-        initialize_velocities(
-            self.velocities, self.masses, self.scalar(kB * float(temperature)),
-            self._momentum, self._total_mass, self._com,
-            random_seed=seed, remove_com=True,
-        )
 
     def remove_com_motion(self) -> None:
         """Subtract the centre-of-mass velocity, in place on the device.

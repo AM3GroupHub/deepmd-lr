@@ -17,11 +17,11 @@ import argparse
 
 import numpy as np
 from ase import units
+from ase.md.velocitydistribution import Stationary, thermalize_momenta
 
 from deepmd_lr.nvalchemi import (
     VelocityVerlet,
     build_evaluator,
-    maxwell_boltzmann,
     read_structure,
 )
 
@@ -40,7 +40,8 @@ def main():
 
     atoms = read_structure(a.structure, a.index)
     ev = build_evaluator(a.model, atoms)
-    maxwell_boltzmann(atoms, temperature_K=a.temperature, seed=1)
+    thermalize_momenta(atoms, temperature_K=a.temperature, rng=np.random.default_rng(1))
+    Stationary(atoms)
     md = VelocityVerlet(ev, atoms, a.dt * units.fs, logfile="-",
                         loginterval=max(a.steps // 20, 1))
     print(f"NVE  {len(atoms)} atoms  dt {a.dt} fs  {a.steps} steps")

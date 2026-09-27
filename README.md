@@ -140,11 +140,13 @@ on nvalchemiops kernels. The evaluator holds the model on every device, is
 built once, and is shared by every stage that follows:
 
 ```python
-from deepmd_lr.nvalchemi import FIRE2, Langevin, build_evaluator, maxwell_boltzmann
+from ase.md.velocitydistribution import Stationary, thermalize_momenta
+from deepmd_lr.nvalchemi import FIRE2, Langevin, build_evaluator
 
 ev = build_evaluator("run_joint/model.ckpt.pt", atoms, devices=["cuda:0", "cuda:1"])
 FIRE2(ev, atoms).run(fmax=0.05)
-maxwell_boltzmann(atoms, temperature_K=300, seed=1)
+thermalize_momenta(atoms, temperature_K=300)
+Stationary(atoms)
 Langevin(ev, atoms, 0.5 * units.fs, temperature_K=300, friction=0.01 / units.fs,
          logfile="md.log", loginterval=100).run(10000)
 ```

@@ -1321,11 +1321,11 @@ class TestUnwrappedCoordinates:
         import pathlib
 
         from ase import units
+        from ase.md.velocitydistribution import Stationary, thermalize_momenta
 
         from deepmd_lr.nvalchemi import (
             Langevin,
             build_evaluator,
-            maxwell_boltzmann,
             read_structure,
         )
 
@@ -1334,7 +1334,8 @@ class TestUnwrappedCoordinates:
         compress = os.environ.get("DEEPMD_LR_WATER_COMPRESS") == "1"
         ev = build_evaluator(os.environ["DEEPMD_LR_WATER_MODEL"], atoms,
                              devices=[DEVICE] * 2, compress=compress)
-        maxwell_boltzmann(atoms, temperature_K=300.0, seed=1)
+        thermalize_momenta(atoms, temperature_K=300.0, rng=np.random.default_rng(1))
+        Stationary(atoms)
         md = Langevin(ev, atoms, 0.5 * units.fs, 300.0, friction=0.05, seed=0)
         cell = np.asarray(ev.cell)
         inverse = np.linalg.inv(cell)
