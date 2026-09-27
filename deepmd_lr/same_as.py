@@ -60,7 +60,7 @@ only as ``1/L_z``.
 
 How it is installed
 -------------------
-Three upstream symbols are wrapped, none edited, all from :mod:`deepmd_lr.register`
+Four upstream symbols are wrapped, none edited, all from :mod:`deepmd_lr.register`
 which already runs on every ``deepmd.pt_expt`` import. Each wrapper is a
 straight pass-through when no ``same_as`` branch is present, so an ordinary
 run is byte-unchanged.
@@ -255,7 +255,7 @@ def _validated_base(
 
 
 # --------------------------------------------------------------------------
-# The three hooks.
+# The four hooks.
 #
 # Order matters and is not free to change:
 #
@@ -325,7 +325,7 @@ def _alias_groups(wrapper: Any) -> None:
 
 
 def install() -> None:
-    """Wrap the three upstream symbols. Idempotent."""
+    """Wrap the four upstream symbols. Idempotent."""
     from deepmd.pt_expt.train import training as _training
     from deepmd.pt_expt.train import wrapper as _wrapper
     from deepmd.pt_expt.utils import multi_task as _multi_task

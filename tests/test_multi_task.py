@@ -107,8 +107,7 @@ class TestSchema:
         assert cfg["model"]["model_dict"]["a"]["info"] == {"theory": "PBE-D3"}
 
     def test_heterogeneous_branches_normalize(self):
-        """One branch with a long-range term, one without -- the layout the
-        molecule head uses before the isolated term exists."""
+        """One branch with a long-range term, one without."""
         cfg, _ = multi_task_config({"a": lr_branch(True), "b": lr_branch(False)})
         assert cfg["model"]["model_dict"]["a"]["long_range"] is not None
         assert not cfg["model"]["model_dict"]["b"].get("long_range")

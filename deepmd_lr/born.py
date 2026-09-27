@@ -113,6 +113,23 @@ def screening_factor(eps_inf: Any) -> float:
     return math.sqrt(value)
 
 
+def edge_born_response(g, vec, edge_index, edge_mask, n_node: int) -> torch.Tensor:
+    """The edge half of the Born tensor, per node: ``(n_node, 3, 3)``.
+
+    ``g`` is ``d raw_charge / d edge_vec`` for every edge and ``vec`` the edge
+    vectors themselves. Each directed edge contributes ``+1/2 r (x) g`` to its
+    destination and ``-1/2 r (x) g`` to its source -- the same quantity
+    gathered at opposite ends, which is why this is a difference of segment
+    sums rather than a double loop over pairs. Padding edges are masked out.
+    """
+    g = g * edge_mask[:, None].to(g.dtype)
+    # (E, 3, 3), r_ji (x) dq/dr_ji
+    outer = vec[:, :, None] * g[:, None, :]
+    src = edge_index[0].to(torch.int64)
+    dst = edge_index[1].to(torch.int64)
+    return 0.5 * (segment_sum(outer, dst, n_node) - segment_sum(outer, src, n_node))
+
+
 def born_charges(
     charge: torch.Tensor,
     raw: torch.Tensor,
@@ -180,20 +197,8 @@ def born_charges(
     # mask, so a guard edge already contributes an identically zero gradient.
     # `edge_force_virial` masks anyway, and so do we -- a future builder that
     # stopped zeroing them would otherwise corrupt Z silently.
-    g = g * edge_mask[:, None].to(g.dtype)
-
     vec = edge_vec if create_graph else edge_vec.detach()
-    # (E, 3, 3), r_ji (x) dq/dr_ji
-    outer = vec[:, :, None] * g[:, None, :]
-
-    src = edge_index[0].to(torch.int64)
-    dst = edge_index[1].to(torch.int64)
-    # The two terms of the sum are the same quantity gathered at opposite ends
-    # of each directed edge, which is why this is a difference of segment sums
-    # rather than a double loop over pairs.
-    response = 0.5 * (
-        segment_sum(outer, dst, n_total) - segment_sum(outer, src, n_total)
-    )
+    response = edge_born_response(g, vec, edge_index, edge_mask, n_total)
 
     eye = torch.eye(3, dtype=charge.dtype, device=charge.device)
     diag = charge.reshape(-1)[:, None, None] * eye[None]

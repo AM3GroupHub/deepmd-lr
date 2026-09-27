@@ -40,7 +40,14 @@ from scipy.spatial import (
     cKDTree,
 )
 
-__all__ = ["Partition", "partition_system"]
+__all__ = [
+    "Partition",
+    "decomposition_grid",
+    "default_skin",
+    "halo_node_ratio",
+    "partition_system",
+    "skin_for_node_ratio",
+]
 
 
 @dataclass
@@ -122,6 +129,25 @@ class Partition:
             self._views[key] = t
         return t
 
+    def counts_on(self, device) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(n_node, n_local)`` as one-element device tensors, built once.
+
+        The model's lower interface takes them as tensors. Making them from
+        Python ints every step is an upload from pageable memory, and that
+        blocks the host until everything already queued on ``device`` has
+        run -- twice per partition per step, for two integers that only change
+        when the partition does.
+        """
+        key = ("counts", torch.device(device))
+        c = self._views.get(key)
+        if c is None:
+            c = (
+                torch.tensor([self.n_node], dtype=torch.int64, device=device),
+                torch.tensor([self.n_owned], dtype=torch.int64, device=device),
+            )
+            self._views[key] = c
+        return c
+
 
 def _image_shifts(cell: np.ndarray, pbc, rcut: float) -> np.ndarray:
     """Lattice translations that could bring an image within ``rcut``.
@@ -130,18 +156,175 @@ def _image_shifts(cell: np.ndarray, pbc, rcut: float) -> np.ndarray:
     than assumed to be +-1: a thin cell needs more images, and silently
     missing one would drop real neighbours.
     """
-    volume = abs(np.linalg.det(cell))
+    widths = _perpendicular_widths(cell)
     ranges = []
     for axis in range(3):
         if not pbc[axis]:
             ranges.append([0])
             continue
-        other = [cell[i] for i in range(3) if i != axis]
-        area = np.linalg.norm(np.cross(*other))
-        width = volume / area  # perpendicular width along this axis
-        n = int(np.ceil(rcut / width))
+        n = int(np.ceil(rcut / widths[axis]))
         ranges.append(list(range(-n, n + 1)))
     return np.array(list(product(*ranges)), dtype=int)
+
+
+def _perpendicular_widths(cell: np.ndarray) -> np.ndarray:
+    """The cell's width perpendicular to each pair of faces: ``V / |a_j x a_k|``."""
+    volume = abs(np.linalg.det(cell))
+    return np.array(
+        [
+            volume / np.linalg.norm(np.cross(cell[(j + 1) % 3], cell[(j + 2) % 3]))
+            for j in range(3)
+        ]
+    )
+
+
+def decomposition_grid(
+    cell: np.ndarray, n_partitions: int, rcut: float
+) -> tuple[int, int, int]:
+    """How many pieces each cell axis is cut into, ``(n0, n1, n2)``.
+
+    The choice that minimises one partition's halo box, ``prod(l_i / n_i +
+    2 rcut)``: what a device has to hold is its owned block *plus* a shell of
+    ghosts `rcut` deep on every side, and the shell is what does not shrink
+    when the block does. Cutting one axis into thin slabs keeps the other two
+    faces full size, so at eight partitions of 98,304 atoms each device holds
+    about 2.8 times its share; cutting three axes in half, about 2.3 times. A
+    count that only factors one way -- a prime -- can only be cut into slabs.
+
+    Ties -- a cube cut in two, say -- go to the grid that cuts the lowest
+    axis first.
+    """
+    n = max(int(n_partitions), 1)
+    lengths = np.linalg.norm(np.asarray(cell, dtype=float).reshape(3, 3), axis=1)
+    best = None
+    for n0 in range(1, n + 1):
+        if n % n0:
+            continue
+        for n1 in range(1, n // n0 + 1):
+            if (n // n0) % n1:
+                continue
+            grid = (n0, n1, n // n0 // n1)
+            cost = float(np.prod(lengths / np.array(grid) + 2.0 * rcut))
+            key = (round(cost, 6), -grid[0], -grid[1])
+            if best is None or key < best[0]:
+                best = (key, grid)
+    return best[1]
+
+
+def _halo_edges(cell: np.ndarray, rcut: float, n_partitions: int) -> np.ndarray:
+    """The three edges of one partition's halo box at zero skin."""
+    lengths = np.linalg.norm(np.asarray(cell, dtype=float).reshape(3, 3), axis=1)
+    grid = decomposition_grid(cell, n_partitions, rcut)
+    return lengths / np.array(grid, dtype=float) + 2.0 * rcut
+
+
+def _largest_skin(admissible, upper_guess: float) -> float:
+    """The largest non-negative skin ``admissible`` accepts, by bisection.
+
+    ``admissible`` must be monotone: true below some skin and false above it.
+    Bracket first, then bisect. A fixed upper bound is not a bracket: for a
+    very anisotropic cell -- edges [100, 100, 1], say -- even a skin of half
+    the shortest edge can stay well inside the bound, and returning that cap
+    would hand back an arbitrary number rather than the largest admissible one.
+    The halo volume grows without bound in the skin, so doubling terminates.
+    """
+    if not admissible(0.0):
+        return 0.0
+    lo, hi = 0.0, max(float(upper_guess), 1.0)
+    for _ in range(64):
+        if not admissible(hi):
+            break
+        lo, hi = hi, 2.0 * hi
+    else:  # pragma: no cover - the volume is cubic in s; 2**64 cannot survive
+        raise RuntimeError("no skin is large enough to violate the bound")
+    for _ in range(40):
+        mid = 0.5 * (lo + hi)
+        if admissible(mid):
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+def halo_node_ratio(
+    cell: np.ndarray,
+    rcut: float,
+    n_partitions: int,
+    skin: float,
+    skin_from: float = 0.0,
+) -> float:
+    """How many times as many nodes a halo at ``skin`` holds as one at
+    ``skin_from``.
+
+    Nodes are density times volume, and the density cancels in the ratio, which
+    is why this needs no atom count. Its use is the other direction: multiply
+    by a node count someone has actually *counted* and the answer is an
+    absolute prediction for a different skin -- which is what a memory budget
+    has to be written in. See
+    :meth:`~deepmd_lr.nvalchemi.evaluator.DistributedEvaluator._fit_skin_to_memory`.
+    """
+    base = _halo_edges(cell, rcut, n_partitions)
+    return float(np.prod((base + 2.0 * skin) / (base + 2.0 * skin_from)))
+
+
+def skin_for_node_ratio(
+    cell: np.ndarray,
+    rcut: float,
+    n_partitions: int,
+    ratio: float,
+    skin_from: float = 0.0,
+) -> float:
+    """The largest skin whose halo stays within ``ratio`` of the one at
+    ``skin_from`` -- the inverse of :func:`halo_node_ratio`."""
+    base = _halo_edges(cell, rcut, n_partitions)
+    return _largest_skin(
+        lambda s: halo_node_ratio(cell, rcut, n_partitions, s, skin_from) <= ratio,
+        upper_guess=float(base.min()),
+    )
+
+
+def default_skin(
+    cell: np.ndarray,
+    rcut: float,
+    n_partitions: int = 1,
+    tolerance: float = 0.25,
+) -> float:
+    r"""The skin a partitioned run should use when the caller does not pick one.
+
+    The halo is rebuilt whenever an atom has moved more than half the skin, so
+    a larger skin trades ghost work for a rarer rebuild. Which way that trade
+    goes is not a constant: the rebuild is a host-side spatial sort whose cost
+    grows with the atom count, while the *relative* cost of a thicker halo
+    shrinks as the partition gets larger. A fixed default is therefore wrong at
+    both ends -- measured on 2 A40s at 98,304 atoms, the old default of 1 A
+    spent **76 % of every step** rebuilding (3.9 s per rebuild, one every 13
+    steps) and capped the two-GPU speed-up at 1.14x; at 4 A the same step ran
+    3.4x faster and the ceiling rose to 1.9x. On a few thousand atoms the
+    ordering reverses and a thick halo is the waste.
+
+    So the rule scales with the geometry instead: take the largest skin whose
+    halo costs at most ``tolerance`` more nodes than a zero-skin halo would.
+    For a partition with edges :math:`l_i`,
+
+    .. math::
+        \prod_i \frac{l_i + 2(r_c + s)}{l_i + 2 r_c} \le 1 + \text{tolerance}
+
+    which is monotone in :math:`s` and solved here by bisection. It returns
+    about 1.4 A for 1,536 atoms, 4.3 A for 98,304 and 5.3 A for 192,000 -- and
+    4.3 A is where the 98k measurement put the optimum.
+
+    The estimate treats the cell as orthorhombic and the density as uniform,
+    which is what a default needs to be: cheap and roughly right. Pass an
+    explicit ``skin`` when the system is neither.
+
+    What it deliberately does not model is memory. Bytes per node belong to
+    the model, not the geometry -- an uncompressed descriptor holds several
+    times what a compressed one does -- so
+    :class:`~deepmd_lr.nvalchemi.evaluator.DistributedEvaluator` caps this
+    value by measurement instead: a first-step probe of the cost per node, and
+    a halving whenever a device runs out anyway.
+    """
+    return skin_for_node_ratio(cell, rcut, n_partitions, 1.0 + float(tolerance))
 
 
 def partition_system(
@@ -152,12 +335,15 @@ def partition_system(
     pbc=(True, True, True),
     skin: float = 0.0,
 ) -> list[Partition]:
-    """Split atoms into ``n_partitions`` slabs, each with an ``rcut`` halo.
+    """Split atoms into ``n_partitions`` blocks, each with an ``rcut`` halo.
 
-    The split is along the longest cell vector, by fractional coordinate. That
-    is cruder load balancing than DistMLIP's graph partitioning, but the
-    correctness contract is identical and it has no compiled dependency; the
-    partitioner can be swapped later without touching anything downstream.
+    The blocks form a grid, :func:`decomposition_grid` pieces per cell axis,
+    chosen to make each block's halo as small as the count allows -- slabs for
+    two partitions, 2 x 2 x 1 for four and 2 x 2 x 2 for eight on a cubic box.
+    Each cut is by fractional coordinate at equal atom count. That is cruder
+    load balancing than DistMLIP's graph partitioning, but the correctness
+    contract is identical and it has no compiled dependency; the partitioner
+    can be swapped later without touching anything downstream.
 
     Parameters
     ----------
@@ -189,49 +375,83 @@ def partition_system(
             f"{n_partitions} partitions requested for only {n_atoms} atoms"
         )
 
-    # Assign owners by fractional coordinate along the longest cell vector.
+    # Assign owners on a grid of blocks, `decomposition_grid` pieces per axis.
     inverse = np.linalg.inv(cell)
     frac = coord @ inverse
-    axis = int(np.argmax(np.linalg.norm(cell, axis=1)))
-    key = frac[:, axis]
-    if pbc[axis]:
-        key = key - np.floor(key)
-    else:
-        lo, hi = key.min(), key.max()
-        key = (key - lo) / (hi - lo + 1e-12)
-    # Equal-count slabs rather than equal-width: atom density is not uniform,
+    keys = np.empty_like(frac)
+    for axis in range(3):
+        key = frac[:, axis]
+        if pbc[axis]:
+            key = key - np.floor(key)
+        else:
+            lo, hi = key.min(), key.max()
+            key = (key - lo) / (hi - lo + 1e-12)
+        keys[:, axis] = key
+    # Equal-count blocks rather than equal-width: atom density is not uniform,
     # and for a slab system with vacuum equal-width would leave empty
-    # partitions.
-    order = np.argsort(key, kind="stable")
+    # partitions. Cut one axis at a time, each group by its own sort, so the
+    # counts stay equal however the density varies.
+    grid = decomposition_grid(cell, n_partitions, rcut)
+    groups = [np.arange(n_atoms)]
+    for axis in range(3):
+        if grid[axis] == 1:
+            continue
+        groups = [
+            piece
+            for group in groups
+            for piece in np.array_split(
+                group[np.argsort(keys[group, axis], kind="stable")], grid[axis]
+            )
+        ]
     owner = np.empty(n_atoms, dtype=int)
-    for p, chunk in enumerate(np.array_split(order, n_partitions)):
-        owner[chunk] = p
+    for p, members in enumerate(groups):
+        owner[members] = p
 
-    # No shortcut for a single partition: it still owns every atom but still
-    # needs periodic images as ghosts, because the subgraph is built
-    # non-periodically. Returning an empty halo here silently dropped every
-    # interaction across the boundary.
-
-    # Every periodic image that could reach into some partition.
+    # Every periodic image that could reach into some partition. A single
+    # partition needs them too: it owns every atom, but its subgraph is built
+    # non-periodically, so its ghosts are the only interactions across the
+    # boundary.
     halo = rcut + skin
     shifts = _image_shifts(cell, pbc, halo)
     offsets = shifts @ cell
     images = (coord[None, :, :] + offsets[:, None, :]).reshape(-1, 3)
     image_atom = np.tile(np.arange(n_atoms), len(shifts))
     image_shift = np.repeat(offsets, n_atoms, axis=0)
-    tree = cKDTree(images)
+    # Fractional coordinates of every image, and how far a Euclidean step of
+    # `halo` can move each fractional coordinate: the distance between the
+    # planes f_j = c and f_j = c + d is d times the cell's perpendicular width
+    # along j, so no point within `halo` of x differs from it by more than
+    # `halo / width_j` in f_j.
+    image_frac = images @ inverse
+    reach = halo / _perpendicular_widths(cell)
+    # Upper bound handed to the nearest-neighbour query. `query` keeps only
+    # distances strictly below its bound, so nudge it by one ulp: the halo is
+    # a closed ball, and an image at exactly `halo` is a ghost.
+    bound = np.nextafter(halo, np.inf)
 
     partitions = []
     for p in range(n_partitions):
         owned = np.flatnonzero(owner == p)
-        # Anything within rcut of an owned atom is needed to complete that
-        # atom's neighbour shell.
-        near = tree.query_ball_point(coord[owned], r=halo)
-        candidates = (
-            np.unique(np.concatenate([np.asarray(x, dtype=int) for x in near]))
-            if len(near)
-            else np.empty(0, dtype=int)
+        # Anything within `halo` of an owned atom is needed to complete that
+        # atom's neighbour shell. Two passes, both without Python-level
+        # neighbour lists (which is what made this the slowest thing in a
+        # rebuild: millions of list objects at 98,304 atoms):
+        #   1. keep images inside the owned atoms' fractional bounding box
+        #      grown by `reach` -- a superset, by the bound above;
+        #   2. of those, keep the ones whose NEAREST owned atom is within
+        #      `halo`, which is exactly the set a ball query would return.
+        lo = frac[owned].min(axis=0) - reach
+        hi = frac[owned].max(axis=0) + reach
+        boxed = np.flatnonzero(
+            np.all((image_frac >= lo) & (image_frac <= hi), axis=1)
         )
+        if len(owned) and len(boxed):
+            nearest, _ = cKDTree(coord[owned]).query(
+                images[boxed], k=1, distance_upper_bound=bound, workers=-1
+            )
+            candidates = boxed[np.isfinite(nearest)]
+        else:
+            candidates = np.empty(0, dtype=int)
         # Drop the owned atoms' own unshifted copies; a shifted copy of an
         # owned atom is a legitimate ghost when the cell is small.
         is_self = np.isin(image_atom[candidates], owned) & (

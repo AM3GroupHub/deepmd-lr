@@ -64,7 +64,7 @@ def build_evaluator(model: Any, atoms: Any, devices: Any = None,
     coincidence.
     """
     if isinstance(model, str):
-        loaded = load_model(str(model), head=head, long_range=long_range)
+        loaded = load_model(model, head=head, long_range=long_range)
     else:
         loaded = model
         if long_range is not None:

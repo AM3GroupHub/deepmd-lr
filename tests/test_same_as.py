@@ -12,6 +12,7 @@ anyone asked for.
 """
 
 import copy
+import json
 
 import pytest
 import torch
@@ -22,7 +23,7 @@ from deepmd.utils.argcheck import normalize
 
 from deepmd_lr.same_as import expand_same_as, groups
 
-from .test_joint_model import DESCRIPTOR, FITTING, LONG_RANGE, frame
+from .test_joint_model import DESCRIPTOR, FITTING, LONG_RANGE, build, frame
 from .test_multi_task import lr_branch
 
 SLAB_RECIPROCAL = {
@@ -314,8 +315,6 @@ class TestSetLongRange:
     checkpoint, because the long-range term holds no weights."""
 
     def test_swapping_changes_the_term_and_no_weight(self):
-        from .test_joint_model import build
-
         model = build()
         before = {k: v.clone() for k, v in model.state_dict().items()}
         model.set_long_range({**SLAB_RECIPROCAL})
@@ -325,8 +324,6 @@ class TestSetLongRange:
         assert all(torch.equal(before[k], after[k]) for k in before)
 
     def test_swapping_to_isolated_drops_the_cell_requirement(self):
-        from .test_joint_model import build
-
         model = build()
         assert model.long_range_energy.needs_cell is True
         model.set_long_range({"method": "isolated"})
@@ -338,23 +335,17 @@ class TestSetLongRange:
     def test_the_recorded_config_keeps_up(self):
         import json
 
-        from .test_joint_model import build
-
         model = build()
         model.set_long_range({"method": "isolated"})
         recorded = json.loads(model.model_def_script)
         assert recorded["long_range"]["reciprocal"]["method"] == "isolated"
 
     def test_a_different_alpha_is_refused(self):
-        from .test_joint_model import build
-
         model = build()
         with pytest.raises(ValueError, match="alpha is fixed"):
             model.set_long_range({"method": "isolated", "alpha": 0.5})
 
     def test_a_short_range_model_says_so(self):
-        from .test_joint_model import build
-
         with pytest.raises(ValueError, match="no `long_range` block"):
             build(long_range=False).set_long_range({"method": "isolated"})
 
@@ -365,10 +356,8 @@ class TestSetLongRange:
 
         from deepmd_lr.ase import load_model
 
-        from .test_joint_model import build
-
         model = build()
-        cfg = json_loads(model.model_def_script)
+        cfg = json.loads(model.model_def_script)
         state = {f"model.Default.{k}": v for k, v in model.state_dict().items()}
         state["_extra_state"] = {"model_params": cfg}
         path = tmp_path / "model.ckpt.pt"
@@ -381,9 +370,3 @@ class TestSetLongRange:
         swapped = load_model(str(path), device="cpu", long_range=SLAB_RECIPROCAL)
         assert swapped.long_range_energy.slab_correction is True
         assert swapped.long_range_energy.pbc == (True, True, False)
-
-
-def json_loads(text: str) -> dict:
-    import json
-
-    return json.loads(text)

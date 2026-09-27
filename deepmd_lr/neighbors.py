@@ -29,10 +29,6 @@ which nvalchemiops' own docstring warns carries a penalty. Both produce
 identical edge sets and identical ``edge_vec`` gradients.
 """
 
-from typing import (
-    Any,
-)
-
 import torch
 from deepmd.dpmodel.utils.neighbor_graph import (
     build_neighbor_graph,
@@ -66,10 +62,8 @@ def build_neighbor_graph_fast(
     atype: torch.Tensor,
     box: torch.Tensor | None,
     rcut: float,
-    layout: Any = None,
     *,
     method: str = "auto",
-    **kwargs: Any,
 ):
     """Build a neighbour graph, choosing the backend by frame size.
 
@@ -99,5 +93,5 @@ def build_neighbor_graph_fast(
             build_neighbor_graph_nv,
         )
 
-        return build_neighbor_graph_nv(coord, atype, box, rcut, layout, **kwargs)
-    return build_neighbor_graph(coord, atype, box, rcut, layout, **kwargs)
+        return build_neighbor_graph_nv(coord, atype, box, rcut)
+    return build_neighbor_graph(coord, atype, box, rcut)

@@ -18,21 +18,21 @@ input-normalization time -- both strictly after the backend import that
 brings us here.
 """
 
-from deepmd_lr import (  # noqa: F401  schema args; `same_as`, EMA, compression hooks
+from deepmd_lr import (  # schema args; `same_as`, EMA, compression hooks
     argcheck,
     compress,
     ema_default,
     same_as,
 )
-from deepmd_lr.fitting import (  # noqa: F401  registers the `charge` fitting head
+from deepmd_lr.fitting import (  # registers the `charge` fitting head
     charge,
 )
-from deepmd_lr.model import (  # noqa: F401  registers the `dp_lr` model type
+from deepmd_lr.model import (  # registers the `dp_lr` model type
     lr_model,
 )
 
 # Unlike the three imports above, this one is not registration-by-decorator:
-# it wraps three DeePMD-kit symbols. It is called last because it imports
+# it wraps four DeePMD-kit symbols. It is called last because it imports
 # `deepmd.pt_expt.train.training`, and we are running *inside*
 # `deepmd.pt_expt.__init__`. Kept here rather than at `same_as` import time so
 # that merely importing the module -- which `argcheck` does, for one constant

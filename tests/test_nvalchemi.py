@@ -3,8 +3,8 @@
 The claim is partition-count invariance: 1, 2, 4 and 8 partitions must all
 agree with the undivided model, to the floor set by GPU nondeterminism. This
 is precisely the test the LAMMPS domain decomposition failed -- splitting a
-reciprocal sum across ranks gave 2.0% error at 2 ranks and 36.5% at 8
-(see LAMMPS.md) -- so here it has to pass exactly, not approximately.
+reciprocal sum across ranks gave 2.0% error at 2 ranks and 36.5% at 8 --
+so here it has to pass exactly, not approximately.
 
 Phase A covers the short-range model; Phase B adds the long-range term,
 gathered onto one device.
@@ -23,6 +23,7 @@ from deepmd_lr.nvalchemi import (
     partition_system,
     to_numpy,
 )
+from deepmd_lr.nvalchemi.partition import default_skin
 
 from .test_joint_model import build, frame
 
@@ -127,6 +128,78 @@ class TestPartitioner:
             partition_system(coord, cell, RCUT, len(coord) + 1)
 
 
+class TestHaloMatchesABallQuery:
+    """The rebuild's ghost set is exactly "every image within the halo of an
+    owned atom" -- the definition, computed here the slow way as a reference.
+
+    The rebuild used to compute it that way too, with a ball query returning a
+    Python list of neighbours per owned atom; at 98,304 atoms that was 2.3 s of
+    a serial host step. It now filters images through the owned atoms'
+    fractional bounding box grown by the halo, then keeps those whose nearest
+    owned atom is in range. Same set, same order, byte for byte.
+    """
+
+    @staticmethod
+    def reference(coord, cell, rcut, parts, pbc, skin):
+        from itertools import product
+
+        from scipy.spatial import cKDTree
+
+        mine = partition_system(coord, cell, rcut, parts, pbc, skin=skin)
+        halo = rcut + skin
+        volume = abs(np.linalg.det(cell))
+        ranges = []
+        for axis in range(3):
+            if not pbc[axis]:
+                ranges.append([0])
+                continue
+            other = [cell[i] for i in range(3) if i != axis]
+            n = int(np.ceil(halo / (volume / np.linalg.norm(np.cross(*other)))))
+            ranges.append(list(range(-n, n + 1)))
+        offsets = np.array(list(product(*ranges)), dtype=int) @ cell
+        images = (coord[None] + offsets[:, None]).reshape(-1, 3)
+        atom = np.tile(np.arange(len(coord)), len(offsets))
+        shift = np.repeat(offsets, len(coord), axis=0)
+        tree = cKDTree(images)
+        for part in mine:
+            near = tree.query_ball_point(coord[part.owned], r=halo)
+            cand = np.unique(np.concatenate([np.asarray(x, dtype=int) for x in near]))
+            self_copy = np.isin(atom[cand], part.owned) & (
+                np.abs(shift[cand]).sum(axis=1) == 0
+            )
+            ghosts = cand[~self_copy]
+            np.testing.assert_array_equal(part.ghost, atom[ghosts])
+            np.testing.assert_array_equal(part.ghost_shift, shift[ghosts])
+
+    @pytest.mark.parametrize("parts", [1, 2, 3])
+    @pytest.mark.parametrize("skin", [0.0, 2.0])
+    def test_periodic_box(self, system, parts, skin):
+        coord, _atype, cell, *_ = system
+        self.reference(np.asarray(coord), np.asarray(cell), RCUT, parts,
+                       (True, True, True), skin)
+
+    def test_unwrapped_drifted_coordinates(self, system):
+        """MD positions leave the cell; the bounding box must follow them."""
+        coord, _atype, cell, *_ = system
+        rng = np.random.default_rng(0)
+        drifted = np.asarray(coord) + rng.normal(0, 3.0, np.shape(coord)) + [30, -20, 5]
+        self.reference(drifted, np.asarray(cell), RCUT, 2, (True, True, True), 1.0)
+
+    def test_triclinic_cell(self, system):
+        coord, _atype, cell, *_ = system
+        cell = np.asarray(cell, dtype=float)
+        tilted = cell.copy()
+        tilted[1, 0] += 0.4 * cell[0, 0]
+        tilted[2, 1] += 0.3 * cell[1, 1]
+        coord = np.asarray(coord) @ np.linalg.inv(cell) @ tilted
+        self.reference(coord, tilted, RCUT, 2, (True, True, True), 1.5)
+
+    def test_non_periodic_axis(self, system):
+        coord, _atype, cell, *_ = system
+        self.reference(np.asarray(coord), np.asarray(cell), RCUT, 2,
+                       (True, True, False), 1.0)
+
+
 class TestPartitionCountInvariance:
     """The Phase A gate."""
 
@@ -193,6 +266,354 @@ class TestPartitionCountInvariance:
             ))
 
 
+class TestSkinDefault:
+    """The skin is a cost knob, and a constant is the wrong setting for it.
+
+    Measured on two A40s at 98,304 atoms: skin 1.0 spent 76 % of every step
+    rebuilding the decomposition and capped the two-GPU speed-up at 1.14x;
+    skin 4.0 ran 3.4x faster and lifted the ceiling to 1.9x. On a couple of
+    thousand atoms the trade reverses. So the default scales with geometry.
+    """
+
+    def test_auto_grows_with_the_cell_and_shrinks_with_partitions(self):
+        small = np.diag([24.86] * 3)
+        large = np.diag([99.43] * 3)
+        assert default_skin(small, 6.0, 1) < default_skin(large, 6.0, 1)
+        assert default_skin(large, 6.0, 4) < default_skin(large, 6.0, 1)
+
+    def test_auto_matches_the_measured_optimum_at_98k_atoms(self):
+        """The 99.43 A box is the 98,304-atom system the profile was run on."""
+        assert default_skin(np.diag([99.43] * 3), 6.0, 1) == pytest.approx(4.3, abs=0.4)
+
+    @pytest.fixture(scope="class")
+    def model(self):
+        m = build(long_range=False)
+        m.eval()
+        return m
+
+    def test_halo_inflation_stays_within_the_tolerance(self):
+        from deepmd_lr.nvalchemi.partition import decomposition_grid
+
+        cell = np.diag([99.43] * 3)
+        for parts in (1, 2, 4, 8):
+            skin = default_skin(cell, 6.0, parts, tolerance=0.25)
+            edges = np.array([99.43] * 3) / np.array(
+                decomposition_grid(cell, parts, 6.0), dtype=float
+            )
+            base = edges + 12.0
+            assert float(np.prod((base + 2 * skin) / base)) <= 1.25 + 1e-9
+
+    def test_bracket_grows_for_an_anisotropic_cell(self):
+        """Half the shortest edge is not a bracket, only a guess.
+
+        With edges [100, 100, 1] even a skin of 0.5 stays far inside the
+        tolerance, so a fixed upper bound would return that cap instead of the
+        largest admissible skin.
+        """
+        cell = np.diag([100.0, 100.0, 1.0])
+        skin = default_skin(cell, 6.0, 1)
+        assert skin > 0.5 * 1.0
+        base = np.array([100.0, 100.0, 1.0]) + 12.0
+        assert float(np.prod((base + 2 * skin) / base)) == pytest.approx(1.25, abs=1e-6)
+
+    def test_auto_follows_the_cell_through_set_cell(self, model, system):
+        """A barostat replaces the cell; the rule reads the cell."""
+        _coord, atype, cell, *_ = system
+        ev = DistributedEvaluator(
+            model, atype, cell, devices=[DEVICE], memory_headroom=None
+        )
+        before = ev.skin
+        ev.set_cell(cell * 2.0)
+        assert ev.skin > before
+        assert ev.skin == pytest.approx(default_skin(cell * 2.0, ev._rcut, 1))
+        ev.set_cell(cell)
+        assert ev.skin == pytest.approx(before)
+
+    def test_an_explicit_skin_is_not_touched_by_set_cell(self, model, system):
+        _coord, atype, cell, *_ = system
+        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE], skin=2.5)
+        ev.set_cell(cell * 2.0)
+        assert ev.skin == 2.5
+
+    def test_rejects_an_unknown_string(self, model, system):
+        _coord, atype, cell, *_ = system
+        with pytest.raises(ValueError, match="number or 'auto'"):
+            DistributedEvaluator(model, atype, cell, devices=[DEVICE], skin="wide")
+
+
+class TestSkinIsFittedToMemory:
+    """The halo is chosen from a measurement, not from a guess about bytes.
+
+    The geometry rule knows how many nodes a skin costs. What a node costs in
+    bytes belongs to the model and spans a factor of thirty: 755 kB per node
+    for an uncompressed long-range model against 24.3 kB compressed, measured
+    on this machine. So the first evaluation is a probe at the floor skin, and
+    the skin the rest of the run uses is the largest one whose extrapolated
+    footprint fits the budget -- never more than the geometry rule asks for.
+    """
+
+    @pytest.fixture(scope="class")
+    def model(self):
+        m = build(long_range=False)
+        m.eval()
+        return m
+
+    @staticmethod
+    def _pin_memory(monkeypatch, peak, free, reserved=0):
+        """Fix the three device numbers the fit reads."""
+        monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda d=None: peak)
+        monkeypatch.setattr(torch.cuda, "memory_reserved", lambda d=None: reserved)
+        monkeypatch.setattr(torch.cuda, "mem_get_info", lambda d=None: (free, free))
+
+    def test_the_probe_runs_at_the_floor_then_the_rule_decides(self, system, model):
+        from deepmd_lr.nvalchemi.evaluator import MIN_AUTO_SKIN
+
+        coord, atype, cell, *_ = system
+        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE])
+        assert ev.skin == pytest.approx(MIN_AUTO_SKIN)
+        ev(coord)
+        # This device has room to spare, so the geometry rule still decides.
+        assert ev.skin == pytest.approx(default_skin(cell, ev._rcut, 1))
+        assert ev.bytes_per_node is not None and ev.bytes_per_node > 0
+        rebuilds = ev.rebuild_count
+        ev(coord)
+        assert ev.rebuild_count == rebuilds + 1, "the probe halo must be replaced"
+
+    def test_a_budget_that_does_not_fit_caps_the_halo(self, system, model):
+        from deepmd_lr.nvalchemi.evaluator import MIN_AUTO_SKIN
+
+        coord, atype, cell, *_ = system
+        ev = DistributedEvaluator(
+            model, atype, cell, devices=[DEVICE], memory_headroom=1e-6
+        )
+        with pytest.warns(RuntimeWarning, match="does not fit"):
+            ev(coord)
+        assert ev.skin == pytest.approx(MIN_AUTO_SKIN)
+        assert ev.skin < default_skin(cell, ev._rcut, 1)
+
+    def test_the_fitted_skin_is_the_arithmetic_it_claims(
+        self, system, model, monkeypatch
+    ):
+        """A budget of twice the probe's footprint buys twice the nodes."""
+        from deepmd_lr.nvalchemi.evaluator import MIN_AUTO_SKIN
+        from deepmd_lr.nvalchemi.partition import (
+            halo_node_ratio,
+            skin_for_node_ratio,
+        )
+
+        coord, atype, cell, *_ = system
+        peak, free = 8 * 2**30, 20 * 2**30
+        headroom = 0.8
+        ev = DistributedEvaluator(
+            model, atype, cell, devices=[DEVICE], memory_headroom=headroom
+        )
+        self._pin_memory(monkeypatch, peak=peak, free=free)
+        ev(coord)
+        ratio = headroom * free / peak
+        expected = min(
+            skin_for_node_ratio(cell, ev._rcut, 1, ratio, skin_from=MIN_AUTO_SKIN),
+            default_skin(cell, ev._rcut, 1),
+        )
+        assert ev.skin == pytest.approx(expected, rel=1e-6)
+        # and the prediction that skin encodes: at most `ratio` times the
+        # nodes the probe actually counted.
+        got = halo_node_ratio(cell, ev._rcut, 1, ev.skin, MIN_AUTO_SKIN)
+        assert got <= ratio + 1e-9
+
+    def test_a_tight_budget_binds_before_the_geometry_rule(
+        self, system, model, monkeypatch
+    ):
+        coord, atype, cell, *_ = system
+        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE])
+        self._pin_memory(monkeypatch, peak=8 * 2**30, free=int(8.5 * 2**30))
+        with pytest.warns(RuntimeWarning, match="does not fit"):
+            ev(coord)
+        assert ev.skin < default_skin(cell, ev._rcut, 1)
+
+    def test_none_skips_the_probe_entirely(self, system, model):
+        coord, atype, cell, *_ = system
+        ev = DistributedEvaluator(
+            model, atype, cell, devices=[DEVICE], memory_headroom=None
+        )
+        assert ev.skin == pytest.approx(default_skin(cell, ev._rcut, 1))
+        ev(coord)
+        assert ev.bytes_per_node is None
+        assert ev.skin == pytest.approx(default_skin(cell, ev._rcut, 1))
+
+    def test_an_explicit_skin_is_never_probed(self, system, model):
+        coord, atype, cell, *_ = system
+        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE], skin=2.5)
+        assert ev.skin == 2.5
+        ev(coord)
+        assert ev.skin == 2.5
+        assert ev.bytes_per_node is None
+
+    def test_the_probe_changes_no_numbers(self, system, model):
+        """A halo only has to cover the cutoff; its thickness is a cost knob."""
+        coord, atype, cell, *_ = system
+        plain = DistributedEvaluator(
+            model, atype, cell, devices=[DEVICE], memory_headroom=None
+        )
+        want_e, want_f = plain(coord)
+        want_f = want_f.clone()
+        probed = DistributedEvaluator(model, atype, cell, devices=[DEVICE])
+        probed(coord)
+        energy, forces = probed(coord)
+        assert energy == pytest.approx(want_e, abs=1e-9)
+        np.testing.assert_allclose(
+            forces.cpu().numpy(), want_f.cpu().numpy(), atol=1e-10
+        )
+
+    def test_a_nonsensical_headroom_is_refused(self, system, model):
+        _coord, atype, cell, *_ = system
+        for bad in (0.0, -0.5, 1.5):
+            with pytest.raises(ValueError, match="memory_headroom"):
+                DistributedEvaluator(
+                    model, atype, cell, devices=[DEVICE], memory_headroom=bad
+                )
+
+
+class TestSkinBacksOffWhenMemoryRunsOut:
+    """The halo is the one part of the footprint this class chooses.
+
+    The geometry rule sizes it blind to bytes: the same 25 % of extra nodes
+    whether a node costs a compressed descriptor's memory or an uncompressed
+    one's several times that. At 98,304 atoms on eight devices that was the
+    difference between running and an out-of-memory, where the old fixed 1 A
+    skin fitted. Predicting the footprint means guessing bytes per node for a
+    model this class never inspects; reacting to it does not.
+    """
+
+    @pytest.fixture(scope="class")
+    def model(self):
+        m = build(long_range=False)
+        m.eval()
+        return m
+
+    @staticmethod
+    def _fail_n_times(monkeypatch, failures, error=None):
+        """Make the first ``failures`` evaluations report an out-of-memory."""
+        from deepmd_lr.nvalchemi import evaluator as ev_mod
+
+        real = ev_mod.evaluate_partitioned
+        left = {"n": failures}
+
+        def fake(*args, **kwargs):
+            if left["n"]:
+                left["n"] -= 1
+                raise error or torch.cuda.OutOfMemoryError("CUDA out of memory")
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(ev_mod, "evaluate_partitioned", fake)
+        return left
+
+    def test_the_halo_shrinks_and_the_step_still_completes(
+        self, system, model, monkeypatch
+    ):
+        coord, atype, cell, *_ = system
+        reference = DistributedEvaluator(
+            model, atype, cell, devices=[DEVICE], memory_headroom=None
+        )
+        want_energy, want_forces = reference(coord)
+        want_forces = want_forces.clone()
+
+        ev = DistributedEvaluator(
+            model, atype, cell, devices=[DEVICE], memory_headroom=None
+        )
+        before = ev.skin
+        self._fail_n_times(monkeypatch, 1)
+        with pytest.warns(RuntimeWarning, match="out of memory"):
+            energy, forces = ev(coord)
+        assert ev.skin == pytest.approx(0.5 * before)
+        assert ev.skin_backoffs == 1
+        assert energy == pytest.approx(want_energy, abs=1e-9)
+        np.testing.assert_allclose(
+            forces.cpu().numpy(), want_forces.cpu().numpy(), atol=1e-10
+        )
+
+    def test_it_keeps_halving_until_it_fits(self, system, model, monkeypatch):
+        coord, atype, cell, *_ = system
+        ev = DistributedEvaluator(
+            model, atype, cell, devices=[DEVICE], memory_headroom=None
+        )
+        before = ev.skin
+        self._fail_n_times(monkeypatch, 3)
+        with pytest.warns(RuntimeWarning):
+            ev(coord)
+        assert ev.skin == pytest.approx(before / 8)
+        assert ev.skin_backoffs == 3
+
+    def test_the_new_ceiling_survives_a_barostat(self, system, model, monkeypatch):
+        """`set_cell` re-runs the geometry rule, which must not climb back."""
+        coord, atype, cell, *_ = system
+        ev = DistributedEvaluator(
+            model, atype, cell, devices=[DEVICE], memory_headroom=None
+        )
+        self._fail_n_times(monkeypatch, 1)
+        with pytest.warns(RuntimeWarning):
+            ev(coord)
+        capped = ev.skin
+        ev.set_cell(cell * 2.0)
+        assert ev.skin == pytest.approx(capped)
+        assert default_skin(cell * 2.0, ev._rcut, 1) > capped
+
+    def test_an_explicit_skin_is_the_callers_and_is_not_touched(
+        self, system, model, monkeypatch
+    ):
+        coord, atype, cell, *_ = system
+        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE], skin=2.5)
+        self._fail_n_times(monkeypatch, 1)
+        with pytest.raises(torch.cuda.OutOfMemoryError):
+            ev(coord)
+        assert ev.skin == 2.5
+        assert ev.skin_backoffs == 0
+
+    def test_the_floor_ends_the_backoff_rather_than_looping(
+        self, system, model, monkeypatch
+    ):
+        """Below the floor the halo is not what is filling the device."""
+        from deepmd_lr.nvalchemi.evaluator import MIN_AUTO_SKIN
+
+        coord, atype, cell, *_ = system
+        ev = DistributedEvaluator(
+            model, atype, cell, devices=[DEVICE], memory_headroom=None
+        )
+        self._fail_n_times(monkeypatch, 10**6)
+        with (
+            pytest.warns(RuntimeWarning, match="floor"),
+            pytest.raises(torch.cuda.OutOfMemoryError),
+        ):
+            ev(coord)
+        assert ev.skin == pytest.approx(MIN_AUTO_SKIN)
+
+    def test_any_other_failure_is_not_swallowed(self, system, model, monkeypatch):
+        coord, atype, cell, *_ = system
+        ev = DistributedEvaluator(
+            model, atype, cell, devices=[DEVICE], memory_headroom=None
+        )
+        before = ev.skin
+        self._fail_n_times(monkeypatch, 1, error=ValueError("not a memory problem"))
+        with pytest.raises(ValueError, match="not a memory problem"):
+            ev(coord)
+        assert ev.skin == before
+        assert ev.skin_backoffs == 0
+
+    def test_a_plain_runtime_error_about_memory_counts(
+        self, system, model, monkeypatch
+    ):
+        """warp and the allocator behind the search raise a bare RuntimeError."""
+        coord, atype, cell, *_ = system
+        ev = DistributedEvaluator(
+            model, atype, cell, devices=[DEVICE], memory_headroom=None
+        )
+        self._fail_n_times(
+            monkeypatch, 1, error=RuntimeError("Failed to allocate 4 GiB on cuda:0")
+        )
+        with pytest.warns(RuntimeWarning):
+            ev(coord)
+        assert ev.skin_backoffs == 1
+
+
 class TestGatherIsOnTheDevice:
     """One assembly path, and it ends on the gather device.
 
@@ -240,7 +661,7 @@ class TestGatherIsOnTheDevice:
         """`np.add.at` in the gather is the regression this class exists for."""
         import numpy as real_np
 
-        def refuse(*args, **kwargs):  # noqa: ANN002, ANN003
+        def refuse(*args, **kwargs):
             raise AssertionError("the gather scattered on the host")
 
         monkeypatch.setattr(real_np.add, "at", refuse)
@@ -256,7 +677,8 @@ class TestGatheredLongRange:
     """Phase B: the reciprocal term is gathered, not decomposed.
 
     Splitting a reciprocal sum spatially does not work -- measured at 2.0%
-    error on 2 ranks and 36.5% on 8 (LAMMPS.md). So it is evaluated once on
+    error on 2 ranks and 36.5% on 8 in a LAMMPS domain decomposition. So it
+    is evaluated once on
     one device over every atom. The charges feeding it still come from the
     partitioned descriptor, and the total-charge projection is applied after
     the gather because it constrains a sum over all atoms.
@@ -667,8 +1089,6 @@ class TestBackboneCapture:
 
     @staticmethod
     def _system(n_mol=8):
-        from .test_joint_model import build, frame  # noqa: PLC0415
-
         model = build()
         coord, atype, cell = frame(n_mol=n_mol)
         return (model, coord[0].cpu().numpy(), atype[0].cpu().numpy(),
@@ -676,8 +1096,7 @@ class TestBackboneCapture:
 
     @staticmethod
     def _run(model, c, a, cl, devices, *, force_fallback=False, **kw):
-        import deepmd_lr.nvalchemi.driver as DRV  # noqa: PLC0415
-        from deepmd_lr.nvalchemi import DistributedEvaluator  # noqa: PLC0415
+        import deepmd_lr.nvalchemi.driver as DRV
 
         original = DRV._usable_capture
         if force_fallback:
@@ -691,7 +1110,7 @@ class TestBackboneCapture:
             DRV._usable_capture = original
 
     def test_capture_is_taken_on_every_partition(self):
-        import deepmd_lr.nvalchemi.driver as DRV  # noqa: PLC0415
+        import deepmd_lr.nvalchemi.driver as DRV
 
         model, c, a, cl = self._system()
         calls = {"n": 0}

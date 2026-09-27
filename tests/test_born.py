@@ -311,12 +311,12 @@ class TestGuards:
 
 class TestAtScale:
     def test_large_periodic_system(self):
-        """576 atoms, past the neighbour-backend size threshold.
+        """576 atoms: Born tensors at a size where indexing errors show.
 
-        `neighbors.py` switches builder above 512 atoms, and Z is assembled
-        from whichever graph the energy path captured. A brute-force Jacobian
-        is out of reach here (3456 forwards), so this checks the properties
-        that would break on an indexing or shape error at scale.
+        Z is assembled from whichever graph the energy path captured. A
+        brute-force Jacobian is out of reach here (3456 forwards), so this
+        checks the properties that would break on an indexing or shape error
+        at scale.
         """
         model = build(isolated=False)
         coord, atype, box = frame(n_mol=192)
@@ -349,8 +349,6 @@ class TestDistributed:
 
     @staticmethod
     def _setup(n_mol=8):
-        from deepmd.pt_expt.model.get_model import get_model  # noqa: PLC0415
-
         cfg = {
             "type": "dp_lr",
             "type_map": ["O", "H"],
@@ -372,7 +370,7 @@ class TestDistributed:
         )
 
     def test_matches_the_serial_tensor_at_every_partition_count(self):
-        from deepmd_lr.nvalchemi import evaluate_partitioned, to_numpy  # noqa: PLC0415
+        from deepmd_lr.nvalchemi import evaluate_partitioned, to_numpy
 
         model, c, a, cl, coord, atype, cell = self._setup()
         model.compute_born = True
@@ -396,7 +394,7 @@ class TestDistributed:
             )
 
     def test_off_by_default(self):
-        from deepmd_lr.nvalchemi import evaluate_partitioned, to_numpy  # noqa: PLC0415
+        from deepmd_lr.nvalchemi import evaluate_partitioned, to_numpy
 
         model, c, a, cl, *_ = self._setup()
         out = to_numpy(evaluate_partitioned(
@@ -405,7 +403,7 @@ class TestDistributed:
         assert "born_charge" not in out
 
     def test_exposed_on_the_evaluator(self):
-        from deepmd_lr.nvalchemi import DistributedEvaluator  # noqa: PLC0415
+        from deepmd_lr.nvalchemi import DistributedEvaluator
 
         model, c, a, cl, *_ = self._setup()
         ev = DistributedEvaluator(
@@ -425,7 +423,7 @@ class TestDistributed:
         number -- but it would die only when Born was enabled, which is easy
         to miss.
         """
-        from deepmd_lr.nvalchemi import evaluate_partitioned, to_numpy  # noqa: PLC0415
+        from deepmd_lr.nvalchemi import evaluate_partitioned, to_numpy
 
         model, c, a, cl, *_ = self._setup()
         plain = to_numpy(evaluate_partitioned(
@@ -462,13 +460,13 @@ class TestDistributedField:
     FIELD = [0.03, -0.02, 0.05]
 
     def _evaluator(self, **kwargs):
-        from deepmd_lr.nvalchemi import DistributedEvaluator  # noqa: PLC0415
+        from deepmd_lr.nvalchemi import DistributedEvaluator
 
         model, c, a, cl, *_ = self._setup()
         return DistributedEvaluator(model, a, cl, **kwargs), c, model
 
     def test_matches_the_serial_field_force(self):
-        from deepmd_lr.nvalchemi import DistributedEvaluator  # noqa: PLC0415
+        from deepmd_lr.nvalchemi import DistributedEvaluator
 
         model, c, a, cl, coord, atype, cell = self._setup()
         model.compute_born = True
@@ -501,7 +499,7 @@ class TestDistributedField:
     def test_zero_field_leaves_the_forces_alone(self):
         """A zero field must be exactly a no-op, not merely small -- otherwise
         the field path is adding noise to every trajectory that enables it."""
-        from deepmd_lr.nvalchemi import DistributedEvaluator  # noqa: PLC0415
+        from deepmd_lr.nvalchemi import DistributedEvaluator
 
         model, c, a, cl, *_ = self._setup()
         pos = torch.tensor(c, dtype=DT, device=DEVICE)
@@ -519,9 +517,7 @@ class TestDistributedField:
         assert ev.compute_born is True
 
     def test_field_without_a_charge_head_is_refused(self):
-        from deepmd.pt_expt.model.get_model import get_model  # noqa: PLC0415
-
-        from deepmd_lr.nvalchemi import DistributedEvaluator  # noqa: PLC0415
+        from deepmd_lr.nvalchemi import DistributedEvaluator
 
         model, c, a, cl, *_ = self._setup()
         short = get_model(
@@ -538,7 +534,7 @@ class TestDistributedField:
     def test_virial_and_field_are_refused_together(self):
         """The field's contribution to the stress is a separate derivation, so
         the field-free virial would be quietly wrong rather than absent."""
-        from deepmd_lr.nvalchemi import DistributedEvaluator  # noqa: PLC0415
+        from deepmd_lr.nvalchemi import DistributedEvaluator
 
         model, c, a, cl, *_ = self._setup()
         with pytest.raises(ValueError, match="cannot be combined"):

@@ -32,16 +32,11 @@ for ``r -> (I + e) r``.
 
 Cost
 ----
-The charge head needs the descriptor, and the short-range path consumes and
-discards its own descriptor output, so a frame currently runs the descriptor
-twice. Correctness first: sharing one pass means giving the atomic model a
-second, non-reducible ``charge`` output, and ``init_out_stat`` sizes its bias
-and std buffers from *every* output key -- which would entangle charges with
-the out-stat and data-statistics machinery that has no charge labels. The
-carry-through itself is known to work (``fit_output_to_model_output_graph``
-does ``model_ret = dict(fit_ret.items())`` and merely skips reduction for
-non-reducible keys), so the optimization is available later if profiling says
-it matters.
+The charge head reads the descriptor features the energy head has already
+computed: ``_capturing_backbone`` records them during the energy pass, so a
+frame runs the descriptor once. A second pass, ``_predict_charges``, runs only
+when the energy path did not route through the graph lower and so left nothing
+to capture.
 """
 
 import contextlib
@@ -151,9 +146,50 @@ def _strip_comments(block: dict) -> dict:
     return {k: v for k, v in block.items() if not k.startswith("_comment")}
 
 
+def _symmetric_strain(dtype, device, batch: tuple[int, ...] = ()):
+    """A strain leaf ``eps`` and the transform ``I + sym(eps)`` it defines.
+
+    ``eps`` is the leaf a virial differentiates with respect to; only its
+    symmetric part acts, so a rotation cannot masquerade as stress. ``batch``
+    prepends frame axes: ``()`` for one ``(3, 3)`` strain, ``(nf,)`` for one per
+    frame.
+    """
+    eps = torch.zeros((*batch, 3, 3), dtype=dtype, device=device, requires_grad=True)
+    identity = torch.eye(3, dtype=dtype, device=device).expand(*batch, 3, 3)
+    return eps, identity + 0.5 * (eps + eps.transpose(-1, -2))
+
+
+def _run_backbone(model, graph, atype_flat, charge_spin):
+    """Run ``model``'s descriptor on ``graph``: ``(features, rot_mat)``.
+
+    The charge head must see the SAME frame conditioning as the energy head,
+    or the two descriptor passes disagree about what system they are
+    describing. Gated on the descriptor's own capability, exactly as
+    ``DPAtomicModel.forward_atomic_graph`` gates it -- only the DPA4 family
+    accepts the keyword, and ``dp_lr`` allows any descriptor.
+    """
+    descriptor = model.atomic_model.descriptor
+    kwargs = (
+        {"charge_spin": charge_spin}
+        if model.atomic_model.supports_charge_spin
+        else {}
+    )
+    return descriptor.call_graph(
+        graph,
+        atype_flat,
+        type_embedding=descriptor.graph_type_embedding_table(),
+        **kwargs,
+    )
+
+
+def _is_compressed(model) -> bool:
+    """Whether ``model``'s descriptor is running from compressed tables."""
+    return bool(getattr(model.atomic_model.descriptor, "compress", False))
+
+
 @BaseModel.register(MODEL_TYPE)
 class LongRangeEnergyModel(EnergyModel):
-    """Energy model that will carry an explicit long-range electrostatic term.
+    """Energy model that carries an explicit long-range electrostatic term.
 
     Reached from an input file through ``model.type: "dp_lr"``. The generic
     dispatch in ``deepmd.dpmodel.model.model_factory.get_model`` ends with
@@ -275,13 +311,15 @@ class LongRangeEnergyModel(EnergyModel):
         # after a swap describes the term it actually has rather than the one
         # it was trained with.
         script = getattr(self, "model_def_script", None)
-        if script:
-            recorded = json.loads(script)
-            block = recorded.get(LONG_RANGE_KEY)
-            if block is not None:
-                block.pop(_LEGACY_RECIPROCAL_KEY, None)
-                block[RECIPROCAL_KEY] = self.long_range_energy.serialize()
-                self.model_def_script = json.dumps(recorded)
+        if not script:
+            return
+        recorded = json.loads(script)
+        block = recorded.get(LONG_RANGE_KEY)
+        if block is None:
+            return
+        block.pop(_LEGACY_RECIPROCAL_KEY, None)
+        block[RECIPROCAL_KEY] = self.long_range_energy.serialize()
+        self.model_def_script = json.dumps(recorded)
 
     @classmethod
     def get_model(cls, model_params: dict) -> "LongRangeEnergyModel":
@@ -294,7 +332,6 @@ class LongRangeEnergyModel(EnergyModel):
         :func:`get_model_components`, which owns the ``ntypes`` / ``type_map``
         / ``dim_descrpt`` injection that is easy to get subtly wrong.
         """
-        model_params_old = copy.deepcopy(model_params)
         data = copy.deepcopy(model_params)
         data.pop("type", None)
 
@@ -322,7 +359,7 @@ class LongRangeEnergyModel(EnergyModel):
             charge_fitting=charge_fitting,
             long_range_energy=long_range_energy,
         )
-        model.model_def_script = json.dumps(model_params_old)
+        model.model_def_script = json.dumps(model_params)
         return model
 
     @classmethod
@@ -379,7 +416,7 @@ class LongRangeEnergyModel(EnergyModel):
         why it is not applied to the coordinates and cell before.
         """
         descriptor = self.atomic_model.descriptor
-        if getattr(descriptor, "compress", False):
+        if _is_compressed(self):
             # At DP_CUDA_INFER=1 the compressed branch lives inside
             # `call_graph`, so the energy pass is always captured and this
             # second pass never runs. Reaching it means the capture was
@@ -416,34 +453,11 @@ class LongRangeEnergyModel(EnergyModel):
             graph.edge_vec = torch.einsum(
                 "eab,eb->ea", strain[frame_of_edge], graph.edge_vec
             )
-        atype_flat = atype.reshape(-1)
-        # The charge head must see the SAME frame conditioning as the energy
-        # head, or the two descriptor passes disagree about what system they
-        # are describing. Gated on the descriptor's own capability, exactly as
-        # `DPAtomicModel.forward_atomic_graph` gates it -- only the DPA4
-        # family accepts the keyword, and `dp_lr` allows any descriptor.
-        charge_spin_kwargs = (
-            {"charge_spin": charge_spin}
-            if self.atomic_model.supports_charge_spin
-            else {}
-        )
-        gg, rot_mat = descriptor.call_graph(
-            graph,
-            atype_flat,
-            type_embedding=descriptor.graph_type_embedding_table(),
-            **charge_spin_kwargs,
-        )
-        raw = self.charge_fitting.call_graph(gg, atype_flat, gr=rot_mat)["charge"]
-        raw = raw.reshape(coord.shape[0], coord.shape[1])
-
-        # Column 0 of charge_spin is the frame's total charge; absent it, the
-        # frame is assumed neutral, which is the common case in training data.
-        total = (
-            charge_spin[:, 0].to(raw.dtype)
-            if charge_spin is not None
-            else torch.zeros(raw.shape[0], dtype=raw.dtype, device=raw.device)
-        )
-        return project_to_total_charge(raw, total, mask=mask)
+        gg, rot_mat = _run_backbone(self, graph, atype.reshape(-1), charge_spin)
+        # The same head and projection a captured backbone goes through. Column
+        # 0 of charge_spin is the frame's total charge; absent it, the frame is
+        # assumed neutral, the common case in training data.
+        return self._charges_from_features(gg, rot_mat, atype, charge_spin, mask)
 
     @contextlib.contextmanager
     def _capturing_backbone(self) -> Any:
@@ -585,11 +599,7 @@ class LongRangeEnergyModel(EnergyModel):
         # force differentiable with respect to them.
         base_coord = coord.detach().reshape(nf, nloc, 3)
         base_box = None if box is None else box.detach().reshape(nf, 3, 3)
-        eps = torch.zeros(
-            (nf, 3, 3), dtype=dtype, device=device, requires_grad=True
-        )
-        sym = 0.5 * (eps + eps.transpose(-1, -2))
-        strain = torch.eye(3, dtype=dtype, device=device).expand(nf, 3, 3) + sym
+        eps, strain = _symmetric_strain(dtype, device, batch=(nf,))
 
         leaf_coord = base_coord.clone().requires_grad_(True)
         # Row vectors: r' = r (I + eps)^T, and the cell rows transform alike.
@@ -669,7 +679,7 @@ class LongRangeEnergyModel(EnergyModel):
             # Fallback: run the backbone again on our own strained graph. Used
             # when the energy path did not route through the graph lower, so
             # nothing was captured.
-            if getattr(self.atomic_model.descriptor, "compress", False):
+            if _is_compressed(self):
                 # Compressed inference is defined only on the captured route;
                 # the fallback would rebuild a CSR-less graph and run the
                 # uncompressed math while the model still claims otherwise.
@@ -880,7 +890,7 @@ class LongRangeEnergyModel(EnergyModel):
             self._refuse_export(
                 "The graph-lower interface (DeepPot, `dp test`, compiled training)"
             )
-        if getattr(self.atomic_model.descriptor, "compress", False):
+        if _is_compressed(self):
             if not _kernel_available():
                 raise RuntimeError(_NO_KERNEL)
             # Level before CSR: at level 0 upstream builds no CSR at all, so

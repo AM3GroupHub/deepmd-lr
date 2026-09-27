@@ -2,8 +2,8 @@
 
 The ensemble that asks most of the model: the barostat is driven by the
 pressure tensor, which needs the **virial**, so the evaluator must be built
-with `compute_virial=True`. That costs almost nothing -- DeePMD-kit's lower
-graph already produces the virial alongside the force.
+with `compute_virial=True`. That costs a strain leaf per partition and an
+extra target in the charge-response backward.
 
 The part specific to this package is the cell. `DistributedEvaluator` builds
 its spatial partitioning against the cell it was given, and the Verlet
@@ -12,6 +12,16 @@ cannot see the cell move. So after the barostat moves it, `thermo.set_cell()`
 pushes the new cell back, invalidates the partitioning and refreshes the
 volume, in that order. Skip it and the halo goes stale with ghost images at
 the wrong offsets: forces quietly wrong, nothing raising.
+
+Two things the kernel signatures do not say:
+
+  * Refresh the kinetic energy and the pressure right before each barostat
+    and thermostat half-step, including after the second kick, as LAMMPS'
+    fix nh does. The barostat must see the current state, not a value cached
+    earlier in the step.
+  * The kernels compute N_f = 3 * (the atom count they are given). The centre
+    of mass is at rest and stays there, so the moving degrees of freedom are
+    3N - 3: pass N - 1. Otherwise the system is held 3N/(3N-3) hot.
 
     python 05_npt_mtk.py --model ../../path/to/model.ckpt.pt
 """
@@ -71,9 +81,10 @@ def main():
         (ndof + 3) * float(th.kT.numpy()[0]) * (a.tau_p * fs) ** 2
     )
     target_p = th.scalar(a.pressure * GPa)
+    # N - 1: the kernels count N_f = 3 * this, and the COM does not move.
+    dof_count = wp.array([th.n_atoms - 1], dtype=wp.int32, device=th.device)
 
     th.evaluate()
-    th.update_pressure()
 
     print(f"NPT (MTK)  {th.n_atoms} atoms  dt {a.dt} fs  T {a.temperature} K  "
           f"P {a.pressure} GPa  tau_T {a.tau_t} fs  tau_P {a.tau_p} fs")
@@ -83,31 +94,30 @@ def main():
             break
 
         # First half: thermostat, barostat, then the velocity half-kick that
-        # already knows about the cell's motion.
+        # already knows about the cell's motion -- all on fresh KE and pressure.
         th.update_kinetic_energy()
+        th.update_pressure()
         npt_thermostat_half_step(eta, eta_dot, th.ke_w, th.kT, th_mass,
-                                 th.natoms, L, th.dt)
+                                 dof_count, L, th.dt)
         npt_barostat_half_step(cell_v, th.press_w, target_p, th.volume_w,
-                               cell_mass, th.ke_w, th.natoms, th.dt)
+                               cell_mass, th.ke_w, dof_count, th.dt)
         npt_velocity_half_step(th.velocities, th.masses, th.forces, cell_v,
-                               volumes=th.volume_w, eta_dots=eta_dot,
-                               num_atoms=th.natoms, dt=th.dt)
+                               eta_dots=eta_dot, num_atoms=dof_count, dt=th.dt)
         # Drift the atoms and the cell together, then re-sync the evaluator.
         npt_position_update(th.positions, th.velocities, th.cell, cell_v, th.dt)
         npt_cell_update(th.cell, cell_v, th.dt)
         th.set_cell()
         th.evaluate()
-        th.update_pressure()
 
-        # Second half, in reverse order.
-        th.update_kinetic_energy()
+        # Second half, in reverse order: the kick, then KE and pressure after it.
         npt_velocity_half_step(th.velocities, th.masses, th.forces, cell_v,
-                               volumes=th.volume_w, eta_dots=eta_dot,
-                               num_atoms=th.natoms, dt=th.dt)
+                               eta_dots=eta_dot, num_atoms=dof_count, dt=th.dt)
+        th.update_kinetic_energy()
+        th.update_pressure()
         npt_barostat_half_step(cell_v, th.press_w, target_p, th.volume_w,
-                               cell_mass, th.ke_w, th.natoms, th.dt)
+                               cell_mass, th.ke_w, dof_count, th.dt)
         npt_thermostat_half_step(eta, eta_dot, th.ke_w, th.kT, th_mass,
-                                 th.natoms, L, th.dt)
+                                 dof_count, L, th.dt)
 
     half = len(th.rows) // 2
     rows = th.rows[half:]

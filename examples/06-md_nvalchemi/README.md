@@ -2,7 +2,8 @@
 
 nvalchemiops ships integrator **kernels** and no driver, so the loop belongs to
 you. That is the point of these six scripts: each is a complete, runnable loop
-to copy, not a wrapper hiding one.
+to copy, not a wrapper hiding one. For production runs -- restarts, several
+GPUs, a trajectory -- use the driver in [07](../07-multi-gpu-md) instead.
 
 Every script was run to produce the numbers below.
 
@@ -42,9 +43,8 @@ treated as a molecule in vacuum.
 | [`05_npt_mtk.py`](05_npt_mtk.py) | NPT | MTK, isotropic | equilibrating density; needs the virial |
 | [`06_nvt_efield.py`](06_nvt_efield.py) | NVT | Langevin | response to an external electric field |
 
-There is no `common.py`: the shared setup now lives in the package itself, so
-these scripts demonstrate the API you would actually use rather than a helper
-file sitting beside them.
+The shared setup lives in the package itself, so these scripts demonstrate
+the API you would actually use.
 
 ```python
 from deepmd_lr.nvalchemi import Thermo, build_evaluator, read_structure
@@ -76,10 +76,8 @@ The model works in **angstrom, eV, amu and ASE time units**, which are mutually
 consistent — no conversion factors appear in any loop.
 
 **Temperature is `k_B T` in energy units, not kelvin.** Every nvalchemiops
-dynamics entry point takes it that way, which is the *opposite* of the heavy
-`nvalchemi-toolkit`, whose thermostats took kelvin. Pass kelvin where `kT` is
-expected and you thermostat to ~11,600× the temperature you meant; pass `kT`
-where kelvin is expected and you get a system at rest.
+dynamics entry point takes it that way. Pass kelvin where `kT` is expected and
+you thermostat to ~11,600× the temperature you meant.
 
 The defence is structural rather than a helper function: `Thermo` takes
 `temperature` in **kelvin** and builds `th.kT` itself, so no script has any
@@ -97,7 +95,7 @@ Time is the other one. One ASE time unit is **10.181 fs**, and `friction` is in
 | 0.1 | 102 fs | the default in `02` |
 | 0.5 | 20 fs | very strong; use under a field |
 
-## Three API conventions you cannot guess
+## API conventions you cannot guess
 
 Found by running into them:
 
@@ -112,6 +110,15 @@ Found by running into them:
   2-D `(B, 9)`. Only `cells` is `mat33`. `vec9d` comes from nvalchemiops, not
   from warp — `wp.vec9d` does not exist. `Thermo.update_pressure` owns this
   mess so no script has to.
+- **The NPT kernels count `3N` degrees of freedom** unless told otherwise:
+  each computes `N_f = 3 × (the atom count passed)`. The centre of mass does
+  not move, so pass `N − 1` to all three, as `05` does. Pass `N` and the
+  system is held `3N/(3N−3)` hot.
+- **Refresh right before the barostat reads.** `ke_w` and `press_w` hold
+  whatever was last computed into them, so call `update_kinetic_energy()` and
+  `update_pressure()` before each barostat/thermostat half-step, after the
+  second kick too. `Thermo`'s getters never write them, so logging cannot
+  change a run.
 
 The NHC chain update is also called once at **each end** of the step, not once
 per step.
@@ -156,9 +163,8 @@ It re-runs `partition_system` only — **do not rebuild the evaluator**, which
 would deepcopy the model onto every device.
 
 NPT also needs `compute_virial=True`, since the barostat is driven by the
-pressure tensor. That costs essentially nothing: DeePMD-kit's lower graph
-already produces the virial alongside the force (measured at under 1% of a
-step).
+pressure tensor. It costs a strain leaf per partition and an extra target in
+the charge-response backward.
 
 For **NPH**, drop the two `npt_thermostat_half_step` calls from `05` and use
 the `nph_*` kernels, which take the same arguments without the thermostat
@@ -188,15 +194,14 @@ NPT under a field is refused rather than quietly wrong.
 
 ## Several GPUs
 
-Every script takes its device list through `common.build_evaluator`, so
-partitioning across cards is one argument:
+The scripts build their evaluator with `build_evaluator`, which takes the
+device list, so partitioning across cards is one argument there:
 
 ```python
-ev, masses = build_evaluator(model, symbols, cell,
-                             devices=["cuda:0", "cuda:1"])
+ev = build_evaluator(model, atoms, devices=["cuda:0", "cuda:1"])
 ```
 
-Worth it above a few thousand atoms per card and not below — see the
+Whether it pays depends on where a step spends its time -- see
 [partitioned MD](../../docs/partitioned-md.md#limits) for the measured scaling.
 
 ## Throughput
@@ -213,7 +218,7 @@ and not about the model alone — at 1 fs the same model doubles it.
 The first logged interval is excluded, because it carries kernel compilation:
 ~1 s against a ~30 ms step here. Fitting through that point is not enough — a
 least-squares slope over all points still lands 2× high — so it is dropped
-outright, as the benchmarks in `experiments/` do.
+outright.
 
 It measures the loop as it actually ran, `log` included. Logging every step
 means a device synchronisation every step, and any analysis you pass as a
@@ -226,8 +231,8 @@ keyword runs every step too. Measured on this machine, 192 atoms at 0.5 fs:
 | NVT + field | 44.9 | 0.96 |
 
 NPT pays for repartitioning every step as the cell moves; the field pays for
-the extra backward pass Born charges need. Both match the costs measured in
-the main README's benchmarks.
+the extra backward pass Born charges need. Both match the costs in
+[Cost](../../docs/cost.md).
 
 ## What these runs are not
 

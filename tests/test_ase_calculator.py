@@ -92,6 +92,9 @@ class TestCalculatorMatchesTheModel:
         assert atoms.calc.results["charges"].sum() == pytest.approx(1.0, abs=1e-9)
 
     def test_stress_shape_and_symmetry(self):
+        """Voigt shape, finite values. The Voigt form has no room for an
+        antisymmetric part, so symmetry itself is pinned on the virial, by
+        `test_virial_is_symmetric` in test_joint_model and test_nvalchemi."""
         atoms = water_atoms()
         atoms.calc = LongRangeCalculator(build())
         stress = atoms.get_stress()
@@ -119,7 +122,7 @@ class TestCalculatorGuards:
         assert np.isfinite(atoms.get_forces()).all()
 
     def test_accepts_non_periodic_atoms_for_the_isolated_term(self):
-        from .test_isolated_term import isolated_model  # noqa: PLC0415
+        from .test_isolated_term import isolated_model
 
         atoms = water_atoms()
         atoms.pbc = False
@@ -225,11 +228,11 @@ class TestPlainEnergyModel:
 
     @staticmethod
     def _standard_model():
-        import copy  # noqa: PLC0415
+        import copy
 
-        from deepmd.pt_expt.model.get_model import get_model  # noqa: PLC0415
+        from deepmd.pt_expt.model.get_model import get_model
 
-        from .test_joint_model import DESCRIPTOR, FITTING  # noqa: PLC0415
+        from .test_joint_model import DESCRIPTOR, FITTING
 
         model = get_model(
             {

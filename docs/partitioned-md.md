@@ -4,6 +4,17 @@
 `DistributedEvaluator` evaluates the model over spatial partitions — one per
 GPU:
 
+```python
+from deepmd_lr.nvalchemi import DistributedEvaluator
+
+evaluator = DistributedEvaluator(
+    model, atype, cell,
+    devices=["cuda:0", "cuda:1", "cuda:2", "cuda:3"],
+    compute_virial=False,       # True also fills .virial and .stress
+)
+energy, forces = evaluator(positions)      # eV, eV/angstrom
+```
+
 `Thermo` is the other half an MD loop needs — it owns the state those kernels
 mutate (positions, velocities, masses, forces, cell, timestep, each a warp
 array bound once) and reports the thermodynamics, which nvalchemiops does not
@@ -18,18 +29,6 @@ atoms = read_structure("start.xyz")
 ev = build_evaluator("model.ckpt.pt", atoms, compute_virial=True)
 th = Thermo(ev, atoms.get_positions(), timestep=0.5, temperature=300.0,
             columns=("step", "time", "temp", "press", "vol"))
-```
-
-```python
-from deepmd_lr.nvalchemi import DistributedEvaluator
-
-evaluator = DistributedEvaluator(
-    model, atype, cell,
-    devices=["cuda:0", "cuda:1", "cuda:2", "cuda:3"],
-    skin=1.0,
-    compute_virial=False,       # True also fills .virial and .stress
-)
-energy, forces = evaluator(positions)      # eV, eV/angstrom
 ```
 
 **That is the whole object.** It owns the partitioning, the ghost halo, the
@@ -50,8 +49,9 @@ cannot touch on-device state, which is the point of this path.
 
 ### Driving it with nvalchemiops
 
-nvalchemiops ships half-step kernels and no driver, so the loop is yours. NVE
-is four lines:
+nvalchemiops ships half-step kernels and no driver, so the loop is yours; for
+a ready-made one with restarts and a GPU-count benchmark, see
+[examples/07-multi-gpu-md](../examples/07-multi-gpu-md). NVE is four lines:
 
 ```python
 from nvalchemiops.dynamics.integrators import (
@@ -78,9 +78,8 @@ Three conventions to respect, none of them guessable from the signatures, all
 found by running into them:
 
 - **Temperature is `k_B T` in energy units, not Kelvin.** Every nvalchemiops
-  dynamics entry point documents it that way — the *opposite* of the heavy
-  `nvalchemi-toolkit`, whose thermostats took Kelvin, where passing kT
-  silently gave a system at rest. For eV, `kT = ase.units.kB * T[K]`.
+  dynamics entry point documents it that way. For eV,
+  `kT = ase.units.kB * T[K]`.
 - **Half-step factors are inconsistent between kernels.** Measured:
   `nhc_velocity_half_step` and `velocity_verlet_position_update` apply their
   own factor of ½ (`dv = (F/m) dt/2`), `nhc_position_update` does not
@@ -90,6 +89,11 @@ found by running into them:
 - **`ndof` dtypes disagree.** `nhc_compute_masses` requires int32 while
   `nhc_thermostat_chain_update` and `nhc_compute_chain_energy` require
   float64. That is a Warp launch error, not a cast, so keep both.
+- **The NPT kernels count `N_f = 3 ×` the atom count they are given.** The
+  centre of mass does not move, so pass `N − 1` for `3N − 3`, the count
+  `Thermo.temperature` uses; otherwise the system is held `3N/(3N−3)` hot.
+  Refresh `ke_w` and `press_w` (`update_kinetic_energy`, `update_pressure`)
+  right before each barostat half-step; `Thermo`'s getters never write them.
 
 Units: the model works in angstrom and eV. Pair that with masses in amu and a
 timestep in ASE time units (`A sqrt(amu/eV)`) and the set is self-consistent.
@@ -111,6 +115,33 @@ E_pot + E_kin + sum_k Q_k eta_dot_k^2 / 2 + N_dof kT eta_1 + kT sum_{k>1} eta_k
 > formula exactly, so it is neither the forces nor the bookkeeping. It scales
 > as the square of the coupling strength, so weak coupling is the safe regime.
 > Treat NVE as the trustworthy conservation check.
+
+### How the atoms are split
+
+Into a grid of blocks, not slabs. What a device has to hold is its owned block
+plus a shell of ghosts `rcut + skin` deep on every side, and that shell is the
+part that does not shrink when the block does. Slabs keep two faces at full
+cell size however thin they get; cutting more axes keeps every face smaller.
+`decomposition_grid` picks, per partition count, the factorisation that
+minimises one block's halo box: slabs for two, 2 x 2 x 1 for four, 2 x 2 x 2
+for eight on a cubic box, and slabs again along a long axis when the box is
+elongated enough. Each cut is at equal atom count, one axis at a time.
+
+What that buys, as nodes on the busiest device, water at the auto skin:
+
+| atoms | partitions | slabs | grid | change |
+|---|---|---:|---:|---:|
+| 12,288 | 4 | 9,761 | 8,855 | -9 % |
+| 12,288 | 8 | 7,192 | 5,034 | -30 % |
+| 41,472 | 4 | 26,015 | 23,555 | -9 % |
+| 41,472 | 8 | 17,600 | 13,067 | -26 % |
+| 98,304 | 4 | 52,898 | 49,135 | -7 % |
+| 98,304 | 8 | 33,942 | 26,623 | -22 % |
+
+Two partitions are unchanged, since a slab is the only way to cut in two. An
+uncompressed step is device-bound -- about 5 ms of host work at 41,472 atoms
+against hundreds on the device -- and its work follows the node count, so the
+busiest device's count is what sets the step.
 
 ### What is split and what is not
 
@@ -144,7 +175,91 @@ of 40, with results identical to rebuilding every step. `repartition_every=1`
 forces a rebuild each step; it changes timing, never results — there is a test
 asserting exactly that.
 
-### What the driver returns
+### The knob that decides multi-GPU scaling
+
+**`skin` (default `"auto"`).** The decomposition is reused until an atom has
+moved half the skin, then rebuilt on the host by a spatial sort whose cost
+grows with the atom count. Measured on two A40s at 98,304 atoms:
+
+| skin (Å) | ms/step | rebuild | serial fraction | 2-GPU Amdahl ceiling |
+|---|---|---|---|---|
+| 1.0 (the old default) | 347 | every 13 steps | 76 % | 1.14x |
+| 2.0 | 206 | every 40 steps | 54 % | 1.30x |
+| 4.0 | 101 | none in 40 steps | 5 % | 1.90x |
+| 8.0 | 189 | none | 4 % | 1.92x |
+
+A constant is wrong at both ends -- a few thousand atoms rebuild cheaply and
+pay for a thick halo -- so `"auto"` takes the largest skin whose halo costs at
+most 25 % more nodes than a zero-skin halo, from the cell, the cutoff and the
+partition count (`partition.default_skin`). That is 1.4 Å at 1,536 atoms,
+4.3 Å at 98,304 and 5.3 Å at 192,000, and 4.3 Å is where the measurement put
+the optimum. Pass a number to override; `evaluator.skin` reports what was used.
+
+**What the rule cannot see: bytes.** The skin is sized from the cell, the
+cutoff and the partition count, because those decide how much ghost work it
+buys and how often the rebuild runs. How many bytes a node costs is a property
+of the *model* -- an uncompressed descriptor holds several times what a
+compressed one does -- and of the step, so no geometric rule can predict it. It
+showed up as an out-of-memory at 98,304 atoms on eight devices with an
+uncompressed long-range model, where the old fixed 1 A skin had fitted: the
+rule grants 25 % more nodes on top of a halo that is already 2.5x the owned
+count when the blocks are that small.
+
+Memory therefore enters as a cap that is **measured**, not as a term in the
+formula. The first evaluation is a probe: it runs at the floor skin, the
+smallest halo there is, and its peak allocation divided by its node count is
+what a node costs. That coefficient spans a factor of thirty between models,
+which is exactly why no formula can carry it:
+
+| model | bytes per node | linear fit error |
+|---|---|---|
+| uncompressed long-range | 755 kB | 0.3 % |
+| compressed long-range | 24.3 kB | 1.2 % |
+
+The footprint is linear in the node count, so the coefficient extrapolates to
+any other skin, and the skin becomes the largest value whose predicted
+footprint fits `memory_headroom` (0.8 by default) of what this process could
+hold on the device -- free memory plus its own cached blocks, so a co-tenant
+process is accounted for. It is only ever a ceiling: the geometry rule still
+decides whenever memory is not the binding constraint. Measured at 41,472
+atoms uncompressed, predicted against actual peak: 47.4 against 47.23 GiB.
+
+Density is what turns a skin into a node count, and it enters through the node
+count the probe actually **counted**, not through `N/V`: for a slab, an
+interface or anything with a void, the counted occupancy is right where a
+uniform density is not.
+
+The reactive path remains underneath, because a prediction can still be wrong
+when another process grows on the same device. On an out-of-memory the
+evaluator halves the skin, rebuilds and retries the step, and that value
+becomes a ceiling too, `set_cell` under a barostat included.
+`evaluator.skin_backoffs` counts the reductions and each one warns. An explicitly chosen skin is never overridden, and the
+backoff stops at 0.1 A, below which the halo is not what is filling the
+device. Lowering the skin instead of raising it in the rule was rejected on
+measurement: an owned-count-relative rule gives 1.2 A at eight partitions,
+which is the old fixed default and puts the step straight back into the
+rebuild-dominated regime the auto skin exists to escape.
+
+### Why the launch phase is single-threaded
+
+A thread per device once recovered part of the overlap that the neighbour
+search's blocking host reads take away -- 1.31x to 1.88x of an ideal 2x on two
+A40s at 98,304 atoms. It was removed (`406f775`): the lazily-initialised
+libraries underneath -- deepmd-kit's fake-op registration, torch's CUDA
+linear-algebra loader, warp's code generation -- raced on first use, and a
+4-GPU V100 scaling matrix kept losing rows. The loop now runs one partition at
+a time, in order. Two things from that work stay, because they are about
+correctness rather than overlap:
+
+- **`_current_device` around each partition.** The compressed operator binds
+  the *current* device rather than its arguments' device: without this, a
+  compressed model whose buffers sit on `cuda:1` returns forces wrong by
+  5 eV/A while `cuda:0` is current.
+- **One coordinate copy per device, taken before the loop.** Every partition
+  on a device reads the same full array and gathers its own rows, so this is
+  one upload per device instead of one per partition.
+
+## What the driver returns
 
 `evaluate_partitioned` assembles on the gather device and returns **device
 tensors** (scalars as 0-d tensors). There is no host-side assembly path: the
@@ -167,20 +282,12 @@ and `results` converts an entry to numpy only when it is read
 (`results_on_device=True` skips even that). One download per step remains, the
 energy scalar, because the call returns it as a Python float.
 
-Measured effect of removing the host gather, compressed, 98,304 atoms on one
-GB10: long-range 344 to 315 ms/step, long-range with Born tensors 442 to 358.
-Short-range is unchanged, because its step had only one transfer to remove. On
-two H200s the difference is within run-to-run scatter. The gather was never the
-ceiling: at 98k atoms a compressed step is 48 % host-side partitioning, 19 %
-neighbour search, 17 % edge sort for the compressed kernel, 16 % network, and
-under 1 % gather.
-
 ## Limits
 
 - **`stress` is available, opt-in.** Pass `compute_virial=True` and read
   `evaluator.virial` (eV) or `evaluator.stress` (eV/Å³, ASE's sign convention).
-  It is off by default because it costs a strain leaf per partition and a
-  second backward through the charge head; the `(energy, forces)` return
+  It is off by default because it costs a strain leaf per partition and an
+  extra target in the charge-response backward; the `(energy, forces)` return
   signature is unchanged either way.
 
   All three contributions decompose. The short-range virial is the sum of the
@@ -196,63 +303,25 @@ under 1 % gather.
   serial virial — itself finite-difference checked — to ~6e-15, symmetric, and
   identical at 1, 2, 4 and 8 partitions.
 
-- **Multi-GPU pays above a few thousand atoms per card, and not below.**
-  Results are identical either way — verified on 2 × A40 (ΔE = 0 at 768 and
-  2592 atoms, 9.1e-13 at 6144) and on 3 × RTX PRO 6000 Blackwell, where Born
-  charges match the single-GPU answer to ~1e-15 at 1, 2 and 3 real devices and
-  stay flat from 81 to 5184 atoms.
+- **Multi-GPU pays only where the devices are the bottleneck.** Results are
+  identical either way: on two distinct A40s, every returned quantity at 2, 3,
+  4 and 8 partitions (grids 2x1x1 to 2x2x2) matches the undivided model at the
+  run-to-run floor, and NVE energy traces from the same start agree to 1e-5
+  meV/atom. Speed depends on where a step spends its time, measured on two
+  A40s:
 
-  Speed depends entirely on size, because the parallelism is real but the fixed
-  per-partition cost is Python. Measured on RTX PRO 6000:
+  | case | 1 GPU | 2 GPUs | limited by |
+  |---|---:|---:|---|
+  | compressed long-range, 12,288 atoms | 20.4 ms | 24.8 ms | host (device busy 3.8 ms of the step) |
+  | compressed long-range, 41,472 atoms | 48.7 ms | 47.6 ms | host (device busy 10.7 ms) |
+  | uncompressed short-range, 12,288 atoms | 222 ms | 141 ms | devices (121 ms each) |
 
-  | system | 1 GPU | 2 GPUs | speedup |
-  |---|---:|---:|---:|
-  | 12,000 atoms | 121.7 ms | 78.6 ms | 1.55× |
-  | 131,712 atoms (weak scaling vs 65,856 on one) | 403.8 ms | 421.5 ms | 96% efficiency |
+  So compressed runs below roughly 100,000 atoms belong on one GPU, and an
+  uncompressed run overlaps at 80–86 % across two. The fixed per-partition
+  host cost -- the neighbour search and eager-PyTorch dispatch -- is what more
+  partitions multiply.
 
-  Below that it is worthless and can be negative: an older 2 × A40 measurement
-  at ≤ 6,144 atoms gave **0.92–1.03×**, i.e. none. The reason is measured, not
-  guessed. Put every partition on one device, so total GPU work is constant and
-  only the number of launch iterations changes, and the wall time still grows —
-  49 → 184 ms going from 1 to 8 partitions — while the GPU work outstanding
-  when the call returns is 0.04 ms at every count. The ~11 ms per partition is
-  eager-PyTorch dispatch, not GPU compute. At 6,000 atoms per card that is most
-  of the step; at 65,856 it is ~2% of it, which is why efficiency climbs from
-  81% to 96% across that range. Partitioning multiplies that fixed cost, so
-  fewer, larger partitions stay cheaper than many small ones.
-
-- **The short-range path needs `neighbor_graph_method` set for inference.**
-  DeePMD-kit resolves it once at *training* startup (default `auto`, which is
-  `nv` on CUDA) and does not record it in the checkpoint. A model rebuilt for
-  inference therefore falls back to the `dense` O(N²) builder. On the
-  6520-atom LiFSI frame that is **48.2 GB and 724 ms** against **4.0 GB and
-  201 ms** for `nv`, at a bit-identical energy — and 48 GB does not fit on a
-  48 GB card, which is how it first showed up, as an OOM. `load_model` now sets
-  it via DeePMD-kit's own `resolve_neighbor_graph_method("auto", device)`, so
-  CPU or a missing nvalchemiops degrades to `dense` instead of raising.
-
-- **Only the `dense` builder carries a cell derivative — and nothing here
-  needs one any more.** Measured `d(edge_vec)/d(box)`: `dense` 1932.8, `nv`
-  **6.7e-13**, `ase` and `vesin` raise. `nv` returning round-off rather than an
-  error is the dangerous part: forces stay correct and a virial that leaned on
-  it would go silently wrong. `_long_range` gets the virial by differentiating
-  the charge prediction through a strain, and now builds the graph from the
-  *unstrained* geometry and applies the strain to the finished edge vectors.
-  That is exact — the strain is affine and an edge vector is
-  `coord[j] + S·box − coord[i]`, every term of which transforms by the same
-  `(I+ε)ᵀ` — so the derivative flows through `edge_vec` alone and the O(N)
-  builder is used: **8.3 GB and 0.92 s per step**, against 63 GB and 3.0 s when
-  it routed through the box.
-
-- **The neighbour-graph choice in `deepmd_lr/neighbors.py`.** DeePMD-kit's
-  `build_neighbor_graph` calls itself a "correctness oracle" and is O(N²);
-  `deepmd_lr/neighbors.py` swaps in the nvalchemiops GPU cell list wherever it
-  pays — see [Which neighbour list runs](neighbour-lists.md#which-neighbour-list-runs) for the
-  thresholds. Only the *search* is taken from nvalchemiops: its edge vectors
-  come out of a Warp kernel with no gradient, so they are discarded and
-  DeePMD-kit's `neighbor_graph_from_ijs` recomputes `edge_vec` from
-  `coord`/`box`. Using the kernel's vectors directly would produce a model
-  with no forces. Edge sets are identical to the oracle — same count, same
-  vectors to 9 decimals, periodic and not. End-to-end this is 1.00–1.77× over
-  768–12288 atoms.
-
+- **Neighbour lists.** Which builder runs for the descriptor and for the
+  charge head, why a rebuilt model must re-resolve `neighbor_graph_method`,
+  and why the virial never needs the O(N²) builder, is in
+  [Which neighbour list runs](neighbour-lists.md).

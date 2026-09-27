@@ -43,7 +43,7 @@ pip install "e3nn>=0.5.9" "vesin[torch]" mpich
 pip install "nvalchemi-toolkit-ops>=0.4.1" "warp-lang>=1.13.0"
 
 # 5. data / MD / dev tooling
-pip install "dpdata>=0.2.7" "ase>=3.23.0" pytest pytest-cov ruff pre-commit
+pip install "dpdata>=0.2.7" "ase>=3.23.0" pytest pytest-cov ruff
 ```
 
 **`mpich` is required, not optional.** The PyPI wheel is cibuildwheel-built,
@@ -110,6 +110,7 @@ match ([dataset layout](docs/dataset-layout.md)).
 | [04](examples/04-multi-head) | all three at once | `shared_dict`/`model_dict`, and the gradient clipping it needs |
 | [05](examples/05-pseudo-head) | bulk + slab, one weight set | `same_as`, and setting the long-range type at load |
 | [06](examples/06-md_nvalchemi) | MD with nvalchemiops | NVE, NVT, NPT and a field, one runnable loop each |
+| [07](examples/07-multi-gpu-md) | production MD, one or more GPUs | one command: restarts, a GPU-count benchmark, pre-relaxation |
 
 `scripts/xyz_to_deepmd.py` converts a trajectory ASE can read into a DeePMD
 dataset, including the `--split-by-composition` and `--vacuum` cases the
@@ -135,8 +136,9 @@ VelocityVerlet(atoms, timestep=0.5 * units.fs).run(10000)
 ```
 
 For MD that never leaves the GPU, and for several GPUs, use the nvalchemiops
-path — `examples/06-md_nvalchemi` has a runnable loop per ensemble
-([partitioned MD](docs/partitioned-md.md)). A field run, Born effective
+path — `examples/06-md_nvalchemi` has a runnable loop per ensemble, and
+`examples/07-multi-gpu-md/run_md.py` is a ready-made driver for production
+runs ([partitioned MD](docs/partitioned-md.md)). A field run, Born effective
 charges, and reporting them screened by a medium's ε∞ (`eps_inf=`):
 [born-charges](docs/born-charges.md).
 
@@ -191,8 +193,8 @@ persistence: [docs/compression.md](docs/compression.md).
 | [born-charges.md](docs/born-charges.md) | Born effective charges and MD in an external field |
 | [partitioned-md.md](docs/partitioned-md.md) | `DistributedEvaluator`, `Thermo`, nvalchemiops conventions, scaling |
 | [neighbour-lists.md](docs/neighbour-lists.md) | which neighbour list runs, and the measured thresholds |
-| [tests.md](docs/tests.md) · [results.md](docs/results.md) | what the suite pins; the benchmark |
+| [tests.md](docs/tests.md) | what the suite pins |
 
 ```bash
-pytest tests/ -q          # 415 tests on the wheel; +13 kernel tests with a CUDA build
+pytest tests/ -q          # on the wheel; the 13 kernel tests need a CUDA build
 ```

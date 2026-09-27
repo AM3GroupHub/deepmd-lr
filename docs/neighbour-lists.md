@@ -8,9 +8,12 @@ Two neighbour graphs are built per step, chosen independently.
 **not recorded in the checkpoint**, so a model rebuilt for inference falls
 back to the `dense` O(N²) builder. `deepmd_lr.ase.load_model` re-resolves it,
 so anything loaded through `load_model` or `LongRangeCalculator` gets `nv`
-again; a model you rebuild by hand does not. That gap is the 48.2 GB / 724 ms
-versus 4.0 GB / 201 ms difference described under
-[Running MD over partitions](partitioned-md.md#limits).
+again; a model you rebuild by hand does not. On the 6520-atom LiFSI frame
+that gap is **48.2 GB and 724 ms** for `dense` against **4.0 GB and 201 ms**
+for `nv`, at a bit-identical energy -- and 48 GB does not fit on a 48 GB card,
+which is how it first showed up, as an out-of-memory. `load_model` uses
+DeePMD-kit's own `resolve_neighbor_graph_method("auto", device)`, so CPU or a
+missing nvalchemiops degrades to `dense` instead of raising.
 
 **The charge head's**, which this package owns, comes from
 `build_neighbor_graph_fast`. With `method="auto"` it uses the cell list when
@@ -47,5 +50,17 @@ without nvalchemiops, `auto` always yields `dense` rather than raising.
 Computing the virial does **not** force the dense builder. The strain is
 applied to the finished edge vectors rather than to the coordinates and cell,
 so the derivative never flows through the box — which is what lets the O(N)
-builder be used on the charge graph at all.
+builder be used on the charge graph at all. That matters because only `dense`
+carries a cell derivative: measured `d(edge_vec)/d(box)` is 1932.8 for
+`dense` and **6.7e-13** for `nv`, while `ase` and `vesin` raise. `nv`
+returning round-off rather than an error is the dangerous part -- forces stay
+correct and a virial that leaned on it would go silently wrong. Straining the
+edge vectors is exact (an edge vector is `coord[j] + S·box − coord[i]`, every
+term of which transforms by the same `(I+ε)ᵀ`) and cost **8.3 GB and 0.92 s
+per step**, against 63 GB and 3.0 s when the derivative routed through the box.
+
+Only the *search* is taken from nvalchemiops: its edge vectors come out of a
+Warp kernel with no gradient, so they are discarded and DeePMD-kit's
+`neighbor_graph_from_ijs` recomputes `edge_vec` from `coord`/`box`. Using the
+kernel's vectors directly would produce a model with no forces.
 

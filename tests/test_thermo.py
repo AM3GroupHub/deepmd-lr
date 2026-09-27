@@ -72,6 +72,26 @@ class TestMeasurements:
         expected = np.trace(kinetic + np.asarray(ev.virial)) / (3 * ev.volume)
         assert th.pressure == pytest.approx(expected, rel=1e-8)
 
+    def test_reading_a_measurement_leaves_the_kernel_inputs_alone(self):
+        """Logging reads these getters, and the NPT thermostat and barostat
+        read `ke_w` and `press_w`. A getter that refreshed those buffers let
+        turning logging on change the trajectory: the next barostat half-step
+        saw the logger's pressure instead of the integrator's."""
+        ev, pos = setup(compute_virial=True)
+        th = Thermo(ev, pos, temperature=300.0)
+        th.evaluate()
+        th.update_kinetic_energy()
+        th.update_pressure()
+        ke_w, press_w = th.ke_w.numpy().copy(), th.press_w.numpy().copy()
+        ke = th.kinetic_energy
+        wp.to_torch(th.velocities).mul_(1.1)            # as a velocity kick does
+        assert th.kinetic_energy == pytest.approx(1.21 * ke, rel=1e-10)
+        _ = th.temperature, th.pressure, th.total_energy
+        np.testing.assert_array_equal(th.ke_w.numpy(), ke_w)
+        np.testing.assert_array_equal(th.press_w.numpy(), press_w)
+        th.update_kinetic_energy()                       # the explicit refresh
+        assert float(th.ke_w.numpy()[0]) == pytest.approx(1.21 * ke, rel=1e-10)
+
     def test_pressure_without_the_virial_is_refused(self):
         ev, pos = setup()
         th = Thermo(ev, pos, temperature=300.0)

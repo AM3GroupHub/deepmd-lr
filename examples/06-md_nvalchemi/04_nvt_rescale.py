@@ -4,8 +4,7 @@ The bluntest thermostat there is -- multiply every velocity by
 `sqrt(T_target / T_now)`. It samples no correct ensemble and destroys the
 dynamics, so never use it for production. It is genuinely useful for one
 thing: dragging a badly prepared structure to temperature before handing it to
-a real thermostat, which is exactly what the lattice these examples build
-needs.
+a real thermostat.
 
 `velocity_rescale` takes the scale factor, not a temperature, so the policy is
 yours -- here, rescale only when the drift exceeds a tolerance.

@@ -24,31 +24,14 @@ from typing import Any
 __all__ = [
     "EMA_DEFAULTS",
     "apply_ema_default",
-    "has_long_range_model",
     "install",
 ]
 
 #: Required enable flag and default decay.
 EMA_DEFAULTS: dict[str, Any] = {"enable_ema": True, "ema_decay": 0.999}
 
-_MODEL_TYPE = "dp_lr"
 # DeePMD-kit: "training.enable_ema currently only supports training.zero_stage < 2".
 _ZERO_STAGE_LIMIT = 2
-
-
-def has_long_range_model(model_config: Any) -> bool:
-    """True when the model, or any ``model_dict`` branch, is ``dp_lr``."""
-    if not isinstance(model_config, dict):
-        return False
-    if model_config.get("type") == _MODEL_TYPE:
-        return True
-    branches = model_config.get("model_dict")
-    if not isinstance(branches, dict):
-        return False
-    return any(
-        isinstance(branch, dict) and branch.get("type") == _MODEL_TYPE
-        for branch in branches.values()
-    )
 
 
 def apply_ema_default(config: dict[str, Any]) -> dict[str, Any]:

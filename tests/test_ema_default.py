@@ -10,7 +10,6 @@ import pytest
 from deepmd_lr.ema_default import (
     EMA_DEFAULTS,
     apply_ema_default,
-    has_long_range_model,
 )
 
 SINGLE = {
@@ -37,13 +36,6 @@ PLAIN = {
     "model": {"type": "standard", "type_map": ["H", "O"]},
     "training": {"numb_steps": 1000},
 }
-
-
-def test_detects_dp_lr_in_single_and_multi_branch_configs():
-    assert has_long_range_model(SINGLE["model"])
-    assert has_long_range_model(MULTI["model"])
-    assert not has_long_range_model(PLAIN["model"])
-    assert not has_long_range_model(None)
 
 
 def test_sets_defaults_for_ordinary_and_lr_models():

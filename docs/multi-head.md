@@ -26,8 +26,8 @@ tensors, so one optimizer step updates the backbone for all of them.
 charge head. That is the right default when the branches are different levels
 of theory — the charges genuinely differ — but it does mean the branches are
 only tied through the backbone. When the branches are the *same* theory and
-differ only in boundary condition, see [`same_as`](same-as.md#one-theory-two-boundaries-same_as)
-below, which ties everything instead.
+differ only in boundary condition, see [`same_as`](same-as.md#one-theory-two-boundaries-same_as),
+which ties everything instead.
 
 DPA4C supports `shared_level: 0` only (share everything). It also checks that
 the structural parameters match *exactly* — `rcut`, `channels`, `lmax`,

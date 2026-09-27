@@ -67,9 +67,11 @@ def test_edge_vec_is_differentiable():
 def test_auto_agrees_with_the_oracle_on_both_sides_of_the_crossover(periodic):
     """`auto` switches backend by size; the graph must not switch with it.
 
-    With a cell the GPU cell list wins at every measured size, so the
-    periodic threshold is 0. Without one, a partition's dense search has no
-    ghost images to materialise and stays cheaper to about a thousand atoms.
+    Without a cell a partition's dense search has no ghost images to
+    materialise and stays cheaper to about a thousand atoms, so the two frames
+    here, 96 and 1,536 atoms, straddle the crossover. With a cell the GPU cell
+    list wins at every measured size, the threshold is 0, and both frames take
+    the cell list.
     """
     threshold = CELL_LIST_MIN_ATOMS_PBC if periodic else CELL_LIST_MIN_ATOMS_FREE
     for n_mol, box in [(32, 18.0), (512, 44.0)]:
