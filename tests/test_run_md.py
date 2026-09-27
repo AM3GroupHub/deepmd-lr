@@ -191,6 +191,8 @@ def test_bad_input_exits_1_with_a_message(inputs, tmp_path, capsys):
     assert run(inputs, tmp_path / "e", "--ensemble", "npt",
                "--efield", "0.1", "0", "0") == 1
     assert "--efield needs --ensemble nvt" in capsys.readouterr().err
+    assert run(inputs, tmp_path / "s", "--pair-skin", "-1") == 1
+    assert "--pair-skin must be 'auto' or a non-negative" in capsys.readouterr().err
     assert run(inputs, tmp_path / "b", "--barostat", "full") == 1
     assert "--barostat applies to --ensemble npt or nph" in capsys.readouterr().err
     assert run(inputs, tmp_path / "b2", "--ensemble", "npt", "--steps", "2") == 0

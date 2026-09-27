@@ -6,8 +6,8 @@ Epot + Ekin + P V + W |eps_dot|^2 / 2 -- the check that the barostat is
 integrated right, as NVE's total energy is for velocity Verlet.
 
 As for NPT, the barostat needs the **virial**, `--cell` picks what the cell
-may do, and the new cell is pushed to the evaluator every step, which
-repartitions. The barostat mass W = 3N kT tau_P^2 still needs a temperature:
+may do, and the new cell is pushed to the evaluator every step, whose
+partitions follow it. The barostat mass W = 3N kT tau_P^2 still needs a temperature:
 the atoms' own at the start, unless `temperature_K` is given.
 
 With no thermostat and no field, nothing here is first order: halving dt

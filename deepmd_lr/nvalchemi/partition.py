@@ -70,12 +70,18 @@ class Partition:
         unwrapped. Both shifts are relative to those coordinates: a node sits
         at ``coord[atom] + shift``, folded into the cell, however far the atom
         itself has wandered.
+    ghost_image, owned_image
+        The integer lattice vectors behind the shifts, ``shift = image @ cell``.
+        With them :meth:`set_cell` moves the nodes to a deformed cell without
+        repartitioning; a barostat deforms it a little every step.
     """
 
     owned: np.ndarray
     ghost: np.ndarray
     ghost_shift: np.ndarray
     owned_shift: np.ndarray | None = None
+    ghost_image: np.ndarray | None = None
+    owned_image: np.ndarray | None = None
     #: Device-resident index tensors, built once per device (see :meth:`views`).
     _views: dict = field(default_factory=dict, repr=False, compare=False)
 
@@ -102,6 +108,30 @@ class Partition:
 
     def types(self, atype: np.ndarray) -> np.ndarray:
         return np.concatenate([atype[self.owned], atype[self.ghost]])
+
+    def set_cell(self, cell: np.ndarray) -> None:
+        """Re-express the node shifts in a new cell, keeping the nodes.
+
+        The nodes stay the same atoms and lattice images; only their Cartesian
+        offsets follow the cell, host copies and cached device views alike.
+        Whether the halo still covers every neighbour after the change is the
+        caller's to judge: the evaluator's Verlet bound counts the cell's
+        change as well as the atoms'.
+        """
+        if self.ghost_image is None or self.owned_image is None:
+            raise ValueError(
+                "this partition carries no lattice images; rebuild it for the "
+                "new cell instead"
+            )
+        cell = np.asarray(cell, dtype=np.float64).reshape(3, 3)
+        self.ghost_shift = self.ghost_image @ cell
+        self.owned_shift = self.owned_image @ cell
+        for v in self._views.values():
+            if isinstance(v, dict) and "ghost_image" in v:
+                shift = v["shift"]
+                h = torch.as_tensor(cell, dtype=shift.dtype, device=shift.device)
+                shift.copy_(v["ghost_image"] @ h)
+                v["owned_shift"].copy_(v["owned_image"] @ h)
 
     def views(self, device, dtype=torch.float64) -> dict:
         """This partition's index tensors on ``device``, built once and cached.
@@ -133,8 +163,33 @@ class Partition:
                     device=dev,
                 ),
             }
+            if self.ghost_image is not None and self.owned_image is not None:
+                for name, image in (
+                    ("ghost_image", self.ghost_image),
+                    ("owned_image", self.owned_image),
+                ):
+                    v[name] = torch.as_tensor(
+                        np.asarray(image).reshape(-1, 3), dtype=dtype, device=dev
+                    )
             self._views[key] = v
         return v
+
+    def pairs_on(self, device) -> dict | None:
+        """This partition's cached pair list on ``device``, if one is live.
+
+        Built by :func:`~deepmd_lr.nvalchemi.driver.partition_graph` at
+        ``rcut`` plus a skin and filtered to ``rcut`` every step; the
+        evaluator drops it (:meth:`drop_pairs`) once the atoms or the cell
+        have moved far enough to invalidate it.
+        """
+        return self._views.get(("pairs", str(torch.device(device))))
+
+    def store_pairs(self, device, pairs: dict) -> None:
+        self._views[("pairs", str(torch.device(device)))] = pairs
+
+    def drop_pairs(self) -> None:
+        for key in [k for k in self._views if isinstance(k, tuple) and k[0] == "pairs"]:
+            del self._views[key]
 
     def types_on(self, atype: np.ndarray, device) -> torch.Tensor:
         """Node types on ``device``, cached (the type of an atom never changes)."""
@@ -403,7 +458,9 @@ def partition_system(
     # folded positions, and the nodes are expressed back relative to the
     # coordinates handed in -- `owned_shift` and `ghost_shift` -- so callers
     # keep integrating unwrapped positions and nothing else changes.
-    image = np.where(np.asarray(pbc, dtype=bool), np.floor(coord @ inverse), 0.0)
+    image = np.where(
+        np.asarray(pbc, dtype=bool), np.floor(coord @ inverse), 0.0
+    ).astype(np.int64)
     fold = image @ cell
     coord = coord - fold
     # Assign owners on a grid of blocks, `decomposition_grid` pieces per axis.
@@ -445,8 +502,8 @@ def partition_system(
     shifts = _image_shifts(cell, pbc, halo)
     offsets = shifts @ cell
     images = (coord[None, :, :] + offsets[:, None, :]).reshape(-1, 3)
+    # Image `i` is atom `i % n_atoms` under lattice shift `shifts[i // n_atoms]`.
     image_atom = np.tile(np.arange(n_atoms), len(shifts))
-    image_shift = np.repeat(offsets, n_atoms, axis=0)
     # Fractional coordinates of every image, and how far a Euclidean step of
     # `halo` can move each fractional coordinate: the distance between the
     # planes f_j = c and f_j = c + d is d times the cell's perpendicular width
@@ -484,17 +541,22 @@ def partition_system(
             candidates = np.empty(0, dtype=int)
         # Drop the owned atoms' own unshifted copies; a shifted copy of an
         # owned atom is a legitimate ghost when the cell is small.
-        is_self = np.isin(image_atom[candidates], owned) & (
-            np.abs(image_shift[candidates]).sum(axis=1) == 0
+        is_self = np.isin(image_atom[candidates], owned) & np.all(
+            shifts[candidates // n_atoms] == 0, axis=1
         )
         ghosts = candidates[~is_self]
+        # Relative to the coordinates handed in, not the folded ones, and as
+        # integer lattice vectors, so a deformed cell can re-express them.
+        ghost_image = shifts[ghosts // n_atoms] - image[image_atom[ghosts]]
+        owned_image = -image[owned]
         partitions.append(
             Partition(
                 owned=owned,
                 ghost=image_atom[ghosts],
-                # Relative to the coordinates handed in, not the folded ones.
-                ghost_shift=image_shift[ghosts] - fold[image_atom[ghosts]],
-                owned_shift=-fold[owned],
+                ghost_shift=ghost_image @ cell,
+                owned_shift=owned_image @ cell,
+                ghost_image=ghost_image,
+                owned_image=owned_image,
             )
         )
     return partitions

@@ -99,8 +99,8 @@ Each of these has cost a run.
   centre of mass is at rest. The classes remove its motion at start-up (with
   a warning when it was large), and Langevin's `fixcm` keeps it at rest. A
   custom loop has to do the same, or the drift's kinetic energy reads as heat.
-- **NPT needs the virial and repartitions every step.** Reach the density
-  with NPT, then produce with NVT. NPT under a field is refused. A cell
+- **NPT needs the virial.** Reach the density with NPT, then produce with
+  NVT. NPT under a field is refused. A cell
   relaxation (`FIRE2(..., relax_cell="isotropic")`) reaches the zero-kelvin
   density far faster, and needs the virial too.
 - **Relax a liquid's cell isotropically.** A liquid has no shear stiffness, so

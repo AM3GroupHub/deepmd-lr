@@ -164,15 +164,17 @@ affected.
 
 `DistributedEvaluator` partitions the atoms against its cell, and NPT moves
 the cell every step. So after the barostat runs, the NPT and NPH classes push
-the new cell to the evaluator (`Thermo.set_cell`), which invalidates the
-partitioning.
+the new cell to the evaluator (`Thermo.set_cell`). The partitions keep their
+nodes -- the same atoms and lattice images -- and re-express the images'
+offsets in the new cell. The evaluator's Verlet bound counts the cell's change
+as well as the atoms', so they rebuild only once either has moved enough.
 
-This is **correctness, not caching**. The Verlet criterion that decides when to
-rebuild watches *atom displacement only* and cannot see the cell move, so a
-stale halo would put ghost images at the wrong offsets, and the forces would
-be quietly wrong with nothing raising. It re-runs `partition_system` only;
-the model is never copied again. The price is a repartition every step: reach
-the density with NPT, then produce with NVT.
+This is **correctness, not caching**. A halo left as it was built for the old
+cell would put ghost images at the wrong offsets, and the forces would be
+quietly wrong with nothing raising. Until the bound counted the cell, the only
+safe answer was to repartition every step: at 12,288 water atoms that made NPT
+75 % slower than NVT. Now it costs about what NVT does. Reach the density with
+NPT, then produce with NVT.
 
 The barostat needs the virial, since it is driven by the pressure tensor. It
 costs a strain leaf per partition and an extra target in the charge-response
@@ -235,29 +237,31 @@ Whether it pays depends on where a step spends its time -- see
 Every script ends with `md.performance()`:
 
 ```
-  192 atoms, dt 0.5 fs: 32.7 ms/step -> 1.320 ns/day
+  192 atoms, dt 0.5 fs: 17.1 ms/step -> 2.526 ns/day
 ```
 
 `ns/day` scales with the timestep, so it is a statement about *this run's* `dt`
 and not about the model alone — at 1 fs the same model doubles it.
 
 The first logged interval is excluded, because it carries kernel compilation:
-~1 s against a ~30 ms step here. Fitting through that point is not enough — a
+~1 s against a ~17 ms step here. Fitting through that point is not enough — a
 least-squares slope over all points still lands 2× high — so it is dropped
 outright.
 
 It measures the run as it actually went, the log included. Logging every step
 means a device synchronisation every step, and any `extra_columns` or observer
-runs at its own interval too. Measured on this machine, 192 atoms at 0.5 fs:
+runs at its own interval too. Measured on one GB10, 192 atoms at 0.5 fs, a
+trained water model uncompressed, median of three runs (this machine is
+shared, and single runs scatter by about 20 %):
 
 | | ms/step | ns/day |
 |---|---:|---:|
-| NVE, NVT (all three thermostats) | 32.7–33.8 | ~1.29 |
-| NPT | 38.3 | 1.13 |
-| NVT + field | 44.9 | 0.96 |
+| NVE, NVT (Langevin, Nosé–Hoover, rescaling) | 16.8–17.5 | ~2.5 |
+| NPT, NPH | 19.2–19.7 | ~2.2 |
+| NVT + field | 20.7 | 2.09 |
 
-NPT pays for repartitioning every step as the cell moves; the field pays for
-the extra backward pass Born charges need. Both match the costs in
+NPT pays for the virial and the barostat; the field pays for the extra
+backward pass Born charges need. Both match the costs in
 [Cost](../../docs/cost.md).
 
 ## What these runs are not

@@ -1213,7 +1213,8 @@ class _MTKBarostat(MolecularDynamics):
       cell independently, ``"full"`` moves all nine entries. The strain rate is
       driven by the pressure tensor, which is symmetric, so the cell never
       rotates. After each move ``Thermo.set_cell`` pushes the cell to the
-      evaluator, which repartitions: correct, and a cost paid every step.
+      evaluator, whose partitions follow it and rebuild only once the cell
+      or the atoms have moved enough.
     - **Conventions.** nvalchemiops' cell update, h + dt eps_dot h, reads the
       columns of h as the lattice vectors, where ASE's cell has them as rows,
       so the kernels get the transpose. For an isotropic eps_dot the two

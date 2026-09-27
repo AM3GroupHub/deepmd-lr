@@ -125,9 +125,10 @@ algorithms, at 192 and at 12,288 atoms alike (to 0.05 eV/Å and 0.01 GPa):
 | `FIRE` | 750 | 610 | 740 |
 | `FIRE2`, cell force ÷ N | 1000 | 1480 | 1570 |
 
-The new cell goes to the evaluator every step, which repartitions, as NPT
-does. An MD object built before the relaxation then refuses to step, because
-the cell it knew has moved. Build it from the relaxed `atoms`.
+The new cell goes to the evaluator every step, as under NPT; the partitions
+follow it without a rebuild (below). An MD object built before the
+relaxation then refuses to step, because the cell it knew has moved. Build it
+from the relaxed `atoms`.
 
 The units are exactly ASE's: `timestep` in ASE time (`0.5 * units.fs`),
 `friction` in 1/ASE time, `tdamp` and `pdamp` in ASE time, `pressure_au` in
@@ -379,6 +380,41 @@ once atoms have moved far enough to threaten it (the Verlet criterion,
 of 40, with results identical to rebuilding every step. `repartition_every=1`
 forces a rebuild each step; it changes timing, never results — there is a test
 asserting exactly that.
+
+**A changing cell keeps the partitioning too.** Every node is an atom's folded
+position `f_i = r_i − n_i H` plus a lattice shift `S H`, and each partition
+keeps `n_i` and `S` as integers. `set_cell` re-expresses the shifts in the
+new cell, and the Verlet bound counts what the cell's change does to a node:
+each atom's motion in its folded frame, `Δr_i − n_i ΔH`, plus
+`(max|S| + √3) ‖ΔH‖` for the ghosts and the images just outside the halo.
+With the cell fixed that is the raw displacement, as before. Before this,
+`set_cell` threw the partitioning away, so NPT repartitioned at every step:
+66 against 38 ms/step for NVT at 12,288 water atoms, 154 against 97 at
+41,472. It now rebuilds when the atoms or the cell have moved enough, about
+as often as NVT does.
+
+### Reusing each partition's neighbour search
+
+Every step each partition used to search its nodes for pairs within `rcut`
+afresh and sort the edges twice for the compressed kernel's CSR views: half
+of every evaluation at 12,288 atoms and up (27 % search, 23 % sorting). Each
+partition now keeps a pair list searched at `rcut + pair_skin`, sorted by
+centre. Every step filters it to `rcut` and derives both CSR views from
+prefix sums, with no search and no sort, until some node may have moved
+`pair_skin / 2`. `pair_skin="auto"` is 1 Å, capped by the halo's skin, and
+`pair_skin=0` searches every step. The edge set is the fresh search's (a
+test compares them, and the CSR against `attach_edge_csr`). Only the edge
+order differs, which moves results by summation-order rounding. With the
+float32 water model, 200 steps of NVE drifted 1.6e-6 Å from the fresh-search
+run, against 1.2e-6 Å between two fresh-search runs.
+
+Both together, compressed water on one GB10, ms/step:
+
+| atoms | NVT, search every step | NVT | NPT, repartitioning every step | NPT |
+|---:|---:|---:|---:|---:|
+| 192 | 13.1 | 10.6 | 14.7 | 12.9 |
+| 12,288 | 35.6 | 24.9 | 66.3 | 26.9 |
+| 41,472 | 97.0 | 67.9 | 154.5 | 70.4 |
 
 ### The knob that decides multi-GPU scaling
 

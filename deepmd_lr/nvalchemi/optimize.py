@@ -33,7 +33,8 @@ saw -- so relax first.
 The target is ``pressure_au`` (eV/A^3, e.g. ``1e-4 * units.GPa``), and
 ``run(smax=...)`` says how close the stress must come to it. The evaluator must
 compute the virial (``evaluator.set_compute_virial(True)``), and the new cell is
-pushed to it every step, which repartitions.
+pushed to it every step; the partitions follow it, rebuilding only once the
+cell or the atoms have moved enough.
 
 This follows nvalchemiops' variable-cell FIRE example
 (``examples/dynamics/07_fire_variable_cell``): the cell joins the atoms in one

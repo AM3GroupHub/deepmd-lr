@@ -14,8 +14,8 @@ for water; `full` is for crystals.
 What the class does that a hand-written loop has to get right (see
 `07_custom_loop.py` for the loop itself):
 - **The cell.** After the barostat moves the cell it is pushed to the
-  evaluator, which repartitions. Correct, and a cost paid every step: reach
-  the density here, then produce in NVT.
+  evaluator. Its partitions follow the cell and rebuild only once the cell or
+  the atoms have moved enough; reach the density here, then produce in NVT.
 - **Fresh inputs.** The kinetic energy and pressure are refreshed right before
   every barostat/thermostat half-step.
 - **Degrees of freedom.** The kernels count 3N - 3.
