@@ -60,8 +60,10 @@ the model first.
 - `test_ase_calculator.py`, `test_review_regressions.py` — the ASE calculator
   against the model, its pbc guards and export refusal, and NVE drift.
 - `test_nvalchemi.py` — the partitioner and halo (including unwrapped
-  coordinates), the skin rules and memory probe, the device gather, the gathered long-range term and virial, and
-  `DistributedEvaluator`.
+  coordinates), the skin rules and memory probe, the device gather, the
+  gathered long-range term and virial, and `DistributedEvaluator`, whose
+  reused partitions (across cell changes) and cached pair lists must match a
+  fresh evaluation at every call.
 - `test_thermo.py` — `Thermo`'s measurements, warp aliasing, cell sync, and
   the guards that make one evaluator safe to share (`fresh`,
   `cell_is_current`, `set_state`).
@@ -81,7 +83,8 @@ the model first.
   `test_compress_atomic_state.py`, `test_compress_required.py` — compressed
   DPA4C inference: every refusal, the graph-lower guard, argument validation,
   state left intact by a failed compression, and, with the operator, kernel
-  dispatch and compressed-vs-uncompressed agreement.
+  dispatch, compressed-vs-uncompressed agreement, and the cached pair lists'
+  CSR driving the kernel to the fresh search's answer.
 
 **Plumbing**
 

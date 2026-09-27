@@ -163,15 +163,20 @@ class TestAliasing:
 
 
 class TestCell:
-    def test_set_cell_invalidates_the_partitioning(self):
-        """`_needs_rebuild` watches atom displacement only and cannot see the
-        cell move, so nothing else would notice a stale halo."""
-        ev, pos = setup(compute_virial=True)
+    def test_set_cell_keeps_the_partitioning_while_the_halo_holds(self):
+        """A small deformation re-expresses the nodes and repartitions nothing;
+        a large one fails the Verlet bound and rebuilds at the next call. (No
+        memory probe: its first step rebuilds on purpose, at the fitted skin.)"""
+        ev, pos = setup(compute_virial=True, memory_headroom=None)
         th = make_thermo(ev, pos)
         th.evaluate()
-        assert ev._partitions is not None
-        th.set_cell(np.asarray(ev.cell) * 1.01)
-        assert ev._partitions is None
+        kept, rebuilds = ev._partitions, ev.rebuild_count
+        th.set_cell(np.asarray(ev.cell) * 1.0005)
+        th.evaluate()
+        assert ev._partitions is kept and ev.rebuild_count == rebuilds
+        th.set_cell(np.asarray(ev.cell) * 1.1)
+        th.evaluate()
+        assert ev._partitions is not kept and ev.rebuild_count == rebuilds + 1
 
     def test_set_cell_syncs_volume_and_evaluator(self):
         ev, pos = setup(compute_virial=True)

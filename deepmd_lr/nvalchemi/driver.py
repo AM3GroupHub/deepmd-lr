@@ -35,6 +35,10 @@ import torch
 from deepmd.dpmodel.utils.neighbor_graph.csr import (
     attach_edge_csr,
 )
+from deepmd.dpmodel.utils.neighbor_graph.graph import (
+    NeighborGraph,
+    pad_and_guard_edges,
+)
 
 from deepmd_lr.born import (
     edge_born_response,
@@ -192,6 +196,73 @@ def partition_charges(model, graph, node_type, n_owned: int, charge_spin=None):
     return raw.reshape(-1)[:n_owned]
 
 
+def _build_pairs(coord: torch.Tensor, node_type, cutoff: float, n_owned: int) -> dict:
+    """One partition's Verlet list: every (neighbour, owned centre) pair
+    within ``cutoff``, sorted by centre, with the order grouping it by
+    neighbour. A centre-sorted list makes each step's filtered edges
+    centre-major, so their CSR views come from prefix sums, never a sort."""
+    g = build_neighbor_graph_fast(coord, node_type, None, cutoff)
+    keep = g.edge_mask & (g.edge_index[1] < n_owned)
+    src, dst = g.edge_index[0][keep], g.edge_index[1][keep]
+    order = torch.argsort(dst, stable=True)
+    src, dst = src[order].contiguous(), dst[order].contiguous()
+    return {"src": src, "dst": dst, "by_src": torch.argsort(src, stable=True)}
+
+
+def _graph_from_pairs(
+    pairs: dict, coord: torch.Tensor, rcut: float, n_node: int, with_csr: bool
+) -> NeighborGraph:
+    """This step's graph from a cached pair list: the pairs within ``rcut``,
+    in the layout DeePMD-kit's builders emit -- real edges, then two masked
+    guard edges -- with ``edge_vec`` differentiable in ``coord``.
+
+    With ``with_csr`` the destination and source views are attached from the
+    cached orders. They equal what ``attach_edge_csr`` would compute from this
+    payload (a test pins that), without its two stable sorts.
+    """
+    x = coord.reshape(-1, 3)
+    src, dst = pairs["src"], pairs["dst"]
+    # Which pairs are in range, without a gradient; then the differentiable
+    # vectors of those alone, so the force backward is as small as a fresh
+    # search's rather than the whole skin list's.
+    with torch.no_grad():
+        d = x[src] - x[dst]
+        keep = (d * d).sum(dim=1) < rcut * rcut
+    idx = keep.nonzero().squeeze(1)
+    real_index = torch.stack([src[idx], dst[idx]])
+    vec = x[real_index[0]] - x[real_index[1]]  # r_src - r_dst, NeighborGraph's sign
+    edge_index, edge_vec, edge_mask = pad_and_guard_edges(real_index, vec, None)
+    n_real, device = idx.shape[0], x.device
+    csr = {}
+    if with_csr:
+        zero = torch.zeros(1, dtype=torch.int64, device=device)
+        guards = torch.arange(n_real, edge_index.shape[1], device=device)
+
+        def row_ptr(ends):
+            counts = torch.bincount(ends, minlength=n_node)
+            return torch.cat([zero, torch.cumsum(counts, 0)])
+
+        new_position = torch.cumsum(keep, 0) - 1
+        by_src = pairs["by_src"]
+        csr = {
+            "destination_order": torch.arange(
+                edge_index.shape[1], dtype=edge_index.dtype, device=device
+            ),
+            "destination_row_ptr": row_ptr(real_index[1]),
+            "source_order": torch.cat(
+                [new_position[by_src[keep[by_src]]], guards]
+            ).to(edge_index.dtype),
+            "source_row_ptr": row_ptr(real_index[0]),
+        }
+    return NeighborGraph(
+        n_node=torch.tensor([n_node], dtype=torch.int64, device=device),
+        edge_index=edge_index,
+        edge_vec=edge_vec,
+        edge_mask=edge_mask,
+        **csr,
+    )
+
+
 def partition_graph(
     part: Partition,
     coord: np.ndarray,
@@ -201,6 +272,8 @@ def partition_graph(
     dtype=torch.float64,
     requires_grad: bool = False,
     strain: torch.Tensor | None = None,
+    pair_skin: float = 0.0,
+    with_csr: bool = False,
 ):
     """Build one partition's neighbour graph, keeping only owned destinations.
 
@@ -233,6 +306,16 @@ def partition_graph(
     ``coord`` may be a device tensor or a numpy array; either way the node
     set is gathered on ``device`` with :meth:`Partition.views`, never
     concatenated on the host.
+
+    With ``pair_skin`` the search runs once, at ``rcut + pair_skin``, and is
+    cached on the partition (:meth:`Partition.pairs_on`); every later call
+    only filters the cached pairs to ``rcut``. The caller keeps the list
+    honest by dropping it once any node may have moved ``pair_skin / 2`` --
+    :class:`~deepmd_lr.nvalchemi.evaluator.DistributedEvaluator` does. At
+    12,288 water atoms that turned 19.4 ms of search and CSR into 3.6.
+
+    ``with_csr`` attaches the destination/source CSR views the compressed
+    kernel needs, after the ownership mask.
     """
     # One gather, on the device: owned nodes plus ghosts shifted into place,
     # taken from the global coordinate tensor with this partition's cached
@@ -254,10 +337,27 @@ def partition_graph(
         if strain is None
         else torch.bmm(node_coord, strain.transpose(-1, -2).unsqueeze(0))
     )
-    graph = build_neighbor_graph_fast(search_coord, node_type, None, rcut)
+    if pair_skin > 0:
+        pairs = part.pairs_on(device)
+        if pairs is None:
+            pairs = _build_pairs(
+                search_coord.detach(), node_type, rcut + pair_skin, part.n_owned
+            )
+            part.store_pairs(device, pairs)
+        graph = _graph_from_pairs(pairs, search_coord, rcut, part.n_node, with_csr)
+        return graph, node_type.reshape(-1), node_coord
 
+    graph = build_neighbor_graph_fast(search_coord, node_type, None, rcut)
     owned_dst = graph.edge_index[1] < part.n_owned
     graph.edge_mask = graph.edge_mask & owned_dst
+    if with_csr:
+        # AFTER the ownership mask: `build_edge_csr` routes masked edges into
+        # a padding segment using the mask it is shown, so attaching inside
+        # the builder would leave ghost-destination edges in owned rows.
+        # `canonicalize=False` leaves `edge_vec` the very tensor the search
+        # produced, so the charge-response backward still reaches
+        # `node_coord` through it.
+        graph = attach_edge_csr(graph, part.n_node)
     return graph, node_type.reshape(-1), node_coord
 
 
@@ -276,6 +376,7 @@ def evaluate_partitioned(
     charge_spin: torch.Tensor | tuple[float, float] | None = None,
     compute_born: bool = False,
     eps_inf: float = 1.0,
+    pair_skin: float = 0.0,
 ) -> dict[str, Any]:
     """Run ``model`` over spatial partitions and assemble the global result.
 
@@ -303,6 +404,11 @@ def evaluate_partitioned(
         ``q~_i q~_j / (4 pi eps_0 eps_inf r)``. Energies and forces are
         evaluated with the model's own charges and are unchanged. ``1.0`` is
         vacuum. See :func:`deepmd_lr.born.screening_factor`.
+    pair_skin
+        Reuse each partition's cached pair list, searched at ``rcut +
+        pair_skin`` (see :func:`partition_graph`). ``0``, the default, searches
+        afresh; only a caller that tracks displacement between calls -- the
+        evaluator -- can promise the list is still complete.
     Returns
     -------
     dict
@@ -384,6 +490,7 @@ def evaluate_partitioned(
             if compute_virial:
                 eps, strain = _symmetric_strain(dtype, device)
             # `requires_grad` only when the charge-response backward will need it.
+            # The compressed kernel needs the destination CSR views.
             graph, node_type, node_coord = partition_graph(
                 part,
                 coord_on[torch.device(device)],
@@ -393,18 +500,10 @@ def evaluate_partitioned(
                 dtype,
                 requires_grad=long_range,
                 strain=strain,
+                pair_skin=pair_skin,
+                with_csr=_is_compressed(local),
             )
             n_node, n_local = part.counts_on(device)
-
-            if _is_compressed(local):
-                # The compressed kernel needs the destination CSR views, attached
-                # AFTER the ownership mask: `build_edge_csr` routes masked edges
-                # into a padding segment using the mask it is shown, so attaching
-                # inside the builder would leave ghost-destination edges in owned
-                # rows. `canonicalize=False` leaves `edge_vec` the very tensor the
-                # search produced, so the charge-response backward below still
-                # reaches `node_coord` through it.
-                graph = attach_edge_csr(graph, part.n_node)
             # The model's own capture context: it records the backbone output the
             # charge head reuses, and it is what permits the graph lower -- any
             # caller outside one would be reporting the short-range energy alone.

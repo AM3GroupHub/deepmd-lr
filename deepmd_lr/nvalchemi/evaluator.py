@@ -72,6 +72,12 @@ __all__ = [
 #: further would trade real speed for nothing.
 MIN_AUTO_SKIN = 0.1
 
+#: The ``"auto"`` pair-list skin, in angstrom. Every step filters the pairs
+#: within ``rcut + skin``, so a wider skin costs each step more and rebuilds
+#: less often. On 12,288 water atoms 1 A turned the step's search and CSR from
+#: 19.4 ms into 3.6, for a 16.5 ms rebuild every few tens of steps.
+AUTO_PAIR_SKIN = 1.0
+
 
 def _is_out_of_memory(exc: BaseException) -> bool:
     """Whether ``exc`` is a device that ran out of memory.
@@ -169,6 +175,13 @@ class DistributedEvaluator:
     repartition_every
         Force a rebuild every N calls regardless. ``None`` uses the skin
         criterion alone, which is exact rather than merely usually right.
+    pair_skin
+        Skin of each partition's cached pair list, in angstrom: the search
+        runs at ``rcut + pair_skin`` only when some node may have moved half
+        of it, and the steps between only filter the cached pairs to ``rcut``
+        (see :func:`~deepmd_lr.nvalchemi.driver.partition_graph`). ``"auto"``
+        is :data:`AUTO_PAIR_SKIN`; either is capped by the halo skin, whose
+        nodes the list pairs. ``0`` searches afresh every step.
     compute_born
         Also assemble Born effective charge tensors, available afterwards as
         ``results["born_charge"]`` with shape ``(natoms, 3, 3)``. The global
@@ -239,6 +252,7 @@ class DistributedEvaluator:
         devices: list[Any],
         skin: float | str = "auto",
         repartition_every: int | None = None,
+        pair_skin: float | str = "auto",
         compute_virial: bool = False,
         compute_born: bool = False,
         efield: Any = None,
@@ -255,6 +269,10 @@ class DistributedEvaluator:
                 raise ValueError(f"skin must be a number or 'auto', got {skin!r}")
         elif skin < 0:
             raise ValueError(f"skin must be non-negative, got {skin}")
+        if pair_skin != "auto" and not (
+            isinstance(pair_skin, (int, float)) and pair_skin >= 0
+        ):
+            raise ValueError(f"pair_skin must be 'auto' or >= 0, got {pair_skin!r}")
         if memory_headroom is not None and not 0.0 < memory_headroom <= 1.0:
             raise ValueError(
                 f"memory_headroom must be in (0, 1], got {memory_headroom}"
@@ -338,6 +356,21 @@ class DistributedEvaluator:
         self._partitions = None
         self._reference_positions = None
         self._calls_since_rebuild = 0
+        #: The halo the current partitions were built with, and the cell and
+        #: per-atom fold images they were built in (see :meth:`_drift`).
+        self._halo_skin = 0.0
+        self._reference_cell = None
+        self._images = None
+        self._reach = 0.0
+        self._pair_skin_setting = (
+            AUTO_PAIR_SKIN if pair_skin == "auto" else float(pair_skin)
+        )
+        #: The pair lists' skin (capped by the halo's), and where they were built.
+        self.pair_skin = 0.0
+        self._pair_reference = None
+        self._pair_reference_cell = None
+        #: Pair-list searches, the ones a repartition forces included.
+        self.pair_rebuild_count = 0
 
         self.rebuild_count = 0
         #: Completed evaluations. Several MD objects may share this evaluator,
@@ -407,23 +440,25 @@ class DistributedEvaluator:
         )
 
     def set_cell(self, cell: Any) -> None:
-        """Replace the cell and invalidate the partitioning.
+        """Replace the cell, keeping the partitioning while it still holds.
 
-        A barostat moves the cell every step, and the partitioning was built
-        against the old one. An ``"auto"`` skin is recomputed here too, since
-        the rule is a function of the cell. Invalidation here is
-        **correctness, not caching**:
-        :meth:`_needs_rebuild` watches atom displacement only and cannot see a
-        cell change, so nothing else would ever notice. A stale halo puts ghost
-        images at the wrong offsets and the forces are quietly wrong -- there
-        is no natural backstop for that, which is why this is unconditional
-        rather than left to the caller's judgement.
+        A barostat deforms the cell a little every step. The partitions keep
+        their nodes -- the same atoms and lattice images -- and re-express the
+        images' offsets in the new cell (:meth:`Partition.set_cell`); the
+        Verlet bound in :meth:`_needs_rebuild` counts the cell's change as well
+        as the atoms', so a small deformation costs no repartition and a large
+        one rebuilds at the next call. Before this, every step of NPT
+        repartitioned: 66 against 38 ms/step at 12,288 water atoms.
+
+        An ``"auto"`` skin is recomputed for the next rebuild, since the rule
+        is a function of the cell; the current halo keeps the skin it was
+        built with. An explicitly chosen skin is the caller's and is left
+        alone.
         """
         self.cell = np.asarray(cell, dtype=np.float64).reshape(3, 3)
-        self._partitions = None
-        self._reference_positions = None
-        # The rule is a function of the cell, so a new cell means a new answer.
-        # An explicitly chosen skin is the caller's and is left alone.
+        if self._partitions is not None:
+            for part in self._partitions:
+                part.set_cell(self.cell)
         if self._skin_is_auto:
             self.skin = self._auto_skin()
 
@@ -446,8 +481,39 @@ class DistributedEvaluator:
         # around each atom's folded position at the last rebuild; a caller that
         # wraps an atom moves it by a lattice vector, and a minimum-image check
         # would call that no motion and keep a halo built around the old image.
-        moved = float((positions - self._reference_positions).norm(dim=1).max())
-        return 2.0 * moved > self.skin
+        drift = self._drift(positions, self._reference_positions, self._reference_cell)
+        return 2.0 * drift > self._halo_skin
+
+    def _drift(
+        self, positions: torch.Tensor, reference: torch.Tensor, reference_cell
+    ) -> float:
+        """How far any node -- or any image that could become one -- may have
+        moved since ``reference``, in angstrom.
+
+        A node is an atom's folded position plus a lattice shift ``S``:
+        ``f_i + S H``, with ``f_i = r_i - n_i H`` and ``n_i`` the fold image
+        of the last rebuild. It moves by ``df_i + S dH``. So the bound is each
+        atom's motion in its folded frame, exactly, plus the largest shift's
+        share of the cell's change -- the ghosts' ``S``, one more lattice step
+        for the images just outside the halo. With the cell unchanged it is the
+        raw displacement.
+        """
+        moved = positions - reference
+        dh = self.cell - reference_cell
+        reach = 0.0
+        if np.any(dh):
+            moved = moved - self._images @ torch.as_tensor(
+                dh, dtype=moved.dtype, device=moved.device
+            )
+            reach = self._reach * float(np.linalg.norm(dh, 2))
+        return float(moved.norm(dim=1).max()) + reach
+
+    def _pairs_stale(self, positions: torch.Tensor) -> bool:
+        """The pair lists' own Verlet criterion, with their own skin."""
+        if self.pair_skin <= 0 or self._pair_reference is None:
+            return False
+        drift = self._drift(positions, self._pair_reference, self._pair_reference_cell)
+        return 2.0 * drift > self.pair_skin
 
     def _rebuild(self, tracked: torch.Tensor) -> None:
         """Re-partition at the current skin and restart the displacement clock."""
@@ -462,6 +528,28 @@ class DistributedEvaluator:
             skin=self.skin,
         )
         self._reference_positions = tracked.clone()
+        self._reference_cell = self.cell.copy()
+        self._halo_skin = self.skin
+        # Every atom is owned once, and its owned node is its fold image undone.
+        images = np.zeros((self.n_atoms, 3))
+        for part in self._partitions:
+            images[part.owned] = -part.owned_image
+        self._images = torch.as_tensor(images, dtype=torch.float64, device=self.home)
+        shifts = [
+            part.ghost_image + images[part.ghost]
+            for part in self._partitions
+            if len(part.ghost)
+        ]
+        widest = max(
+            (float(np.linalg.norm(s, axis=1).max()) for s in shifts), default=0.0
+        )
+        self._reach = widest + np.sqrt(3.0)
+        # New partitions carry no pair lists; the next call searches them.
+        self.pair_skin = min(self._pair_skin_setting, self._halo_skin)
+        self._pair_reference = tracked.clone()
+        self._pair_reference_cell = self.cell.copy()
+        if self.pair_skin > 0:
+            self.pair_rebuild_count += 1
         self._calls_since_rebuild = 0
         self.rebuild_count += 1
 
@@ -579,6 +667,7 @@ class DistributedEvaluator:
                     compute_born=self.compute_born,
                     charge_spin=self.charge_spin,
                     eps_inf=self.eps_inf,
+                    pair_skin=self.pair_skin,
                 )
             except Exception as exc:
                 if not _is_out_of_memory(exc) or not self._skin_is_auto:
@@ -648,6 +737,12 @@ class DistributedEvaluator:
 
         if self._needs_rebuild(tracked):
             self._rebuild(tracked)
+        elif self._pairs_stale(tracked):
+            for part in self._partitions:
+                part.drop_pairs()
+            self._pair_reference = tracked.clone()
+            self._pair_reference_cell = self.cell.copy()
+            self.pair_rebuild_count += 1
         self._calls_since_rebuild += 1
 
         out = self._evaluate(tracked)

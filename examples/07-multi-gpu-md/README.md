@@ -71,5 +71,5 @@ A40s is covered by the library's own multi-GPU validation.
 - **Periodic systems only.** The partitioned evaluator assumes periodicity in
   all three directions, so slabs and molecules in vacuum are not supported by
   this script.
-- **NPT repartitions every step**, so it is slower than NVT. Use it to reach
-  the density, then produce in NVT.
+- **NPT costs a little more than NVT**, for the virial and the barostat. Use
+  it to reach the density, then produce in NVT.

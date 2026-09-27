@@ -78,8 +78,9 @@ ENSEMBLES (--ensemble)
          isotropic (the default) scales it uniformly; orthorhombic moves the
          three lengths of a diagonal cell; full lets the whole cell fluctuate.
          A liquid has no shear stiffness, so keep isotropic for it. The cell
-         moves every step and that forces a repartition every step, so NPT is
-         slower than NVT; equilibrate the density with it, then produce in NVT.
+         moves every step and the partitions follow it. NPT pays for the
+         virial and the barostat, a little more than NVT; equilibrate the
+         density with it, then produce in NVT.
     nph  The MTK barostat alone: constant enthalpy and pressure, no
          thermostat, so the temperature goes where the dynamics take it. The
          log's Econs, the enthalpy, should stay flat. --barostat as for npt;
@@ -176,7 +177,7 @@ FIELD RUNS (--efield EX EY EZ, V/A; NVT only)
 KNOWN LIMITATIONS
     - Positions stay unwrapped (diffusion needs them); deepmd-lr folds them into
       the cell at every halo rebuild, so it does not matter how far atoms drift.
-    - NPT repartitions every step, and a field cannot be combined with NPT.
+    - A field cannot be combined with NPT or NPH (both need the virial).
     - There is no conserved quantity for Langevin, NPT or field runs.
 
 EXIT CODES
@@ -301,6 +302,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     g.add_argument("--skin", default="auto",
                    help="halo skin in A, or 'auto' (sized from the cell, the "
                         "cutoff, the GPU count and the GPU memory)")
+    g.add_argument("--pair-skin", default="auto",
+                   help="skin of each partition's cached pair list in A, or "
+                        "'auto' (1 A, capped by the halo skin); 0 searches the "
+                        "neighbours afresh every step")
     g.add_argument("--memory-headroom", type=float, default=0.8,
                    help="fraction of free GPU memory the auto skin may plan for")
 
@@ -407,6 +412,15 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 def check_args(a: argparse.Namespace) -> None:
     """Refuse combinations that cannot work, before any GPU time is spent."""
+    for name in ("skin", "pair_skin"):
+        value = getattr(a, name)
+        try:
+            ok = value == "auto" or float(value) >= 0
+        except ValueError:
+            ok = False
+        if not ok:
+            raise InputError(f"--{name.replace('_', '-')} must be 'auto' or a "
+                             f"non-negative number of A, not {value!r}")
     if a.efield is not None and a.ensemble != "nvt":
         raise InputError(
             "--efield needs --ensemble nvt: the evaluator refuses a field with "
@@ -501,6 +515,7 @@ def make_evaluator(model, atoms, devices, a: argparse.Namespace):
     kwargs = {
         "devices": devices,
         "skin": "auto" if a.skin == "auto" else float(a.skin),
+        "pair_skin": "auto" if a.pair_skin == "auto" else float(a.pair_skin),
         "memory_headroom": a.memory_headroom,
         "compute_virial": a.ensemble in BAROSTATS,   # the barostat needs it
         "eps_inf": a.eps_inf,
@@ -875,6 +890,7 @@ def summarize(md, ev, a, n, devices) -> dict:
                       f"{md.ns_per_day:.3f} ns/day ({n} atoms on {len(devices)} "
                       "device(s))")
     s["halo"] = (f"skin {ev.skin:.2f} A, {ev.rebuild_count} rebuilds, "
+                 f"{ev.pair_rebuild_count} pair searches (skin {ev.pair_skin:.2f} A), "
                  f"{ev.skin_backoffs} out-of-memory backoffs")
     rows = md.rows
     if len(rows) >= 2:

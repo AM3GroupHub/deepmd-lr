@@ -439,6 +439,34 @@ class TestKernel:
             atol=1e-6,
         )
 
+    @pytest.mark.parametrize("n_part", [1, 2, 4])
+    def test_cached_pairs_feed_the_compressed_kernel(self, n_part):
+        """A partition's cached pair list hands the compressed kernel CSR views
+        made from prefix sums rather than sorts. The first call searches and
+        caches, the second reuses; both give the fresh search's answer."""
+        from deepmd_lr.nvalchemi.partition import partition_system
+
+        model = build32()
+        model.enable_compression()
+        model.compute_born = True
+        coord, atype, cell = frame(n_mol=8, box=12.0)
+        c, a, h = (t[0].cpu().numpy() for t in (coord, atype, cell))
+        parts = partition_system(c, h, float(model.get_rcut()), n_part, skin=1.0)
+
+        def run(pair_skin):
+            return DRV.to_numpy(DRV.evaluate_partitioned(
+                model, c, a, h, n_partitions=n_part, compute_born=True,
+                partitions=parts, pair_skin=pair_skin,
+            ))
+
+        fresh = run(0.0)
+        for _ in range(2):
+            cached = run(0.5)
+            assert abs(cached["energy"] - fresh["energy"]) < 1e-6
+            for key in ("force", "born_charge"):
+                np.testing.assert_allclose(cached[key], fresh[key], atol=1e-6)
+        assert all(part.pairs_on(DEVICE) is not None for part in parts)
+
     def test_a_replica_carries_the_tables(self):
         model = build32()
         model.enable_compression()

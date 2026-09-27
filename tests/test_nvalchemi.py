@@ -1360,3 +1360,122 @@ class TestUnwrappedCoordinates:
         assert spread > 12.0, "the run never reached the regime it guards"
         assert worst <= 1e-5
 
+
+
+class TestReusedNeighbourhoods:
+    """Between calls the evaluator reuses the partitions -- across cell
+    changes too -- and each partition's pair list. Neither may change an
+    answer: every check compares with a fresh evaluation of the same positions
+    and cell, with new partitions and a fresh neighbour search."""
+
+    KEYS = ("energy", "force", "charge", "born_charge", "virial")
+
+    @pytest.fixture(scope="class")
+    def model(self):
+        m = build(long_range=True)
+        m.eval()
+        return m
+
+    @staticmethod
+    def fresh(model, coord, atype, cell, n):
+        return to_numpy(evaluate_partitioned(
+            model, coord, atype, cell, n_partitions=n, devices=[DEVICE] * n,
+            compute_born=True, compute_virial=True,
+        ))
+
+    @staticmethod
+    def reused(ev, coord):
+        energy, forces = ev(torch.as_tensor(coord, device=DEVICE))
+        return {
+            "energy": energy,
+            "force": forces.cpu().numpy().copy(),
+            "charge": np.asarray(ev.results["charge"]).copy(),
+            "born_charge": np.asarray(ev.results["born_charge"]).copy(),
+            "virial": ev.virial.copy(),
+        }
+
+    def assert_same(self, got, want):
+        for key in self.KEYS:
+            np.testing.assert_allclose(got[key], want[key], atol=1e-9, err_msg=key)
+
+    @staticmethod
+    def evaluator(model, atype, cell, n, **kwargs):
+        return DistributedEvaluator(
+            model, atype, cell, devices=[DEVICE] * n, compute_born=True,
+            compute_virial=True, memory_headroom=None, **kwargs,
+        )
+
+    @pytest.mark.parametrize("n", [1, 2, 4])
+    def test_each_kind_of_change_rebuilds_only_what_it_must(self, system, model, n):
+        """A halo of 2 A, pair lists of 0.5 A: a small shear reuses both, a
+        0.3 A step (past half the pair skin) rebuilds the pair lists only,
+        and a 10 % strain repartitions."""
+        coord, atype, cell, *_ = system
+        ev = self.evaluator(model, atype, cell, n, skin=2.0, pair_skin=0.5)
+        x, h = coord.copy(), cell.copy()
+        self.assert_same(self.reused(ev, x), self.fresh(model, x, atype, h, n))
+        counts = (ev.rebuild_count, ev.pair_rebuild_count)
+        shear = np.eye(3)
+        shear[1, 0] = shear[0, 1] = 1e-3
+        h, x = h @ shear, x @ shear
+        ev.set_cell(h)
+        self.assert_same(self.reused(ev, x), self.fresh(model, x, atype, h, n))
+        assert (ev.rebuild_count, ev.pair_rebuild_count) == counts
+        x[3] += [0.3, 0.0, 0.0]
+        self.assert_same(self.reused(ev, x), self.fresh(model, x, atype, h, n))
+        assert (ev.rebuild_count, ev.pair_rebuild_count) == (counts[0], counts[1] + 1)
+        h, x = h * 1.1, x * 1.1
+        ev.set_cell(h)
+        self.assert_same(self.reused(ev, x), self.fresh(model, x, atype, h, n))
+        assert ev.rebuild_count == counts[0] + 1
+
+    @pytest.mark.parametrize("n", PARTITION_COUNTS)
+    def test_a_walk_under_a_barostat_matches_fresh_evaluations(self, system, model, n):
+        """Atoms walk and the cell strains a little every call, as under NPT,
+        with the default skins. Every call matches a fresh evaluation, and the
+        partitions survive the cell's changes."""
+        coord, atype, cell, *_ = system
+        ev = self.evaluator(model, atype, cell, n)
+        rng = np.random.default_rng(1)
+        x, h = coord.copy(), cell.copy()
+        for step in range(10):
+            if step:
+                strain = np.eye(3) + 1e-3 * rng.normal(size=(3, 3))
+                strain = 0.5 * (strain + strain.T)
+                h, x = h @ strain, x @ strain + rng.normal(scale=0.01, size=x.shape)
+                ev.set_cell(h)
+            self.assert_same(self.reused(ev, x), self.fresh(model, x, atype, h, n))
+        assert ev.rebuild_count < 5
+
+    def test_the_cached_graph_is_the_fresh_one(self, system, model):
+        """Same edges as a fresh search, and CSR views equal to what
+        ``attach_edge_csr`` computes from the payload, without its sorts."""
+        from deepmd.dpmodel.utils.neighbor_graph.csr import attach_edge_csr
+
+        coord, atype, cell, *_ = system
+        for part in partition_system(coord, cell, RCUT, 2, skin=1.0):
+            fresh, _, _ = partition_graph(part, coord, atype, RCUT, DEVICE)
+            cached, _, _ = partition_graph(
+                part, coord, atype, RCUT, DEVICE, pair_skin=0.5, with_csr=True
+            )
+            assert part.pairs_on(DEVICE) is not None
+
+            def edges(g):
+                src, dst = (g.edge_index[k][g.edge_mask].tolist() for k in (0, 1))
+                return set(zip(src, dst, strict=True))
+
+            assert edges(cached) == edges(fresh)
+            want = attach_edge_csr(cached, part.n_node)
+            for name in ("destination_order", "destination_row_ptr",
+                         "source_order", "source_row_ptr"):
+                assert torch.equal(getattr(cached, name), getattr(want, name)), name
+            part.drop_pairs()
+            assert part.pairs_on(DEVICE) is None
+
+    def test_no_pair_skin_searches_every_call(self, system, model):
+        coord, atype, cell, *_ = system
+        ev = self.evaluator(model, atype, cell, 2, pair_skin=0)
+        want = self.fresh(model, coord, atype, cell, 2)
+        self.assert_same(self.reused(ev, coord), want)
+        assert ev.pair_skin == 0 and ev.pair_rebuild_count == 0
+        assert all(p.pairs_on(DEVICE) is None for p in ev._partitions)
