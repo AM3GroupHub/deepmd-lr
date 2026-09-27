@@ -15,6 +15,18 @@ DP_CUDA_INFER=1 DEEPMD_LR_REQUIRE_COMPRESS=1 pytest tests/ -q
 `DEEPMD_LR_REQUIRE_COMPRESS=1` turns the kernel skips into failures, so a
 build that silently lost its operator cannot pass.
 
+One slow test is opt-in: 25 ps of water MD, never wrapped, checking every 500
+steps that the partitioned forces match a fresh evaluation of the wrapped
+positions. It needs a trained water checkpoint, takes about 10 minutes
+compressed on one GPU, and runs as
+
+```bash
+DEEPMD_LR_WATER_MODEL=path/to/model.ckpt.pt pytest tests/test_nvalchemi.py -k long_water -s
+```
+
+Add `DEEPMD_LR_WATER_COMPRESS=1` (with the CUDA-operator build) to compress
+the model first.
+
 **The model and its long-range term**
 
 - `test_lr_term.py` — the reciprocal-space term against a hand-written Ewald
@@ -43,8 +55,8 @@ build that silently lost its operator cannot pass.
 
 - `test_ase_calculator.py`, `test_review_regressions.py` — the ASE calculator
   against the model, its pbc guards and export refusal, and NVE drift.
-- `test_nvalchemi.py` — the partitioner and halo, the skin rules and memory
-  probe, the device gather, the gathered long-range term and virial, and
+- `test_nvalchemi.py` — the partitioner and halo (including unwrapped
+  coordinates), the skin rules and memory probe, the device gather, the gathered long-range term and virial, and
   `DistributedEvaluator`.
 - `test_thermo.py` — `Thermo`'s measurements, warp aliasing, cell sync,
   logging and throughput arithmetic.

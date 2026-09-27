@@ -10,6 +10,8 @@ Phase A covers the short-range model; Phase B adds the long-range term,
 gathered onto one device.
 """
 
+import os
+
 import numpy as np
 import pytest
 import torch
@@ -146,6 +148,12 @@ class TestHaloMatchesABallQuery:
         from scipy.spatial import cKDTree
 
         mine = partition_system(coord, cell, rcut, parts, pbc, skin=skin)
+        # The definition applies to the atoms folded into the cell: an image of
+        # an atom is the same atom however far it has wandered, and the nodes
+        # are then expressed back relative to the coordinates handed in.
+        n = np.where(np.asarray(pbc), np.floor(coord @ np.linalg.inv(cell)), 0.0)
+        fold = n @ cell
+        coord = coord - fold
         halo = rcut + skin
         volume = abs(np.linalg.det(cell))
         ranges = []
@@ -169,7 +177,10 @@ class TestHaloMatchesABallQuery:
             )
             ghosts = cand[~self_copy]
             np.testing.assert_array_equal(part.ghost, atom[ghosts])
-            np.testing.assert_array_equal(part.ghost_shift, shift[ghosts])
+            np.testing.assert_array_equal(
+                part.ghost_shift, shift[ghosts] - fold[atom[ghosts]]
+            )
+            np.testing.assert_array_equal(part.owned_shift, -fold[part.owned])
 
     @pytest.mark.parametrize("parts", [1, 2, 3])
     @pytest.mark.parametrize("skin", [0.0, 2.0])
@@ -177,6 +188,13 @@ class TestHaloMatchesABallQuery:
         coord, _atype, cell, *_ = system
         self.reference(np.asarray(coord), np.asarray(cell), RCUT, parts,
                        (True, True, True), skin)
+
+    @pytest.mark.parametrize("parts", [1, 2, 3])
+    def test_unwrapped_box(self, system, parts):
+        """Atoms several cell lengths out, as an integrator leaves them."""
+        coord, _atype, cell, *_ = system
+        moved = TestUnwrappedCoordinates.shifted(np.asarray(coord), np.asarray(cell))
+        self.reference(moved, np.asarray(cell), RCUT, parts, (True, True, True), 2.0)
 
     def test_unwrapped_drifted_coordinates(self, system):
         """MD positions leave the cell; the bounding box must follow them."""
@@ -1162,3 +1180,182 @@ class TestBackboneCapture:
             model, c, a, cl, [DEVICE] * 2, compute_virial=True, force_fallback=True
         )
         assert np.abs(ev_cap.virial - ev_ref.virial).max() < 1e-10
+
+
+class TestUnwrappedCoordinates:
+    """Integrators never wrap, so no result may depend on which periodic image
+    an atom sits in. The halo used to be built from the raw coordinates with
+    only the +-1 images, so atoms that had diffused out through opposite faces
+    silently lost their neighbours: 1.1 eV/A on water at a spread of L + 12 A,
+    and blow-ups after 5-20 ps. Every check compares with the same atoms
+    wrapped into the cell.
+    """
+
+    KEYS = ("energy", "force", "charge", "born_charge", "virial")
+
+    @pytest.fixture(scope="class")
+    def model(self):
+        m = build(long_range=True)
+        m.eval()
+        return m
+
+    @staticmethod
+    def shifted(coord, cell, n_moved=12, seed=0, reach=3):
+        """Random atoms moved by random lattice vectors, up to `reach` cells."""
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(len(coord), n_moved, replace=False)
+        out = np.array(coord, dtype=np.float64, copy=True)
+        out[idx] += rng.integers(-reach, reach + 1, size=(n_moved, 3)) @ cell
+        return out
+
+    def evaluate(self, model, coord, atype, cell, n):
+        return to_numpy(evaluate_partitioned(
+            model, coord, atype, cell, n_partitions=n, devices=[DEVICE] * n,
+            compute_born=True, compute_virial=True,
+        ))
+
+    def assert_same(self, got, want):
+        for key in self.KEYS:
+            np.testing.assert_allclose(got[key], want[key], atol=1e-9, err_msg=key)
+
+    @pytest.mark.parametrize("n", PARTITION_COUNTS)
+    def test_lattice_shifts_change_nothing(self, system, model, n):
+        coord, atype, cell, *_ = system
+        want = self.evaluate(model, coord, atype, cell, n)
+        got = self.evaluate(model, self.shifted(coord, cell), atype, cell, n)
+        self.assert_same(got, want)
+
+    def test_the_evaluator_is_indifferent_to_images(self, system, model):
+        coord, atype, cell, *_ = system
+        results = []
+        for positions in (coord, self.shifted(coord, cell)):
+            ev = DistributedEvaluator(
+                model, atype, cell, devices=[DEVICE] * 2, compute_born=True,
+                compute_virial=True, memory_headroom=None,
+            )
+            energy, forces = ev(torch.as_tensor(positions, device=DEVICE))
+            results.append((energy, forces.cpu().numpy().copy(), ev.virial.copy(),
+                            np.asarray(ev.results["born_charge"]).copy()))
+        (e0, f0, v0, z0), (e1, f1, v1, z1) = results
+        assert e1 == pytest.approx(e0, abs=1e-9)
+        np.testing.assert_allclose(f1, f0, atol=1e-9)
+        np.testing.assert_allclose(v1, v0, atol=1e-9)
+        np.testing.assert_allclose(z1, z0, atol=1e-9)
+
+    @pytest.mark.parametrize("spread", [6.0, 8.0, 10.0, 12.0])
+    def test_a_two_sided_spread(self, system, model, spread):
+        """Atoms near x = 0 leave through +x and atoms near x = L through -x,
+        so the unwrapped cloud spans L + spread along x."""
+        coord, atype, cell, *_ = system
+        length = cell[0, 0]
+        moved = np.array(coord, copy=True)
+        moved[coord[:, 0] < spread / 2, 0] += length
+        moved[coord[:, 0] > length - spread / 2, 0] -= length
+        assert np.ptp(moved[:, 0]) > length + spread - 2.0
+        for n in (1, 2):
+            self.assert_same(self.evaluate(model, moved, atype, cell, n),
+                             self.evaluate(model, coord, atype, cell, n))
+
+    def test_the_serial_model_is_indifferent_to_images(self, system, model):
+        """The serial path (the ASE calculator, training) never had the bug:
+        DeePMD-kit's own neighbour builder wraps. Pinned so an upgrade that
+        stops doing so is caught here rather than in a trajectory."""
+        coord, _atype, cell, coord_t, atype_t, cell_t = system
+        moved = torch.as_tensor(self.shifted(coord, cell), dtype=coord_t.dtype,
+                                device=coord_t.device).unsqueeze(0)
+        want = model(coord_t, atype_t, box=cell_t)
+        got = model(moved, atype_t, box=cell_t)
+        for key in ("energy", "force", "charge", "virial"):
+            torch.testing.assert_close(got[key], want[key], atol=1e-9, rtol=0,
+                                       msg=key)
+
+    def test_crossing_a_face_between_rebuilds(self, system, model):
+        """An atom walks out through a face while the partitioning is reused:
+        every step must match a fresh evaluation of the wrapped positions."""
+        coord, atype, cell, *_ = system
+        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE], skin=3.0,
+                                  memory_headroom=None)
+        walk = np.array(coord, copy=True)
+        i = int(np.argmax(walk[:, 0]))
+        ev(torch.as_tensor(walk, device=DEVICE))
+        rebuilds = ev.rebuild_count
+        for _ in range(7):
+            walk[i, 0] += 0.2
+            energy, forces = ev(torch.as_tensor(walk, device=DEVICE))
+            wrapped = walk.copy()
+            wrapped[i] -= np.floor(wrapped[i] @ np.linalg.inv(cell)) @ cell
+            want = self.evaluate(model, wrapped, atype, cell, 1)
+            assert energy == pytest.approx(want["energy"], abs=1e-9)
+            np.testing.assert_allclose(forces.cpu().numpy(), want["force"], atol=1e-9)
+        assert walk[i, 0] > cell[0, 0], "the walk never crossed the face"
+        assert ev.rebuild_count == rebuilds, "the walk was meant to reuse the halo"
+
+    def test_a_lattice_jump_forces_a_rebuild(self, system, model):
+        """The Verlet check uses raw displacement on purpose: a caller that
+        wraps an atom moves it by a lattice vector, and the halo built around
+        its old image must not be reused."""
+        coord, atype, cell, *_ = system
+        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE], skin=2.0,
+                                  memory_headroom=None)
+        e0, _ = ev(torch.as_tensor(coord, device=DEVICE))
+        rebuilds = ev.rebuild_count
+        jumped = np.array(coord, copy=True)
+        jumped[0] += cell[0]
+        e1, _ = ev(torch.as_tensor(jumped, device=DEVICE))
+        assert ev.rebuild_count == rebuilds + 1
+        assert e1 == pytest.approx(e0, abs=1e-9)
+
+    @pytest.mark.skipif(
+        not os.environ.get("DEEPMD_LR_WATER_MODEL"),
+        reason="slow: set DEEPMD_LR_WATER_MODEL to a trained water checkpoint",
+    )
+    def test_a_long_water_run_keeps_exact_forces(self):
+        """25 ps of Langevin water on two partitions, never wrapped. Every
+        500 steps the forces must match a fresh evaluation of the wrapped
+        positions. Water diffuses past L + 12 A within this time, the spread
+        at which the old halo was off by 1.1 eV/A.
+
+        Opt-in: DEEPMD_LR_WATER_MODEL (checkpoint), DEEPMD_LR_WATER_COMPRESS=1
+        (needs the CUDA-operator build), DEEPMD_LR_WATER_STEPS (default 50000).
+        """
+        import pathlib
+
+        from nvalchemiops.dynamics.integrators import (
+            langevin_baoab_finalize,
+            langevin_baoab_half_step,
+        )
+
+        from deepmd_lr.nvalchemi import Thermo, build_evaluator, read_structure
+
+        root = pathlib.Path(__file__).resolve().parents[1]
+        atoms = read_structure(root / "examples" / "06-md_nvalchemi" / "water_192.xyz")
+        compress = os.environ.get("DEEPMD_LR_WATER_COMPRESS") == "1"
+        ev = build_evaluator(os.environ["DEEPMD_LR_WATER_MODEL"], atoms,
+                             devices=[DEVICE] * 2, compress=compress)
+        th = Thermo(ev, atoms.get_positions(), timestep=0.5, temperature=300.0)
+        th.maxwell_boltzmann(300.0, seed=1)
+        friction = th.scalar(0.05)
+        th.evaluate()
+        cell = np.asarray(ev.cell)
+        inverse = np.linalg.inv(cell)
+        steps = int(os.environ.get("DEEPMD_LR_WATER_STEPS", 50_000))
+        worst, spread = 0.0, 0.0
+        for step in range(steps):
+            langevin_baoab_half_step(th.positions, th.velocities, th.forces,
+                                     th.masses, th.dt, th.kT, friction, step)
+            th.evaluate()
+            langevin_baoab_finalize(th.velocities, th.forces, th.masses, th.dt)
+            if (step + 1) % 500:
+                continue
+            x = th.positions.numpy()
+            assert np.isfinite(x).all(), f"blew up by step {step + 1}"
+            spread = max(spread, float((np.ptp(x, axis=0) - np.diag(cell)).max()))
+            wrapped = x - np.floor(x @ inverse) @ cell
+            fresh = to_numpy(evaluate_partitioned(ev.model, wrapped, ev.atype, cell,
+                                                  devices=[DEVICE]))
+            worst = max(worst, float(np.abs(th.forces.numpy() - fresh["force"]).max()))
+        print(f"\n  {steps} steps: widest spread L + {spread:.1f} A, "
+              f"worst force difference {worst:.2e} eV/A")
+        assert spread > 12.0, "the run never reached the regime it guards"
+        assert worst <= 1e-5
+

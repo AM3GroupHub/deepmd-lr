@@ -127,6 +127,19 @@ minimises one block's halo box: slabs for two, 2 x 2 x 1 for four, 2 x 2 x 2
 for eight on a cubic box, and slabs again along a long axis when the box is
 elongated enough. Each cut is at equal atom count, one axis at a time.
 
+The positions may be **unwrapped** -- integrators never wrap them, and a
+trajectory that is to yield diffusion should not be wrapped either. Every
+rebuild folds the atoms into the cell first, builds the owners, images and
+ghosts from the folded positions, and expresses each node back relative to the
+positions it was given, so a node sits in the cell however far its atom has
+wandered. Before this, the halo was built from the raw positions with only the
+nearest images, and atoms that had diffused out through opposite faces lost
+their neighbours: 1.1 eV/Å on water once the unwrapped cloud spanned L + 12 Å,
+which a few picoseconds of diffusion reaches. Nothing needs folding between
+rebuilds: a node moves with its atom, and the Verlet check below reads raw
+displacement, so a caller that does wrap an atom (a jump by a lattice vector)
+simply triggers a rebuild.
+
 What that buys, as nodes on the busiest device, water at the auto skin:
 
 | atoms | partitions | slabs | grid | change |

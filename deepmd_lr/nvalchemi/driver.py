@@ -245,7 +245,7 @@ def partition_graph(
     )
     v = part.views(device, dtype)
     c = coord_t.detach().to(device=device, dtype=dtype)
-    nodes = torch.cat([c[v["owned"]], c[v["ghost"]] + v["shift"]])
+    nodes = torch.cat([c[v["owned"]] + v["owned_shift"], c[v["ghost"]] + v["shift"]])
     node_coord = nodes.unsqueeze(0).clone().requires_grad_(requires_grad)
     node_type = part.types_on(atype, device).unsqueeze(0)
 

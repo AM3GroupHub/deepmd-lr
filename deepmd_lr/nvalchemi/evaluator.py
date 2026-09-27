@@ -417,6 +417,10 @@ class DistributedEvaluator:
             and self._calls_since_rebuild >= self.repartition_every
         ):
             return True
+        # Raw displacement, not minimum image, on purpose. The halo was built
+        # around each atom's folded position at the last rebuild; a caller that
+        # wraps an atom moves it by a lattice vector, and a minimum-image check
+        # would call that no motion and keep a halo built around the old image.
         moved = float((positions - self._reference_positions).norm(dim=1).max())
         return 2.0 * moved > self.skin
 

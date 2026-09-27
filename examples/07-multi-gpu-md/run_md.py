@@ -157,9 +157,8 @@ FIELD RUNS (--efield EX EY EZ, V/A; NVT only)
     field force.
 
 KNOWN LIMITATIONS
-    - The partitioned evaluator drops neighbours once unwrapped positions spread
-      more than about one cutoff beyond the cell. This script works around it by
-      giving the evaluator folded positions; see the Folder class.
+    - Positions stay unwrapped (diffusion needs them); deepmd-lr folds them into
+      the cell at every halo rebuild, so it does not matter how far atoms drift.
     - NPT repartitions every step, and a field cannot be combined with NPT.
     - There is no conserved quantity for Langevin, NPT or field runs.
 
@@ -178,7 +177,6 @@ FOR AI AGENTS
     5. Production with --max-hours, resubmitting with --restart until done.
 
     Code map:
-    - Folder: the unwrapped-coordinate workaround.
     - VelocityVerlet, Langevin, NoseHooverChain, IsotropicMTK: one step each.
     - relax(): the FIRE pre-relaxation.
     - Logger, TrajectoryWriter, save_checkpoint() and load_checkpoint():
@@ -234,8 +232,6 @@ from nvalchemiops.dynamics.optimizers import fire2_step
 from deepmd_lr.ase import load_model
 from deepmd_lr.nvalchemi import Thermo, build_evaluator, read_structure
 
-#: How far (A) an atom may stray past a cell face before its image is refolded.
-FOLD_MARGIN = 2.0
 #: Bumped whenever the checkpoint layout changes.
 CHECKPOINT_VERSION = 1
 #: Settings a restart must share with the checkpoint it continues.
@@ -493,66 +489,6 @@ def fingerprint(model, symbols) -> dict:
     }
 
 
-class Folder:
-    """Give the evaluator positions folded into the cell.
-
-    WHY. deepmd-lr's partitioner builds each partition's halo from the
-    coordinates it is handed, using only the +-1 periodic images. Integrators
-    never wrap positions, so atoms that diffuse out through opposite faces end
-    up more than a cell length apart. Once that spread exceeds about one
-    cutoff, the neighbours between them are silently dropped: on water this
-    gave force errors of 1.1 eV/A, and runs blew up after 5-20 ps. Until the
-    library folds coordinates itself, this class does it here.
-
-    HOW. The integrator keeps UNWRAPPED positions, so the trajectory is usable
-    for diffusion, and every force call sees a folded copy. Each atom keeps its
-    integer image until it strays FOLD_MARGIN past a face. The margin is there
-    because a refold moves the atom by a lattice vector in the evaluator's
-    view, which forces one halo rebuild; with it, refolds are rare. Forces are
-    per atom and periodic, so they apply unchanged to the unwrapped atoms.
-    """
-
-    def __init__(self, th: Thermo):
-        self.th = th
-        self._x = wp.to_torch(th.positions)        # zero-copy (n, 3) view
-        self._forces_ptr = th.forces.ptr
-        self.image = None
-        self.refolds = 0
-        self.set_cell(th.evaluator.cell)
-
-    def set_cell(self, cell) -> None:
-        """Call after every cell change (the NPT integrator does)."""
-        cell = np.asarray(cell, dtype=np.float64).reshape(3, 3)
-        volume = abs(np.linalg.det(cell))
-        widths = np.array([
-            volume / np.linalg.norm(np.cross(cell[(j + 1) % 3], cell[(j + 2) % 3]))
-            for j in range(3)
-        ])
-        dev = self._x.device
-        self.cell_t = torch.as_tensor(cell, device=dev)
-        self.inv_t = torch.linalg.inv(self.cell_t)
-        self.margin_t = torch.as_tensor(FOLD_MARGIN / widths, device=dev)
-
-    def evaluate(self) -> float:
-        """Energy and forces at the current positions. Returns the energy."""
-        th = self.th
-        wp.synchronize_device(th.device)          # warp kernels wrote positions
-        frac = self._x @ self.inv_t               # rows: r = f @ cell
-        if self.image is None:
-            self.image = torch.floor(frac)
-        else:
-            d = frac - self.image
-            if bool(((d < -self.margin_t) | (d > 1.0 + self.margin_t)).any()):
-                self.image = torch.floor(frac)
-                self.refolds += 1
-        energy, forces = th.evaluator((frac - self.image) @ self.cell_t)
-        if forces.data_ptr() != self._forces_ptr:
-            raise RuntimeError("the evaluator reallocated its forces buffer; "
-                               "the integrator would read stale forces")
-        th.energy = energy
-        return energy
-
-
 # --------------------------------------------------------------------------
 # Integrators: each step is the kernels around exactly one force evaluation.
 # Every kernel takes the FULL timestep and applies its own factor 1/2.
@@ -710,13 +646,12 @@ class IsotropicMTK(Integrator):
       at stale offsets, giving quietly wrong forces.
     """
 
-    def __init__(self, th, evaluate, folder, pressure_gpa, tau_t_fs, tau_p_fs,
+    def __init__(self, th, evaluate, pressure_gpa, tau_t_fs, tau_p_fs,
                  chain_length):
         super().__init__(th, evaluate)
         self.name = (f"NPT, isotropic MTK, P {pressure_gpa:g} GPa, "
                      f"tau_t {tau_t_fs:g} fs, tau_p {tau_p_fs:g} fs, "
                      f"chain {chain_length}")
-        self.folder = folder
         self.L = chain_length
         kT = float(th.kT.numpy()[0])
         ndof = 3 * th.n_atoms - 3
@@ -765,7 +700,6 @@ class IsotropicMTK(Integrator):
                             th.dt)
         npt_cell_update(th.cell, self.cell_v, th.dt)
         th.set_cell()                                # evaluator + volume
-        self.folder.set_cell(th.evaluator.cell)      # and the fold
         self.evaluate()
         self._kick()
         self._refresh()                              # after the kick
@@ -782,14 +716,14 @@ class IsotropicMTK(Integrator):
         self.cell_v.assign(arrays["npt_cell_v"])
 
 
-def build_integrator(a, th, folder, seed) -> Integrator:
+def build_integrator(a, th, seed) -> Integrator:
     if a.ensemble == "nve":
-        return VelocityVerlet(th, folder.evaluate)
+        return VelocityVerlet(th, th.evaluate)
     if a.ensemble == "nvt" and a.thermostat == "langevin":
-        return Langevin(th, folder.evaluate, a.tau_t, seed)
+        return Langevin(th, th.evaluate, a.tau_t, seed)
     if a.ensemble == "nvt":
-        return NoseHooverChain(th, folder.evaluate, a.tau_t, a.chain_length)
-    return IsotropicMTK(th, folder.evaluate, folder, a.pressure, a.tau_t,
+        return NoseHooverChain(th, th.evaluate, a.tau_t, a.chain_length)
+    return IsotropicMTK(th, th.evaluate, a.pressure, a.tau_t,
                         a.tau_p, a.chain_length)
 
 
@@ -810,7 +744,7 @@ def covalent_bonds(symbols, positions, cell) -> set:
     return set(zip(i[keep].tolist(), j[keep].tolist(), strict=True))
 
 
-def relax(th: Thermo, folder: Folder, a: argparse.Namespace, symbols) -> None:
+def relax(th: Thermo, a: argparse.Namespace, symbols) -> None:
     """FIRE on the positions only; the cell never changes.
 
     A freshly packed box can hold tens of eV of clashes. Released by MD, that
@@ -844,7 +778,7 @@ def relax(th: Thermo, folder: Folder, a: argparse.Namespace, symbols) -> None:
     for k in range(1, a.relax_steps + 1):
         fire2_step(th.positions, vel, th.forces, batch, alpha, fire_dt, n_inc,
                    *scratch)
-        folder.evaluate()
+        th.evaluate()
         if not math.isfinite(th.energy):
             break
         if k % 10 == 0:
@@ -1208,20 +1142,19 @@ def run_md(a: argparse.Namespace) -> int:
     th = Thermo(ev, atoms.get_positions(),
                 velocities=np.zeros((n, 3)) if velocities is None else velocities,
                 timestep=a.dt, temperature=a.temperature)
-    folder = Folder(th)
-    integ = build_integrator(a, th, folder, seed)
+    integ = build_integrator(a, th, seed)
     if a.restart:
         integ.load_state(arrays)
     print(f"  ensemble {integ.name}; seed {seed}", flush=True)
 
     t0 = time.perf_counter()
-    folder.evaluate()
+    th.evaluate()
     print(f"  first force call {time.perf_counter() - t0:.1f} s (kernel "
           f"compilation, memory probe); skin {ev.skin:.2f} A", flush=True)
     report_charges(ev, symbols, a)
     if not a.restart:
         if a.relax_steps > 0:
-            relax(th, folder, a, symbols)
+            relax(th, a, symbols)
         if velocities is None:
             th.maxwell_boltzmann(a.temperature, seed=seed)
     integ.prepare()
@@ -1330,7 +1263,7 @@ def run_md(a: argparse.Namespace) -> int:
     final.set_velocities(th.velocities.numpy())
     ase.io.write(out / "final.extxyz", final)
 
-    summary = summarize(th, ev, folder, a, rows, clock, n, devices)
+    summary = summarize(th, ev, a, rows, clock, n, devices)
     print(f"\n{status}\n" + "\n".join(f"  {k}: {v}" for k, v in summary.items()),
           flush=True)
     segment.update(status=status, end_step=step, summary=summary)
@@ -1338,7 +1271,7 @@ def run_md(a: argparse.Namespace) -> int:
     return 0
 
 
-def summarize(th, ev, folder, a, rows, clock, n, devices) -> dict:
+def summarize(th, ev, a, rows, clock, n, devices) -> dict:
     s = {}
     if len(clock) >= 3:               # drop the first interval (compilation)
         (s1, t1), (s2, t2) = clock[1], clock[-1]
@@ -1347,8 +1280,7 @@ def summarize(th, ev, folder, a, rows, clock, n, devices) -> dict:
             s["speed"] = (f"{ms:.1f} ms/step = {a.dt * 86.4 / ms:.3f} ns/day "
                           f"({n} atoms on {len(devices)} device(s))")
     s["halo"] = (f"skin {ev.skin:.2f} A, {ev.rebuild_count} rebuilds, "
-                 f"{ev.skin_backoffs} out-of-memory backoffs, "
-                 f"{folder.refolds} image refolds")
+                 f"{ev.skin_backoffs} out-of-memory backoffs")
     if len(rows) >= 2:
         half = rows[len(rows) // 2:]
         s["mean T (second half)"] = f"{np.mean([r['T[K]'] for r in half]):.1f} K"
@@ -1386,9 +1318,8 @@ def _time_devices(a: argparse.Namespace, devices: list[str]):
     th = Thermo(ev, atoms.get_positions(), velocities=np.zeros((n, 3)),
                 timestep=a.dt, temperature=a.temperature)
     th.maxwell_boltzmann(a.temperature, seed=1)
-    folder = Folder(th)
-    integ = build_integrator(a, th, folder, seed=1)
-    folder.evaluate()
+    integ = build_integrator(a, th, seed=1)
+    th.evaluate()
     integ.prepare()
     warm = max(10, a.benchmark_steps // 5)       # compilation, memory probe
     for i in range(warm):

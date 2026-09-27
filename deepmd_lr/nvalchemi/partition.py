@@ -64,13 +64,24 @@ class Partition:
         of the same atom are in range.
     ghost_shift
         Cartesian offset applied to each ghost, shape ``(n_ghost, 3)``.
+    owned_shift
+        Cartesian offset applied to each owned atom, shape ``(n_owned, 3)``;
+        zeros unless the coordinates handed to :func:`partition_system` were
+        unwrapped. Both shifts are relative to those coordinates: a node sits
+        at ``coord[atom] + shift``, folded into the cell, however far the atom
+        itself has wandered.
     """
 
     owned: np.ndarray
     ghost: np.ndarray
     ghost_shift: np.ndarray
+    owned_shift: np.ndarray | None = None
     #: Device-resident index tensors, built once per device (see :meth:`views`).
     _views: dict = field(default_factory=dict, repr=False, compare=False)
+
+    def __post_init__(self):
+        if self.owned_shift is None:
+            self.owned_shift = np.zeros((len(self.owned), 3))
 
     @property
     def n_owned(self) -> int:
@@ -85,8 +96,9 @@ class Partition:
         return np.concatenate([self.owned, self.ghost])
 
     def coordinates(self, coord: np.ndarray) -> np.ndarray:
-        """Node coordinates: owned as-is, ghosts shifted into place."""
-        return np.concatenate([coord[self.owned], coord[self.ghost] + self.ghost_shift])
+        """Node coordinates, owned then ghost, each shifted into place."""
+        return np.concatenate([coord[self.owned] + self.owned_shift,
+                               coord[self.ghost] + self.ghost_shift])
 
     def types(self, atype: np.ndarray) -> np.ndarray:
         return np.concatenate([atype[self.owned], atype[self.ghost]])
@@ -95,7 +107,8 @@ class Partition:
         """This partition's index tensors on ``device``, built once and cached.
 
         ``owned`` and ``ghost`` are global atom indices, ``ids`` their
-        concatenation in node order, ``shift`` the ghosts' Cartesian offsets.
+        concatenation in node order, ``shift`` and ``owned_shift`` the ghosts'
+        and the owned atoms' Cartesian offsets.
         The partitioning is reused across many steps, so uploading these
         every step would be the kind of per-step host traffic the device
         gather exists to remove.
@@ -111,6 +124,11 @@ class Partition:
                 "ghost": ids[self.n_owned :],
                 "shift": torch.as_tensor(
                     np.asarray(self.ghost_shift, dtype=np.float64).reshape(-1, 3),
+                    dtype=dtype,
+                    device=dev,
+                ),
+                "owned_shift": torch.as_tensor(
+                    np.asarray(self.owned_shift, dtype=np.float64).reshape(-1, 3),
                     dtype=dtype,
                     device=dev,
                 ),
@@ -348,7 +366,8 @@ def partition_system(
     Parameters
     ----------
     coord
-        ``(N, 3)`` Cartesian coordinates.
+        ``(N, 3)`` Cartesian coordinates, wrapped or not: they are folded into
+        the cell on periodic axes before anything is built.
     cell
         ``(3, 3)`` cell vectors as rows.
     rcut
@@ -375,8 +394,19 @@ def partition_system(
             f"{n_partitions} partitions requested for only {n_atoms} atoms"
         )
 
-    # Assign owners on a grid of blocks, `decomposition_grid` pieces per axis.
     inverse = np.linalg.inv(cell)
+    # Fold every atom into the cell on periodic axes. Integrators never wrap,
+    # so atoms that leave through opposite faces end up many cells apart, and
+    # the +-ceil(halo/width) images below only bridge a spread of about one
+    # halo: built from the raw coordinates, the halo silently lost neighbours
+    # (1.1 eV/A on water at a spread of L + 12 A). Everything is built from the
+    # folded positions, and the nodes are expressed back relative to the
+    # coordinates handed in -- `owned_shift` and `ghost_shift` -- so callers
+    # keep integrating unwrapped positions and nothing else changes.
+    image = np.where(np.asarray(pbc, dtype=bool), np.floor(coord @ inverse), 0.0)
+    fold = image @ cell
+    coord = coord - fold
+    # Assign owners on a grid of blocks, `decomposition_grid` pieces per axis.
     frac = coord @ inverse
     keys = np.empty_like(frac)
     for axis in range(3):
@@ -462,7 +492,9 @@ def partition_system(
             Partition(
                 owned=owned,
                 ghost=image_atom[ghosts],
-                ghost_shift=image_shift[ghosts],
+                # Relative to the coordinates handed in, not the folded ones.
+                ghost_shift=image_shift[ghosts] - fold[image_atom[ghosts]],
+                owned_shift=-fold[owned],
             )
         )
     return partitions

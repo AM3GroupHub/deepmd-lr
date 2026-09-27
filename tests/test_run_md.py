@@ -143,9 +143,8 @@ def test_the_thermostat_rests_at_the_reported_temperature(inputs, tmp_path,
     th.maxwell_boltzmann(a.temperature, seed=1)
     wp.to_torch(th.velocities).mul_(math.sqrt(a.temperature / th.temperature))
     assert th.temperature == pytest.approx(a.temperature, rel=1e-12)
-    folder = run_md.Folder(th)
-    integ = run_md.build_integrator(a, th, folder, seed=1)
-    folder.evaluate()
+    integ = run_md.build_integrator(a, th, seed=1)
+    th.evaluate()
     if ensemble == "npt":
         th.update_kinetic_energy()
         integ._thermostat()
