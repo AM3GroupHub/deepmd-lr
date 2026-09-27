@@ -1,15 +1,24 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""Position relaxation on the GPU (FIRE), on the evaluator the MD shares.
+"""Position relaxation on the GPU (FIRE and FIRE2), on the evaluator the MD shares.
 
 .. code-block:: python
 
     ev = build_evaluator("model.ckpt.pt", atoms, devices=["cuda:0"])
-    FIRE(ev, atoms).run(fmax=0.05, steps=2000)    # RelaxationError if it went wrong
+    FIRE2(ev, atoms).run(fmax=0.05, steps=2000)   # RelaxationError if it went wrong
     maxwell_boltzmann(atoms, temperature_K=300, seed=7)
     Langevin(ev, atoms, 0.5 * units.fs, temperature_K=300,
              friction=0.01 / units.fs).run(10_000)  # same evaluator, no second copy
 
-FIRE moves positions only; the cell never changes. A freshly packed box can hold
+Two algorithms, as in ASE, each on its nvalchemiops kernel:
+- :class:`FIRE`, the original (Bitzek et al. 2006), with ASE's defaults;
+- :class:`FIRE2`, FIRE 2.0 (Guenole et al. 2020), with nvalchemiops' more
+  cautious defaults; the production driver in ``examples/07-multi-gpu-md``
+  uses it.
+
+On water, from an MD snapshot, FIRE reached 0.05 eV/A in 199 steps and FIRE2 in
+380; from a TIP3P-relaxed packed box, in 149 and 160.
+
+Both move positions only; the cell never changes. A freshly packed box can hold
 tens of eV of clashes, and MD would release that as heat in the first few
 hundred fs, pushing the model into regions it never saw -- so relax first.
 
@@ -22,7 +31,7 @@ box with a classical force field instead.
 With ``check=True`` (the default) it also refuses a relaxation that did not
 converge, one that changed the covalent-bond topology between non-metal atoms,
 and one whose energy rose. The energy check applies only without a field:
-under a field FIRE seeks zero total force, not minimum energy.
+under a field the minimiser seeks zero total force, not minimum energy.
 """
 
 from __future__ import annotations
@@ -44,7 +53,7 @@ from deepmd_lr.nvalchemi.md import (
 )
 from deepmd_lr.nvalchemi.thermo import Thermo
 
-__all__ = ["FIRE", "RelaxationError"]
+__all__ = ["FIRE", "FIRE2", "RelaxationError"]
 
 #: Elements whose mutual covalent bonds the topology check guards. Metals are
 #: left out on purpose: an ion's coordination shell may legitimately change.
@@ -71,14 +80,31 @@ def _covalent_bonds(atoms: Atoms) -> set:
     return set(zip(i[keep].tolist(), j[keep].tolist(), strict=True))
 
 
-class FIRE:
-    """FIRE2 on the positions, with the checks above.
+def _check_fire(dt, dtmax, dtmin, Nmin, finc, fdec, astart, fa) -> None:
+    problems = []
+    if not 0 < dtmin <= dt <= dtmax:
+        problems.append(f"0 < dtmin <= dt <= dtmax (got {dtmin}, {dt}, {dtmax})")
+    if not int(Nmin) >= 0:
+        problems.append(f"Nmin >= 0 (got {Nmin})")
+    if not (finc > 1 and 0 < fdec < 1):
+        problems.append(f"finc > 1 and 0 < fdec < 1 (got {finc}, {fdec})")
+    if not (0 < astart < 1 and 0 < fa <= 1):
+        problems.append(f"0 < astart < 1 and 0 < fa <= 1 (got {astart}, {fa})")
+    if problems:
+        raise ValueError("FIRE parameters need " + "; ".join(problems))
+
+
+class _FIREBase:
+    """What FIRE and FIRE2 share: a Thermo of their own on the shared
+    evaluator, the loop with its divergence guard, the checks, the log, the
+    trajectory and observers. A subclass sets up its kernel's state and
+    moves the positions in :meth:`_step`.
 
     Parameters
     ----------
     evaluator
         The :class:`~deepmd_lr.nvalchemi.evaluator.DistributedEvaluator` the MD
-        stages will share; FIRE builds its own ``Thermo`` on it.
+        stages will share; the relaxation builds its own ``Thermo`` on it.
     atoms
         The system, in the evaluator's atom order and cell. Written back at
         the end: relaxed positions, zero momenta, energy and forces.
@@ -89,7 +115,7 @@ class FIRE:
         forces) at every log row and at the end -- the end of a divergence
         included, which is where a failed relaxation went.
     maxstep
-        Largest displacement per step, in angstrom.
+        Largest displacement of any atom per step, in angstrom.
     check
         Refuse a bad relaxation (see the module docstring). Divergence is
         refused either way.
@@ -115,6 +141,8 @@ class FIRE:
             evaluator, atoms.get_positions(), masses=atoms.get_masses()
         )
         self.maxstep = float(maxstep)
+        if not self.maxstep > 0:
+            raise ValueError("maxstep must be positive")
         self.check = bool(check)
         self.loginterval = max(1, int(loginterval))
         self.nsteps = 0
@@ -122,10 +150,6 @@ class FIRE:
         th, n = self.thermo, self.thermo.n_atoms
         self._vel = wp.zeros(n, dtype=wp.vec3d, device=th.device)
         self._batch = wp.zeros(n, dtype=wp.int32, device=th.device)
-        self._alpha = th.scalar(0.09)
-        self._fire_dt = th.scalar(0.01)
-        self._n_inc = th.zeros(1, dtype=wp.int32)
-        self._scratch = [th.zeros(1) for _ in range(4)]
         self._observers: list = []
         self._last_recorded: int | None = None
         self._traj = None if trajectory is None else _Trajectory(trajectory, False)
@@ -156,6 +180,10 @@ class FIRE:
         """The largest force on any atom, eV/A (a host read)."""
         return float(np.linalg.norm(self.thermo.forces.numpy(), axis=1).max())
 
+    def _step(self) -> None:
+        """Move the positions one step from the current forces."""
+        raise NotImplementedError
+
     def run(self, fmax: float = 0.05, steps: int = 100_000_000) -> bool:
         """Relax until the largest force is below ``fmax`` (eV/A) or
         ``steps`` have run. Returns whether it converged; raises
@@ -167,8 +195,6 @@ class FIRE:
 
     def irun(self, fmax: float = 0.05, steps: int = 100_000_000) -> Iterator[int]:
         """Generator form of :meth:`run`; yields the step count."""
-        from nvalchemiops.dynamics.optimizers import fire2_step
-
         th = self.thermo
         th.set_state(positions=self.atoms.get_positions())
         th.evaluate()
@@ -182,17 +208,7 @@ class FIRE:
             for _ in range(int(steps)):
                 if self.converged:
                     break
-                fire2_step(
-                    th.positions,
-                    self._vel,
-                    th.forces,
-                    self._batch,
-                    self._alpha,
-                    self._fire_dt,
-                    self._n_inc,
-                    *self._scratch,
-                    maxstep=self.maxstep,
-                )
+                self._step()
                 th.evaluate()
                 self.nsteps += 1
                 if not math.isfinite(th.energy):
@@ -278,3 +294,177 @@ class FIRE:
             self._logger.close()
         if self._traj is not None:
             self._traj.close()
+
+
+class FIRE(_FIREBase):
+    """FIRE, the original algorithm (Bitzek et al., Phys. Rev. Lett. 97, 170201
+    (2006)), through nvalchemiops' ``fire_step``.
+
+    While the power P = F.v stays positive, each step mixes the velocity toward
+    the force, kicks and moves; the moment P turns negative the velocity is
+    zeroed and the timestep shrinks. ASE's names and defaults, and, as in ASE,
+    unit masses: the timestep is a relaxation parameter, not a physical one.
+    (With real masses, oxygen moved 16x slower and water took 2-6x as many
+    steps.) Each atom's step is capped at ``maxstep`` on its own.
+
+    Parameters
+    ----------
+    dt, dtmax, dtmin
+        Initial, largest and smallest timestep.
+    Nmin
+        Steps of positive power before the timestep may grow.
+    finc, fdec
+        The timestep's growth factor (after ``Nmin``) and shrink factor (when
+        P turns negative).
+    astart, fa
+        The mixing parameter at a (re)start, and its decay factor.
+
+    ``evaluator``, ``atoms``, ``logfile``, ``loginterval``, ``trajectory``,
+    ``maxstep`` and ``check`` are as for :class:`FIRE2`.
+    """
+
+    def __init__(
+        self,
+        evaluator: Any,
+        atoms: Atoms,
+        *,
+        dt: float = 0.1,
+        dtmax: float = 1.0,
+        dtmin: float = 0.01,
+        Nmin: int = 5,
+        finc: float = 1.1,
+        fdec: float = 0.5,
+        astart: float = 0.1,
+        fa: float = 0.99,
+        **kwargs: Any,
+    ) -> None:
+        import warp as wp
+        from nvalchemiops.dynamics.optimizers import fire_step
+
+        _check_fire(dt, dtmax, dtmin, Nmin, finc, fdec, astart, fa)
+        super().__init__(evaluator, atoms, **kwargs)
+        th = self.thermo
+        self._kernel = fire_step
+        self._alpha, self._dt = th.scalar(astart), th.scalar(dt)
+        self._limits = [th.scalar(v) for v in (astart, fa, dtmin, dtmax, self.maxstep)]
+        self._n_positive = th.zeros(1, dtype=wp.int32)
+        self._n_min = th.scalar(int(Nmin), dtype=wp.int32)
+        self._factors = [th.scalar(fdec), th.scalar(finc)]
+        self._uphill = th.zeros(1, dtype=wp.int32)
+        self._reductions = [th.zeros(1) for _ in range(3)]
+        self._unit_masses = wp.array(
+            np.ones(th.n_atoms), dtype=wp.float64, device=th.device
+        )
+
+    def _step(self) -> None:
+        th = self.thermo
+        self._kernel(
+            th.positions,
+            self._vel,
+            th.forces,
+            self._unit_masses,
+            self._alpha,
+            self._dt,
+            *self._limits,
+            self._n_positive,
+            self._n_min,
+            *self._factors,
+            self._uphill,
+            *self._reductions,
+            batch_idx=self._batch,
+        )
+
+
+class FIRE2(_FIREBase):
+    """FIRE 2.0 (Guenole et al., Comput. Mater. Sci. 175, 109584 (2020)),
+    through nvalchemiops' ``fire2_step``.
+
+    FIRE with the changes of FIRE 2.0, as nvalchemiops implements them: the
+    kick comes before the power is measured (semi-implicit Euler); a step on
+    which the power turns negative is undone by half a step back, with the
+    velocity zeroed; and the whole step is scaled so that no atom moves more
+    than ``maxstep``, the timestep with it. Unit masses. The defaults are
+    nvalchemiops', more cautious than ASE's FIRE2; the parameters keep ASE's
+    names (``Nmin`` is the kernel's ``delaystep``, ``finc`` its ``dtgrow``,
+    ``fdec`` its ``dtshrink``, ``astart`` its ``alpha0``, ``fa`` its
+    ``alphashrink``, and ``dtmax``/``dtmin`` its ``tmax``/``tmin``).
+
+    Parameters
+    ----------
+    evaluator
+        The :class:`~deepmd_lr.nvalchemi.evaluator.DistributedEvaluator` the MD
+        stages will share; the relaxation builds its own ``Thermo`` on it.
+    atoms
+        The system, in the evaluator's atom order and cell. Written back at
+        the end: relaxed positions, zero momenta, energy and forces.
+    dt, dtmax, dtmin
+        Initial, largest and smallest timestep.
+    Nmin
+        Steps of positive power before the timestep may grow.
+    finc, fdec
+        The timestep's growth factor (after ``Nmin``) and shrink factor (when
+        the power turns negative).
+    astart, fa
+        The mixing parameter at a (re)start, and its decay factor.
+    logfile, loginterval
+        ``'-'`` (stdout), a path, or None; one row every ``loginterval`` steps.
+    trajectory
+        A ``.traj`` or extxyz path, or None: a frame (positions, energy,
+        forces) at every log row and at the end -- the end of a divergence
+        included, which is where a failed relaxation went.
+    maxstep
+        Largest displacement of any atom per step, in angstrom.
+    check
+        Refuse a bad relaxation (see the module docstring). Divergence is
+        refused either way.
+    """
+
+    def __init__(
+        self,
+        evaluator: Any,
+        atoms: Atoms,
+        *,
+        dt: float = 0.01,
+        dtmax: float = 0.08,
+        dtmin: float = 0.005,
+        Nmin: int = 60,
+        finc: float = 1.05,
+        fdec: float = 0.75,
+        astart: float = 0.09,
+        fa: float = 0.985,
+        **kwargs: Any,
+    ) -> None:
+        import warp as wp
+        from nvalchemiops.dynamics.optimizers import fire2_step
+
+        _check_fire(dt, dtmax, dtmin, Nmin, finc, fdec, astart, fa)
+        super().__init__(evaluator, atoms, **kwargs)
+        th = self.thermo
+        self._kernel = fire2_step
+        self._alpha, self._dt = th.scalar(astart), th.scalar(dt)
+        self._n_inc = th.zeros(1, dtype=wp.int32)
+        self._scratch = [th.zeros(1) for _ in range(4)]
+        self._parameters = {
+            "delaystep": int(Nmin),
+            "dtgrow": float(finc),
+            "dtshrink": float(fdec),
+            "alphashrink": float(fa),
+            "alpha0": float(astart),
+            "tmax": float(dtmax),
+            "tmin": float(dtmin),
+        }
+
+    def _step(self) -> None:
+        th = self.thermo
+        self._kernel(
+            th.positions,
+            self._vel,
+            th.forces,
+            self._batch,
+            self._alpha,
+            self._dt,
+            self._n_inc,
+            *self._scratch,
+            maxstep=self.maxstep,
+            **self._parameters,
+        )

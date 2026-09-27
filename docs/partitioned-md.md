@@ -41,13 +41,13 @@ a whole workflow:
 ```python
 from ase import units
 from deepmd_lr.nvalchemi import (
-    FIRE, IsotropicMTKNPT, NoseHooverChainNVT, build_evaluator,
+    FIRE2, IsotropicMTKNPT, NoseHooverChainNVT, build_evaluator,
     maxwell_boltzmann, read_structure,
 )
 
 atoms = read_structure("start.xyz")
 ev = build_evaluator("model.ckpt.pt", atoms, devices=["cuda:0", "cuda:1"])
-FIRE(ev, atoms).run(fmax=0.05)
+FIRE2(ev, atoms).run(fmax=0.05)
 maxwell_boltzmann(atoms, temperature_K=300, seed=7)
 NoseHooverChainNVT(ev, atoms, 0.5 * units.fs, temperature_K=300,
                    tdamp=100 * units.fs, logfile="nvt.log",
@@ -66,7 +66,16 @@ npt.run(20_000)
 | `Langevin` | NVT, BAOAB; `fixcm=True` keeps the centre of mass at rest | none |
 | `NoseHooverChainNVT` | NVT, Nosé–Hoover chain | Etot + the chain energy |
 | `IsotropicMTKNPT` | NPT, MTK, isotropic cell | the MTK H′ |
-| `FIRE` | relaxes the positions; the cell is fixed | — |
+| `FIRE` | relaxes the positions, classic FIRE with ASE's defaults; the cell is fixed | — |
+| `FIRE2` | relaxes the positions, FIRE 2.0 with nvalchemiops' more cautious defaults | — |
+
+`FIRE` and `FIRE2` are ASE's two relaxations, each on its nvalchemiops kernel,
+with ASE's parameter names and, as in ASE, unit masses. FIRE caps each atom's
+step on its own. FIRE2 kicks before it measures the power, takes half a step
+back after an uphill step, and scales the whole step so that no atom moves
+more than `maxstep`. On water, from an MD snapshot, `FIRE` reached 0.05 eV/Å
+in 199 steps and `FIRE2` in 380; from a TIP3P-relaxed packed box, in 149 and
+160.
 
 The units are exactly ASE's: `timestep` in ASE time (`0.5 * units.fs`),
 `friction` in 1/ASE time, `tdamp` and `pdamp` in ASE time, `pressure_au` in

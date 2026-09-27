@@ -11,7 +11,8 @@ The float64 fixture model runs on the GPU. What is pinned:
   checkpoints.
 - **Physics.** Each class keeps its promise: NVE and MTK conservation, the
   Nose-Hoover eta/2 quirk, and 3N - 3 degrees of freedom.
-- **FIRE's refusals.**
+- **FIRE and FIRE2.** Each drives its own kernel, under ASE's names, and
+  both refuse a bad relaxation.
 """
 
 import json
@@ -43,6 +44,7 @@ from nvalchemiops.dynamics.integrators import (
 
 from deepmd_lr.nvalchemi import (
     FIRE,
+    FIRE2,
     DistributedEvaluator,
     IsotropicMTKNPT,
     Langevin,
@@ -293,13 +295,13 @@ class TestOwnership:
             Thermo(ev, atoms.get_positions(), temperature=300.0)
 
     def test_one_evaluator_carries_a_whole_workflow(self, model):
-        """FIRE, then Langevin, then NPT on one evaluator: no second model
+        """FIRE2, then Langevin, then NPT on one evaluator: no second model
         copy, no rebuild at the hand-overs, and the same trajectory as
         separate evaluators give."""
 
         def workflow(evaluators):
             atoms = make_atoms(model)
-            FIRE(evaluators[0], atoms, logfile=None, check=False).run(
+            FIRE2(evaluators[0], atoms, logfile=None, check=False).run(
                 fmax=1.0, steps=30
             )
             maxwell_boltzmann(atoms, temperature_K=T0, seed=3)
@@ -777,31 +779,37 @@ class _Perturbed:
         return energy + self._energy(self.n), forces
 
 
+OPTIMIZERS = pytest.mark.parametrize("relax", [FIRE, FIRE2], ids=["FIRE", "FIRE2"])
+
+
 class TestFIRE:
-    def test_it_relaxes_and_writes_back(self, model):
+    @OPTIMIZERS
+    def test_it_relaxes_and_writes_back(self, model, relax):
         atoms = make_atoms(model)
         cell = atoms.cell.array.copy()
-        opt = FIRE(make_ev(model, atoms), atoms, logfile=None, check=False)
+        opt = relax(make_ev(model, atoms), atoms, logfile=None, check=False)
         assert opt.run(fmax=0.5, steps=500)
         assert opt.nsteps > 0
         assert np.linalg.norm(atoms.get_forces(), axis=1).max() < 0.5
         assert np.abs(atoms.get_momenta()).max() == 0.0
         np.testing.assert_array_equal(atoms.cell.array, cell)
 
-    def test_divergence_is_fatal_even_without_checks(self, model):
+    @OPTIMIZERS
+    def test_divergence_is_fatal_even_without_checks(self, model, relax):
         atoms = make_atoms(model)
         ev = _Perturbed(
             make_ev(model, atoms), force_scale=lambda n: 1e4 if n > 3 else 1.0
         )
         with pytest.raises(RelaxationError, match="diverged"):
-            FIRE(ev, atoms, logfile=None, check=False).run(fmax=1e-6, steps=100)
+            relax(ev, atoms, logfile=None, check=False).run(fmax=1e-6, steps=100)
 
-    def test_the_trajectory_ends_where_the_run_did(self, model, tmp_path):
+    @OPTIMIZERS
+    def test_the_trajectory_ends_where_the_run_did(self, model, relax, tmp_path):
         """A frame at every log row and one at the end, never twice for the
         same step; the end of a divergence is where it went wrong."""
         atoms = make_atoms(model)
         path = tmp_path / "fire.extxyz"
-        opt = FIRE(
+        opt = relax(
             make_ev(model, atoms),
             atoms.copy(),
             logfile=None,
@@ -817,7 +825,7 @@ class TestFIRE:
             make_ev(model, atoms), force_scale=lambda n: 1e4 if n > 3 else 1.0
         )
         path = tmp_path / "diverged.extxyz"
-        opt = FIRE(ev, atoms.copy(), logfile=None, trajectory=path, check=False)
+        opt = relax(ev, atoms.copy(), logfile=None, trajectory=path, check=False)
         with pytest.raises(RelaxationError, match="diverged"):
             opt.run(fmax=1e-6, steps=100)
         opt.close()
@@ -825,12 +833,16 @@ class TestFIRE:
         assert last.info["step"] == opt.nsteps > 0
         assert np.abs(last.get_forces()).max() > 1e3
 
-    def test_non_convergence_is_refused(self, model):
+    @OPTIMIZERS
+    def test_non_convergence_is_refused(self, model, relax):
         atoms = make_atoms(model)
         with pytest.raises(RelaxationError, match="not converged"):
-            FIRE(make_ev(model, atoms), atoms, logfile=None).run(fmax=1e-9, steps=3)
+            relax(make_ev(model, atoms), atoms, logfile=None).run(fmax=1e-9, steps=3)
 
-    def test_an_energy_rise_is_refused_only_without_a_field(self, model, monkeypatch):
+    @OPTIMIZERS
+    def test_an_energy_rise_is_refused_only_without_a_field(
+        self, model, relax, monkeypatch
+    ):
         """The fixture's random weights legitimately distort its molecules, so
         the bond check is pinned here to isolate the energy check."""
         monkeypatch.setattr(optimize_module, "_covalent_bonds", lambda a: set())
@@ -840,18 +852,141 @@ class TestFIRE:
             return _Perturbed(ev, energy=lambda n: 100.0 if n > 1 else 0.0)
 
         with pytest.raises(RelaxationError, match="energy rose"):
-            FIRE(rising(make_ev(model, atoms)), atoms.copy(), logfile=None).run(
+            relax(rising(make_ev(model, atoms)), atoms.copy(), logfile=None).run(
                 fmax=0.5, steps=500
             )
         field = rising(make_ev(model, atoms, efield=[0.01, 0.0, 0.0]))
-        assert FIRE(field, atoms.copy(), logfile=None).run(fmax=0.5, steps=500)
+        assert relax(field, atoms.copy(), logfile=None).run(fmax=0.5, steps=500)
 
-    def test_a_topology_change_is_refused(self, model, monkeypatch):
+    @OPTIMIZERS
+    def test_a_topology_change_is_refused(self, model, relax, monkeypatch):
         atoms = make_atoms(model)
         sets = iter([{(0, 1)}, {(0, 2)}])
         monkeypatch.setattr(optimize_module, "_covalent_bonds", lambda a: next(sets))
         with pytest.raises(RelaxationError, match="topology"):
-            FIRE(make_ev(model, atoms), atoms, logfile=None).run(fmax=1.0, steps=300)
+            relax(make_ev(model, atoms), atoms, logfile=None).run(fmax=1.0, steps=300)
+
+    @OPTIMIZERS
+    def test_bad_parameters_are_refused(self, model, relax):
+        atoms = make_atoms(model)
+        ev = make_ev(model, atoms)
+        with pytest.raises(ValueError, match="dtmin <= dt <= dtmax"):
+            relax(ev, atoms, dt=2.0, dtmax=1.0, logfile=None)
+        with pytest.raises(ValueError, match="finc > 1"):
+            relax(ev, atoms, finc=0.9, logfile=None)
+        with pytest.raises(ValueError, match="maxstep"):
+            relax(ev, atoms, maxstep=0.0, logfile=None)
+
+
+#: Distinct non-default values, so that a parameter reaching the wrong kernel
+#: argument changes the trajectory.
+ASE_NAMES = {
+    "dt": 0.05,
+    "dtmax": 0.3,
+    "dtmin": 0.03,
+    "Nmin": 2,
+    "finc": 1.3,
+    "fdec": 0.4,
+    "astart": 0.2,
+    "fa": 0.9,
+    "maxstep": 0.03,
+}
+
+
+def loop_fire(ev, atoms, steps, p):
+    """Classic FIRE by hand, in the kernel's own argument names; unit masses."""
+    from nvalchemiops.dynamics.optimizers import fire_step
+
+    th = Thermo(ev, atoms.get_positions())
+    s, n = th.scalar, th.n_atoms
+    vel = th.zeros(n, dtype=wp.vec3d)
+    alpha, dt = s(p["astart"]), s(p["dt"])
+    n_pos, uphill = th.zeros(1, dtype=wp.int32), th.zeros(1, dtype=wp.int32)
+    dts = []
+    th.evaluate()
+    for _ in range(steps):
+        fire_step(
+            positions=th.positions,
+            velocities=vel,
+            forces=th.forces,
+            masses=wp.array(np.ones(n), dtype=wp.float64, device=th.device),
+            alpha=alpha,
+            dt=dt,
+            alpha_start=s(p["astart"]),
+            f_alpha=s(p["fa"]),
+            dt_min=s(p["dtmin"]),
+            dt_max=s(p["dtmax"]),
+            maxstep=s(p["maxstep"]),
+            n_steps_positive=n_pos,
+            n_min=s(p["Nmin"], dtype=wp.int32),
+            f_dec=s(p["fdec"]),
+            f_inc=s(p["finc"]),
+            uphill_flag=uphill,
+            vf=th.zeros(1),
+            vv=th.zeros(1),
+            ff=th.zeros(1),
+        )
+        th.evaluate()
+        dts.append(float(dt.numpy()[0]))
+    return th.positions.numpy(), dts
+
+
+def loop_fire2(ev, atoms, steps, p):
+    """FIRE2 by hand, in the kernel's own argument names."""
+    from nvalchemiops.dynamics.optimizers import fire2_step
+
+    th = Thermo(ev, atoms.get_positions())
+    n = th.n_atoms
+    vel = th.zeros(n, dtype=wp.vec3d)
+    alpha, dt = th.scalar(p["astart"]), th.scalar(p["dt"])
+    n_inc = th.zeros(1, dtype=wp.int32)
+    dts = []
+    th.evaluate()
+    for _ in range(steps):
+        fire2_step(
+            th.positions,
+            vel,
+            th.forces,
+            th.zeros(n, dtype=wp.int32),
+            alpha,
+            dt,
+            n_inc,
+            *[th.zeros(1) for _ in range(4)],
+            delaystep=p["Nmin"],
+            dtgrow=p["finc"],
+            dtshrink=p["fdec"],
+            alphashrink=p["fa"],
+            alpha0=p["astart"],
+            tmax=p["dtmax"],
+            tmin=p["dtmin"],
+            maxstep=p["maxstep"],
+        )
+        th.evaluate()
+        dts.append(float(dt.numpy()[0]))
+    return th.positions.numpy(), dts
+
+
+class TestFIREKernels:
+    @pytest.mark.parametrize(
+        "relax, loop", [(FIRE, loop_fire), (FIRE2, loop_fire2)], ids=["FIRE", "FIRE2"]
+    )
+    def test_ase_names_reach_the_kernel(self, model, relax, loop):
+        """The class under ASE's names matches its kernel driven by hand under
+        the kernel's names. The timestep both grows and shrinks on the way,
+        so the growth and the uphill parameters are both exercised. (Classic
+        FIRE starts at rest, so its first step is uphill, as in ASE, and the
+        shrink lands on dtmin.)"""
+        atoms = make_atoms(model)
+        want, dts = loop(make_ev(model, atoms), atoms, 40, ASE_NAMES)
+        dts = [ASE_NAMES["dt"], *dts]
+        assert max(dts) > ASE_NAMES["dt"] and min(np.diff(dts)) < 0
+        opt = relax(
+            make_ev(model, atoms), atoms, logfile=None, check=False, **ASE_NAMES
+        )
+        opt.run(fmax=1e-12, steps=40)
+        assert opt.nsteps == 40
+        np.testing.assert_allclose(opt.thermo.positions.numpy(), want, atol=1e-10)
+        assert float(opt._dt.numpy()[0]) == pytest.approx(dts[-1], rel=1e-12)
 
 
 class TestDipoleCurrent:

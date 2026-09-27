@@ -50,19 +50,19 @@ nvalchemiops kernels:
 
 ```python
 from ase import units
-from deepmd_lr.nvalchemi import FIRE, NoseHooverChainNVT, build_evaluator, maxwell_boltzmann
+from deepmd_lr.nvalchemi import FIRE2, NoseHooverChainNVT, build_evaluator, maxwell_boltzmann
 
 ev = build_evaluator("run_joint/model.ckpt.pt", atoms, devices=["cuda:0"])
-FIRE(ev, atoms).run(fmax=0.05)
+FIRE2(ev, atoms).run(fmax=0.05)
 maxwell_boltzmann(atoms, temperature_K=300, seed=7)
 NoseHooverChainNVT(ev, atoms, 0.5 * units.fs, temperature_K=300,
                    tdamp=100 * units.fs, logfile="md.log",
                    loginterval=100).run(20_000)
 ```
 
-`VelocityVerlet`, `Langevin`, `NoseHooverChainNVT`, `IsotropicMTKNPT` and
-`FIRE` share that one evaluator, so a relaxation and several MD stages run on
-one copy of the model. [Partitioned MD](partitioned-md.md#the-md-classes)
+`VelocityVerlet`, `Langevin`, `NoseHooverChainNVT`, `IsotropicMTKNPT`, and
+the relaxations `FIRE` and `FIRE2`, share that one evaluator, so a relaxation
+and several MD stages run on one copy of the model. [Partitioned MD](partitioned-md.md#the-md-classes)
 covers the API and what each piece owns.
 [Example 06](../examples/06-md_nvalchemi) has a script per ensemble, and
 [example 07](../examples/07-multi-gpu-md) is a production driver.
@@ -74,8 +74,8 @@ Each of these has cost a run.
 - **A freshly packed box collapses.** The model has no repulsive wall below
   the shortest contacts it was trained on, so a minimiser, or the first MD
   steps, can pull clashing atoms together instead of pushing them apart.
-  `FIRE` stops with a `RelaxationError` once forces grow tenfold or more than
-  2 eV/atom is released. Pre-relax with a classical force field
+  `FIRE` and `FIRE2` stop with a `RelaxationError` once forces grow tenfold
+  or more than 2 eV/atom is released. Pre-relax with a classical force field
   ([below](#relaxing-a-packed-box-first)).
 - **Check conservation before trusting a model**, with NVE: the drift has to
   vanish as dt shrinks ([above](#check-energy-conservation-before-trusting-a-trajectory)).
@@ -111,7 +111,7 @@ Each of these has cost a run.
 ## Relaxing a packed box first
 
 A box from a packing tool starts with clashes. A packed 64-water box here had
-O–O contacts down to 1.56 Å, and FIRE with the model diverged from it: the
+O–O contacts down to 1.56 Å, and FIRE2 with the model diverged from it: the
 molecules slid into the short-range hole. A classical force field has the
 wall, so push the molecules apart with rigid TIP3P first, then refine with the
 model:
@@ -154,7 +154,7 @@ def tip3p_prerelax(atoms, fmax=0.05, steps=5000):
 
 
 atoms = tip3p_prerelax(atoms)
-FIRE(ev, atoms).run(fmax=0.05)             # the model's own minimum, on the GPU
+FIRE2(ev, atoms).run(fmax=0.05)            # the model's own minimum, on the GPU
 ```
 
 {{TIP3P}}

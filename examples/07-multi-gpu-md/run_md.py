@@ -179,7 +179,7 @@ FOR AI AGENTS
 
     Code map:
     - The MD itself is deepmd_lr.nvalchemi: VelocityVerlet, Langevin,
-      NoseHooverChainNVT, IsotropicMTKNPT, FIRE, maxwell_boltzmann. This script
+      NoseHooverChainNVT, IsotropicMTKNPT, FIRE2, maxwell_boltzmann. This script
       turns the command line into those objects (build_md, output_settings)
       and adds what a job needs around them.
     - run_md(): a new run or a --restart; benchmark(): the GPU-count timing.
@@ -211,7 +211,7 @@ from ase import units
 
 from deepmd_lr.ase import load_model
 from deepmd_lr.nvalchemi import (
-    FIRE,
+    FIRE2,
     IsotropicMTKNPT,
     Langevin,
     MDInstabilityError,
@@ -318,10 +318,10 @@ def parse_args(argv=None) -> argparse.Namespace:
                         "(e.g. a previous final.extxyz) instead of drawing "
                         "them; any centre-of-mass drift is removed")
     g.add_argument("--relax-steps", type=int, default=0,
-                   help="FIRE relaxation of positions (cell fixed) before MD; "
+                   help="FIRE2 relaxation of positions (cell fixed) before MD; "
                         "0 = off. Recommended for freshly built boxes")
     g.add_argument("--relax-fmax", type=float, default=0.05,
-                   help="FIRE convergence criterion, eV/A")
+                   help="FIRE2 convergence criterion, eV/A")
     g.add_argument("--no-relax-checks", action="store_true",
                    help="continue even if the relaxation did not converge or "
                         "changed covalent bonds")
@@ -690,9 +690,9 @@ def run_md(a: argparse.Namespace) -> int:
                       f"{a.temperature} K instead", flush=True)
                 kept = None
             if a.relax_steps > 0:
-                FIRE(ev, atoms, logfile="-", loginterval=max(1, a.relax_steps // 10),
-                     check=not a.no_relax_checks).run(fmax=a.relax_fmax,
-                                                      steps=a.relax_steps)
+                FIRE2(ev, atoms, logfile="-", loginterval=max(1, a.relax_steps // 10),
+                      check=not a.no_relax_checks).run(fmax=a.relax_fmax,
+                                                       steps=a.relax_steps)
             if kept is not None:
                 atoms.set_velocities(kept)
             else:

@@ -15,8 +15,10 @@
 **Who owns what.**
 - **The evaluator** is built once by the caller and shared: model replicas on
   every device, the partitioning, the forces buffer. Several MD objects (and a
-  :class:`~deepmd_lr.nvalchemi.optimize.FIRE`) may use it one after another --
-  a relaxation, an NVT stage, an NPT stage -- without copying the model again.
+  :class:`~deepmd_lr.nvalchemi.optimize.FIRE` or
+  :class:`~deepmd_lr.nvalchemi.optimize.FIRE2` relaxation) may use it one after
+  another -- a relaxation, an NVT stage, an NPT stage -- without copying the
+  model again.
 - **Each MD object** builds its own :class:`~deepmd_lr.nvalchemi.thermo.Thermo`
   (the device state) around that evaluator, and :attr:`MolecularDynamics.evaluator`
   simply returns ``self.thermo.evaluator``, so the two can never diverge.
@@ -122,7 +124,7 @@ def _kernels() -> types.SimpleNamespace:
 
 
 # ----------------------------------------------------------------------------
-# Shared by the MD classes and FIRE
+# Shared by the MD classes and the relaxations
 # ----------------------------------------------------------------------------
 
 

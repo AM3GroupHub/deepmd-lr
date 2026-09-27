@@ -5,10 +5,10 @@
   devices, plus the virial and Born charges on request. Build it once, with
   :func:`build_evaluator`, and share it.
 - The MD classes -- :class:`VelocityVerlet`, :class:`Langevin`,
-  :class:`NoseHooverChainNVT`, :class:`IsotropicMTKNPT` -- and :class:`FIRE`
-  take that evaluator and an ``ase.Atoms``, ASE-style: parameters in
-  ``__init__``, then ``run(steps)``. Several may run one after another on one
-  evaluator.
+  :class:`NoseHooverChainNVT`, :class:`IsotropicMTKNPT` -- and the relaxations
+  :class:`FIRE` and :class:`FIRE2` take that evaluator and an ``ase.Atoms``,
+  ASE-style: parameters in ``__init__``, then ``run(steps)``. Several may run
+  one after another on one evaluator.
 - Each builds a :class:`Thermo`: the device state the nvalchemiops kernels
   mutate (positions, velocities, masses, forces view, cell) and its
   measurements. A custom kernel loop can use a Thermo directly; see
@@ -36,6 +36,7 @@ from deepmd_lr.nvalchemi.md import (
 )
 from deepmd_lr.nvalchemi.optimize import (
     FIRE,
+    FIRE2,
     RelaxationError,
 )
 from deepmd_lr.nvalchemi.partition import (
@@ -53,6 +54,7 @@ from deepmd_lr.nvalchemi.thermo import (
 __all__ = [
     "DistributedEvaluator",
     "FIRE",
+    "FIRE2",
     "IsotropicMTKNPT",
     "Langevin",
     "MDInstabilityError",

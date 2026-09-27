@@ -140,17 +140,18 @@ on nvalchemiops kernels. The evaluator holds the model on every device, is
 built once, and is shared by every stage that follows:
 
 ```python
-from deepmd_lr.nvalchemi import FIRE, Langevin, build_evaluator, maxwell_boltzmann
+from deepmd_lr.nvalchemi import FIRE2, Langevin, build_evaluator, maxwell_boltzmann
 
 ev = build_evaluator("run_joint/model.ckpt.pt", atoms, devices=["cuda:0", "cuda:1"])
-FIRE(ev, atoms).run(fmax=0.05)
+FIRE2(ev, atoms).run(fmax=0.05)
 maxwell_boltzmann(atoms, temperature_K=300, seed=1)
 Langevin(ev, atoms, 0.5 * units.fs, temperature_K=300, friction=0.01 / units.fs,
          logfile="md.log", loginterval=100).run(10000)
 ```
 
 `VelocityVerlet`, `NoseHooverChainNVT` and `IsotropicMTKNPT` work the same
-way, with a trajectory, observers and checkpoints.
+way, with a trajectory, observers and checkpoints, and `FIRE` is the classic
+relaxation beside `FIRE2`.
 `examples/06-md_nvalchemi` has a script per ensemble, and
 `examples/07-multi-gpu-md/run_md.py` is a ready-made driver for production
 runs ([partitioned MD](docs/partitioned-md.md)). A field run, Born effective
