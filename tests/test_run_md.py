@@ -3,23 +3,22 @@
 Short runs of the float64 fixture model through the script's `main()`, all on
 one GPU; "two partitions" means that GPU twice. The fixture has random weights,
 so these tests pin the plumbing rather than the physics:
-- every ensemble runs and writes its files;
+- every ensemble runs and writes its files, NPH and full-cell NPT included;
 - a restart reproduces an uninterrupted run;
 - two partitions match one;
 - unwrapped input is folded before it reaches the evaluator;
+- --relax-cell relaxes the cell before the MD;
 - bad input exits with code 1 and a message, and instability with code 2.
 """
 
 import importlib.util
 import json
-import math
 import pathlib
 
 import ase.io
 import numpy as np
 import pytest
 import torch
-import warp as wp
 from ase import Atoms
 
 from .test_joint_model import build, frame
@@ -69,7 +68,10 @@ ENSEMBLES = {
     "nve": ["--ensemble", "nve"],
     "langevin": ["--ensemble", "nvt", "--thermostat", "langevin"],
     "nhc": ["--ensemble", "nvt", "--thermostat", "nhc"],
+    "rescale": ["--ensemble", "nvt", "--thermostat", "rescale"],
     "npt": ["--ensemble", "npt"],
+    "npt_full": ["--ensemble", "npt", "--barostat", "full"],
+    "nph": ["--ensemble", "nph"],
 }
 
 
@@ -86,15 +88,15 @@ def test_each_ensemble_runs_and_writes_its_files(inputs, tmp_path, ensemble):
     assert [f.info["step"] for f in frames] == [0, 5, 10]
     assert np.abs(ase.io.read(out / "final.extxyz").get_velocities()).max() > 0
     with np.load(out / "checkpoint.npz") as z:
-        assert json.loads(str(z["meta"]))["step"] == 10
+        assert json.loads(str(z["meta"]))["nsteps"] == 10
     segment = json.loads((out / "run.json").read_text())["segments"][-1]
     assert segment["status"] == "finished"
 
 
-@pytest.mark.parametrize("ensemble", ["langevin", "npt"])
+@pytest.mark.parametrize("ensemble", ["langevin", "npt", "nph"])
 def test_restart_reproduces_an_uninterrupted_run(inputs, tmp_path, ensemble):
-    """Langevin replays its noise from the step number; NPT restores the cell
-    and its velocity. Either way, 6 + 6 steps must equal 12."""
+    """Langevin replays its noise from the step number; NPT and NPH restore the
+    cell and its velocity. Either way, 6 + 6 steps must equal 12."""
     common = [*ENSEMBLES[ensemble], "--log-every", "3", "--traj-every", "3",
               "--checkpoint-every", "6"]
     assert run(inputs, tmp_path / "a", *common, "--steps", "12") == 0
@@ -121,38 +123,7 @@ def test_logging_does_not_change_an_npt_trajectory(inputs, tmp_path):
             np.load(tmp_path / "loud" / "checkpoint.npz") as lo:
         np.testing.assert_allclose(lo["positions"], q["positions"], atol=1e-9)
         np.testing.assert_allclose(lo["cell"], q["cell"], atol=1e-11)
-        np.testing.assert_allclose(lo["npt_cell_v"], q["npt_cell_v"], atol=1e-14)
-
-
-@pytest.mark.parametrize("ensemble", ["nhc", "npt"])
-def test_the_thermostat_rests_at_the_reported_temperature(inputs, tmp_path,
-                                                          ensemble):
-    """One definition of the kinetic degrees of freedom, 3N - 3, for both the
-    thermostat's target and the temperature it is judged by. So at exactly the
-    reported target temperature the chain feels no force. The NPT kernels
-    count 3N unless told otherwise; left at that, eta_dot moved by
-    -3 kT / Q_0 per half-step and held the system 3N/(3N-3) hot."""
-    ckpt, xyz = inputs
-    a = run_md.parse_args(["--model", str(ckpt), "--structure", str(xyz),
-                           "--out", str(tmp_path), *ENSEMBLES[ensemble]])
-    atoms, model = run_md.load_system(a, "cuda:0")
-    ev = run_md.make_evaluator(model, atoms, ["cuda:0"], a)
-    th = run_md.Thermo(ev, atoms.get_positions(),
-                       velocities=np.zeros((len(atoms), 3)),
-                       timestep=a.dt, temperature=a.temperature)
-    th.maxwell_boltzmann(a.temperature, seed=1)
-    wp.to_torch(th.velocities).mul_(math.sqrt(a.temperature / th.temperature))
-    assert th.temperature == pytest.approx(a.temperature, rel=1e-12)
-    integ = run_md.build_integrator(a, th, seed=1)
-    th.evaluate()
-    if ensemble == "npt":
-        th.update_kinetic_energy()
-        integ._thermostat()
-    else:
-        integ._chain()
-    # Only the first link feels the particles (2 KE - N_f kT); the others are
-    # pulled by -kT/Q_k from rest whatever N_f is.
-    assert abs(integ.eta_dot.numpy().reshape(-1)[0]) < 1e-12
+        np.testing.assert_allclose(lo["cell_v"], q["cell_v"], atol=1e-14)
 
 
 def _step0(out):
@@ -192,6 +163,18 @@ def test_unwrapped_input_is_folded(inputs, tmp_path):
     np.testing.assert_allclose(f2, f1, atol=1e-8)
 
 
+def test_relax_cell_changes_the_cell_and_keeps_its_shape(inputs, tmp_path, capsys):
+    out = tmp_path / "cell"
+    assert run(inputs, out, "--steps", "2", "--relax-steps", "20",
+               "--relax-cell", "isotropic", "--no-relax-checks") == 0
+    assert "cell (isotropic):" in capsys.readouterr().out
+    start, final = ase.io.read(inputs[1]), ase.io.read(out / "final.extxyz")
+    ratio = np.diag(final.cell.array) / np.diag(start.cell.array)
+    assert np.ptp(ratio) < 1e-12 and abs(ratio[0] - 1.0) > 1e-4
+    assert run(inputs, tmp_path / "c2", "--relax-cell", "full") == 1
+    assert "--relax-cell relaxes during --relax-steps" in capsys.readouterr().err
+
+
 def test_bad_input_exits_1_with_a_message(inputs, tmp_path, capsys):
     out = tmp_path / "run"
     assert run(inputs, out, "--steps", "2") == 0
@@ -201,13 +184,19 @@ def test_bad_input_exits_1_with_a_message(inputs, tmp_path, capsys):
     assert run(inputs, out, "--steps", "3", "--overwrite") == 0
     assert not (out / "blowup.extxyz").exists()             # a clean slate
     with np.load(out / "checkpoint.npz") as z:
-        assert json.loads(str(z["meta"]))["step"] == 3
+        assert json.loads(str(z["meta"]))["nsteps"] == 3
     assert run(inputs, out, "--steps", "4", "--restart",
                "--temperature", "350") == 1              # physics changed
     assert "temperature: 300.0 -> 350.0" in capsys.readouterr().err
     assert run(inputs, tmp_path / "e", "--ensemble", "npt",
                "--efield", "0.1", "0", "0") == 1
     assert "--efield needs --ensemble nvt" in capsys.readouterr().err
+    assert run(inputs, tmp_path / "b", "--barostat", "full") == 1
+    assert "--barostat applies to --ensemble npt or nph" in capsys.readouterr().err
+    assert run(inputs, tmp_path / "b2", "--ensemble", "npt", "--steps", "2") == 0
+    assert run(inputs, tmp_path / "b2", "--ensemble", "npt", "--barostat", "full",
+               "--steps", "4", "--restart") == 1       # the cell mode changed
+    assert "barostat: 'isotropic' -> 'full'" in capsys.readouterr().err
 
     _, xyz = inputs
     atoms = ase.io.read(xyz)

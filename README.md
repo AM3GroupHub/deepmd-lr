@@ -109,7 +109,7 @@ match ([dataset layout](docs/dataset-layout.md)).
 | [03](examples/03-slab) | Li/LiFSI interface, 2D-periodic | vacuum padding, `slab_correction` + `pbc` |
 | [04](examples/04-multi-head) | all three at once | `shared_dict`/`model_dict`, and the gradient clipping it needs |
 | [05](examples/05-pseudo-head) | bulk + slab, one weight set | `same_as`, and setting the long-range type at load |
-| [06](examples/06-md_nvalchemi) | MD with nvalchemiops | NVE, NVT, NPT and a field, one runnable loop each |
+| [06](examples/06-md_nvalchemi) | MD with nvalchemiops | NVE, NVT, NPT and a field, one script each, plus a custom kernel loop |
 | [07](examples/07-multi-gpu-md) | production MD, one or more GPUs | one command: restarts, a GPU-count benchmark, pre-relaxation |
 
 `scripts/xyz_to_deepmd.py` converts a trajectory ASE can read into a DeePMD
@@ -135,8 +135,26 @@ atoms.calc = LongRangeCalculator("run_joint/model.ckpt.pt")
 VelocityVerlet(atoms, timestep=0.5 * units.fs).run(10000)
 ```
 
-For MD that never leaves the GPU, and for several GPUs, use the nvalchemiops
-path — `examples/06-md_nvalchemi` has a runnable loop per ensemble, and
+For MD that never leaves the GPU, and for several GPUs, the same pattern runs
+on nvalchemiops kernels. The evaluator holds the model on every device, is
+built once, and is shared by every stage that follows:
+
+```python
+from deepmd_lr.nvalchemi import FIRE2, Langevin, build_evaluator, maxwell_boltzmann
+
+ev = build_evaluator("run_joint/model.ckpt.pt", atoms, devices=["cuda:0", "cuda:1"])
+FIRE2(ev, atoms).run(fmax=0.05)
+maxwell_boltzmann(atoms, temperature_K=300, seed=1)
+Langevin(ev, atoms, 0.5 * units.fs, temperature_K=300, friction=0.01 / units.fs,
+         logfile="md.log", loginterval=100).run(10000)
+```
+
+Every ensemble nvalchemiops provides has a class that works the same way,
+with a trajectory, observers and checkpoints: `VelocityVerlet` (NVE),
+`Langevin`, `NoseHooverChainNVT` and `VelocityRescaling` (NVT), `MTKNPT` and
+`MTKNPH` in isotropic, orthorhombic or full-cell modes (NPT, NPH). `FIRE` is
+the classic relaxation beside `FIRE2`, and both can relax the cell.
+`examples/06-md_nvalchemi` has a script per ensemble, and
 `examples/07-multi-gpu-md/run_md.py` is a ready-made driver for production
 runs ([partitioned MD](docs/partitioned-md.md)). A field run, Born effective
 charges, and reporting them screened by a medium's ε∞ (`eps_inf=`):
@@ -188,10 +206,10 @@ persistence: [docs/compression.md](docs/compression.md).
 | [dataset-layout.md](docs/dataset-layout.md) | systems, `type_map.raw`, the full-periodic-table convention, HDF5 |
 | [training.md](docs/training.md) | schedules, grafting, EMA, what to watch, validating, troubleshooting |
 | [cost.md](docs/cost.md) | step time and memory, compressed and not |
-| [md.md](docs/md.md) | why export is refused; energy-conservation check |
+| [md.md](docs/md.md) | why export is refused; energy-conservation check; the GPU classes, the traps, relaxing a packed box |
 | [compression.md](docs/compression.md) | compressed backbone: requirements, what changes, building the CUDA operators |
 | [born-charges.md](docs/born-charges.md) | Born effective charges and MD in an external field |
-| [partitioned-md.md](docs/partitioned-md.md) | `DistributedEvaluator`, `Thermo`, nvalchemiops conventions, scaling |
+| [partitioned-md.md](docs/partitioned-md.md) | `DistributedEvaluator`, the MD classes and one shared evaluator, your own kernel loop, what is conserved, scaling |
 | [neighbour-lists.md](docs/neighbour-lists.md) | which neighbour list runs, and the measured thresholds |
 | [tests.md](docs/tests.md) | what the suite pins |
 

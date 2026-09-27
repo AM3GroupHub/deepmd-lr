@@ -15,13 +15,17 @@ DP_CUDA_INFER=1 DEEPMD_LR_REQUIRE_COMPRESS=1 pytest tests/ -q
 `DEEPMD_LR_REQUIRE_COMPRESS=1` turns the kernel skips into failures, so a
 build that silently lost its operator cannot pass.
 
-One slow test is opt-in: 25 ps of water MD, never wrapped, checking every 500
-steps that the partitioned forces match a fresh evaluation of the wrapped
-positions. It needs a trained water checkpoint, takes about 10 minutes
-compressed on one GPU, and runs as
+Two sets of tests are opt-in, since they need a trained water checkpoint:
+
+- **25 ps of water MD**, never wrapped. Every 500 steps it checks that the
+  partitioned forces match a fresh evaluation of the wrapped positions. It
+  takes about 10 minutes compressed on one GPU.
+- **The cell relaxation on water**: a box stretched by 4% comes back to zero
+  stress in each mode, in about 20 seconds.
 
 ```bash
 DEEPMD_LR_WATER_MODEL=path/to/model.ckpt.pt pytest tests/test_nvalchemi.py -k long_water -s
+DEEPMD_LR_WATER_MODEL=path/to/model.ckpt.pt pytest tests/test_md.py -k water_relaxes
 ```
 
 Add `DEEPMD_LR_WATER_COMPRESS=1` (with the CUDA-operator build) to compress
@@ -58,10 +62,21 @@ the model first.
 - `test_nvalchemi.py` — the partitioner and halo (including unwrapped
   coordinates), the skin rules and memory probe, the device gather, the gathered long-range term and virial, and
   `DistributedEvaluator`.
-- `test_thermo.py` — `Thermo`'s measurements, warp aliasing, cell sync,
-  logging and throughput arithmetic.
-- `test_run_md.py` — the production MD driver in `examples/07-multi-gpu-md`:
-  every ensemble, restarts, partitions, the coordinate fold, exit codes.
+- `test_thermo.py` — `Thermo`'s measurements, warp aliasing, cell sync, and
+  the guards that make one evaluator safe to share (`fresh`,
+  `cell_is_current`, `set_state`).
+- `test_md.py` — the MD classes, `FIRE` and `FIRE2`: each integrator and each
+  relaxation against a hand-written kernel loop, one evaluator carrying a
+  whole workflow, `atoms` kept in step both ways, run semantics and
+  observers, checkpoints, the log, conservation (NVE, NPT and NPH as dt² in
+  every cell mode, the Nosé–Hoover invariant), the barostats' cell handed to
+  the kernels transposed, the relaxations' refusals, the cell relaxation
+  (its force against finite differences of the enthalpy, every mode reaching
+  the target pressure), and the dipole current.
+- `test_run_md.py` — the production MD driver in `examples/07-multi-gpu-md`,
+  which delegates to those classes: every ensemble (NPH, full-cell NPT and
+  velocity rescaling included), restarts, partitions, unwrapped input,
+  `--relax-cell`, exit codes.
 - `test_compress.py`, `test_compress_arguments.py`,
   `test_compress_atomic_state.py`, `test_compress_required.py` — compressed
   DPA4C inference: every refusal, the graph-lower guard, argument validation,
