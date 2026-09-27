@@ -67,7 +67,7 @@ evaluator, so a relaxation and several MD stages run on one copy of the
 model. Between them they cover every integrator nvalchemiops ships. [Partitioned MD](partitioned-md.md#the-md-classes)
 covers the API and what each piece owns.
 [Example 06](../examples/06-md_nvalchemi) has a script per ensemble, and
-[example 07](../examples/07-multi-gpu-md) is a production driver.
+[example 07](../examples/07-ase-calculator) covers the ASE calculator.
 
 ## Traps
 

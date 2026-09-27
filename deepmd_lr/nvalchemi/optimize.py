@@ -12,8 +12,7 @@
 Two algorithms, as in ASE, each on its nvalchemiops kernel:
 - :class:`FIRE`, the original (Bitzek et al. 2006), with ASE's defaults;
 - :class:`FIRE2`, FIRE 2.0 (Guenole et al. 2020), with nvalchemiops' more
-  cautious defaults; the production driver in ``examples/07-multi-gpu-md``
-  uses it.
+  cautious defaults.
 
 On water, from an MD snapshot, FIRE reached 0.05 eV/A in 199 steps and FIRE2 in
 380; from a TIP3P-relaxed packed box, in 149 and 160.

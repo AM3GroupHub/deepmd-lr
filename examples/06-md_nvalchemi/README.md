@@ -1,13 +1,13 @@
 # 6 — MD with nvalchemiops
 
-Eight short scripts: one per ensemble, plus a custom loop. The MD classes in
-`deepmd_lr.nvalchemi` do the stepping, ASE-style -- parameters in `__init__`,
-then `run(steps)` -- so each script is mostly the physics worth knowing about
-its ensemble. Between them the classes cover every integrator nvalchemiops
-ships. [`07_custom_loop.py`](07_custom_loop.py) drives the kernels by hand,
-for an integrator of your own. For production runs --
-restarts, several GPUs, a trajectory -- use the driver in
-[07](../07-multi-gpu-md).
+Eight short scripts: one per ensemble, a field run on every visible GPU, and
+a thermostat of your own. The MD classes in `deepmd_lr.nvalchemi` do the
+stepping, ASE-style -- parameters in `__init__`, then `run(steps)` -- so each
+script is mostly the physics worth knowing about its ensemble. Between them
+the classes cover every integrator nvalchemiops ships;
+[`07_custom_berendsen.py`](07_custom_berendsen.py) adds one of your own as a
+subclass. Trajectories, observers and checkpoints are arguments of every class
+(`trajectory=`, `attach()`, `checkpoint=` and `Cls.from_checkpoint`).
 
 ## Prerequisite
 
@@ -43,8 +43,8 @@ treated as a molecule in vacuum.
 | [`03_nvt_nose_hoover.py`](03_nvt_nose_hoover.py) | NVT | Nosé–Hoover chain | transport, spectra — anything where dynamics matter |
 | [`04_nvt_rescale.py`](04_nvt_rescale.py) | — | velocity rescaling | equilibration only, never production |
 | [`05_npt_mtk.py`](05_npt_mtk.py) | NPT | MTK + Nosé–Hoover chain; `--cell` isotropic, orthorhombic or full | equilibrating density; needs the virial |
-| [`06_nvt_efield.py`](06_nvt_efield.py) | NVT | Langevin | response to an external electric field |
-| [`07_custom_loop.py`](07_custom_loop.py) | NVT | your own | a raw kernel loop on a `Thermo`, and an integrator written as a subclass |
+| [`06_nvt_efield.py`](06_nvt_efield.py) | NVT | Langevin | response to an external electric field, on every visible GPU |
+| [`07_custom_berendsen.py`](07_custom_berendsen.py) | NVT | Berendsen, your own | an integrator of your own, written as a subclass |
 | [`08_nph_mtk.py`](08_nph_mtk.py) | NPH | MTK alone; `--cell` as for NPT | constant enthalpy: the check that the barostat is integrated right |
 
 ```python
@@ -106,12 +106,12 @@ units, so the relaxation time is `1/friction` of those:
 
 ## API conventions you cannot guess
 
-They matter when you drive the kernels yourself (`07`); the classes handle
+They matter when you drive the kernels yourself, as `07` does; the classes handle
 them. All were found by running into them:
 
 - **`ndof` dtypes disagree.** `nhc_compute_masses` wants **int32**;
   `nhc_thermostat_chain_update` wants **float64**. That is a Warp launch error,
-  not a cast, so `07` builds both.
+  not a cast.
 - **Half-step factors are inconsistent between kernels.**
   `nhc_velocity_half_step` and `velocity_verlet_position_update` apply their own
   factor of ½; `nhc_position_update` does not. So the **full `dt`** goes to
@@ -222,15 +222,28 @@ NPT under a field is refused rather than quietly wrong.
 
 ## Several GPUs
 
-The scripts build their evaluator with `build_evaluator`, which takes the
-device list, so partitioning across cards is one argument there:
+`build_evaluator` takes the device list, so partitioning across cards is one
+argument. `06` uses every visible GPU unless told otherwise (`--gpus`):
 
 ```python
 ev = build_evaluator(model, atoms, devices=["cuda:0", "cuda:1"])
 ```
 
-Whether it pays depends on where a step spends its time -- see
-[partitioned MD](../../docs/partitioned-md.md#limits) for the measured scaling.
+Each device gets one spatial partition with a halo of ghost atoms, and the
+forces, charges and Born tensors are assembled on the first device. Whether a
+second card pays depends on where a step spends its time. NVT on water, 2x
+A40, ms/step:
+
+| atoms | uncompressed, 1 GPU | 2 GPUs | compressed, 1 GPU | 2 GPUs |
+|---:|---:|---:|---:|---:|
+| 12,288 | 184 | 145 | 14.8 | 18.4 |
+| 41,472 | 574 | 399 | 36.2 | 36.5 |
+| 98,304 | — | — | 75.9 | 72.3 |
+
+Uncompressed, the model's work on the device dominates, and two cards help
+from about ten thousand atoms. Compressed, the host's share dominates below
+~100,000 atoms, and one card is as fast. More in
+[partitioned MD](../../docs/partitioned-md.md#limits).
 
 ## Throughput
 

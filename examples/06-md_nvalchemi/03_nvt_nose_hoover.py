@@ -11,7 +11,7 @@ script computed the chain energy with the kernel's own `eta`, which runs twice
 as fast as `eta_dot` implies, and reported a timestep-independent drift of a few
 meV/atom per 20 fs as unexplained. The class uses `eta/2`; the dynamics never
 depended on it. The kernel-level traps (full dt, `total_scale`, ndof dtypes)
-are written down in `07_custom_loop.py`.
+are written down in this folder's README.
 
     python 03_nvt_nose_hoover.py --model ../../path/to/model.ckpt.pt
 """

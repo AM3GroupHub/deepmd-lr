@@ -11,8 +11,7 @@ uniformly, `orthorhombic` moves the three lengths of a diagonal cell, `full`
 lets all of it fluctuate. A liquid has no shear stiffness, so keep isotropic
 for water; `full` is for crystals.
 
-What the class does that a hand-written loop has to get right (see
-`07_custom_loop.py` for the loop itself):
+What the class does that a hand-written loop has to get right:
 - **The cell.** After the barostat moves the cell it is pushed to the
   evaluator. Its partitions follow the cell and rebuild only once the cell or
   the atoms have moved enough; reach the density here, then produce in NVT.

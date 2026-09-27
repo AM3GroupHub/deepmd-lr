@@ -185,9 +185,7 @@ measurable.
 fingerprint of the model and system. `Cls.from_checkpoint(ev, atoms, path)`
 continues exactly: Langevin's noise is seeded per step, so a restart draws
 what an uninterrupted run would. After a hard kill it trims the log and the
-trajectory back to the checkpoint. For a ready-made driver with restarts
-across jobs, signal handling and a GPU-count benchmark, see
-[examples/07-multi-gpu-md](../examples/07-multi-gpu-md).
+trajectory back to the checkpoint.
 
 ### Your own loop
 
@@ -195,8 +193,8 @@ For an integrator the classes lack, drive nvalchemiops' kernels on a
 `Thermo` directly, or subclass `MolecularDynamics` and write `step()` — the
 kernels around exactly one `self.thermo.evaluate()` — to get the log,
 trajectory, observers and checkpoints for free.
-[`07_custom_loop.py`](../examples/06-md_nvalchemi/07_custom_loop.py) shows
-both. NVE on a `Thermo`:
+[`07_custom_berendsen.py`](../examples/06-md_nvalchemi/07_custom_berendsen.py)
+does the second, for a Berendsen thermostat. NVE on a `Thermo`:
 
 ```python
 from nvalchemiops.dynamics.integrators import (

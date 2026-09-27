@@ -75,10 +75,6 @@ the model first.
   the kernels transposed, the relaxations' refusals, the cell relaxation
   (its force against finite differences of the enthalpy, every mode reaching
   the target pressure), and the dipole current.
-- `test_run_md.py` — the production MD driver in `examples/07-multi-gpu-md`,
-  which delegates to those classes: every ensemble (NPH, full-cell NPT and
-  velocity rescaling included), restarts, partitions, unwrapped input,
-  `--relax-cell`, exit codes.
 - `test_compress.py`, `test_compress_arguments.py`,
   `test_compress_atomic_state.py`, `test_compress_required.py` — compressed
   DPA4C inference: every refusal, the graph-lower guard, argument validation,
