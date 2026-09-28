@@ -20,7 +20,6 @@
 """
 
 from deepmd_lr.nvalchemi.driver import (
-    device_replicas,
     evaluate_partitioned,
     partition_graph,
     to_numpy,
@@ -73,7 +72,6 @@ __all__ = [
     "VelocityVerlet",
     "atomic_masses",
     "build_evaluator",
-    "device_replicas",
     "evaluate_partitioned",
     "partition_graph",
     "partition_system",

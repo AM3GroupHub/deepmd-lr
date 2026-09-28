@@ -424,3 +424,38 @@ class TestNonPeriodicStatistics:
             type(model).__mro__[1].compute_or_load_stat = original
         assert seen["box"] is not None
         assert np.allclose(seen["box"], cell)
+
+
+# --- two atoms at one point --------------------------------------------------
+
+@pytest.mark.parametrize("padded", [False, True])
+def test_coincident_pair_derivatives(padded):
+    coord = torch.tensor(
+        [[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 0.0]]],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    q = torch.tensor([[1.0, -1.0, 0.5]], dtype=torch.float64, requires_grad=True)
+    mask = torch.tensor([[True, True, not padded]])
+    term = IsolatedLongRangeEnergy()
+
+    def fn(r, charges):
+        return term(r, charges, mask=mask).sum()
+
+    assert torch.autograd.gradcheck(fn, (coord, q))
+    assert torch.autograd.gradgradcheck(fn, (coord, q))
+    if padded:
+        trimmed = term(coord[:, :2], q[:, :2]).sum()
+        torch.testing.assert_close(fn(coord, q), trimmed)
+        grad = torch.autograd.grad(fn(coord, q), coord)[0]
+        torch.testing.assert_close(grad[:, 2], torch.zeros_like(grad[:, 2]))
+
+
+def test_coincident_pair_has_analytic_limit():
+    coord = torch.zeros((1, 2, 3), dtype=torch.float64)
+    q = torch.tensor([[1.0, -1.0]], dtype=torch.float64)
+    alpha = 0.4
+    energy = IsolatedLongRangeEnergy(alpha=alpha)(coord, q).sum()
+    assert float(energy) == pytest.approx(
+        -2 * alpha / np.sqrt(np.pi) * ELECTROSTATIC_CONVERSION
+    )

@@ -537,9 +537,9 @@ to_numpy(out)["force"]            # numpy (N, 3), one explicit download
 
 `DistributedEvaluator` keeps the tensor path: the forces go straight into the
 buffer the warp integrator aliases, so they never leave the GPU between steps,
-and `results` converts an entry to numpy only when it is read
-(`results_on_device=True` skips even that). One download per step remains, the
-energy scalar, because the call returns it as a Python float.
+and `results` converts an entry to numpy only when it is read. One download
+per step remains, the energy scalar, because the call returns it as a Python
+float.
 
 ## Limits
 

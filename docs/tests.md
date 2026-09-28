@@ -46,8 +46,6 @@ the model first.
   guards, and serialization.
 - `test_charge_head.py` — the total-charge projection (exactness, masking,
   differentiability) and the charge head's physical symmetries.
-- `test_charge_contracts.py` — `charge_spin` and `exclude_types`, serial
-  against partitioned.
 - `test_born.py`, `test_eps_inf.py` — Born effective charges against a
   brute-force derivative, their symmetries, the field force, and the
   `sqrt(eps_inf)` screening on every path.
@@ -57,10 +55,10 @@ the model first.
 
 **Running it**
 
-- `test_ase_calculator.py`, `test_review_regressions.py` — the ASE calculator
-  against the model, its pbc guards and export refusal, and NVE drift; each
-  frame's pbc picking its sum and its cell the mesh; a slab with too little
-  vacuum refused.
+- `test_ase_calculator.py` — the ASE calculator against the model, its pbc
+  guards and export refusal, and NVE drift; each frame's pbc picking its sum
+  and its cell the mesh; a slab with too little vacuum refused; a multi-head
+  checkpoint's branch loaded by name.
 - `test_read_structure.py` — the file's pbc kept; a slab's open axis padded to
   the vacuum, centred, and made whole when the file wrapped it; fixed atoms
   read back and moved with the slab; molecules and wires refused.
@@ -74,6 +72,7 @@ the model first.
   `isolated` term is refused. A supercell gets the mesh its cell needs and
   reproduces its unit cell. Evaluators sharing one model, for different cells
   and boundaries, each keep their own term, and none changes the model.
+  `charge_spin` and `exclude_types` hold serially and partitioned alike.
 - `test_thermo.py` — `Thermo`'s measurements, warp aliasing, cell sync, the
   guards that make one evaluator safe to share (`fresh`,
   `cell_is_current`, `set_state`), and fixed atoms: read from `FixAtoms` by
@@ -93,12 +92,12 @@ the model first.
   and the Nosé–Hoover target count three degrees of freedom per mobile atom,
   NVE matches ASE's own `VelocityVerlet` with the same `FixAtoms`, and
   output, checkpoints and refusals carry the constraint.
-- `test_compress.py`, `test_compress_arguments.py`,
-  `test_compress_atomic_state.py`, `test_compress_required.py` — compressed
-  DPA4C inference: every refusal, the graph-lower guard, argument validation,
-  state left intact by a failed compression, and, with the operator, kernel
-  dispatch, compressed-vs-uncompressed agreement, and the cached pair lists'
-  CSR driving the kernel to the fresh search's answer.
+- `test_compress.py` — compressed DPA4C inference: every refusal, the
+  graph-lower guard, argument validation, state left intact by a failed
+  compression, the strict mode's refusal to collect without a kernel, and,
+  with the operator, kernel dispatch, compressed-vs-uncompressed agreement,
+  and the cached pair lists' CSR driving the kernel to the fresh search's
+  answer.
 
 **Plumbing**
 

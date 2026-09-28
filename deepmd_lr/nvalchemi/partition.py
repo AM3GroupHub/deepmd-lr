@@ -484,7 +484,7 @@ def partition_system(
     grid_cell = np.array(cell, dtype=np.float64)
     for axis in range(3):
         if not pbc[axis]:
-            extent = frac[:, axis].max() - frac[:, axis].min() if n_atoms else 0.0
+            extent = frac[:, axis].max() - frac[:, axis].min()
             grid_cell[axis] *= max(extent, 1e-6)
     grid = decomposition_grid(grid_cell, n_partitions, rcut)
     groups = [np.arange(n_atoms)]

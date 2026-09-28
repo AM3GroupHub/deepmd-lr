@@ -210,10 +210,9 @@ class _Logger:
     """The thermo table: one ``#`` header line, then whitespace-separated
     rows. ``numpy.loadtxt`` reads it directly. ``'-'`` writes to stdout."""
 
-    def __init__(self, target: Any, columns: list, append: bool, echo: bool = False):
+    def __init__(self, target: Any, columns: list, append: bool):
         self.columns = columns  # [(name, width, spec)]
         self.path = None
-        self.echo = echo and target != "-"
         header = "".join(f"{name:>{width}}" for name, width, _ in columns)
         header = "#" + header[1:]
         fresh = True
@@ -228,8 +227,6 @@ class _Logger:
         if fresh:
             self.fh.write(header + "\n")
             self.fh.flush()
-        if self.echo:
-            print(header, flush=True)
 
     def write(self, row: Mapping[str, float]) -> None:
         fields = [f"{row[name]:>{width}{spec}}" for name, width, spec in self.columns]
@@ -238,8 +235,6 @@ class _Logger:
         line = "".join(f if f[:1].isspace() else " " + f for f in fields)
         self.fh.write(line + "\n")
         self.fh.flush()
-        if self.echo:
-            print(line, flush=True)
 
     def tell(self) -> int | None:
         return self.fh.tell() if self.path is not None else None
@@ -413,8 +408,6 @@ class MolecularDynamics:
         checkpoint: Any = None,
         checkpoint_interval: int | None = None,
         max_temperature: float | None = None,
-        echo_log: bool = False,
-        traj_wrapped: bool = False,
         _restoring: bool = False,
     ) -> None:
         _check_evaluator(evaluator)
@@ -447,11 +440,8 @@ class MolecularDynamics:
         self._logger = (
             None
             if logfile is None
-            else _Logger(logfile, self._columns(), append=_restoring, echo=echo_log)
+            else _Logger(logfile, self._columns(), append=_restoring)
         )
-        self.traj_wrapped = bool(traj_wrapped)
-        #: Free-form, JSON-serialisable; travels with every checkpoint.
-        self.metadata: dict = {}
         self._traj = None
         self.traj_interval = int(traj_interval or loginterval)
         self.trajectory_properties = tuple(trajectory_properties)
@@ -470,7 +460,6 @@ class MolecularDynamics:
             "checkpoint": None if checkpoint is None else str(checkpoint),
             "checkpoint_interval": checkpoint_interval,
             "max_temperature": max_temperature,
-            "traj_wrapped": self.traj_wrapped,
         }
         if not _restoring:
             self._remove_com_drift()
@@ -744,8 +733,6 @@ class MolecularDynamics:
             )
         if results:
             frame.calc = SinglePointCalculator(frame, **results)
-        if self.traj_wrapped:
-            frame.wrap()
         frame.info["step"] = self.nsteps
         frame.info["time_ps"] = self._time / (1000 * units.fs)
         self._traj.write(frame)
@@ -827,7 +814,6 @@ class MolecularDynamics:
             "fingerprint": _fingerprint(
                 self.evaluator, self._masses, self.thermo.fixed
             ),
-            "metadata": self.metadata,
             "log_bytes": None if self._logger is None else self._logger.tell(),
             "traj_bytes": (
                 None
@@ -884,8 +870,6 @@ class MolecularDynamics:
             "checkpoint",
             "checkpoint_interval",
             "max_temperature",
-            "echo_log",
-            "traj_wrapped",
         }
         if set(io_overrides) - allowed:
             raise TypeError(
@@ -911,7 +895,7 @@ class MolecularDynamics:
         atoms.set_velocities(arrays["velocities"])
         if not np.array_equal(np.asarray(evaluator.cell), arrays["cell"]):
             evaluator.set_cell(arrays["cell"])
-        io = {k: v for k, v in meta["io"].items() if v is not None}
+        io = {k: v for k, v in meta["io"].items() if v is not None and k in allowed}
         io.update(io_overrides)
         for key, size_key in (("logfile", "log_bytes"), ("trajectory", "traj_bytes")):
             target, size = io.get(key), meta.get(size_key)
@@ -923,7 +907,6 @@ class MolecularDynamics:
             evaluator, atoms, meta["timestep"], **meta["params"], **io, _restoring=True
         )
         md.nsteps, md._time = int(meta["nsteps"]), float(meta["time"])
-        md.metadata = dict(meta.get("metadata", {}))
         md._load_state(arrays)
         return md
 

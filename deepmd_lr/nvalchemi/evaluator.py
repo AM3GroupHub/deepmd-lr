@@ -244,10 +244,6 @@ class DistributedEvaluator:
         what a run that wants the geometry rule and nothing else should pass.
         The out-of-memory backoff stays either way, since a prediction can
         still be wrong when another process is sharing the device.
-    results_on_device
-        Keep :attr:`results` as device tensors. By default they are wrapped so
-        that each entry is converted to numpy on first access -- the forces
-        the integrator consumes never leave the GPU either way.
     compress
         ``True`` to compress the DPA4C backbone at DeePMD-kit's default table
         stride, or a float stride in angstrom. Done before the device replicas
@@ -289,7 +285,6 @@ class DistributedEvaluator:
         charge_spin: torch.Tensor | tuple[float, float] | None = None,
         compress: bool | float = False,
         eps_inf: float = 1.0,
-        results_on_device: bool = False,
         memory_headroom: float | None = 0.8,
     ) -> None:
         if not devices:
@@ -360,7 +355,6 @@ class DistributedEvaluator:
         screening_factor(eps_inf)
         self.eps_inf = float(eps_inf)
         #: Leave ``results`` as device tensors instead of the lazy numpy view.
-        self.results_on_device = bool(results_on_device)
         self.home = next(model.parameters()).device
         self.atype = np.asarray(atype, dtype=np.int64).reshape(-1)
         #: Whether the caller asked for the geometry rule. Kept because the
@@ -836,9 +830,8 @@ class DistributedEvaluator:
             self._reference_positions = None
         # Results stay on the device; `_LazyNumpy` hands out numpy on access,
         # so a caller that reads `results["charge"]` pays for that copy and a
-        # caller that reads nothing pays for none. `results_on_device` skips
-        # the wrapper for callers that want the tensors themselves.
-        self.results = out if self.results_on_device else _LazyNumpy(out)
+        # caller that reads nothing pays for none.
+        self.results = _LazyNumpy(out)
         self.virial = (
             None if out.get("virial") is None else out["virial"].detach().cpu().numpy()
         )
@@ -858,8 +851,7 @@ class DistributedEvaluator:
             self.forces += response
             # Kept separately so a caller can watch the field term without
             # re-deriving it, and so `out["force"]` stays the field-free force.
-            self.results["field_force"] = (
-                response if self.results_on_device else response.cpu().numpy()
-            )
+            # A tensor, like the rest: downloaded only if read.
+            self.results["field_force"] = response
         self.calls += 1
         return float(out["energy"]), self.forces

@@ -15,6 +15,9 @@ how a source build proves itself.
 
 import copy
 import os
+import subprocess
+import sys
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -29,6 +32,7 @@ from deepmd_lr import compress as compress_module
 from deepmd_lr.ase import LongRangeCalculator, load_model
 from deepmd_lr.compress import compress_model
 from deepmd_lr.fitting.charge import resolve_charge_spin
+from deepmd_lr.model import lr_model
 from deepmd_lr.neighbors import build_neighbor_graph_fast
 from deepmd_lr.nvalchemi import build_evaluator
 from deepmd_lr.nvalchemi import driver as DRV
@@ -495,3 +499,153 @@ class TestKernel:
         forces = atoms.get_forces()
         assert np.isfinite(forces).all()
         assert np.isfinite(atoms.calc.results["born_charge"]).all()
+
+
+# --- compress_model's switch and stride contracts ------------------------------
+
+@pytest.mark.parametrize(
+    "value", [0, 0.0, -0.01, float("nan"), float("inf"), -float("inf")]
+)
+def test_invalid_numeric_stride_is_rejected(value):
+    with pytest.raises(ValueError, match="positive and finite"):
+        compress_model(None, value)
+
+
+@pytest.mark.parametrize("value", [None, "0.01", [], {}])
+def test_non_numeric_stride_is_rejected(value):
+    with pytest.raises(TypeError, match="bool or"):
+        compress_model(None, value)
+
+
+def test_false_true_and_positive_stride(monkeypatch):
+    model = build32()
+    calls = []
+    monkeypatch.setattr(
+        model, "enable_compression", lambda **kwargs: calls.append(kwargs)
+    )
+    assert compress_model(model, False) is model
+    assert calls == []
+    compress_model(model, True)
+    compress_model(model, 0.002)
+    assert calls == [
+        {"charge_spin": None},
+        {"table_stride_1": 0.002, "charge_spin": None},
+    ]
+
+
+@pytest.mark.parametrize("value", [0.0, -1.0, float("nan"), float("inf")])
+def test_direct_model_api_rejects_bad_stride_before_mutation(monkeypatch, value):
+    monkeypatch.setenv("DP_CUDA_INFER", "0")
+    model = build32()
+    with pytest.raises(ValueError, match="positive and finite"):
+        model.enable_compression(table_stride_1=value)
+    assert not model.atomic_model.descriptor.compress
+    assert os.environ["DP_CUDA_INFER"] == "0"
+
+
+@pytest.mark.parametrize("long_range", [False, True])
+def test_level_two_is_rejected_for_both_model_types(monkeypatch, long_range):
+    monkeypatch.setattr(lr_model, "_kernel_available", lambda: True)
+    monkeypatch.setenv("DP_CUDA_INFER", "2")
+    model = build32(long_range=long_range)
+    with pytest.raises(RuntimeError, match="DP_CUDA_INFER=2"):
+        model.enable_compression()
+    assert not model.atomic_model.descriptor.compress
+
+
+# --- a failed compression leaves the model as it was ---------------------------
+
+@pytest.fixture
+def available_operator(monkeypatch):
+    # Table construction uses PyTorch; CUDA dispatch is outside these tests.
+    monkeypatch.setattr(lr_model, "_kernel_available", lambda: True)
+
+
+@pytest.mark.parametrize("level", [None, "0", "1"])
+@pytest.mark.parametrize("condition", [[1, 2, 3], [float("nan"), 1], [0.5, 1]])
+def test_invalid_condition_leaves_state_unchanged(
+    available_operator, monkeypatch, level, condition
+):
+    if level is None:
+        monkeypatch.delenv("DP_CUDA_INFER", raising=False)
+    else:
+        monkeypatch.setenv("DP_CUDA_INFER", level)
+    model = build32(chg_ebd=True)
+    descriptor = model.atomic_model.descriptor
+    before = descriptor.state_dict()
+    with pytest.raises(ValueError):
+        model.enable_compression(charge_spin=condition)
+    assert not descriptor.compress
+    assert getattr(model, "_compressed_charge_spin", None) is None
+    assert os.environ.get("DP_CUDA_INFER") == level
+    assert descriptor.state_dict().keys() == before.keys()
+    for key, value in before.items():
+        torch.testing.assert_close(descriptor.state_dict()[key], value)
+    model.enable_compression(charge_spin=[0, 1])
+    assert descriptor.compress
+    assert model._compressed_charge_spin == (0, 1)
+
+
+@pytest.mark.parametrize("method", ["enable_compression", "apply_charge_state"])
+def test_partial_failure_restores_buffers_and_allows_retry(
+    available_operator, monkeypatch, method
+):
+    monkeypatch.delenv("DP_CUDA_INFER", raising=False)
+    model = build32(chg_ebd=True)
+    descriptor = model.atomic_model.descriptor
+    original = getattr(type(descriptor), method)
+    buffers = descriptor._buffers.copy()
+    had_scalars = hasattr(descriptor, "_compression_scalars")
+    scalars = getattr(descriptor, "_compression_scalars", None)
+
+    def fail_after_mutation(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        raise RuntimeError("injected post-mutation failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(type(descriptor), method, fail_after_mutation)
+        with pytest.raises(RuntimeError, match="injected"):
+            model.enable_compression(charge_spin=[0, 1])
+    assert model.atomic_model.descriptor is descriptor
+    assert not descriptor.compress
+    assert descriptor._buffers.keys() == buffers.keys()
+    assert all(descriptor._buffers[key] is value for key, value in buffers.items())
+    assert hasattr(descriptor, "_compression_scalars") == had_scalars
+    assert getattr(descriptor, "_compression_scalars", None) == scalars
+    assert "DP_CUDA_INFER" not in os.environ
+    model.enable_compression(charge_spin=[0, 1])
+    assert descriptor.compress
+    with pytest.raises(ValueError, match="already"):
+        model.enable_compression(charge_spin=[0, 1])
+    assert descriptor.compress
+    assert model._compressed_charge_spin == (0, 1)
+
+
+# --- DEEPMD_LR_REQUIRE_COMPRESS=1 refuses to run without the prerequisites -----
+
+@pytest.mark.parametrize(
+    "cuda,operator", [(False, True), (True, False), (False, False)]
+)
+def test_required_mode_fails_collection_without_prerequisites(cuda, operator):
+    # Import the backend before simulating availability. No kernels are executed.
+    code = f"""
+import deepmd.pt_expt
+import torch
+import deepmd.kernels.cuda.dpa4c.graph_compress as gc
+import pytest
+torch.cuda.is_available = lambda: {cuda!r}
+gc.op_available = lambda: {operator!r}
+raise SystemExit(pytest.main([
+    '-p', 'no:cacheprovider', '--collect-only', '-q', 'tests/test_compress.py'
+]))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=Path(__file__).resolve().parents[1],
+        env={**os.environ, "DEEPMD_LR_REQUIRE_COMPRESS": "1"},
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "requires a usable CUDA device" in result.stdout + result.stderr

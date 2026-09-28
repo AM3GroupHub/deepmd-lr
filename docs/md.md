@@ -45,33 +45,10 @@ short step — and is nothing to do with the long-range term.)
 
 The calculator above runs on one device, and every step copies the positions
 to the host and back. For MD that never leaves the GPU, and for several GPUs,
-the classes in `deepmd_lr.nvalchemi` follow the same ASE pattern on
-nvalchemiops kernels:
-
-```python
-from ase import units
-from ase.md.velocitydistribution import Stationary, thermalize_momenta
-from deepmd_lr.nvalchemi import FIRE2, NoseHooverChainNVT, build_evaluator
-
-ev = build_evaluator("run_joint/model.ckpt.pt", atoms, devices=["cuda:0"])
-FIRE2(ev, atoms).run(fmax=0.05)
-thermalize_momenta(atoms, temperature_K=300)
-Stationary(atoms)
-NoseHooverChainNVT(ev, atoms, 0.5 * units.fs, temperature_K=300,
-                   tdamp=100 * units.fs, logfile="md.log",
-                   loginterval=100).run(20_000)
-```
-
-`VelocityVerlet` (NVE); `Langevin`, `NoseHooverChainNVT` and
-`VelocityRescaling` (NVT); `MTKNPT` (NPT) and `MTKNPH` (NPH), each with an
-isotropic, orthorhombic or full cell; and the relaxations `FIRE` and `FIRE2`
-share that one evaluator, so a relaxation and several MD stages run on one
-copy of the model. ASE's `FixAtoms` on `atoms` holds those atoms in place, in
-every class but the barostats
-([example 06](../examples/06-md_nvalchemi/README.md#fixed-atoms)). Between them they cover every integrator nvalchemiops ships. [Partitioned MD](partitioned-md.md#the-md-classes)
-covers the API and what each piece owns.
-[Example 06](../examples/06-md_nvalchemi) has a script per ensemble, and
-[example 07](../examples/07-ase-calculator) covers the ASE calculator.
+use the classes in `deepmd_lr.nvalchemi`. [Partitioned MD](partitioned-md.md#the-md-classes)
+shows the workflow and class API; [example 06](../examples/06-md_nvalchemi)
+has a script per ensemble. [Example 07](../examples/07-ase-calculator)
+covers the ASE calculator.
 
 ## Traps
 
