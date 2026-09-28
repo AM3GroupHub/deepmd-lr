@@ -184,6 +184,13 @@ class _FIREBase:
                 f"relax_cell must be None or one of {', '.join(_CELL_MODES)}; "
                 f"got {relax_cell!r}"
             )
+        if relax_cell is not None and not all(
+            getattr(evaluator, "pbc", (True, True, True))
+        ):
+            raise ValueError(
+                "relax_cell moves the cell, and a slab's open axis is not a "
+                "periodic length a stress can act on; relax the positions only"
+            )
         self.relax_cell = relax_cell
         self.pressure_au = float(pressure_au)
         if relax_cell is None and self.pressure_au != 0.0:

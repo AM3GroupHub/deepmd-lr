@@ -1492,3 +1492,52 @@ class TestDipoleCurrent:
         v = md.thermo.velocities.numpy()
         np.testing.assert_allclose(md.dipole_current(), np.einsum("iab,ib->a", z, v))
         assert not np.allclose(md.dipole_current(), np.einsum("iba,ib->a", z, v))
+
+
+SLAB = (True, True, False)
+
+
+def make_slab(model, vacuum=20.0, seed=0):
+    """The fixture's molecules as a slab: z opened, with `vacuum` above the
+    layer, which is centred."""
+    atoms = make_atoms(model, seed=seed)
+    pos = atoms.get_positions()
+    pos[:, 2] += vacuum / 2 - pos[:, 2].min()
+    cell = atoms.cell.array.copy()
+    cell[2, 2] = np.ptp(pos[:, 2]) + vacuum
+    atoms.set_positions(pos)
+    atoms.set_cell(cell, scale_atoms=False)
+    atoms.pbc = SLAB
+    return atoms
+
+
+class TestSlabs:
+    def test_nvt_runs_on_a_slab_and_keeps_it_in_the_cell(self, model):
+        atoms = make_slab(model)
+        md = Langevin(make_ev(model, atoms, pbc=SLAB), atoms, DT, T0, FRICTION, seed=1)
+        md.run(20)
+        assert np.isfinite(md.thermo.energy)
+        z = md.thermo.positions.numpy()[:, 2]
+        assert 0.0 < z.min() and z.max() < atoms.cell[2, 2]
+
+    def test_atoms_must_carry_the_evaluators_pbc(self, model):
+        atoms = make_slab(model)
+        ev = make_ev(model, atoms, pbc=SLAB)
+        atoms.pbc = True
+        with pytest.raises(ValueError, match="evaluator was built for"):
+            VelocityVerlet(ev, atoms, DT)
+
+    def test_barostats_are_refused_on_a_slab(self, model):
+        atoms = make_slab(model)
+        ev = make_ev(model, atoms, pbc=SLAB, compute_virial=True)
+        with pytest.raises(ValueError, match="open axis"):
+            MTKNPT(ev, atoms, DT, T0, PRESSURE, TDAMP, PDAMP, cell="isotropic")
+        with pytest.raises(ValueError, match="open axis"):
+            MTKNPH(ev, atoms, DT, PRESSURE, PDAMP, temperature_K=T0)
+
+    def test_fire_relaxes_a_slabs_positions_but_not_its_cell(self, model):
+        atoms = make_slab(model)
+        ev = make_ev(model, atoms, pbc=SLAB, compute_virial=True)
+        with pytest.raises(ValueError, match="relax the positions only"):
+            FIRE2(ev, atoms, relax_cell="isotropic", logfile=None)
+        FIRE2(ev, atoms, logfile=None, check=False).run(fmax=1.0, steps=5)

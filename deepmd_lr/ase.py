@@ -275,6 +275,30 @@ class LongRangeCalculator(Calculator):
             ) from exc
         return torch.tensor(indices, dtype=torch.int64, device=self.device)
 
+    def _check_slab_gap(self, atoms) -> None:
+        """Refuse a slab whose vacuum a cutoff sphere could cross.
+
+        This calculator hands the model the full cell, so the descriptor sees
+        a slab as 3D-periodic. With a gap narrower than the cutoff, atoms at
+        one face would see the next image's opposite face, an interaction the
+        slab does not have.
+        """
+        axis = [bool(p) for p in atoms.pbc].index(False)
+        cell = np.asarray(atoms.get_cell(), dtype=np.float64)
+        a, b = (cell[j] for j in range(3) if j != axis)
+        normal = np.cross(a, b)
+        normal /= np.linalg.norm(normal)
+        depth = abs(float(cell[axis] @ normal))
+        gap = depth - float(np.ptp(atoms.get_positions() @ normal))
+        rcut = float(self.model.get_rcut())
+        if gap < rcut:
+            raise ValueError(
+                f"the slab leaves {gap:.2f} A of vacuum along its open axis, "
+                f"less than the cutoff {rcut} A: atoms would see their images "
+                "across it. Pad the cell and centre the slab, e.g. "
+                "deepmd_lr.nvalchemi.read_structure(path) does both."
+            )
+
     def _check_pbc(self, atoms) -> bool:
         """Refuse a boundary condition this model cannot evaluate.
 
@@ -296,12 +320,14 @@ class LongRangeCalculator(Calculator):
                     "and so no cell to repeat. For an isolated molecule build the "
                     "model with `long_range.reciprocal.method: 'isolated'`."
                 )
-            expected_pbc = term.pbc if term.needs_cell else (False, False, False)
-            if not np.array_equal(atoms.pbc, expected_pbc):
+            if not term.needs_cell and periodic:
                 raise ValueError(
                     f"Atoms pbc={atoms.pbc.tolist()} does not match the "
-                    f"selected long-range branch pbc={list(expected_pbc)}"
+                    "selected long-range branch pbc=[False, False, False]: the "
+                    "isolated term sums no periodic images"
                 )
+            if term.needs_cell and sum(bool(p) for p in atoms.pbc) == 2:
+                self._check_slab_gap(atoms)
         elif periodic and not atoms.pbc.all():
             raise ValueError(
                 "Partial pbc is unsupported by the short-range graph interface"
@@ -317,6 +343,12 @@ class LongRangeCalculator(Calculator):
         super().calculate(atoms, properties or ["energy"], system_changes)
         atoms = self.atoms
         periodic = self._check_pbc(atoms)
+        if self._has_long_range and periodic:
+            # The frame decides how the sum is taken: its pbc picks the 3D or
+            # the slab sum, its cell the PME mesh. The term holds no weights,
+            # so this changes no parameter, and each frame gets the mesh its
+            # own cell needs.
+            self.model.adapt_long_range(np.asarray(atoms.get_cell()), atoms.pbc)
 
         coord = torch.tensor(
             np.asarray(atoms.get_positions()),

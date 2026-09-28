@@ -30,10 +30,12 @@ python 02_nvt_langevin.py --model ... --structure traj.xyz --index 250
 ```
 
 `--index` picks the frame from a multi-frame file and defaults to the last,
-usually the most equilibrated. **A cell is required** — these are periodic
-simulations, and a structure without one is refused rather than quietly
-treated as a molecule in vacuum. Molecules, clusters and slabs run through the
-ASE calculator instead ([example 07](../07-ase-calculator)).
+usually the most equilibrated. **A cell is required** along every periodic
+axis. A slab, whose `pbc` leaves one axis open, runs too: `read_structure` pads
+that axis to at least 20 Å of vacuum (`vacuum=`) and centres the slab, and the
+long-range sum takes its slab form. Molecules and clusters are refused rather
+than quietly treated as periodic; they run through the ASE calculator
+([example 07](../07-ase-calculator)).
 
 ## The scripts
 

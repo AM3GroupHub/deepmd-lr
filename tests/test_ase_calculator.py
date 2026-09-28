@@ -134,6 +134,7 @@ class TestCalculatorGuards:
         """pbc=[True, True, False] is exactly the configuration
         `slab_correction` exists for; the guard used to reject it."""
         atoms = water_atoms()
+        atoms.set_cell([10.0, 10.0, 30.0])  # a real slab: 20 A of vacuum over it
         atoms.pbc = [True, True, False]
         from deepmd_lr.lr.term import LongRangeEnergy
 
@@ -143,6 +144,52 @@ class TestCalculatorGuards:
         model.long_range_energy = LongRangeEnergy(**settings)
         atoms.calc = LongRangeCalculator(model)
         assert np.isfinite(atoms.get_potential_energy())
+
+    def test_each_frames_pbc_picks_its_sum(self):
+        """One calculator, three frames: the slab sum where pbc opens z, the
+        3D sum where it does not, matching calculators fixed to each."""
+        from deepmd_lr.lr.term import LongRangeEnergy
+
+        bulk = water_atoms()
+        slab = water_atoms()
+        slab.set_cell([10.0, 10.0, 30.0])
+        slab.pbc = [True, True, False]
+
+        def fixed(atoms, slab_mode):
+            model = build()
+            settings = model.long_range_energy.serialize()
+            if slab_mode:
+                settings.update(slab_correction=True, pbc=[True, True, False])
+            settings.update(mesh_dimensions=[15, 15, 24 if slab_mode else 15])
+            model.long_range_energy = LongRangeEnergy(**settings)
+            a = atoms.copy()
+            a.calc = LongRangeCalculator(model)
+            return a.get_potential_energy()
+
+        calc = LongRangeCalculator(build())
+        for atoms, slab_mode in ((bulk, False), (slab, True), (bulk, False)):
+            a = atoms.copy()
+            a.calc = calc
+            energy = a.get_potential_energy()
+            assert calc.model.long_range_energy.slab_correction is slab_mode
+            assert energy == pytest.approx(fixed(atoms, slab_mode), abs=1e-9)
+
+    def test_each_frame_gets_the_mesh_its_cell_needs(self):
+        calc = LongRangeCalculator(build())
+        for box, mesh in ((10.0, (15, 15, 15)), (40.0, (32, 32, 32))):
+            atoms = water_atoms(box=box)
+            atoms.calc = calc
+            atoms.get_potential_energy()
+            assert calc.model.long_range_energy.mesh_dimensions == mesh
+
+    def test_a_slab_with_less_vacuum_than_the_cutoff_is_refused(self):
+        """The calculator hands the model the whole cell, so across a thin
+        gap the descriptor would see the next image's other face."""
+        atoms = water_atoms()
+        atoms.pbc = [True, True, False]  # a 10 A cell with atoms up to its faces
+        atoms.calc = LongRangeCalculator(build())
+        with pytest.raises(ValueError, match="less than the cutoff"):
+            atoms.get_potential_energy()
 
     def test_rejects_unknown_elements(self):
         atoms = water_atoms()

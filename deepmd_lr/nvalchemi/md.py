@@ -184,11 +184,13 @@ def _check_atoms(evaluator: Any, atoms: Atoms) -> None:
             "atoms carries ASE constraints, which the GPU kernels would "
             "silently ignore; remove them (atoms.set_constraint())"
         )
-    if not atoms.pbc.all():
+    expected_pbc = tuple(getattr(evaluator, "pbc", (True, True, True)))
+    if tuple(bool(p) for p in atoms.pbc) != expected_pbc:
         raise ValueError(
-            "the partitioned evaluator needs periodicity along all three "
-            f"axes; atoms.pbc is {atoms.pbc.tolist()}. Molecules, clusters and "
-            "slabs run through the ASE calculator, deepmd_lr.ase.LongRangeCalculator"
+            f"atoms.pbc is {atoms.pbc.tolist()} but the evaluator was built for "
+            f"{list(expected_pbc)}; build it from these atoms (build_evaluator "
+            "reads their pbc). Molecules and clusters run through the ASE "
+            "calculator, deepmd_lr.ase.LongRangeCalculator"
         )
     if not np.allclose(atoms.cell.array, evaluator.cell, rtol=0, atol=1e-9):
         raise ValueError(
@@ -1220,6 +1222,12 @@ class _MTKBarostat(MolecularDynamics):
     ) -> None:
         _check_evaluator(evaluator)
         name = type(self).__name__
+        if not all(getattr(evaluator, "pbc", (True, True, True))):
+            raise ValueError(
+                f"{name} moves the cell, and a slab's open axis is not a "
+                "periodic length a pressure can act on; run the slab in NVE or "
+                "NVT (the in-plane pressure is not controlled)"
+            )
         if not evaluator.compute_virial:
             raise ValueError(
                 f"{name} needs the virial: build the evaluator with "

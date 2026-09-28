@@ -10,6 +10,7 @@ Phase A covers the short-range model; Phase B adds the long-range term,
 gathered onto one device.
 """
 
+import math
 import os
 
 import numpy as np
@@ -1096,27 +1097,155 @@ class TestDistributedEvaluator:
 
 
 class TestLongRangeBoundary:
-    """A long-range term whose boundary is not the system's is refused, as the
-    ASE calculator refuses it. Before the check, the partitioned path ran an
-    ``isolated`` term on the periodic water box 1.1 eV off and a slab term
-    0.03 eV off, and raised nothing."""
+    """The system's pbc decides how the long-range sum is taken, and only a
+    term that cannot be adapted is refused. Before either, the partitioned
+    path ran an ``isolated`` term on the periodic water box 1.1 eV off, and a
+    slab term 0.03 eV off, and raised nothing."""
 
-    @pytest.mark.parametrize(
-        "settings",
-        [
-            {"method": "isolated"},
-            {"method": "pme", "slab_correction": True, "pbc": [True, True, False]},
-        ],
-        ids=["isolated", "slab"],
-    )
-    def test_a_term_that_is_not_3d_periodic_is_refused(self, system, settings):
+    def test_an_isolated_term_is_refused(self, system):
         coord, atype, cell, *_ = system
         model = build()
-        model.set_long_range(settings)
+        model.set_long_range({"method": "isolated"})
         with pytest.raises(ValueError, match="ASE calculator"):
             DistributedEvaluator(model, atype, cell, devices=[DEVICE])
         with pytest.raises(ValueError, match="does not match the system's pbc"):
             evaluate_partitioned(model, coord, atype, cell, n_partitions=1)
+
+    def test_a_slab_term_on_a_bulk_cell_takes_the_3d_sum(self, system):
+        coord, atype, cell, *_ = system
+
+        def slab_model():
+            model = build()
+            settings = model.long_range_energy.serialize()
+            settings.update(slab_correction=True, pbc=[True, True, False])
+            model.set_long_range(settings)
+            return model
+
+        ev = DistributedEvaluator(
+            slab_model(), atype, cell, devices=[DEVICE], memory_headroom=None
+        )
+        assert ev.model.long_range_energy.slab_correction is False
+        bulk = DistributedEvaluator(
+            build(), atype, cell, devices=[DEVICE], memory_headroom=None
+        )
+        (e, f), (e_ref, f_ref) = ev(coord), bulk(coord)
+        assert e == pytest.approx(e_ref, abs=1e-9)
+        np.testing.assert_allclose(f.cpu().numpy(), f_ref.cpu().numpy(), atol=1e-9)
+        # The functional API adapts nothing, so there the mismatch is refused.
+        with pytest.raises(ValueError, match="does not match the system's pbc"):
+            evaluate_partitioned(slab_model(), coord, atype, cell, n_partitions=1)
+
+
+def slab(n_mol=16, box=14.0, vacuum=20.0):
+    """The fixture's molecules as a slab: a periodic xy plane, an open z with
+    `vacuum` of it above the layer, the layer centred."""
+    coord, atype, _ = frame(n_mol=n_mol, box=box)
+    c = coord[0].cpu().numpy().copy()
+    c[:, 2] += vacuum / 2 - c[:, 2].min()
+    height = np.ptp(c[:, 2]) + vacuum
+    return c, atype[0].cpu().numpy(), np.diag([box, box, height])
+
+
+SLAB_PBC = (True, True, False)
+
+
+class TestSlab:
+    """One open axis: no periodic images along it, and the slab form of the
+    long-range sum (Yeh-Berkowitz), whatever the model was trained with."""
+
+    def serial(self, coord, atype, cell):
+        """The unpartitioned model on the same slab. Its descriptor sees the
+        cell as 3D-periodic, which the 20 A gap, far above rcut, makes the
+        same as an open z."""
+        model = build()
+        model.adapt_long_range(cell, SLAB_PBC)
+        out = model(
+            torch.tensor(coord, dtype=torch.float64, device=DEVICE)[None],
+            torch.tensor(atype, device=DEVICE)[None],
+            box=torch.tensor(cell, dtype=torch.float64, device=DEVICE)[None],
+        )
+        energy = float(out["energy"].reshape(-1)[0])
+        return energy, out["force"][0].detach().cpu().numpy()
+
+    @pytest.mark.parametrize("n_part", [1, 2, 4])
+    def test_a_slab_matches_the_serial_model(self, n_part):
+        coord, atype, cell = slab()
+        e_ref, f_ref = self.serial(coord, atype, cell)
+        ev = DistributedEvaluator(
+            build(), atype, cell, devices=[DEVICE] * n_part, pbc=SLAB_PBC,
+            memory_headroom=None,
+        )
+        e, f = ev(coord)
+        assert float(e) == pytest.approx(e_ref, abs=1e-9)
+        np.testing.assert_allclose(f.cpu().numpy(), f_ref, atol=1e-9)
+
+    def test_pbc_switches_the_slab_sum_on(self):
+        coord, atype, cell = slab()
+        ev = DistributedEvaluator(
+            build(), atype, cell, devices=[DEVICE], pbc=SLAB_PBC, memory_headroom=None
+        )
+        term = ev.model.long_range_energy
+        assert term.slab_correction is True
+        assert term.pbc == SLAB_PBC
+        # The mesh covers the vacuum too: at least ceil(2 alpha L) along z.
+        assert term.mesh_dimensions[2] >= math.ceil(0.8 * cell[2, 2])
+
+    def test_two_partitions_cut_the_plane_not_the_slab(self):
+        coord, atype, cell = slab(n_mol=32)
+        parts = partition_system(coord, cell, 6.0, 2, pbc=SLAB_PBC, skin=1.0)
+        for part in parts:
+            # Each half spans the whole thickness: the cut is in-plane.
+            assert np.ptp(coord[part.owned, 2]) > 0.8 * np.ptp(coord[:, 2])
+
+    def test_an_atom_near_an_open_face_is_refused(self):
+        coord, atype, cell = slab()
+        coord[0, 2] = cell[2, 2] - 0.1        # 0.1 A under the top face
+        ev = DistributedEvaluator(
+            build(), atype, cell, devices=[DEVICE], pbc=SLAB_PBC, memory_headroom=None
+        )
+        with pytest.raises(ValueError, match="inside a face"):
+            ev(coord)
+
+    def test_two_open_axes_are_refused(self):
+        coord, atype, cell = slab()
+        with pytest.raises(ValueError, match="bulk cell and a slab"):
+            DistributedEvaluator(
+                build(), atype, cell, devices=[DEVICE], pbc=(True, False, False)
+            )
+
+
+class TestMeshFollowsTheCell:
+    def test_a_supercell_gets_the_mesh_its_cell_needs(self):
+        """A 2x2x2 supercell is the same periodic system, so it must give the
+        unit cell's energy per atom and its forces. It does only because the
+        mesh doubles with the cell: a stored mesh kept on the bigger cell
+        under-resolves the sum."""
+
+        def model(mesh):
+            m = build()
+            settings = m.long_range_energy.serialize()
+            settings.update(mesh_dimensions=list(mesh), mesh_spacing=None)
+            m.set_long_range(settings)
+            return m
+
+        coord, atype, cell = frame(n_mol=8, box=10.0)
+        c, t, h = coord[0].cpu().numpy(), atype[0].cpu().numpy(), cell[0].cpu().numpy()
+        unit = DistributedEvaluator(model((8, 8, 8)), t, h, devices=[DEVICE],
+                                    memory_headroom=None)
+        e1, f1 = unit(c)
+        shifts = np.array(
+            [[i, j, k] for i in range(2) for j in range(2) for k in range(2)]
+        )
+        c2 = np.concatenate([c + s @ h for s in shifts])
+        t2, h2 = np.tile(t, len(shifts)), 2.0 * h
+        big = DistributedEvaluator(model((8, 8, 8)), t2, h2, devices=[DEVICE],
+                                   memory_headroom=None)
+        assert big.model.long_range_energy.mesh_dimensions == (16, 16, 16)
+        e2, f2 = big(c2)
+        assert float(e2) / len(t2) == pytest.approx(float(e1) / len(t), abs=1e-10)
+        np.testing.assert_allclose(
+            f2.cpu().numpy(), np.tile(f1.cpu().numpy(), (len(shifts), 1)), atol=1e-9
+        )
 
 
 class TestBackboneCapture:

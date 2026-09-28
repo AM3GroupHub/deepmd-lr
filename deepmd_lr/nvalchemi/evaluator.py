@@ -58,6 +58,7 @@ from deepmd_lr.nvalchemi.driver import (
     evaluate_partitioned,
 )
 from deepmd_lr.nvalchemi.partition import (
+    _perpendicular_widths,
     default_skin,
     partition_system,
     skin_for_node_ratio,
@@ -147,6 +148,18 @@ _VIRIAL_UNDER_FIELD = (
 )
 
 
+def _checked_pbc(pbc: Any) -> tuple[bool, bool, bool]:
+    """A bulk cell or a slab: the two boundaries partitioned MD handles."""
+    flags = tuple(bool(p) for p in np.broadcast_to(np.asarray(pbc, dtype=bool), (3,)))
+    if sum(flags) < 2:
+        raise ValueError(
+            f"pbc={list(flags)}: partitioned MD handles a bulk cell and a slab "
+            "(one open axis). Molecules, clusters and wires run through the "
+            "ASE calculator, deepmd_lr.ase.LongRangeCalculator."
+        )
+    return flags
+
+
 class DistributedEvaluator:
     """Evaluate a ``dp_lr`` model over spatial partitions, one per device.
 
@@ -158,6 +171,14 @@ class DistributedEvaluator:
         Atom types ``(natoms,)`` and the cell ``(3, 3)``. The types are fixed
         for the life of the driver; a barostat changes the cell through
         :meth:`set_cell`.
+    pbc
+        Which cell axes are periodic; all three by default. One open axis is
+        a slab: no periodic images along it, and the long-range term takes its
+        slab form (the Yeh-Berkowitz correction). The term's PME mesh is set
+        from ``cell`` as well, once, for the life of the driver
+        (:meth:`~deepmd_lr.model.lr_model.LongRangeEnergyModel.adapt_long_range`).
+        A slab's atoms must stay inside the cell along the open axis; see
+        :meth:`_check_open_axes`.
     devices
         One device per partition. Repeats are accepted and exercise the
         partitioning arithmetic, but only distinct devices test placement.
@@ -251,6 +272,7 @@ class DistributedEvaluator:
         cell: np.ndarray,
         *,
         devices: list[Any],
+        pbc: Any = (True, True, True),
         skin: float | str = "auto",
         repartition_every: int | None = None,
         pair_skin: float | str = "auto",
@@ -281,7 +303,16 @@ class DistributedEvaluator:
 
         # Partitions are built 3D-periodic, so the term must be too. Checked
         # here as well as per call, to fail before the memory probe.
-        check_long_range_boundary(model, (True, True, True))
+        self.cell = np.asarray(cell, dtype=np.float64).reshape(3, 3)
+        self.pbc = _checked_pbc(pbc)
+        # The term holds no weights, so it is set for this system: its pbc
+        # picks the 3D or the slab sum, its cell the PME mesh. The mesh is
+        # fixed here for the life of the driver, so the small cell changes of
+        # a barostat keep the energy smooth. Before the replicas are made, so
+        # they carry it.
+        if getattr(model, "has_long_range", False):
+            model.adapt_long_range(self.cell, self.pbc)
+        check_long_range_boundary(model, self.pbc)
         self.model = model
         self.devices = list(devices)
         self.repartition_every = repartition_every
@@ -318,7 +349,6 @@ class DistributedEvaluator:
         self.results_on_device = bool(results_on_device)
         self.home = next(model.parameters()).device
         self.atype = np.asarray(atype, dtype=np.int64).reshape(-1)
-        self.cell = np.asarray(cell, dtype=np.float64).reshape(3, 3)
         #: Whether the caller asked for the geometry rule. Kept because the
         #: rule reads the cell, and `set_cell` can replace it mid-run: under a
         #: barostat a contraction would otherwise keep a skin that no longer
@@ -519,16 +549,45 @@ class DistributedEvaluator:
         drift = self._drift(positions, self._pair_reference, self._pair_reference_cell)
         return 2.0 * drift > self.pair_skin
 
+    def _check_open_axes(self, coord: np.ndarray) -> None:
+        """Keep every atom inside the cell along an open axis.
+
+        Nothing folds an open axis, but the reciprocal sum is still taken over
+        the whole cell, so an atom that crossed a face would be summed as its
+        image at the opposite face, across the vacuum. An atom moves less than
+        half the skin before the next rebuild, so being that far inside the
+        faces now keeps it inside until then.
+        """
+        open_axes = [k for k in range(3) if not self.pbc[k]]
+        if not open_axes:
+            return
+        frac = coord @ np.linalg.inv(self.cell)
+        widths = _perpendicular_widths(self.cell)
+        margin = 0.5 * self.skin
+        for k in open_axes:
+            depth = np.minimum(frac[:, k], 1.0 - frac[:, k]) * widths[k]
+            i = int(np.argmin(depth))
+            if depth[i] < margin:
+                raise ValueError(
+                    f"atom {i} is {depth[i]:.2f} A inside a face of the cell "
+                    f"along the open axis {k}, and must stay {margin:.2f} A "
+                    "inside (half the skin): past the face the long-range sum "
+                    "would put it across the vacuum. Give the slab more vacuum, "
+                    "e.g. read_structure(..., vacuum=30.0)."
+                )
+
     def _rebuild(self, tracked: torch.Tensor) -> None:
         """Re-partition at the current skin and restart the displacement clock."""
         # The only host copy of the coordinates: the spatial decomposition is
         # a numpy/scipy routine, and it runs only when the skin says so.
+        host = tracked.cpu().numpy()
+        self._check_open_axes(host)
         self._partitions = partition_system(
-            tracked.cpu().numpy(),
+            host,
             self.cell,
             self._rcut,
             len(self.devices),
-            pbc=(True, True, True),
+            pbc=self.pbc,
             skin=self.skin,
         )
         self._reference_positions = tracked.clone()
@@ -672,6 +731,7 @@ class DistributedEvaluator:
                     charge_spin=self.charge_spin,
                     eps_inf=self.eps_inf,
                     pair_skin=self.pair_skin,
+                    pbc=self.pbc,
                 )
             except Exception as exc:
                 if not _is_out_of_memory(exc) or not self._skin_is_auto:

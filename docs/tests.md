@@ -36,7 +36,7 @@ the model first.
 - `test_lr_term.py` — the reciprocal-space term against a hand-written Ewald
   sum; `pme` against `ewald`; the slab correction; boundary-condition guards,
   batching, masking, and gradients including the double backward force
-  training needs.
+  training needs; the mesh and the sum a system's cell and pbc pick.
 - `test_isolated_term.py` — the no-cell term: its periodic limit, invariances,
   differentiability, configuration, and use inside the model.
 - `test_pme_physics.py` — nvalchemiops' PME against the NaCl Madelung
@@ -58,13 +58,21 @@ the model first.
 **Running it**
 
 - `test_ase_calculator.py`, `test_review_regressions.py` — the ASE calculator
-  against the model, its pbc guards and export refusal, and NVE drift.
+  against the model, its pbc guards and export refusal, and NVE drift; each
+  frame's pbc picking its sum and its cell the mesh; a slab with too little
+  vacuum refused.
+- `test_read_structure.py` — the file's pbc kept; a slab's open axis padded to
+  the vacuum, centred, and made whole when the file wrapped it; molecules and
+  wires refused.
 - `test_nvalchemi.py` — the partitioner and halo (including unwrapped
   coordinates), the skin rules and memory probe, the device gather, the
   gathered long-range term and virial, and `DistributedEvaluator`, whose
   reused partitions (across cell changes) and cached pair lists must match a
-  fresh evaluation at every call; a long-range term that is not 3D-periodic
-  (`isolated`, slab) is refused.
+  fresh evaluation at every call. A slab matches the serial model at 1, 2 and
+  4 partitions, its pbc switches the slab sum on, and an atom near an open
+  face is refused; a slab term on a bulk cell takes the 3D sum, and an
+  `isolated` term is refused. A supercell gets the mesh its cell needs and
+  reproduces its unit cell.
 - `test_thermo.py` — `Thermo`'s measurements, warp aliasing, cell sync, and
   the guards that make one evaluator safe to share (`fresh`,
   `cell_is_current`, `set_state`).
@@ -75,7 +83,8 @@ the model first.
   every cell mode, the Nosé–Hoover invariant), the barostats' cell handed to
   the kernels transposed, the relaxations' refusals, the cell relaxation
   (its force against finite differences of the enthalpy, every mode reaching
-  the target pressure), and the dipole current.
+  the target pressure), the dipole current, and slabs: NVT keeps one in its
+  cell, while barostats and cell relaxation refuse it.
 - `test_compress.py`, `test_compress_arguments.py`,
   `test_compress_atomic_state.py`, `test_compress_required.py` — compressed
   DPA4C inference: every refusal, the graph-lower guard, argument validation,

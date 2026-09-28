@@ -73,7 +73,7 @@ Two other things behave differently without a cell, both deliberately:
 ## Running MD
 
 Through the ASE calculator, with any ASE integrator. The GPU MD classes in
-`deepmd_lr.nvalchemi` are for 3D-periodic cells and refuse anything else.
+`deepmd_lr.nvalchemi` run bulk cells and slabs, and refuse a molecule.
 
 ```python
 from ase import units
@@ -94,6 +94,7 @@ LongRangeCalculator("bulk.ckpt.pt", long_range={"method": "isolated"})
 
 That makes the electrostatics exact for the cluster. Whether the short-range
 part transfers is a question of training data: a model trained on bulk has
-never seen a surface. Slabs run the same way, with `slab_correction` and `pbc`
-in `long_range` ([example 03](../examples/03-slab)).
+never seen a surface. A slab needs no override at all: its `pbc`, with one axis
+`false`, switches on the slab sum, in the ASE calculator and in the GPU classes
+alike ([example 03](../examples/03-slab)).
 

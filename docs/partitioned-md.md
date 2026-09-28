@@ -151,10 +151,19 @@ it between stages is safe by construction:
   step (`Thermo.cell_is_current`).
 - **Atoms.** `atoms` must match the evaluator's atom order and cell. ASE
   constraints and non-periodic axes are refused rather than ignored.
-- **Boundary.** Partitions are 3D-periodic, so the model's long-range term
-  must be too: an `isolated` or slab term is refused, as the ASE calculator
-  refuses a mismatch. Molecules, clusters and slabs run through the ASE
-  calculator ([non-periodic](non-periodic.md#running-md)).
+- **Boundary.** The structure's `pbc` decides it: a bulk cell, or a slab with
+  one open axis. Along an open axis the evaluator makes no images, and the
+  long-range sum takes its slab form (Yeh–Berkowitz) whatever the model was
+  trained with, since the term holds no weights. `read_structure` pads a
+  slab's open axis to at least 20 Å of vacuum (`vacuum=`) and centres the
+  slab. An atom that comes within half a skin of an open face is refused,
+  because past it the sum would put the atom across the vacuum. NPT, NPH and
+  cell relaxation are refused for a slab. An `isolated` term, and molecules
+  and clusters, belong to the ASE calculator
+  ([non-periodic](non-periodic.md#running-md)).
+- **PME mesh.** Set from the cell when the evaluator is built, at least
+  `ceil(2 alpha L)` points per axis, and kept for the run
+  ([alpha and mesh](alpha-and-mesh.md)).
 - **Virial.** `set_compute_virial` switches it on for the stage that needs
   it; it is refused under a field.
 

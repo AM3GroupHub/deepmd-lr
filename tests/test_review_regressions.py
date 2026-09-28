@@ -25,6 +25,8 @@ def test_checkpoint_head_to_ase(tmp_path, name):
     path = str(tmp_path / "multi.pt")
     torch.save({"model": state}, path)
     atoms = water_atoms(n_mol=2)
+    if name == "interface":
+        atoms.set_cell([10.0, 10.0, 30.0])  # a slab needs vacuum over it
     atoms.pbc = {"interface": [True, True, False], "bulk": True, "molecule": False}[
         name
     ]
@@ -46,21 +48,39 @@ def test_checkpoint_head_to_ase(tmp_path, name):
 
 
 @pytest.mark.parametrize(
-    "name,pbc",
+    "name,pbc,message",
     [
-        ("bulk", [True, False, False]),
-        ("interface", [True, True, True]),
-        ("interface", [False, True, True]),
-        ("molecule", [True, True, True]),
+        ("bulk", [True, False, False], "2 axes open"),
+        ("molecule", [True, True, True], "does not match"),
     ],
 )
-def test_reject_boundary_mismatch(name, pbc):
+def test_reject_boundary_mismatch(name, pbc, message):
+    """What no periodic sum can take: a wire, and the isolated term in a cell."""
     model = ThreeBranch().build()[name]
     atoms = water_atoms(n_mol=1)
     atoms.pbc = pbc
     atoms.calc = LongRangeCalculator(model)
-    with pytest.raises(ValueError, match="does not match"):
+    with pytest.raises(ValueError, match=message):
         atoms.get_potential_energy()
+
+
+@pytest.mark.parametrize("pbc", [[True, True, True], [False, True, True]])
+def test_a_slab_branch_follows_the_frames_pbc(pbc):
+    """The term holds no weights, so the frame's pbc picks the sum: the
+    interface branch runs a bulk cell, or a slab open along x."""
+    model = ThreeBranch().build()["interface"]
+    atoms = water_atoms(n_mol=1)
+    if not all(pbc):
+        axis = pbc.index(False)
+        cell = atoms.cell.array.copy()
+        cell[axis, axis] += 20.0  # vacuum along the open axis
+        atoms.set_cell(cell)
+    atoms.pbc = pbc
+    atoms.calc = LongRangeCalculator(model)
+    assert np.isfinite(atoms.get_potential_energy())
+    term = model.long_range_energy
+    assert term.slab_correction is (not all(pbc))
+    assert list(term.pbc) == pbc
 
 
 def test_short_range_partial_pbc_is_refused():

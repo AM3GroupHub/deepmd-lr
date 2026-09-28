@@ -84,6 +84,7 @@ from deepmd_lr.fitting.charge import (
 from deepmd_lr.lr.term import (
     LongRangeTerm,
     build_long_range_energy,
+    system_reciprocal,
 )
 from deepmd_lr.neighbors import (
     build_neighbor_graph_fast,
@@ -265,6 +266,36 @@ class LongRangeEnergyModel(EnergyModel):
             self.charge_fitting is not None and self.long_range_energy is not None
         )
 
+    def adapt_long_range(
+        self, cell: Any, pbc: Any, base: dict[str, Any] | None = None
+    ) -> bool:
+        """Evaluate the long-range term the way this system needs.
+
+        The system's ``pbc`` picks the 3D sum or the slab one and its cell the
+        PME mesh (:func:`~deepmd_lr.lr.term.system_reciprocal`), starting from
+        ``base``: the settings to adapt, by default the term's current ones.
+        Returns whether the term changed. A model without a long-range block,
+        or with the ``isolated`` term, is left as it is.
+
+        By default the settings adapted are the ones the model had before its
+        first adaptation, not its current ones. Otherwise one run on a large
+        cell would leave its mesh behind for the next, smaller one: the rule
+        never lowers a mesh. An explicit :meth:`set_long_range` is a new
+        starting point.
+        """
+        if not self.has_long_range:
+            return False
+        if base is None:
+            if getattr(self, "_reciprocal_base", None) is None:
+                self._reciprocal_base = self.long_range_energy.serialize()
+            base = self._reciprocal_base
+        current = self.long_range_energy.serialize()
+        wanted = system_reciprocal(base, cell, pbc)
+        if build_long_range_energy(wanted).serialize() == current:
+            return False
+        self._install_long_range(wanted)
+        return True
+
     def set_long_range(self, settings: dict[str, Any]) -> None:
         """Swap the long-range term for one built from ``settings``.
 
@@ -289,7 +320,14 @@ class LongRangeEnergyModel(EnergyModel):
         supply exactly the ``erfc(alpha r)/r`` remainder left at *that* split
         -- so it defines the model as surely as the weights do. Passing a
         different one is refused rather than silently honoured.
+
+        The new settings are also what :meth:`adapt_long_range` adapts from.
         """
+        self._install_long_range(settings)
+        self._reciprocal_base = None
+
+    def _install_long_range(self, settings: dict[str, Any]) -> None:
+        """The swap itself, leaving :meth:`adapt_long_range`'s base alone."""
         if not self.has_long_range:
             raise ValueError(
                 "this model has no `long_range` block, so there is no "

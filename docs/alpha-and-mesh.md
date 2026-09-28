@@ -75,6 +75,16 @@ harmless at fixed cell (NVE/NVT) and a real problem under NPT or any strain
 derivative — it showed up here as a 2% virial error that looked like a bug in
 the strain derivative.
 
+**At inference the mesh follows the cell.** A fixed mesh is right for the cell
+it was chosen for and for no other. The water model's `[10, 10, 10]` is exact
+on its 12.43 Å training box, but on the 49.7 Å 4×4×4 supercell of that same
+box it left 0.49 meV/atom and 0.0077 eV/Å rms of error. So both inference
+paths give each axis at least `ceil(2 alpha L)` points, the `1/(2 alpha)`
+spacing of the table above, and never fewer than the model asks for; that
+supercell gets `[40, 40, 40]` and is exact. The GPU evaluator sets the mesh
+once, when it is built, so NPT keeps the smooth energy a fixed mesh buys. The
+ASE calculator sets it per frame. Training is unchanged.
+
 ## `pme` or `ewald`
 
 Both compute the *same* reciprocal sum, by different routes.

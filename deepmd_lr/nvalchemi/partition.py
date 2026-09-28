@@ -478,7 +478,15 @@ def partition_system(
     # and for a slab system with vacuum equal-width would leave empty
     # partitions. Cut one axis at a time, each group by its own sort, so the
     # counts stay equal however the density varies.
-    grid = decomposition_grid(cell, n_partitions, rcut)
+    # An open axis counts with the atoms' extent, not the cell's: a slab's
+    # vacuum would otherwise make its normal the longest axis, and the grid
+    # would slice the slab through its thickness, each slice mostly halo.
+    grid_cell = np.array(cell, dtype=np.float64)
+    for axis in range(3):
+        if not pbc[axis]:
+            extent = frac[:, axis].max() - frac[:, axis].min() if n_atoms else 0.0
+            grid_cell[axis] *= max(extent, 1e-6)
+    grid = decomposition_grid(grid_cell, n_partitions, rcut)
     groups = [np.arange(n_atoms)]
     for axis in range(3):
         if grid[axis] == 1:

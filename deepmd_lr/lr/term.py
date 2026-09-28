@@ -94,6 +94,7 @@ from typing import (
     Any,
 )
 
+import numpy as np
 import torch
 from deepmd.dpmodel.modifier.dipole_charge import (
     ELECTROSTATIC_CONVERSION,
@@ -682,3 +683,62 @@ def build_long_range_energy(settings: dict[str, Any]) -> torch.nn.Module:
             f"method must be one of {tuple(TERM_CLASSES)}, got {method!r}"
         )
     return TERM_CLASSES[method](**settings)
+
+
+def system_mesh(settings: dict[str, Any], cell: Any) -> tuple[int, int, int]:
+    """The PME mesh a cell needs: at least ``ceil(2 alpha L)`` points along
+    each cell vector, and never fewer than ``settings`` asks for.
+
+    ``1 / (2 alpha)`` is the spacing the screening Gaussian needs -- 1.25 A at
+    alpha 0.4. A fixed mesh is right for the cell it was chosen for and for no
+    other: the water model's (10, 10, 10), exact on its 12.43 A training box,
+    was 0.49 meV/atom and 0.0077 eV/A rms off on the 49.7 A 4x4x4 supercell of
+    that same box, where this rule's (40, 40, 40) is exact.
+    """
+    lengths = np.linalg.norm(np.asarray(cell, dtype=np.float64).reshape(3, 3), axis=1)
+    alpha = float(settings.get("alpha", DEFAULT_ALPHA))
+    if settings.get("mesh_dimensions") is not None:
+        asked = [int(n) for n in settings["mesh_dimensions"]]
+    else:
+        spacing = settings.get("mesh_spacing") or 1.0  # the term's own default
+        asked = [math.ceil(length / spacing - 1e-9) for length in lengths]
+    return tuple(
+        max(n, math.ceil(2.0 * alpha * length - 1e-9), 2)
+        for n, length in zip(asked, lengths, strict=True)
+    )
+
+
+def system_reciprocal(settings: dict[str, Any], cell: Any, pbc: Any) -> dict[str, Any]:
+    """The reciprocal-space settings a system needs, from a model's own.
+
+    The term holds no weights, so how the sum is taken is a property of the
+    system, not of the checkpoint. The system's ``pbc`` picks the sum -- all
+    three axes periodic is the 3D sum, one open axis a slab with the
+    Yeh-Berkowitz correction -- and its cell the PME mesh
+    (:func:`system_mesh`). ``alpha``, the method and the spline order stay
+    the model's.
+
+    The ``isolated`` method comes back unchanged: moving between it and a
+    periodic method changes the physics, so it is asked for explicitly, with
+    ``long_range=``, never inferred from a structure.
+    """
+    method = settings.get("method", "pme")
+    if method not in METHODS:
+        return dict(settings)
+    periodic = [bool(p) for p in np.broadcast_to(np.asarray(pbc, dtype=bool), (3,))]
+    out = dict(settings)
+    if all(periodic):
+        out.update(slab_correction=False, pbc=[True, True, True])
+    elif sum(periodic) == 2:
+        out.update(slab_correction=True, pbc=periodic)
+    else:
+        raise ValueError(
+            f"pbc={periodic} leaves {3 - sum(periodic)} axes open. The periodic "
+            "sum covers a bulk cell and a slab (one open axis); a molecule or a "
+            "wire runs through the ASE calculator with "
+            "long_range={'method': 'isolated'}."
+        )
+    if method == "pme":
+        out["mesh_dimensions"] = list(system_mesh(settings, cell))
+        out["mesh_spacing"] = None
+    return out
