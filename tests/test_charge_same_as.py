@@ -98,6 +98,20 @@ class TestGrouping:
         with pytest.raises(ValueError, match="differs from"):
             build(two_theory_config(extra_mace=mace))
 
+    @pytest.mark.parametrize(
+        "type_map", [None, ["H", "O"]], ids=["same_type_map", "reversed_type_map"]
+    )
+    def test_an_unshared_descriptor_is_refused(self, type_map):
+        """An inline descriptor with the same settings is a second model: the
+        charges agreed only through equal seeds, then drifted by 3e-3 e as it
+        trained, and with the type map reversed the same oxygen got opposite
+        signs under the two theories. Only the built modules can tell."""
+        extra = {"descriptor": copy.deepcopy(DESCRIPTOR)}
+        if type_map is not None:
+            extra["type_map"] = type_map
+        with pytest.raises(ValueError, match="share their descriptor"):
+            build(two_theory_config(extra_mace=extra))
+
     def test_a_chain_is_refused(self):
         model = two_theory_config()
         model["model_dict"]["third"] = lr_branch()

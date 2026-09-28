@@ -371,6 +371,32 @@ def pool(data: Any, nbatches: int, sample: Any, **kwargs: Any) -> list:
     return [s for system in group for s in sample(system, nbatches, **kwargs)]
 
 
+def _require_shared_descriptor(wrapper: Any, owner: str, key: str) -> None:
+    """Refuse a ``charge_same_as`` pair whose descriptors are two models.
+
+    The charge head reads the descriptor's features, so one head is one
+    electrostatics only if both branches feed it the same descriptor. Nothing
+    in the branch config says whether they do -- an inline descriptor with the
+    same settings builds a second, independently trained copy -- so this asks
+    the built modules, after DeePMD-kit's own sharing has run. Two copies agree
+    at initialisation only because their seeds match, then drift apart as each
+    theory trains its own; with the type maps in different orders, one head
+    reads each branch's type indices as the owner's, and the same oxygen got
+    opposite-sign charges under the two theories.
+    """
+    ours = list(wrapper.model[key].atomic_model.descriptor.parameters())
+    theirs = list(wrapper.model[owner].atomic_model.descriptor.parameters())
+    if len(ours) != len(theirs) or any(
+        p.data_ptr() != q.data_ptr() for p, q in zip(ours, theirs, strict=True)
+    ):
+        raise ValueError(
+            f"branch {key!r}: `{CHARGE_SAME_AS_KEY}: {owner}` needs the two "
+            "branches to share their descriptor, since the charge head reads "
+            "its features. Point both `descriptor` entries at one "
+            "`shared_dict` key."
+        )
+
+
 def _alias_groups(wrapper: Any) -> None:
     """Make every member of a group the same model but for its long-range term.
 
@@ -403,6 +429,7 @@ def _alias_groups(wrapper: Any) -> None:
     for owner, members in charge_groups(model_dict).items():
         head = wrapper.model[owner].charge_fitting
         for key in members[1:]:
+            _require_shared_descriptor(wrapper, owner, key)
             wrapper.model[key].charge_fitting = head
 
 

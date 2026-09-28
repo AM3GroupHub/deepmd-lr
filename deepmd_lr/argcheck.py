@@ -121,7 +121,8 @@ def dp_lr_model_args() -> Argument:
                     "fitting net and energy zero (a different level of theory), "
                     "but the per-atom charges -- and with them the long-range "
                     "term, which holds no weights -- are one shared model. Both "
-                    "branches must write an identical `charge_net` block and the "
+                    "branches must share the descriptor (one `shared_dict` "
+                    "entry), and write an identical `charge_net` block and the "
                     "same alpha; `same_as` links of either branch follow it."
                 ),
             ),
