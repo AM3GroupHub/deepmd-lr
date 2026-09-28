@@ -103,6 +103,9 @@ def charge_groups(model_dict: dict[str, Any]) -> dict[str, list[str]]:
     The list holds the owner first, then each ``charge_same_as`` branch, then
     the ``same_as`` links of all of those (a link is its base, so it follows its
     base's charge head). Empty for an ordinary config.
+
+    Every ``charge_same_as`` is validated on the way, which is what lets
+    :func:`expand_same_as` refuse a bad one as the config is read.
     """
     out: dict[str, list[str]] = {}
     links = groups(model_dict)
@@ -121,12 +124,32 @@ def charge_groups(model_dict: dict[str, Any]) -> dict[str, list[str]]:
     return out
 
 
+def _normalized_charge_net(block: dict[str, Any]) -> dict[str, Any]:
+    """``block`` as the model is built from it: defaults in, comments out.
+
+    Compared raw, a default written out on one branch and left out on the
+    other would count as a difference, though the two build the same head.
+    """
+    from dargs import Argument
+
+    from deepmd_lr.argcheck import charge_fitting_args
+
+    schema = Argument("charge_net", dict, charge_fitting_args())
+    return schema.normalize_value(copy.deepcopy(block), trim_pattern="_*")
+
+
 def _validated_charge_owner(
     model_dict: dict[str, Any], key: str, owner: str, branch: dict[str, Any]
-) -> dict[str, Any]:
-    """Refuse every way a shared charge head could be built wrong."""
+) -> None:
+    """Refuse every way a shared charge head could be configured wrong.
+
+    From the config alone; that the two branches share a descriptor can only
+    be read off the built modules (:func:`_require_shared_descriptor`).
+    """
     if owner == key:
-        raise ValueError(f"branch {key!r}: `{CHARGE_SAME_AS_KEY}` cannot point at itself")
+        raise ValueError(
+            f"branch {key!r}: `{CHARGE_SAME_AS_KEY}` cannot point at itself"
+        )
     if owner not in model_dict or not isinstance(model_dict[owner], dict):
         raise ValueError(
             f"branch {key!r}: `{CHARGE_SAME_AS_KEY}` names {owner!r}, which is not "
@@ -139,21 +162,19 @@ def _validated_charge_owner(
             f"head -- not a `{SAME_AS_KEY}` link and not itself a "
             f"`{CHARGE_SAME_AS_KEY}` branch (no chains)."
         )
-    if branch.get(SAME_AS_KEY):
-        raise ValueError(
-            f"branch {key!r}: a `{SAME_AS_KEY}` link inherits its base's charge "
-            f"head already; put `{CHARGE_SAME_AS_KEY}` on the base branch."
-        )
     for name, block in ((owner, base), (key, branch)):
-        if block.get("type") != "dp_lr" or not (block.get("long_range") or {}).get("charge_net"):
+        has_head = (block.get("long_range") or {}).get("charge_net")
+        if block.get("type") != "dp_lr" or not has_head:
             raise ValueError(
                 f"branch {name!r}: `{CHARGE_SAME_AS_KEY}` needs a `dp_lr` branch "
                 "with a `long_range.charge_net` block on both sides."
             )
-    own = {k: v for k, v in branch["long_range"]["charge_net"].items() if not k.startswith("_")}
-    theirs = {k: v for k, v in base["long_range"]["charge_net"].items() if not k.startswith("_")}
+    own = _normalized_charge_net(branch["long_range"]["charge_net"])
+    theirs = _normalized_charge_net(base["long_range"]["charge_net"])
     if own != theirs:
-        differing = sorted(k for k in set(own) | set(theirs) if own.get(k) != theirs.get(k))
+        differing = sorted(
+            k for k in set(own) | set(theirs) if own.get(k) != theirs.get(k)
+        )
         raise ValueError(
             f"branch {key!r}: its `charge_net` block differs from {owner!r}'s "
             f"in {differing}. One charge head has one configuration; write it "
@@ -164,7 +185,6 @@ def _validated_charge_owner(
             f"branch {key!r}: alpha differs from {owner!r}. One charge head "
             "serves one Coulomb split."
         )
-    return base
 
 
 def groups(model_dict: dict[str, Any]) -> dict[str, list[str]]:
@@ -239,6 +259,10 @@ def expand_same_as(model_config: dict[str, Any]) -> dict[str, Any]:
                 merged[carried] = copy.deepcopy(branch[carried])
 
         model_dict[key] = merged
+    # Refuse a bad `charge_same_as` now, from the config alone. The aliasing
+    # would find it too, but only in `share_params`: after every branch is
+    # built and the training data has been sampled for statistics.
+    charge_groups(model_dict)
     return model_config
 
 
@@ -283,6 +307,12 @@ def _validated_base(
         )
 
     extra = _real_keys(branch) - _BRANCH_ALLOWED
+    if CHARGE_SAME_AS_KEY in extra:
+        raise ValueError(
+            f"branch {key!r}: a `{SAME_AS_KEY}` link uses its base's charge "
+            f"head, so `{CHARGE_SAME_AS_KEY}` belongs on {base_key!r}; the "
+            "link follows it there."
+        )
     if extra:
         raise ValueError(
             f"branch {key!r} declares `{SAME_AS_KEY}: {base_key}` but also sets "

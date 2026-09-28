@@ -17,11 +17,13 @@ import copy
 
 import pytest
 import torch
+from dargs import Argument
 from deepmd.pt_expt.model.get_model import get_model
 from deepmd.pt_expt.train.wrapper import ModelWrapper
 from deepmd.pt_expt.utils.multi_task import preprocess_shared_params
 from deepmd.utils.argcheck import normalize
 
+from deepmd_lr.argcheck import charge_fitting_args
 from deepmd_lr.same_as import charge_groups
 
 from .test_joint_model import DESCRIPTOR, frame
@@ -111,6 +113,37 @@ class TestGrouping:
             extra["type_map"] = type_map
         with pytest.raises(ValueError, match="share their descriptor"):
             build(two_theory_config(extra_mace=extra))
+
+    def test_a_different_alpha_is_refused(self):
+        """The whole borrowing theory on another split; its slab link matches
+        it, so `same_as` has nothing to object to and this check is what
+        fires."""
+        model = two_theory_config()
+        model["model_dict"]["ttt_mace"]["long_range"]["reciprocal"]["alpha"] = 0.3
+        model["model_dict"]["ttf_mace"]["long_range"]["reciprocal"]["alpha"] = 0.3
+        with pytest.raises(ValueError, match="alpha differs"):
+            build(model)
+
+    def test_a_default_written_out_matches_one_left_out(self):
+        """The blocks are compared as the heads are built from them."""
+        schema = Argument("charge_net", dict, charge_fitting_args())
+        defaults = schema.normalize_value({}, trim_pattern="_*")
+        mace = {"long_range": copy.deepcopy(lr_branch()["long_range"])}
+        mace["long_range"]["charge_net"]["resnet_dt"] = defaults["resnet_dt"]
+        models, _, _ = build(two_theory_config(extra_mace=mace))
+        assert models["ttt_mace"].charge_fitting is models["ttt_dft"].charge_fitting
+
+    def test_a_bad_owner_fails_as_the_config_is_read(self):
+        """Before any model is built or any data sampled for statistics."""
+        model = two_theory_config(extra_mace={"charge_same_as": "nope"})
+        with pytest.raises(ValueError, match="not a branch"):
+            preprocess_shared_params(model)
+
+    def test_charge_same_as_on_a_link_points_to_its_base(self):
+        model = two_theory_config()
+        model["model_dict"]["ttf_mace"]["charge_same_as"] = "ttt_dft"
+        with pytest.raises(ValueError, match="belongs on 'ttt_mace'"):
+            build(model)
 
     def test_a_chain_is_refused(self):
         model = two_theory_config()
