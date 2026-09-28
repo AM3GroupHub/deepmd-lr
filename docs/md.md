@@ -66,7 +66,9 @@ NoseHooverChainNVT(ev, atoms, 0.5 * units.fs, temperature_K=300,
 `VelocityRescaling` (NVT); `MTKNPT` (NPT) and `MTKNPH` (NPH), each with an
 isotropic, orthorhombic or full cell; and the relaxations `FIRE` and `FIRE2`
 share that one evaluator, so a relaxation and several MD stages run on one
-copy of the model. Between them they cover every integrator nvalchemiops ships. [Partitioned MD](partitioned-md.md#the-md-classes)
+copy of the model. ASE's `FixAtoms` on `atoms` holds those atoms in place, in
+every class but the barostats
+([example 06](../examples/06-md_nvalchemi/README.md#fixed-atoms)). Between them they cover every integrator nvalchemiops ships. [Partitioned MD](partitioned-md.md#the-md-classes)
 covers the API and what each piece owns.
 [Example 06](../examples/06-md_nvalchemi) has a script per ensemble, and
 [example 07](../examples/07-ase-calculator) covers the ASE calculator.
@@ -101,6 +103,9 @@ Each of these has cost a run.
   centre of mass is at rest. The classes remove its motion at start-up (with
   a warning when it was large), and Langevin's `fixcm` keeps it at rest. A
   custom loop has to do the same, or the drift's kinetic energy reads as heat.
+  With fixed atoms the count is three per mobile atom, and nothing is
+  removed. `Thermo.ndof` holds whichever count applies, and a thermostat of
+  your own must use it.
 - **NPT needs the virial.** Reach the density with NPT, then produce with
   NVT. NPT under a field is refused. A cell
   relaxation (`FIRE2(..., relax_cell="isotropic")`) reaches the zero-kelvin

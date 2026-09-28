@@ -9,6 +9,7 @@ slab the file wrapped across the face is first made whole by lattice vectors.
 import numpy as np
 import pytest
 from ase import Atoms
+from ase.constraints import FixAtoms
 from ase.io import write
 
 from deepmd_lr.nvalchemi import read_structure
@@ -108,3 +109,18 @@ def test_molecules_and_wires_are_refused(tmp_path):
         with pytest.raises(ValueError, match="bulk cell or a slab"):
             roundtrip(atoms, tmp_path)
 
+
+def test_fixed_atoms_come_along_and_move_with_the_slab(tmp_path):
+    """extxyz's move_mask comes back as FixAtoms, and centring moves the
+    fixed atoms with the rest: ASE's set_positions would leave them behind."""
+    atoms = layer()
+    atoms.set_cell([10.0, 10.0, 0.0])
+    atoms.pbc = [True, True, False]
+    atoms.set_constraint(FixAtoms(indices=[0, 5]))
+    out = roundtrip(atoms, tmp_path)
+    assert [type(c).__name__ for c in out.constraints] == ["FixAtoms"]
+    np.testing.assert_array_equal(out.constraints[0].index, [0, 5])
+    shift = out.positions - atoms.positions
+    np.testing.assert_allclose(shift, np.broadcast_to(shift[1], shift.shape),
+                               atol=1e-6)
+    assert centred(out)

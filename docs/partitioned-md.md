@@ -149,8 +149,10 @@ it between stages is safe by construction:
   evaluated since re-evaluates before its first kick (`Thermo.fresh`).
 - **Cell.** An object built before an NPT stage moved the cell refuses to
   step (`Thermo.cell_is_current`).
-- **Atoms.** `atoms` must match the evaluator's atom order and cell. ASE
-  constraints and non-periodic axes are refused rather than ignored.
+- **Atoms.** `atoms` must match the evaluator's atom order, cell and pbc.
+  ASE's `FixAtoms` holds its atoms in place, at rest, and the temperature
+  counts three degrees of freedom per mobile atom. Any other ASE constraint is
+  refused rather than ignored.
 - **Boundary.** The structure's `pbc` decides it: a bulk cell, or a slab with
   one open axis. Along an open axis the evaluator makes no images, and the
   long-range sum takes its slab form (Yeh–Berkowitz) whatever the model was

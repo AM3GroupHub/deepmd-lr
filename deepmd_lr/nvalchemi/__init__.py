@@ -14,7 +14,9 @@
 - Each builds a :class:`Thermo`: the device state the nvalchemiops kernels
   mutate (positions, velocities, masses, forces view, cell) and its
   measurements. A custom kernel loop can use a Thermo directly; see
-  ``examples/06-md_nvalchemi``.
+  ``examples/06-md_nvalchemi``. ``Thermo.from_atoms`` builds one from an
+  ``Atoms``, whose ``FixAtoms`` holds atoms in place; there is no other way to
+  fix them.
 """
 
 from deepmd_lr.nvalchemi.driver import (

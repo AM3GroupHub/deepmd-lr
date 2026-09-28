@@ -38,6 +38,10 @@ def read_structure(path: Any, index: int = -1, vacuum: float = DEFAULT_VACUUM) -
 
     Two or three open axes -- a wire, a molecule, a cluster -- are refused:
     those run through the ASE calculator.
+
+    Atoms the file holds fixed (POSCAR's selective dynamics ``F F F``,
+    extxyz's ``move_mask``) come back as ASE's ``FixAtoms``, which the MD
+    classes honour. Centring moves them with the slab.
     """
     atoms = ase.io.read(str(path), index=index)
     if isinstance(atoms, list):
@@ -98,7 +102,9 @@ def _pad_slab(atoms: Any, axis: int, vacuum: float, path: Any) -> None:
     cell[axis] = normal * length
     target = (length - span) / 2.0 - height.min()
     atoms.set_cell(cell, scale_atoms=False)
-    atoms.set_positions(pos + target * normal[None, :])
+    # Past the constraints: FixAtoms would otherwise leave the fixed atoms
+    # behind while the rest of the slab moves.
+    atoms.set_positions(pos + target * normal[None, :], apply_constraint=False)
 
 
 def build_evaluator(model: Any, atoms: Any, devices: Any = None,

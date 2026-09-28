@@ -3,8 +3,8 @@
 
 Most of what `Thermo` does is delegate to nvalchemiops, so these tests check
 the seams rather than the kernels: the conventions we depend on (ndof, units),
-the aliasing invariants that would fail *silently* if broken, and the cell
-sync that has no natural backstop.
+the aliasing invariants that would fail *silently* if broken, the cell sync
+that has no natural backstop, and how fixed atoms are held.
 """
 
 import numpy as np
@@ -12,6 +12,7 @@ import pytest
 import torch
 import warp as wp
 from ase import Atoms
+from ase.constraints import FixAtoms, FixCom
 from ase.md.velocitydistribution import Stationary, thermalize_momenta
 from ase.units import kB
 
@@ -248,3 +249,101 @@ class TestStateGuards:
         ev, pos = setup()
         with pytest.raises(TypeError, match="timestep"):
             Thermo(ev, pos, timestep=0.5)
+
+
+class TestFixedAtoms:
+    """What holds a fixed atom is here, so every kernel loop gets it. The
+    atoms come from ASE's FixAtoms, through from_atoms, and nowhere else."""
+
+    @staticmethod
+    def held(ev, positions, indices):
+        """Momenta drawn before FixAtoms is attached, so the fixed atoms
+        start moving and Thermo has to stop them."""
+        atoms = Atoms(numbers=np.ones(len(positions), dtype=int), positions=positions)
+        atoms.set_masses(ev.masses())
+        thermalize_momenta(atoms, temperature_K=300.0,
+                           rng=np.random.default_rng(0))
+        atoms.set_constraint(FixAtoms(indices=indices))
+        return Thermo.from_atoms(ev, atoms)
+
+    def test_from_atoms_reads_the_state_and_the_constraint(self):
+        ev, pos = setup()
+        th = self.held(ev, pos, [4, 0])
+        assert th.fixed.tolist() == [0, 4]
+        assert not th.velocities.numpy()[[0, 4]].any()
+        assert th.velocities.numpy()[1].any()
+        np.testing.assert_array_equal(th.positions.numpy(), pos)
+        np.testing.assert_array_equal(th.masses.numpy(), ev.masses())
+        assert not len(Thermo(ev, pos).fixed)       # arrays carry no constraint
+
+    def test_evaluate_puts_them_back_at_rest(self):
+        """A kernel that moves every atom -- Langevin's noise does -- cannot
+        carry them off: evaluate puts them back before the force call, and
+        the kernels read zero force on them."""
+        ev, pos = setup()
+        th = self.held(ev, pos, [0, 4])
+        wp.launch(_shift, dim=th.n_atoms, inputs=[th.positions])
+        wp.to_torch(th.velocities)[[0, 4]] = 1.0
+        th.evaluate()
+        np.testing.assert_array_equal(th.positions.numpy()[[0, 4]], pos[[0, 4]])
+        np.testing.assert_allclose(th.positions.numpy()[1], pos[1] + 0.1)
+        assert not th.velocities.numpy()[[0, 4]].any()
+        assert not th.forces.numpy()[[0, 4]].any()
+        raw = th.get_forces(apply_constraint=False)
+        assert np.abs(raw[[0, 4]]).max() > 1e-3
+        np.testing.assert_array_equal(
+            np.delete(raw, [0, 4], axis=0),
+            np.delete(th.get_forces(), [0, 4], axis=0),
+        )
+
+    def test_the_temperature_leaves_them_out(self):
+        ev, pos = setup()
+        th = self.held(ev, pos, [0, 4])
+        n = th.n_atoms
+        assert th.ndof == 3 * (n - 2)
+        assert th.temperature == pytest.approx(
+            2 * th.kinetic_energy / (3 * (n - 2) * kB), rel=1e-12
+        )
+        snapshot = th.atoms()
+        np.testing.assert_array_equal(snapshot.constraints[0].index, [0, 4])
+        assert th.temperature == pytest.approx(snapshot.get_temperature(), rel=1e-12)
+
+    def test_set_state_moves_where_they_are_held(self):
+        ev, pos = setup()
+        th = self.held(ev, pos, [0])
+        th.set_state(positions=pos + 0.2, velocities=np.ones_like(pos))
+        assert not th.velocities.numpy()[0].any()
+        th.evaluate()
+        np.testing.assert_allclose(th.positions.numpy()[0], pos[0] + 0.2)
+
+    def test_the_centre_of_mass_is_theirs_to_hold(self):
+        ev, pos = setup()
+        th = self.held(ev, pos, [0])
+        with pytest.raises(ValueError, match="hold the system in place"):
+            th.remove_com_motion()
+
+    def test_what_fixatoms_can_say(self):
+        """A mask or indices, negative ones counting from the end, several
+        FixAtoms at once; every atom fixed, an index past the last, and any
+        other constraint are refused."""
+        ev, pos = setup()
+        n = len(pos)
+        atoms = Atoms(numbers=np.ones(n, dtype=int), positions=pos)
+        atoms.set_masses(ev.masses())
+        mask = np.zeros(n, dtype=bool)
+        mask[[5, 2]] = True
+        for constraint, want in (
+            (FixAtoms(mask=mask), [2, 5]),
+            (FixAtoms(indices=[-1]), [n - 1]),
+            ([FixAtoms(indices=[3]), FixAtoms(indices=[1, 3])], [1, 3]),
+        ):
+            atoms.set_constraint(constraint)
+            assert Thermo.from_atoms(ev, atoms).fixed.tolist() == want
+        for constraint, error, match in (
+            (FixAtoms(indices=range(n)), ValueError, "every atom"),
+            (FixAtoms(indices=[n]), IndexError, "out of bounds"),
+            (FixCom(), ValueError, "FixAtoms alone"),
+        ):
+            atoms.set_constraint(constraint)
+            with pytest.raises(error, match=match):
+                Thermo.from_atoms(ev, atoms)

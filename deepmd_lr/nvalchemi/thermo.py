@@ -24,6 +24,14 @@ checks make that safe:
 - :attr:`cell_is_current` is False once the evaluator's cell has moved on,
   as an NPT stage leaves it.
 
+**Fixed atoms** come from ASE's ``FixAtoms`` on the ``Atoms`` given to
+:meth:`from_atoms`, with no argument of their own. They stay where they
+started, at rest. :meth:`evaluate` puts them back before every force call, so
+a kernel that moves every atom -- Langevin's noise does -- cannot carry them
+off, and :attr:`forces` gives them zero force, so no kick moves them either.
+They carry no kinetic energy and no degrees of freedom: :attr:`ndof` counts
+three per mobile atom, as ASE's ``Atoms.get_temperature`` does.
+
 Units are the model's throughout -- angstrom, eV, amu, ASE time units. The one
 exception is :attr:`temperature`, in kelvin, because that is what a human reads.
 """
@@ -38,7 +46,6 @@ import warp as wp
 from ase.units import kB
 from nvalchemiops.dynamics.utils import (
     compute_kinetic_energy,
-    compute_temperature,
     remove_com_motion,
 )
 
@@ -74,6 +81,9 @@ class Thermo:
         ``(n,)`` in amu, or ``None`` to take the evaluator's own table. The MD
         classes pass ``atoms.get_masses()``, so isotopes work.
 
+    :meth:`from_atoms` builds one from an ``Atoms`` instead, its ``FixAtoms``
+    included; that is how the MD classes build theirs.
+
     Notes
     -----
     Every warp attribute is bound once here and never reassigned. Rebinding one
@@ -88,6 +98,7 @@ class Thermo:
         *,
         velocities: Any = None,
         masses: Any = None,
+        _fixed: Any = None,
         **moved: Any,
     ) -> None:
         if moved:
@@ -123,13 +134,38 @@ class Thermo:
             np.ascontiguousarray(m), dtype=torch.float64, device=self.device
         )
 
+        #: Indices of the atoms held in place, sorted; empty when none are.
+        self.fixed = np.asarray([] if _fixed is None else _fixed, dtype=np.int64)
+        #: The kinetic degrees of freedom every temperature here divides by.
+        #: With the centre of mass at rest, 3N - 3. Fixed atoms hold the rest
+        #: in place instead, so the mobile atoms' momentum is not conserved
+        #: and each keeps all three.
+        self.ndof = (
+            3 * (self.n_atoms - len(self.fixed))
+            if len(self.fixed)
+            else 3 * self.n_atoms - 3
+        )
+        self._fixed_idx = None
+        if len(self.fixed):
+            self._fixed_idx = torch.as_tensor(self.fixed, device=self.device)
+            #: Where the fixed atoms are held.
+            self._anchor = self._x.index_select(0, self._fixed_idx)
+            self._v.index_fill_(0, self._fixed_idx, 0.0)
+
         self.positions = self._vec(self._x)
         self.velocities = self._vec(self._v)
         self.masses = wp.from_torch(self._m)
         # Bound ONCE to the evaluator's preallocated buffer. Valid for the life
         # of this object because `__call__` copies into it rather than
         # rebinding -- an invariant guarded in `evaluate` and pinned by a test.
-        self.forces = self._vec(evaluator.forces)
+        # With fixed atoms the kernels read a buffer of this object's own
+        # instead, the evaluator's with their rows zeroed; the evaluator's
+        # stays the model's, which is what output records.
+        if self._fixed_idx is None:
+            self.forces = self._vec(evaluator.forces)
+        else:
+            self._f = torch.zeros_like(self._x)
+            self.forces = self._vec(self._f)
         self._forces_ptr = evaluator.forces.data_ptr()
         #: The evaluator's call count after this object's last evaluation.
         self._seen_calls: int | None = None
@@ -149,7 +185,6 @@ class Thermo:
         #: The getters' own kinetic energy. Kernels consume `_ke_w`, and a
         #: getter writing it would let a log change the next step.
         self._ke_probe = self.zeros(1)
-        self._temp_w = self.zeros(1)
         #: Volume as a device array, for kernels that take one.
         self.volume_w = self.scalar(evaluator.volume)
         self._momentum = self.zeros(1, dtype=wp.vec3d)
@@ -167,6 +202,22 @@ class Thermo:
         self._symbols = [
             evaluator.model.get_type_map()[i] for i in np.asarray(evaluator.atype)
         ]
+
+    @classmethod
+    def from_atoms(cls, evaluator: Any, atoms: Any) -> Thermo:
+        """A Thermo for ``atoms``: its positions, velocities, masses, and the
+        atoms its ``FixAtoms`` holds. The MD classes build theirs this way.
+
+        ``FixAtoms`` is the one ASE constraint honoured; any other is refused,
+        since the kernels would ignore it silently.
+        """
+        return cls(
+            evaluator,
+            atoms.get_positions(),
+            velocities=atoms.get_velocities(),
+            masses=atoms.get_masses(),
+            _fixed=_fixed_atoms(atoms),
+        )
 
     # --- allocation helpers, bound to this object's device ----------------
 
@@ -197,7 +248,14 @@ class Thermo:
     # --- the force call ----------------------------------------------------
 
     def evaluate(self) -> float:
-        """Energy and forces at the current positions. Returns the energy."""
+        """Energy and forces at the current positions. Returns the energy.
+
+        Fixed atoms are first put back where they are held, at rest, and
+        leave with zero force in :attr:`forces`.
+        """
+        if self._fixed_idx is not None:
+            self._x.index_copy_(0, self._fixed_idx, self._anchor)
+            self._v.index_fill_(0, self._fixed_idx, 0.0)
         self.energy, forces = self.evaluator(self._x)
         if forces.data_ptr() != self._forces_ptr:
             raise RuntimeError(
@@ -206,8 +264,24 @@ class Thermo:
                 "DistributedEvaluator.__call__ must write into the existing "
                 "tensor, not rebind it."
             )
+        if self._fixed_idx is not None:
+            self._f.copy_(forces)
+            self._f.index_fill_(0, self._fixed_idx, 0.0)
         self._seen_calls = self.evaluator.calls
         return self.energy
+
+    def get_forces(self, apply_constraint: bool = True) -> np.ndarray:
+        """The last evaluation's forces on the host, ``(n, 3)`` in eV/A.
+
+        As ASE's ``Atoms.get_forces``: with ``apply_constraint`` the fixed
+        atoms' rows are zero, as the kernels read them in :attr:`forces`.
+        Without it they hold the force the model puts on those atoms, which
+        is what output records; ASE zeroes them again on reading. Valid until
+        another object evaluates on the shared evaluator.
+        """
+        if apply_constraint or self._fixed_idx is None:
+            return self.forces.numpy().copy()
+        return self.evaluator.forces.detach().cpu().numpy().copy()
 
     @property
     def fresh(self) -> bool:
@@ -245,7 +319,8 @@ class Thermo:
         """Copy new positions and/or velocities into the bound buffers.
 
         Never rebinds, so every warp view stays live. Used when ``atoms`` was
-        edited between runs or by an observer.
+        edited between runs or by an observer. New positions also move where
+        the fixed atoms are held; their velocities stay zero.
         """
         for value, tensor in ((positions, self._x), (velocities, self._v)):
             if value is None:
@@ -254,6 +329,10 @@ class Thermo:
             if new.shape != (self.n_atoms, 3):
                 raise ValueError(f"expected ({self.n_atoms}, 3), got {new.shape}")
             tensor.copy_(torch.as_tensor(new, device=self.device))
+        if self._fixed_idx is not None:
+            if positions is not None:
+                self._anchor.copy_(self._x.index_select(0, self._fixed_idx))
+            self._v.index_fill_(0, self._fixed_idx, 0.0)
 
     # --- measurements ------------------------------------------------------
     # Every getter measures into scratch of its own and never writes a kernel
@@ -268,15 +347,15 @@ class Thermo:
 
     @property
     def temperature(self) -> float:
-        """Instantaneous temperature in kelvin.
+        """Instantaneous temperature in kelvin, ``2 KE / (ndof kB)``.
 
-        nvalchemiops divides by ``3N - 3``, i.e. it assumes the centre-of-mass
-        motion was removed -- which :meth:`remove_com_motion` and the MD
-        classes do.
+        :attr:`ndof` is ``3N - 3``, which assumes the centre-of-mass motion
+        was removed -- :meth:`remove_com_motion` and the MD classes do that --
+        or, with fixed atoms, three per mobile atom.
         """
-        compute_kinetic_energy(self.velocities, self.masses, self._ke_probe)
-        compute_temperature(self._ke_probe, self._temp_w, self.natoms)
-        return float(self._temp_w.numpy()[0]) / kB
+        if self.ndof < 1:
+            return 0.0
+        return 2.0 * self.kinetic_energy / self.ndof / kB
 
     @property
     def potential_energy(self) -> float:
@@ -374,24 +453,65 @@ class Thermo:
         """Subtract the centre-of-mass velocity, in place on the device.
 
         Every temperature and thermostat here counts ``3N - 3`` degrees of
-        freedom, which is only right with the centre of mass at rest.
+        freedom, which is only right with the centre of mass at rest. With
+        fixed atoms it is refused: they hold the system in place, and
+        subtracting a velocity from every atom would set them moving.
         """
+        if self._fixed_idx is not None:
+            raise ValueError(
+                "fixed atoms hold the system in place, so there is no "
+                "centre-of-mass motion to remove; removing it would set them "
+                "moving"
+            )
         remove_com_motion(self.velocities, self.masses, self._momentum,
                           self._total_mass, self._com)
 
     def atoms(self) -> Any:
         """A snapshot as an ASE ``Atoms`` -- the way state leaves this object.
 
-        Positions (unwrapped, as integrated), cell, masses and velocities.
-        ASE's velocity units are these units, so nothing is converted.
+        Positions (unwrapped, as integrated), cell, the evaluator's ``pbc``,
+        masses, velocities, and the fixed atoms as a ``FixAtoms``. ASE's
+        velocity units are these units, so nothing is converted.
         """
         from ase import Atoms
+        from ase.constraints import FixAtoms
 
-        return Atoms(
+        atoms = Atoms(
             symbols=self._symbols,
             positions=self._x.detach().cpu().numpy(),
             cell=np.asarray(self.evaluator.cell),
             masses=self._m.detach().cpu().numpy(),
             velocities=self._v.detach().cpu().numpy(),
-            pbc=True,
+            pbc=getattr(self.evaluator, "pbc", True),
         )
+        if len(self.fixed):
+            atoms.set_constraint(FixAtoms(indices=self.fixed))
+        return atoms
+
+
+def _fixed_atoms(atoms: Any) -> np.ndarray:
+    """The atoms ``atoms``' ``FixAtoms`` constraints hold, as sorted indices.
+
+    ``FixAtoms`` is the one ASE constraint the GPU classes honour, and any
+    other is refused: the kernels would ignore it without a word.
+    """
+    from ase.constraints import FixAtoms
+
+    other = sorted({type(c).__name__ for c in atoms.constraints
+                    if not isinstance(c, FixAtoms)})
+    if other:
+        raise ValueError(
+            f"atoms carries {', '.join(other)}: of ASE's constraints the GPU "
+            "classes honour FixAtoms alone, and the kernels would ignore the "
+            "rest silently. Remove them (atoms.set_constraint()), or run "
+            "through the ASE calculator, deepmd_lr.ase.LongRangeCalculator"
+        )
+    held = [np.asarray(c.get_indices(), dtype=np.int64) for c in atoms.constraints]
+    if not held:
+        return np.zeros(0, dtype=np.int64)
+    # Numpy's indexing, as ASE's own FixAtoms applies it: a negative index
+    # counts from the end, and one past the last atom is refused.
+    idx = np.unique(np.arange(len(atoms))[np.concatenate(held)])
+    if len(idx) == len(atoms):
+        raise ValueError("every atom is fixed, so nothing would move")
+    return idx

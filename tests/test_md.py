@@ -17,6 +17,10 @@ The float64 fixture model runs on the GPU. What is pinned:
 - **FIRE and FIRE2.** Each drives its own kernel, under ASE's names, and
   both refuse a bad relaxation. With `relax_cell` the cell force is the
   enthalpy gradient, and the cell reaches the target pressure.
+- **Fixed atoms.** ASE's FixAtoms holds its atoms exactly, in every class;
+  temperatures and the thermostats count three degrees of freedom per mobile
+  atom, as ASE does; and NVE matches ASE's own VelocityVerlet with the same
+  constraint.
 """
 
 import json
@@ -29,8 +33,9 @@ import pytest
 import torch
 import warp as wp
 from ase import Atoms, units
-from ase.constraints import FixAtoms
+from ase.constraints import FixAtoms, FixBondLengths, FixCartesian, FixCom
 from ase.md.velocitydistribution import Stationary, thermalize_momenta
+from ase.md.verlet import VelocityVerlet as AseVelocityVerlet
 from nvalchemiops.dynamics.integrators import (
     langevin_baoab_finalize,
     langevin_baoab_half_step,
@@ -54,6 +59,7 @@ from nvalchemiops.dynamics.integrators import (
 )
 from nvalchemiops.dynamics.integrators.npt import vec9d
 
+from deepmd_lr.ase import LongRangeCalculator
 from deepmd_lr.nvalchemi import (
     FIRE,
     FIRE2,
@@ -514,7 +520,7 @@ class TestOwnership:
         md.run(3)
         assert md.thermo.kinetic_energy == 0.0
 
-    def test_wrong_order_and_constraints_are_refused(self, model):
+    def test_wrong_order_and_other_constraints_are_refused(self, model):
         atoms = make_atoms(model)
         ev = make_ev(model, atoms)
         swapped = atoms.copy()
@@ -522,10 +528,15 @@ class TestOwnership:
         swapped.numbers[[0, 1]] = swapped.numbers[[1, 0]]
         with pytest.raises(ValueError, match="atom order"):
             VelocityVerlet(ev, swapped, DT)
-        fixed = atoms.copy()
-        fixed.set_constraint(FixAtoms([0]))
-        with pytest.raises(ValueError, match="constraints"):
-            VelocityVerlet(ev, fixed, DT)
+        for constraint in (
+            FixCom(),
+            FixBondLengths([(0, 1)]),
+            FixCartesian(0, mask=(False, False, True)),
+        ):
+            held = atoms.copy()
+            held.set_constraint([FixAtoms([3]), constraint])
+            with pytest.raises(ValueError, match="FixAtoms alone"):
+                VelocityVerlet(ev, held, DT)
 
     def test_isotope_masses_reach_the_kinetic_energy(self, model):
         atoms = make_atoms(model)
@@ -1541,3 +1552,205 @@ class TestSlabs:
         with pytest.raises(ValueError, match="relax the positions only"):
             FIRE2(ev, atoms, relax_cell="isotropic", logfile=None)
         FIRE2(ev, atoms, logfile=None, check=False).run(fmax=1.0, steps=5)
+
+    def test_frames_carry_the_slabs_pbc(self, model, tmp_path):
+        """Read back as periodic, the last frame would restart as bulk: the
+        3D sum, and no correction."""
+        atoms = make_slab(model)
+        ev = make_ev(model, atoms, pbc=SLAB)
+        md = VelocityVerlet(ev, atoms, DT, trajectory=tmp_path / "md.extxyz")
+        md.run(2)
+        md.close()
+        opt = FIRE2(ev, atoms, logfile=None, trajectory=tmp_path / "fire.extxyz",
+                    check=False)
+        opt.run(fmax=1.0, steps=2)
+        opt.close()
+        for name in ("md.extxyz", "fire.extxyz"):
+            for written in ase.io.read(tmp_path / name, ":"):
+                assert written.pbc.tolist() == list(SLAB)
+        assert md.thermo.atoms().pbc.tolist() == list(SLAB)
+
+
+# --- fixed atoms ------------------------------------------------------------------
+
+FIXED = np.arange(12)  # the first four molecules
+
+
+def make_fixed(model, **kwargs):
+    """The fixture, with FixAtoms attached after the momenta were drawn, so
+    the fixed atoms start moving and the classes have to stop them."""
+    atoms = make_atoms(model, **kwargs)
+    atoms.set_constraint(FixAtoms(indices=FIXED))
+    return atoms
+
+
+def mobile(atoms):
+    return np.setdiff1d(np.arange(len(atoms)), FIXED)
+
+
+class TestFixedAtoms:
+    @pytest.mark.parametrize(
+        "make",
+        [
+            CASES["vv"][0],
+            CASES["rescale"][0],
+            CASES["langevin"][0],
+            lambda ev, a: Langevin(ev, a, DT, T0, FRICTION, seed=7),  # fixcm
+            CASES["nhc"][0],
+        ],
+        ids=["vv", "rescale", "langevin", "langevin_fixcm", "nhc"],
+    )
+    def test_they_stay_put_while_the_rest_move(self, model, make):
+        """Exactly. No kick or drift moves them, and the noise Langevin's
+        kernel gives every atom is taken away before the forces are computed."""
+        atoms = make_fixed(model)
+        x0 = atoms.get_positions()
+        md = make(make_ev(model, atoms), atoms)
+        md.run(20)
+        x, v = md.thermo.positions.numpy(), md.thermo.velocities.numpy()
+        np.testing.assert_array_equal(x[FIXED], x0[FIXED])
+        assert not v[FIXED].any()
+        assert np.abs(x - x0)[mobile(atoms)].max() > 1e-3
+
+    def test_the_temperature_counts_three_per_mobile_atom(self, model):
+        """As ASE's Atoms.get_temperature does. The fixed atoms carry neither
+        kinetic energy nor degrees of freedom, and none is taken off for the
+        centre of mass: with them holding the rest in place, the mobile atoms'
+        momentum is not conserved."""
+        atoms = make_fixed(model)
+        md = VelocityVerlet(make_ev(model, atoms), atoms, DT)
+        md.run(5)
+        th = md.thermo
+        assert th.ndof == 3 * len(mobile(atoms))
+        assert th.temperature == pytest.approx(atoms.get_temperature(), rel=1e-12)
+        assert th.temperature == pytest.approx(
+            2 * th.kinetic_energy / (th.ndof * units.kB), rel=1e-12
+        )
+
+    def test_nose_hoover_targets_the_same_count(self, model):
+        """At the target temperature, as reported, the chain rests: its target
+        and its mass use the degrees of freedom the temperature counts."""
+        atoms = make_fixed(model)
+        md = NoseHooverChainNVT(make_ev(model, atoms), atoms, DT, T0, TDAMP)
+        th = md.thermo
+        wp.to_torch(th.velocities).mul_(math.sqrt(T0 / th.temperature))
+        th.evaluate()
+        md._chain()
+        assert abs(md.eta_dot.numpy()[0]) < 1e-12
+        assert md.eta_mass.numpy()[0] == pytest.approx(
+            th.ndof * units.kB * T0 * TDAMP**2, rel=1e-12
+        )
+
+    def test_velocity_verlet_matches_ase_with_the_same_constraint(self, model):
+        """An independent reference: ASE's own VelocityVerlet, with ASE
+        applying FixAtoms, on the ASE calculator."""
+        atoms = make_fixed(model)
+        ref = atoms.copy()
+        ref.calc = LongRangeCalculator(model)
+        AseVelocityVerlet(ref, timestep=DT).run(20)
+        VelocityVerlet(make_ev(model, atoms), atoms, DT).run(20)
+        np.testing.assert_allclose(atoms.positions, ref.positions, atol=1e-10)
+        np.testing.assert_allclose(
+            atoms.get_velocities(), ref.get_velocities(), atol=1e-10
+        )
+
+    def test_output_keeps_the_model_forces_and_the_constraint(self, model, tmp_path):
+        """The kernels see zero force on the fixed atoms; atoms.calc and the
+        trajectory keep what the model puts on them, and ASE zeroes it again
+        on get_forces(), as with any calculator."""
+        atoms = make_fixed(model)
+        md = VelocityVerlet(make_ev(model, atoms), atoms, DT,
+                            trajectory=tmp_path / "md.extxyz")
+        md.run(3)
+        md.close()
+        raw = atoms.get_forces(apply_constraint=False)
+        assert np.abs(raw[FIXED]).max() > 1e-3
+        assert not atoms.get_forces()[FIXED].any()
+        assert not md.thermo.forces.numpy()[FIXED].any()
+        last = ase.io.read(tmp_path / "md.extxyz", -1)
+        assert [type(c).__name__ for c in last.constraints] == ["FixAtoms"]
+        np.testing.assert_array_equal(last.constraints[0].index, FIXED)
+        np.testing.assert_allclose(
+            last.get_forces(apply_constraint=False), raw, atol=1e-6
+        )
+
+    @pytest.mark.parametrize("relax", [FIRE, FIRE2])
+    def test_a_relaxation_moves_only_the_rest(self, model, relax):
+        atoms = make_fixed(model)
+        x0 = atoms.get_positions()
+        opt = relax(make_ev(model, atoms), atoms, logfile=None, check=False)
+        assert opt.run(fmax=0.5, steps=300)
+        np.testing.assert_array_equal(atoms.positions[FIXED], x0[FIXED])
+        free = atoms.get_forces()[mobile(atoms)]
+        assert opt.fmax() == pytest.approx(
+            np.linalg.norm(free, axis=1).max(), rel=1e-12
+        )
+
+    def test_what_would_strain_them_is_refused(self, model):
+        atoms = make_fixed(model)
+        ev = make_ev(model, atoms, compute_virial=True)
+        for make in (
+            lambda: MTKNPT(ev, atoms, DT, T0, PRESSURE, TDAMP, PDAMP),
+            lambda: MTKNPH(ev, atoms, DT, PRESSURE, PDAMP, temperature_K=T0),
+            lambda: FIRE2(ev, atoms, relax_cell="isotropic", logfile=None),
+        ):
+            with pytest.raises(ValueError, match="fixed atoms would not stay"):
+                make()
+
+    def test_edits_move_where_they_are_held(self, model):
+        """ASE's set_positions leaves them where they are. Writing the array
+        directly moves them, and the new place is where they are held."""
+        atoms = make_fixed(model)
+        md = VelocityVerlet(make_ev(model, atoms), atoms, DT)
+        md.run(2)
+        held = atoms.positions[FIXED].copy()
+        atoms.set_positions(atoms.positions + 0.01)
+        md.run(1)
+        np.testing.assert_array_equal(md.thermo.positions.numpy()[FIXED], held)
+        atoms.positions[FIXED] += 0.01
+        moved = atoms.positions[FIXED].copy()
+        md.run(3)
+        np.testing.assert_array_equal(md.thermo.positions.numpy()[FIXED], moved)
+
+    def test_a_changed_constraint_is_refused_between_runs(self, model):
+        atoms = make_fixed(model)
+        md = VelocityVerlet(make_ev(model, atoms), atoms, DT)
+        md.run(2)
+        atoms.set_constraint(FixAtoms(indices=FIXED[:3]))
+        with pytest.raises(ValueError, match="FixAtoms changed"):
+            md.run(1)
+
+    def test_a_checkpoint_carries_them(self, model, tmp_path):
+        atoms = make_fixed(model)
+        straight = NoseHooverChainNVT(make_ev(model, atoms), atoms.copy(), DT, T0,
+                                      TDAMP)
+        straight.run(10)
+        first = NoseHooverChainNVT(make_ev(model, atoms), atoms.copy(), DT, T0, TDAMP)
+        first.run(5)
+        path = first.save_checkpoint(tmp_path / "state.npz")
+        again = NoseHooverChainNVT.from_checkpoint(
+            make_ev(model, atoms), atoms.copy(), path
+        )
+        again.run(5)
+        np.testing.assert_allclose(
+            again.thermo.positions.numpy(), straight.thermo.positions.numpy(),
+            atol=1e-10,
+        )
+        loose = atoms.copy()
+        loose.set_constraint()
+        with pytest.raises(ValueError, match="fixed_sha1"):
+            NoseHooverChainNVT.from_checkpoint(make_ev(model, atoms), loose, path)
+
+    def test_a_slab_held_by_its_bottom_layer(self, model):
+        """What they are for: the bottom of a slab held as the bulk below it
+        would hold it."""
+        atoms = make_slab(model)
+        z = atoms.positions[:, 2]
+        bottom = np.flatnonzero(z < z.min() + 3.0)
+        atoms.set_constraint(FixAtoms(indices=bottom))
+        x0 = atoms.get_positions()
+        md = Langevin(make_ev(model, atoms, pbc=SLAB), atoms, DT, T0, FRICTION,
+                      seed=1)
+        md.run(20)
+        np.testing.assert_array_equal(atoms.positions[bottom], x0[bottom])
+        assert md.thermo.ndof == 3 * (len(atoms) - len(bottom))

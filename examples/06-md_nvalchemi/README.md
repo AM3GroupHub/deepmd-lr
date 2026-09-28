@@ -77,15 +77,48 @@ md.run(1000)
 
 Under the hood `Thermo` calls nvalchemiops' own utilities rather than
 reimplementing them:
-- `initialize_velocities` and `remove_com_motion` handle the centre of mass on
-  the GPU;
-- `compute_kinetic_energy` and `compute_temperature` give the measurements;
+- `remove_com_motion` handles the centre of mass on the GPU;
+- `compute_kinetic_energy` gives the kinetic energy, and the temperature is
+  `2 KE / (ndof k_B)`;
 - `compute_pressure_tensor` gives the pressure.
 
-`compute_temperature` divides by `3N − 3`, and every thermostat here counts
-the same `3N − 3`. That count assumes the centre of mass is at rest, so the MD
-classes remove its motion at start-up; Langevin's `fixcm=True` keeps it at
-rest.
+`Thermo.ndof` is `3N − 3`, and every thermostat here counts the same. That
+count assumes the centre of mass is at rest, so the MD classes remove its
+motion at start-up; Langevin's `fixcm=True` keeps it at rest. With fixed atoms
+it is three per mobile atom instead ([below](#fixed-atoms)).
+
+## Fixed atoms
+
+Attach ASE's `FixAtoms` to `atoms`, as for ASE's own MD. Every class here
+honours it, and refuses any other constraint rather than ignoring it:
+
+```python
+from ase.constraints import FixAtoms
+
+atoms = read_structure("slab.extxyz")                    # pbc T T F
+z = atoms.positions[:, 2]
+atoms.set_constraint(FixAtoms(mask=z < z.min() + 3.0))   # the bottom 3 A
+ev = build_evaluator("model.ckpt.pt", atoms)
+thermalize_momenta(atoms, temperature_K=300)             # fixed atoms stay at rest
+Langevin(ev, atoms, 0.5 * units.fs, temperature_K=300, friction=0.1).run(1000)
+```
+
+- **They stay exactly where they start, at rest.** The kernels see zero force
+  on them. Langevin's kernel gives every atom noise, so `Thermo.evaluate` also
+  puts them back before every force call.
+- **The temperature counts three degrees of freedom per mobile atom**, as
+  ASE's `atoms.get_temperature()` does, and the thermostats target that same
+  count. No centre-of-mass motion is removed, since the fixed atoms hold the
+  system in place: skip `Stationary`, and Langevin's `fixcm` does nothing.
+- **Output keeps the model's force on them.** `atoms.calc` and the trajectory
+  hold it, and the trajectory carries the constraint too (`move_mask` in
+  extxyz). `atoms.get_forces()` zeroes it, as ASE does, and
+  `get_forces(apply_constraint=False)` returns it.
+- **A structure file can carry them.** POSCAR's selective dynamics `F F F` and
+  extxyz's `move_mask` read back as `FixAtoms`, and `read_structure` moves
+  them with the slab when it centres one.
+- **NPT, NPH and cell relaxation refuse them**, because the cell's strain moves
+  every position. Reach the density first, then fix the atoms for NVT.
 
 ## Units, and the one that bites
 

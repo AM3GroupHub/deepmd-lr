@@ -124,6 +124,10 @@ the model the whole cell, so its descriptor sees a 3D-periodic cell as in
 training, and it refuses a slab with less vacuum than the cutoff. The GPU
 classes make no images along z; they only need the atoms kept off the faces.
 
+To hold the bottom layers in place, as the bulk beneath would, attach ASE's
+`FixAtoms`. The GPU classes honour it and count only the mobile atoms in the
+temperature ([example 06](../06-md_nvalchemi/README.md#fixed-atoms)).
+
 ## Caveats
 
 - **34 frames trains nothing.** This is a miniature of a production set of

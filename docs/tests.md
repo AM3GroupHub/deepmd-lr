@@ -62,8 +62,8 @@ the model first.
   frame's pbc picking its sum and its cell the mesh; a slab with too little
   vacuum refused.
 - `test_read_structure.py` — the file's pbc kept; a slab's open axis padded to
-  the vacuum, centred, and made whole when the file wrapped it; molecules and
-  wires refused.
+  the vacuum, centred, and made whole when the file wrapped it; fixed atoms
+  read back and moved with the slab; molecules and wires refused.
 - `test_nvalchemi.py` — the partitioner and halo (including unwrapped
   coordinates), the skin rules and memory probe, the device gather, the
   gathered long-range term and virial, and `DistributedEvaluator`, whose
@@ -73,9 +73,11 @@ the model first.
   face is refused; a slab term on a bulk cell takes the 3D sum, and an
   `isolated` term is refused. A supercell gets the mesh its cell needs and
   reproduces its unit cell.
-- `test_thermo.py` — `Thermo`'s measurements, warp aliasing, cell sync, and
-  the guards that make one evaluator safe to share (`fresh`,
-  `cell_is_current`, `set_state`).
+- `test_thermo.py` — `Thermo`'s measurements, warp aliasing, cell sync, the
+  guards that make one evaluator safe to share (`fresh`,
+  `cell_is_current`, `set_state`), and fixed atoms: read from `FixAtoms` by
+  `from_atoms`, put back at rest before every force call, zero force for the
+  kernels and the model's for output, and left out of the temperature.
 - `test_md.py` — the MD classes, `FIRE` and `FIRE2`: each integrator and each
   relaxation against a hand-written kernel loop, one evaluator carrying a
   whole workflow, `atoms` kept in step both ways, run semantics and
@@ -84,7 +86,11 @@ the model first.
   the kernels transposed, the relaxations' refusals, the cell relaxation
   (its force against finite differences of the enthalpy, every mode reaching
   the target pressure), the dipole current, and slabs: NVT keeps one in its
-  cell, while barostats and cell relaxation refuse it.
+  cell, while barostats and cell relaxation refuse it, and frames keep its
+  pbc. Fixed atoms stay exactly in place in every integrator and relaxation,
+  the temperature and the Nosé–Hoover target count three degrees of freedom
+  per mobile atom, NVE matches ASE's own `VelocityVerlet` with the same
+  `FixAtoms`, and output, checkpoints and refusals carry the constraint.
 - `test_compress.py`, `test_compress_arguments.py`,
   `test_compress_atomic_state.py`, `test_compress_required.py` — compressed
   DPA4C inference: every refusal, the graph-lower guard, argument validation,

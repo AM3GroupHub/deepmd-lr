@@ -63,6 +63,11 @@ converge, one that changed the covalent-bond topology between non-metal atoms,
 and one whose energy (with the cell, enthalpy) rose. That check applies only
 without a field: under a field the minimiser seeks zero total force, not
 minimum energy.
+
+**Fixed atoms** (ASE's ``FixAtoms`` on ``atoms``) stay where they are: the
+kernel sees no force on them, and ``fmax`` is the largest force on the others,
+as in ASE. A cell relaxation would strain them with the cell, so it refuses
+them.
 """
 
 from __future__ import annotations
@@ -75,6 +80,7 @@ import numpy as np
 import torch
 from ase import Atoms, units
 from ase.calculators.singlepoint import SinglePointCalculator
+from ase.constraints import FixAtoms
 
 from deepmd_lr.nvalchemi.md import (
     _check_atoms,
@@ -83,7 +89,7 @@ from deepmd_lr.nvalchemi.md import (
     _sync_atoms,
     _Trajectory,
 )
-from deepmd_lr.nvalchemi.thermo import Thermo
+from deepmd_lr.nvalchemi.thermo import Thermo, _fixed_atoms
 
 __all__ = ["FIRE", "FIRE2", "RelaxationError"]
 
@@ -191,6 +197,12 @@ class _FIREBase:
                 "relax_cell moves the cell, and a slab's open axis is not a "
                 "periodic length a stress can act on; relax the positions only"
             )
+        fixed = _fixed_atoms(atoms)
+        if relax_cell is not None and len(fixed):
+            raise ValueError(
+                "relax_cell strains every position with the cell, so fixed "
+                "atoms would not stay fixed; relax the positions only"
+            )
         self.relax_cell = relax_cell
         self.pressure_au = float(pressure_au)
         if relax_cell is None and self.pressure_au != 0.0:
@@ -209,9 +221,9 @@ class _FIREBase:
                 "needs a diagonal cell; use 'full' for this one"
             )
         self.atoms = atoms
-        self.thermo = Thermo(
-            evaluator, atoms.get_positions(), masses=atoms.get_masses()
-        )
+        self.thermo = Thermo.from_atoms(evaluator, atoms)
+        # A relaxation starts, and hands atoms back, at rest.
+        self.thermo.set_state(velocities=np.zeros((len(atoms), 3)))
         self.maxstep = float(maxstep)
         if not self.maxstep > 0:
             raise ValueError("maxstep must be positive")
@@ -267,7 +279,7 @@ class _FIREBase:
         self._observers.append((fn, int(interval), args, kwargs))
 
     def fmax(self) -> float:
-        """The largest force on any atom, eV/A (a host read)."""
+        """The largest force on any atom not fixed, eV/A (a host read)."""
         return float(np.linalg.norm(self.thermo.forces.numpy(), axis=1).max())
 
     def stress_residual(self) -> float:
@@ -463,10 +475,12 @@ class _FIREBase:
                 self.atoms.get_chemical_symbols(),
                 positions=th.positions.numpy(),
                 cell=np.asarray(self.evaluator.cell),
-                pbc=True,
+                pbc=self.atoms.pbc,
             )
+            if len(th.fixed):
+                frame.set_constraint(FixAtoms(indices=th.fixed))
             frame.calc = SinglePointCalculator(
-                frame, energy=th.energy, forces=th.forces.numpy().copy()
+                frame, energy=th.energy, forces=th.get_forces(apply_constraint=False)
             )
             frame.info["step"] = self.nsteps
             self._traj.write(frame)

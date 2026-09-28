@@ -45,8 +45,17 @@
   ``SinglePointCalculator`` go back at log, trajectory and observer intervals,
   and at the end of every run (even one that raised).
 - **Atoms to device:** edits made to ``atoms`` between runs or by an observer
-  are picked up. Constraints, non-periodic axes and a different atom order are
-  refused at construction.
+  are picked up. A different atom order or ``pbc`` is refused at
+  construction.
+
+**Fixed atoms.** ASE's ``FixAtoms`` on ``atoms`` holds those atoms where they
+start, at rest, in every class here; any other constraint is refused. They
+carry no degrees of freedom: temperatures, and the thermostats' targets, count
+three per mobile atom, as ``atoms.get_temperature()`` does, and no
+centre-of-mass motion is removed, since the fixed atoms already hold the
+system in place. The trajectory and ``atoms.calc`` keep the force the model
+puts on them; ``atoms.get_forces()`` zeroes it, as ASE does. The barostats,
+which strain every position with the cell, refuse them.
 
 **Nothing here adds a host synchronisation per step** beyond the evaluator's
 own; everything else happens at intervals.
@@ -71,8 +80,9 @@ from typing import Any
 import numpy as np
 from ase import Atoms, units
 from ase.calculators.singlepoint import SinglePointCalculator
+from ase.constraints import FixAtoms
 
-from deepmd_lr.nvalchemi.thermo import Thermo
+from deepmd_lr.nvalchemi.thermo import Thermo, _fixed_atoms
 
 __all__ = [
     "Langevin",
@@ -179,11 +189,7 @@ def _check_atoms(evaluator: Any, atoms: Atoms) -> None:
             f"index {first}: {atoms[first].symbol} vs {expected[first]}); "
             "pass the Atoms the evaluator was built from"
         )
-    if atoms.constraints:
-        raise ValueError(
-            "atoms carries ASE constraints, which the GPU kernels would "
-            "silently ignore; remove them (atoms.set_constraint())"
-        )
+    _fixed_atoms(atoms)
     expected_pbc = tuple(getattr(evaluator, "pbc", (True, True, True)))
     if tuple(bool(p) for p in atoms.pbc) != expected_pbc:
         raise ValueError(
@@ -290,8 +296,13 @@ def _sync_atoms(atoms: Atoms, thermo: Thermo, *, results: bool = True) -> dict:
         charge = res.get("charge") if res else None
         if charge is not None:
             extra["charges"] = np.asarray(charge).reshape(-1).copy()
+        # The model's forces, the fixed atoms' included: ASE applies the
+        # constraint itself on get_forces(), as with any calculator.
         atoms.calc = SinglePointCalculator(
-            atoms, energy=thermo.energy, forces=thermo.forces.numpy().copy(), **extra
+            atoms,
+            energy=thermo.energy,
+            forces=thermo.get_forces(apply_constraint=False),
+            **extra,
         )
         born = res.get("born_charge") if res else None
         if born is not None:
@@ -305,11 +316,11 @@ def _sync_atoms(atoms: Atoms, thermo: Thermo, *, results: bool = True) -> dict:
     }
 
 
-def _fingerprint(evaluator: Any, masses: np.ndarray) -> dict:
+def _fingerprint(evaluator: Any, masses: np.ndarray, fixed: Any = ()) -> dict:
     """What a checkpoint must share with the evaluator it is restored onto."""
     type_map = list(evaluator.model.get_type_map())
     symbols = [type_map[i] for i in np.asarray(evaluator.atype)]
-    return {
+    fingerprint = {
         "n_atoms": int(evaluator.n_atoms),
         "symbols_sha1": hashlib.sha1(",".join(symbols).encode()).hexdigest(),
         "masses_sha1": hashlib.sha1(
@@ -328,6 +339,13 @@ def _fingerprint(evaluator: Any, masses: np.ndarray) -> dict:
         ),
         "compute_virial": bool(evaluator.compute_virial),
     }
+    if len(fixed):
+        # Only when there are any, so checkpoints from before fixed atoms
+        # existed still restore.
+        fingerprint["fixed_sha1"] = hashlib.sha1(
+            np.asarray(fixed, dtype=np.int64).tobytes()
+        ).hexdigest()
+    return fingerprint
 
 
 # ----------------------------------------------------------------------------
@@ -349,8 +367,8 @@ class MolecularDynamics:
         as it is.
     atoms
         The system, in the evaluator's atom order and cell. Positions,
-        velocities (from momenta) and masses are read from it; it is written
-        back as the run goes.
+        velocities (from momenta), masses and any ``FixAtoms`` are read from
+        it; it is written back as the run goes.
     timestep
         In ASE time units: ``0.5 * units.fs``.
     logfile, loginterval
@@ -397,12 +415,7 @@ class MolecularDynamics:
         _check_evaluator(evaluator)
         _check_atoms(evaluator, atoms)
         self.atoms = atoms
-        self.thermo = Thermo(
-            evaluator,
-            atoms.get_positions(),
-            velocities=atoms.get_velocities(),
-            masses=atoms.get_masses(),
-        )
+        self.thermo = Thermo.from_atoms(evaluator, atoms)
         self._masses = np.array(atoms.get_masses(), dtype=np.float64)
         self.timestep = float(timestep)
         if not self.timestep > 0:
@@ -653,6 +666,8 @@ class MolecularDynamics:
             )
 
     def _remove_com_drift(self) -> None:
+        if len(self.thermo.fixed):
+            return  # they hold the system in place; Thermo has them at rest
         v, m = self.thermo.velocities.numpy(), self._masses
         p = (m[:, None] * v).sum(axis=0)
         ke = 0.5 * (m[:, None] * v**2).sum()
@@ -676,6 +691,12 @@ class MolecularDynamics:
             )
         if not np.array_equal(atoms.get_masses(), self._masses):
             raise ValueError("atoms masses were changed after construction")
+        if not np.array_equal(_fixed_atoms(atoms), self.thermo.fixed):
+            raise ValueError(
+                "atoms' FixAtoms changed after construction, and with it the "
+                "degrees of freedom the temperature counts; build a new MD "
+                "object for the new constraint"
+            )
         moved = not np.array_equal(atoms.get_positions(), snap["positions"])
         kicked = not np.array_equal(atoms.get_momenta(), snap["momenta"])
         if not (moved or kicked):
@@ -697,16 +718,18 @@ class MolecularDynamics:
             self.atoms.get_chemical_symbols(),
             positions=self.atoms.get_positions(),
             cell=self.atoms.cell,
-            pbc=True,
+            pbc=self.atoms.pbc,
             masses=self._masses,
         )
+        if len(self.thermo.fixed):
+            frame.set_constraint(FixAtoms(indices=self.thermo.fixed))
         if "velocities" in props:
             frame.set_momenta(self.atoms.get_momenta())
         results = {}
         if "energy" in props:
             results["energy"] = self.thermo.energy
         if "forces" in props:
-            results["forces"] = self.thermo.forces.numpy().copy()
+            results["forces"] = self.thermo.get_forces(apply_constraint=False)
         res = self.evaluator.results
         if "charges" in props and res.get("charge") is not None:
             results["charges"] = np.asarray(res["charge"]).reshape(-1).copy()
@@ -796,7 +819,9 @@ class MolecularDynamics:
             "io": self._io,
             "nsteps": self.nsteps,
             "time": self._time,
-            "fingerprint": _fingerprint(self.evaluator, self._masses),
+            "fingerprint": _fingerprint(
+                self.evaluator, self._masses, self.thermo.fixed
+            ),
             "metadata": self.metadata,
             "log_bytes": None if self._logger is None else self._logger.tell(),
             "traj_bytes": (
@@ -864,14 +889,15 @@ class MolecularDynamics:
         atoms.set_cell(arrays["cell"], scale_atoms=False)
         atoms.set_positions(arrays["positions"], apply_constraint=False)
         atoms.set_velocities(arrays["velocities"])
-        want = _fingerprint(evaluator, atoms.get_masses())
+        want = _fingerprint(evaluator, atoms.get_masses(), _fixed_atoms(atoms))
         if not np.array_equal(np.asarray(evaluator.cell), arrays["cell"]):
             evaluator.set_cell(arrays["cell"])
         if meta["fingerprint"] != want:
+            had = meta["fingerprint"]
             diff = {
-                k: (meta["fingerprint"].get(k), v)
-                for k, v in want.items()
-                if meta["fingerprint"].get(k) != v
+                k: (had.get(k), want.get(k))
+                for k in sorted(set(had) | set(want))
+                if had.get(k) != want.get(k)
             }
             raise ValueError(
                 f"{path} belongs to a different system or evaluator: "
@@ -982,6 +1008,11 @@ class Langevin(MolecularDynamics):
     so a restart replays exactly the noise an uninterrupted run would draw.
     ``fixcm`` (ASE's default) removes the centre-of-mass motion the noise adds
     each step, which makes ``3N - 3`` degrees of freedom exact.
+
+    With fixed atoms ``fixcm`` does nothing: they hold the system in place,
+    and every mobile atom is thermostatted in all three directions. The
+    kernel gives the fixed atoms noise too, which ``Thermo.evaluate`` takes
+    away again before the forces are computed.
     """
 
     def __init__(
@@ -1004,6 +1035,7 @@ class Langevin(MolecularDynamics):
         self.friction = float(friction)
         self._friction = self.thermo.scalar(self.friction)
         self.fixcm = bool(fixcm)
+        self._fix_com = self.fixcm and not len(self.thermo.fixed)
         self.seed = (
             int(seed) if seed is not None else int.from_bytes(os.urandom(4), "little")
         )
@@ -1028,7 +1060,7 @@ class Langevin(MolecularDynamics):
         )
         th.evaluate()
         k.langevin_baoab_finalize(th.velocities, th.forces, th.masses, self.dt)
-        if self.fixcm:
+        if self._fix_com:
             th.remove_com_motion()
 
     def _params(self) -> dict:
@@ -1046,7 +1078,8 @@ class NoseHooverChainNVT(MolecularDynamics):
     Conventions verified on water (bend ~1640, stretch ~3400 cm-1):
     - The full dt goes to every call. Passing dt/2 to the kick halves every
       force.
-    - ndof = 3N - 3.
+    - ndof = 3N - 3, or three per mobile atom with fixed atoms
+      (``Thermo.ndof``).
     - ``total_scale`` is reset to 1 before each chain update.
     - :meth:`conserved_energy` uses **eta/2**: each chain update scales the
       velocities by a half step but moves eta by a full ``eta_dot * dt``, so
@@ -1085,7 +1118,7 @@ class NoseHooverChainNVT(MolecularDynamics):
         self.temperature_K, self.tdamp = float(temperature_K), float(tdamp)
         self.tchain, self.tloop = int(tchain), 1
         self.kT = th.scalar(units.kB * self.temperature_K)
-        ndof = 3 * th.n_atoms - 3
+        ndof = th.ndof
         self._ndof = th.scalar(float(ndof))  # float64
         ndof_i32 = wp.array(np.array([ndof]), dtype=wp.int32, device=th.device)
         self.eta, self.eta_dot = th.zeros(self.tchain), th.zeros(self.tchain)
@@ -1227,6 +1260,12 @@ class _MTKBarostat(MolecularDynamics):
                 f"{name} moves the cell, and a slab's open axis is not a "
                 "periodic length a pressure can act on; run the slab in NVE or "
                 "NVT (the in-plane pressure is not controlled)"
+            )
+        if len(_fixed_atoms(atoms)):
+            raise ValueError(
+                f"{name} strains every position with the cell, so fixed atoms "
+                "would not stay fixed; hold them in NVT or NVE, at a cell "
+                "reached without them"
             )
         if not evaluator.compute_virial:
             raise ValueError(
