@@ -63,10 +63,10 @@ NoseHooverChainNVT(ev, atoms, 0.5 * units.fs, temperature_K=300,
 ```
 
 `VelocityVerlet` (NVE); `Langevin`, `NoseHooverChainNVT` and
-`VelocityRescaling` (NVT); `MTKNPT` and `IsotropicMTKNPT` (NPT); `MTKNPH` and
-`IsotropicMTKNPH` (NPH); and the relaxations `FIRE` and `FIRE2` share that one
-evaluator, so a relaxation and several MD stages run on one copy of the
-model. Between them they cover every integrator nvalchemiops ships. [Partitioned MD](partitioned-md.md#the-md-classes)
+`VelocityRescaling` (NVT); `MTKNPT` (NPT) and `MTKNPH` (NPH), each with an
+isotropic, orthorhombic or full cell; and the relaxations `FIRE` and `FIRE2`
+share that one evaluator, so a relaxation and several MD stages run on one
+copy of the model. Between them they cover every integrator nvalchemiops ships. [Partitioned MD](partitioned-md.md#the-md-classes)
 covers the API and what each piece owns.
 [Example 06](../examples/06-md_nvalchemi) has a script per ensemble, and
 [example 07](../examples/07-ase-calculator) covers the ASE calculator.

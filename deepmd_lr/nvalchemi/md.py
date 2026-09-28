@@ -75,8 +75,6 @@ from ase.calculators.singlepoint import SinglePointCalculator
 from deepmd_lr.nvalchemi.thermo import Thermo
 
 __all__ = [
-    "IsotropicMTKNPH",
-    "IsotropicMTKNPT",
     "Langevin",
     "MDInstabilityError",
     "MTKNPH",
@@ -1319,8 +1317,9 @@ class _MTKBarostat(MolecularDynamics):
 
 class MTKNPT(_MTKBarostat):
     """NPT: the MTK barostat with a Nose-Hoover chain thermostat, as ASE's
-    ``MTKNPT``. By default the whole cell fluctuates (``cell="full"``); see
-    :class:`IsotropicMTKNPT` for the isotropic form.
+    ``MTKNPT``. By default the whole cell fluctuates (``cell="full"``);
+    ``cell="isotropic"`` scales it uniformly and ``"orthorhombic"`` moves the
+    three lengths of a diagonal cell.
 
     The step is a palindrome: thermostat, barostat, kick | drift | kick,
     barostat, thermostat. The barostat itself is not thermostatted.
@@ -1467,51 +1466,14 @@ class MTKNPT(_MTKBarostat):
         self.eta_dot.assign(arrays["eta_dot"])
 
 
-class IsotropicMTKNPT(MTKNPT):
-    """NPT with isotropic cell fluctuations, as ASE's ``IsotropicMTKNPT``:
-    :class:`MTKNPT` with ``cell="isotropic"``."""
-
-    def __init__(
-        self,
-        evaluator: Any,
-        atoms: Atoms,
-        timestep: float,
-        temperature_K: float,
-        pressure_au: float,
-        tdamp: float,
-        pdamp: float,
-        *,
-        tchain: int = 3,
-        tloop: int = 1,
-        **kwargs: Any,
-    ) -> None:
-        super().__init__(
-            evaluator,
-            atoms,
-            timestep,
-            temperature_K,
-            pressure_au,
-            tdamp,
-            pdamp,
-            cell="isotropic",
-            tchain=tchain,
-            tloop=tloop,
-            **kwargs,
-        )
-
-    def _params(self) -> dict:
-        params = super()._params()
-        del params["cell"]
-        return params
-
-
 class MTKNPH(_MTKBarostat):
     """NPH: the MTK barostat alone, with no thermostat. The enthalpy
     H' = Epot + Ekin + P V + W |eps_dot|^2 / 2 is conserved; the temperature
     goes where the dynamics take it.
 
     The step is barostat, kick | drift | kick, barostat. By default the whole
-    cell fluctuates (``cell="full"``); see :class:`IsotropicMTKNPH`.
+    cell fluctuates (``cell="full"``); ``cell`` takes the same modes as
+    :class:`MTKNPT`.
 
     ``temperature_K`` sets only the barostat mass, W = 3N kT pdamp^2; it
     defaults to the atoms' temperature at the start, as LAMMPS' fix nph does.
@@ -1581,35 +1543,3 @@ class MTKNPH(_MTKBarostat):
 
     def _params(self) -> dict:
         return {**super()._params(), "temperature_K": self._barostat_T}
-
-
-class IsotropicMTKNPH(MTKNPH):
-    """NPH with isotropic cell fluctuations: :class:`MTKNPH` with
-    ``cell="isotropic"``."""
-
-    def __init__(
-        self,
-        evaluator: Any,
-        atoms: Atoms,
-        timestep: float,
-        pressure_au: float,
-        pdamp: float,
-        *,
-        temperature_K: float | None = None,
-        **kwargs: Any,
-    ) -> None:
-        super().__init__(
-            evaluator,
-            atoms,
-            timestep,
-            pressure_au,
-            pdamp,
-            cell="isotropic",
-            temperature_K=temperature_K,
-            **kwargs,
-        )
-
-    def _params(self) -> dict:
-        params = super()._params()
-        del params["cell"]
-        return params

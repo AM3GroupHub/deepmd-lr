@@ -42,7 +42,7 @@ a whole workflow:
 from ase import units
 from ase.md.velocitydistribution import Stationary, thermalize_momenta
 from deepmd_lr.nvalchemi import (
-    FIRE2, IsotropicMTKNPT, NoseHooverChainNVT, build_evaluator, read_structure,
+    FIRE2, MTKNPT, NoseHooverChainNVT, build_evaluator, read_structure,
 )
 
 atoms = read_structure("start.xyz")
@@ -54,10 +54,10 @@ NoseHooverChainNVT(ev, atoms, 0.5 * units.fs, temperature_K=300,
                    tdamp=100 * units.fs, logfile="nvt.log",
                    loginterval=100).run(20_000)
 ev.set_compute_virial(True)                     # only NPT pays for the virial
-npt = IsotropicMTKNPT(ev, atoms, 0.5 * units.fs, temperature_K=300,
-                      pressure_au=1e-4 * units.GPa, tdamp=100 * units.fs,
-                      pdamp=1000 * units.fs, logfile="npt.log",
-                      trajectory="npt.traj", traj_interval=500)
+npt = MTKNPT(ev, atoms, 0.5 * units.fs, temperature_K=300,
+             pressure_au=1e-4 * units.GPa, tdamp=100 * units.fs,
+             pdamp=1000 * units.fs, cell="isotropic", logfile="npt.log",
+             trajectory="npt.traj", traj_interval=500)
 npt.run(20_000)
 ```
 
@@ -68,9 +68,7 @@ npt.run(20_000)
 | `NoseHooverChainNVT` | NVT, Nosé–Hoover chain | Etot + the chain energy |
 | `VelocityRescaling` | velocity Verlet, rescaled to the target whenever the temperature leaves a window; equilibration only | none |
 | `MTKNPT` | NPT, MTK barostat + Nosé–Hoover chain; `cell="full"` (default), `"orthorhombic"` or `"isotropic"` | the MTK H′ |
-| `IsotropicMTKNPT` | `MTKNPT` with an isotropic cell, under ASE's name | the MTK H′ |
 | `MTKNPH` | NPH, the MTK barostat alone; `cell` as for `MTKNPT` | the enthalpy H′ |
-| `IsotropicMTKNPH` | `MTKNPH` with an isotropic cell | the enthalpy H′ |
 | `FIRE` | relaxes the positions, and the cell with `relax_cell`; classic FIRE with ASE's defaults | — |
 | `FIRE2` | the same with FIRE 2.0 and nvalchemiops' more cautious defaults | — |
 

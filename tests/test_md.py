@@ -60,8 +60,6 @@ from deepmd_lr.nvalchemi import (
     MTKNPH,
     MTKNPT,
     DistributedEvaluator,
-    IsotropicMTKNPH,
-    IsotropicMTKNPT,
     Langevin,
     MDInstabilityError,
     NoseHooverChainNVT,
@@ -368,8 +366,8 @@ CASES = {
         {},
     ),
     "npt": (
-        lambda ev, a, **kw: IsotropicMTKNPT(
-            ev, a, DT, T0, PRESSURE, TDAMP, PDAMP, **kw
+        lambda ev, a, **kw: MTKNPT(
+            ev, a, DT, T0, PRESSURE, TDAMP, PDAMP, cell="isotropic", **kw
         ),
         lambda ev, a, n: loop_npt(ev, a, n, PRESSURE, TDAMP, PDAMP),
         {"compute_virial": True},
@@ -380,8 +378,8 @@ CASES = {
         {"compute_virial": True},
     ),
     "nph": (
-        lambda ev, a, **kw: IsotropicMTKNPH(
-            ev, a, DT, PRESSURE, PDAMP, temperature_K=T0, **kw
+        lambda ev, a, **kw: MTKNPH(
+            ev, a, DT, PRESSURE, PDAMP, cell="isotropic", temperature_K=T0, **kw
         ),
         lambda ev, a, n: loop_nph(ev, a, n, PRESSURE, PDAMP, "isotropic"),
         {"compute_virial": True},
@@ -441,7 +439,9 @@ class TestOwnership:
             thermalize_momenta(atoms, temperature_K=T0, rng=np.random.default_rng(3))
             Stationary(atoms)
             Langevin(evaluators[1], atoms, DT, T0, FRICTION, seed=5).run(5)
-            IsotropicMTKNPT(evaluators[2], atoms, DT, T0, PRESSURE, TDAMP, PDAMP).run(5)
+            MTKNPT(
+                evaluators[2], atoms, DT, T0, PRESSURE, TDAMP, PDAMP, cell="isotropic"
+            ).run(5)
             return atoms
 
         atoms = make_atoms(model)
@@ -486,7 +486,9 @@ class TestOwnership:
         ev = make_ev(model, atoms, compute_virial=True)
         nvt = NoseHooverChainNVT(ev, atoms.copy(), DT, T0, TDAMP)
         nvt.run(2)
-        IsotropicMTKNPT(ev, atoms.copy(), DT, T0, PRESSURE, TDAMP, PDAMP).run(3)
+        MTKNPT(
+            ev, atoms.copy(), DT, T0, PRESSURE, TDAMP, PDAMP, cell="isotropic"
+        ).run(3)
         with pytest.raises(RuntimeError, match="cell has changed"):
             nvt.run(1)
 
@@ -610,7 +612,7 @@ class TestRunSemantics:
     def test_the_log_carries_the_ensemble_and_extra_columns(self, model, tmp_path):
         atoms = make_atoms(model)
         ev = make_ev(model, atoms, compute_virial=True)
-        md = IsotropicMTKNPT(
+        md = MTKNPT(
             ev,
             atoms,
             DT,
@@ -618,6 +620,7 @@ class TestRunSemantics:
             PRESSURE,
             TDAMP,
             PDAMP,
+            cell="isotropic",
             logfile=tmp_path / "npt.log",
             loginterval=2,
             extra_columns={"n2": lambda m: 2.0 * m.nsteps},
@@ -777,7 +780,7 @@ class TestPhysics:
         atoms = make_atoms(model)
 
         def npt(dt):
-            return IsotropicMTKNPT(
+            return MTKNPT(
                 make_ev(model, atoms, compute_virial=True),
                 atoms.copy(),
                 dt,
@@ -785,6 +788,7 @@ class TestPhysics:
                 PRESSURE,
                 1e6 * units.fs,
                 PDAMP,
+                cell="isotropic",
             )
 
         big = _fluctuation(npt(0.2 * units.fs), 100, 5)
@@ -827,11 +831,12 @@ class TestPhysics:
     def test_npt_refuses_no_virial_and_a_short_chain(self, model):
         atoms = make_atoms(model)
         with pytest.raises(ValueError, match="virial"):
-            IsotropicMTKNPT(
-                make_ev(model, atoms), atoms, DT, T0, PRESSURE, TDAMP, PDAMP
+            MTKNPT(
+                make_ev(model, atoms), atoms, DT, T0, PRESSURE, TDAMP, PDAMP,
+                cell="isotropic",
             )
         with pytest.raises(ValueError, match="tchain"):
-            IsotropicMTKNPT(
+            MTKNPT(
                 make_ev(model, atoms, compute_virial=True),
                 atoms,
                 DT,
@@ -839,6 +844,7 @@ class TestPhysics:
                 PRESSURE,
                 TDAMP,
                 PDAMP,
+                cell="isotropic",
                 tchain=1,
             )
 
@@ -847,7 +853,7 @@ class TestPhysics:
         ev = make_ev(model, atoms)
         Langevin(ev, atoms, DT, T0, FRICTION, seed=2).run(2)
         ev.set_compute_virial(True)
-        IsotropicMTKNPT(ev, atoms, DT, T0, PRESSURE, TDAMP, PDAMP).run(2)
+        MTKNPT(ev, atoms, DT, T0, PRESSURE, TDAMP, PDAMP, cell="isotropic").run(2)
 
     def test_velocity_rescaling_holds_its_window(self, model):
         """A hot start is pulled into the window at the first step it may be,

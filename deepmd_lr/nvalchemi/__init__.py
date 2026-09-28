@@ -6,8 +6,8 @@
   :func:`build_evaluator`, and share it.
 - The MD classes -- :class:`VelocityVerlet` (NVE); :class:`Langevin`,
   :class:`NoseHooverChainNVT` and :class:`VelocityRescaling` (NVT);
-  :class:`MTKNPT` and :class:`IsotropicMTKNPT` (NPT); :class:`MTKNPH` and
-  :class:`IsotropicMTKNPH` (NPH) -- and the relaxations :class:`FIRE` and
+  :class:`MTKNPT` (NPT) and :class:`MTKNPH` (NPH), each with an isotropic,
+  orthorhombic or full cell -- and the relaxations :class:`FIRE` and
   :class:`FIRE2` take that evaluator and an ``ase.Atoms``, ASE-style:
   parameters in ``__init__``, then ``run(steps)``. Several may run one after
   another on one evaluator.
@@ -30,8 +30,6 @@ from deepmd_lr.nvalchemi.evaluator import (
 from deepmd_lr.nvalchemi.md import (
     MTKNPH,
     MTKNPT,
-    IsotropicMTKNPH,
-    IsotropicMTKNPT,
     Langevin,
     MDInstabilityError,
     MolecularDynamics,
@@ -60,8 +58,6 @@ __all__ = [
     "DistributedEvaluator",
     "FIRE",
     "FIRE2",
-    "IsotropicMTKNPH",
-    "IsotropicMTKNPT",
     "Langevin",
     "MDInstabilityError",
     "MTKNPH",

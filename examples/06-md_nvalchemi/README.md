@@ -184,13 +184,13 @@ costs a strain leaf per partition and an extra target in the charge-response
 backward. Build the evaluator with `compute_virial=True`, or call
 `ev.set_compute_virial(True)` on one that already ran FIRE or NVT.
 
-The cell may do one of three things:
+`MTKNPT` and `MTKNPH` take `cell=`, one of three things the cell may do:
 
-| `cell=` | the cell | classes |
-|---|---|---|
-| `"isotropic"` | scales uniformly | `IsotropicMTKNPT`, `IsotropicMTKNPH`, or either `MTK` class |
-| `"orthorhombic"` | the three lengths of a diagonal cell move independently | `MTKNPT`, `MTKNPH` |
-| `"full"` (the `MTK` classes' default, as in ASE) | the whole cell fluctuates, without rotating | `MTKNPT`, `MTKNPH` |
+| `cell=` | the cell |
+|---|---|
+| `"isotropic"` | scales uniformly |
+| `"orthorhombic"` | the three lengths of a diagonal cell move independently |
+| `"full"` (the default, as in ASE) | the whole cell fluctuates, without rotating |
 
 A liquid has no shear stiffness, so `"full"` lets its cell shear; keep
 `"isotropic"` for water.
