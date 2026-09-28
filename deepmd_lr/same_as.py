@@ -71,10 +71,23 @@ from __future__ import annotations
 import copy
 from typing import Any
 
-__all__ = ["SAME_AS_KEY", "expand_same_as", "groups", "install", "pool"]
+__all__ = [
+    "CHARGE_SAME_AS_KEY",
+    "SAME_AS_KEY",
+    "charge_groups",
+    "expand_same_as",
+    "groups",
+    "install",
+    "pool",
+]
 
 #: The branch key that names the branch this one copies.
 SAME_AS_KEY = "same_as"
+#: ``charge_same_as``: a *base* branch (its own energy head and energy zero) that
+#: uses another base branch's charge head -- one shared charge network under two
+#: levels of theory. The long-range term holds no weights, so sharing the charge
+#: head is all it takes for both theories to see one electrostatics.
+CHARGE_SAME_AS_KEY = "charge_same_as"
 
 #: What a ``same_as`` branch may write for itself. Everything else is
 #: inherited, and writing it would be discarded by the aliasing below -- so it
@@ -90,6 +103,96 @@ _LONG_RANGE_ALLOWED = frozenset({"reciprocal", "pme"})
 def _real_keys(block: dict[str, Any]) -> set[str]:
     """Keys that configure something, ignoring ``_comment`` annotations."""
     return {key for key in block if not key.startswith("_")}
+
+
+def charge_groups(model_dict: dict[str, Any]) -> dict[str, list[str]]:
+    """Map each charge-owning base branch to every branch that must use its charge head.
+
+    The list holds the owner first, then each ``charge_same_as`` branch, then
+    the ``same_as`` links of all of those (a link is its base, so it follows its
+    base's charge head). Empty for an ordinary config.
+
+    Every ``charge_same_as`` is validated on the way, which is what lets
+    :func:`expand_same_as` refuse a bad one as the config is read.
+    """
+    out: dict[str, list[str]] = {}
+    links = groups(model_dict)
+    for key, branch in model_dict.items():
+        if not isinstance(branch, dict) or branch.get(SAME_AS_KEY):
+            # A `same_as` link is its base (after expansion it even carries the
+            # base's `charge_same_as`); it is listed through its base below.
+            continue
+        owner = branch.get(CHARGE_SAME_AS_KEY)
+        if not owner:
+            continue
+        _validated_charge_owner(model_dict, key, owner, branch)
+        members = out.setdefault(owner, [owner] + links.get(owner, [owner])[1:])
+        members.append(key)
+        members.extend(links.get(key, [key])[1:])
+    return out
+
+
+def _normalized_charge_net(block: dict[str, Any]) -> dict[str, Any]:
+    """``block`` as the model is built from it: defaults in, comments out.
+
+    Compared raw, a default written out on one branch and left out on the
+    other would count as a difference, though the two build the same head.
+    """
+    from dargs import Argument
+
+    from deepmd_lr.argcheck import charge_fitting_args
+
+    schema = Argument("charge_net", dict, charge_fitting_args())
+    return schema.normalize_value(copy.deepcopy(block), trim_pattern="_*")
+
+
+def _validated_charge_owner(
+    model_dict: dict[str, Any], key: str, owner: str, branch: dict[str, Any]
+) -> None:
+    """Refuse every way a shared charge head could be configured wrong.
+
+    From the config alone; that the two branches share a descriptor can only
+    be read off the built modules (:func:`_require_shared_descriptor`).
+    """
+    if owner == key:
+        raise ValueError(
+            f"branch {key!r}: `{CHARGE_SAME_AS_KEY}` cannot point at itself"
+        )
+    if owner not in model_dict or not isinstance(model_dict[owner], dict):
+        raise ValueError(
+            f"branch {key!r}: `{CHARGE_SAME_AS_KEY}` names {owner!r}, which is not "
+            f"a branch. Available: {sorted(model_dict)}"
+        )
+    base = model_dict[owner]
+    if base.get(SAME_AS_KEY) or base.get(CHARGE_SAME_AS_KEY):
+        raise ValueError(
+            f"branch {key!r}: {owner!r} must be the branch that OWNS the charge "
+            f"head -- not a `{SAME_AS_KEY}` link and not itself a "
+            f"`{CHARGE_SAME_AS_KEY}` branch (no chains)."
+        )
+    for name, block in ((owner, base), (key, branch)):
+        has_head = (block.get("long_range") or {}).get("charge_net")
+        if block.get("type") != "dp_lr" or not has_head:
+            raise ValueError(
+                f"branch {name!r}: `{CHARGE_SAME_AS_KEY}` needs a `dp_lr` branch "
+                "with a `long_range.charge_net` block on both sides."
+            )
+    own = _normalized_charge_net(branch["long_range"]["charge_net"])
+    theirs = _normalized_charge_net(base["long_range"]["charge_net"])
+    if own != theirs:
+        differing = sorted(
+            k for k in set(own) | set(theirs) if own.get(k) != theirs.get(k)
+        )
+        raise ValueError(
+            f"branch {key!r}: its `charge_net` block differs from {owner!r}'s "
+            f"in {differing}. One charge head has one configuration; write it "
+            "identically on both branches."
+        )
+    if _alpha(base["long_range"]) != _alpha(branch["long_range"]):
+        raise ValueError(
+            f"branch {key!r}: alpha differs from {owner!r}. One charge head "
+            "serves one Coulomb split."
+        )
 
 
 def groups(model_dict: dict[str, Any]) -> dict[str, list[str]]:
@@ -164,6 +267,10 @@ def expand_same_as(model_config: dict[str, Any]) -> dict[str, Any]:
                 merged[carried] = copy.deepcopy(branch[carried])
 
         model_dict[key] = merged
+    # Refuse a bad `charge_same_as` now, from the config alone. The aliasing
+    # would find it too, but only in `share_params`: after every branch is
+    # built and the training data has been sampled for statistics.
+    charge_groups(model_dict)
     return model_config
 
 
@@ -208,6 +315,12 @@ def _validated_base(
         )
 
     extra = _real_keys(branch) - _BRANCH_ALLOWED
+    if CHARGE_SAME_AS_KEY in extra:
+        raise ValueError(
+            f"branch {key!r}: a `{SAME_AS_KEY}` link uses its base's charge "
+            f"head, so `{CHARGE_SAME_AS_KEY}` belongs on {base_key!r}; the "
+            "link follows it there."
+        )
     if extra:
         raise ValueError(
             f"branch {key!r} declares `{SAME_AS_KEY}: {base_key}` but also sets "
@@ -296,6 +409,32 @@ def pool(data: Any, nbatches: int, sample: Any, **kwargs: Any) -> list:
     return [s for system in group for s in sample(system, nbatches, **kwargs)]
 
 
+def _require_shared_descriptor(wrapper: Any, owner: str, key: str) -> None:
+    """Refuse a ``charge_same_as`` pair whose descriptors are two models.
+
+    The charge head reads the descriptor's features, so one head is one
+    electrostatics only if both branches feed it the same descriptor. Nothing
+    in the branch config says whether they do -- an inline descriptor with the
+    same settings builds a second, independently trained copy -- so this asks
+    the built modules, after DeePMD-kit's own sharing has run. Two copies agree
+    at initialisation only because their seeds match, then drift apart as each
+    theory trains its own; with the type maps in different orders, one head
+    reads each branch's type indices as the owner's, and the same oxygen got
+    opposite-sign charges under the two theories.
+    """
+    ours = list(wrapper.model[key].atomic_model.descriptor.parameters())
+    theirs = list(wrapper.model[owner].atomic_model.descriptor.parameters())
+    if len(ours) != len(theirs) or any(
+        p.data_ptr() != q.data_ptr() for p, q in zip(ours, theirs, strict=True)
+    ):
+        raise ValueError(
+            f"branch {key!r}: `{CHARGE_SAME_AS_KEY}: {owner}` needs the two "
+            "branches to share their descriptor, since the charge head reads "
+            "its features. Point both `descriptor` entries at one "
+            "`shared_dict` key."
+        )
+
+
 def _alias_groups(wrapper: Any) -> None:
     """Make every member of a group the same model but for its long-range term.
 
@@ -322,6 +461,14 @@ def _alias_groups(wrapper: Any) -> None:
             # A plain bool: assigning a Module here would register a submodule
             # and recurse into the state dict.
             link._same_as_link = True
+    # `charge_same_as`: one charge head under several theories. Done AFTER the
+    # `same_as` aliasing so that a link that was just pointed at its base's
+    # charge head is pointed again at the owner's.
+    for owner, members in charge_groups(model_dict).items():
+        head = wrapper.model[owner].charge_fitting
+        for key in members[1:]:
+            _require_shared_descriptor(wrapper, owner, key)
+            wrapper.model[key].charge_fitting = head
 
 
 def install() -> None:

@@ -134,3 +134,46 @@ neutral-to-better per branch; if one branch is clearly worse, reweight with
 `model_prob` or train it separately — `shared_level` cannot be relaxed for
 DPA4C.
 
+### One charge head under two theories: `charge_same_as`
+
+When the branches are different levels of theory that should share one
+electrostatics — the charges are a property of the geometry, and only the
+short-range energy differs — put `charge_same_as: "<owner branch>"` on the
+borrowing base branch. It keeps its own `fitting_net` and energy zero; its
+`charge_fitting` becomes the owner's module (aliased, not copied), and the
+`same_as` links of either branch follow it.
+
+The pair must be one charge model, and each way it could not be is refused:
+
+- **One descriptor**, since the charge head reads its features: point both
+  branches' `descriptor` at one `shared_dict` entry. An inline copy with the
+  same settings is a second model, trained apart. This is checked on the
+  built modules, when the trainer shares the parameters.
+- **An identical `charge_net` block** (compared with defaults filled in) and
+  **the same `alpha`**.
+- **The owner is a base branch**: not a `same_as` link, and not borrowing
+  itself (no chains). `charge_same_as` on a link belongs on its base.
+
+Everything but the descriptor is checked as the config is read, before any
+model is built. The long-range term holds no weights, so "sharing the
+long-range term" means only that both theories use the same `alpha`, method,
+mesh rule and boundaries. Below, `ttt` and `ttf` name the periodic axes: `pbc`
+true-true-true (bulk) and true-true-false (a slab).
+
+```json
+"ttt_dft":  {"type": "dp_lr", "descriptor": "backbone", "fitting_net": {...},
+             "long_range": {"charge_net": {...}, "reciprocal": {...3D...}}},
+"ttf_dft":  {"same_as": "ttt_dft",
+             "long_range": {"reciprocal": {...slab...}}},
+"ttt_mace": {"type": "dp_lr", "descriptor": "backbone", "fitting_net": {...},
+             "charge_same_as": "ttt_dft",
+             "long_range": {"charge_net": {...identical...},
+                            "reciprocal": {...3D...}}},
+"ttf_mace": {"same_as": "ttt_mace",
+             "long_range": {"reciprocal": {...slab...}}}
+```
+
+Tests: `tests/test_charge_same_as.py` — object identity, the optimizer's
+parameter count, gradient routing per theory, the state-dict round trip,
+equal charges under both theories, links differing by the slab correction
+only, and each refusal.
