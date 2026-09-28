@@ -71,7 +71,15 @@ from __future__ import annotations
 import copy
 from typing import Any
 
-__all__ = ["CHARGE_SAME_AS_KEY", "SAME_AS_KEY", "charge_groups", "expand_same_as", "groups", "install", "pool"]
+__all__ = [
+    "CHARGE_SAME_AS_KEY",
+    "SAME_AS_KEY",
+    "charge_groups",
+    "expand_same_as",
+    "groups",
+    "install",
+    "pool",
+]
 
 #: The branch key that names the branch this one copies.
 SAME_AS_KEY = "same_as"

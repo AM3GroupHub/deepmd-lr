@@ -42,9 +42,15 @@ def two_theory_config(extra_mace: dict | None = None) -> dict:
         "shared_dict": {"tm": ["O", "H"], "des": copy.deepcopy(DESCRIPTOR)},
         "model_dict": {
             "ttt_dft": lr_branch(),
-            "ttf_dft": {"same_as": "ttt_dft", "long_range": {"reciprocal": dict(SLAB_RECIPROCAL)}},
+            "ttf_dft": {
+                "same_as": "ttt_dft",
+                "long_range": {"reciprocal": dict(SLAB_RECIPROCAL)},
+            },
             "ttt_mace": mace,
-            "ttf_mace": {"same_as": "ttt_mace", "long_range": {"reciprocal": dict(SLAB_RECIPROCAL)}},
+            "ttf_mace": {
+                "same_as": "ttt_mace",
+                "long_range": {"reciprocal": dict(SLAB_RECIPROCAL)},
+            },
         },
     }
 
@@ -56,7 +62,9 @@ def normalized(model: dict):
         "learning_rate": {"start_lr": 1e-3},
         "loss_dict": {k: {"type": "ener"} for k in model["model_dict"]},
         "training": {
-            "data_dict": {k: {"training_data": {"systems": ["./d"]}} for k in model["model_dict"]},
+            "data_dict": {
+                k: {"training_data": {"systems": ["./d"]}} for k in model["model_dict"]
+            },
             "numb_steps": 1,
         },
     }
@@ -67,7 +75,10 @@ def normalized(model: dict):
 def build(model: dict | None = None):
     """Build the four branches and alias them exactly as the trainer does."""
     cfg, links = normalized(model or two_theory_config())
-    models = {key: get_model(copy.deepcopy(params)) for key, params in cfg["model"]["model_dict"].items()}
+    models = {
+        key: get_model(copy.deepcopy(params))
+        for key, params in cfg["model"]["model_dict"].items()
+    }
     prob = {key: 1.0 / len(models) for key in models}
     wrapper = ModelWrapper(models, model_params=cfg["model"])
     wrapper.share_params(links, prob, resume=True)
@@ -77,7 +88,9 @@ def build(model: dict | None = None):
 class TestGrouping:
     def test_the_owner_comes_first_and_links_follow(self):
         cfg, _ = normalized(two_theory_config())
-        assert charge_groups(cfg["model"]["model_dict"]) == {"ttt_dft": ["ttt_dft", "ttf_dft", "ttt_mace", "ttf_mace"]}
+        assert charge_groups(cfg["model"]["model_dict"]) == {
+            "ttt_dft": ["ttt_dft", "ttf_dft", "ttt_mace", "ttf_mace"]
+        }
 
     def test_an_ordinary_config_has_no_groups(self):
         assert charge_groups({"a": lr_branch(), "b": lr_branch()}) == {}
@@ -172,15 +185,21 @@ class TestIdentity:
 
     def test_the_backbone_is_shared_the_usual_way(self):
         models, _, _ = build()
-        da, db = models["ttt_dft"].atomic_model.descriptor, models["ttt_mace"].atomic_model.descriptor
+        da, db = (
+            models["ttt_dft"].atomic_model.descriptor,
+            models["ttt_mace"].atomic_model.descriptor,
+        )
         assert da.type_embedding is db.type_embedding
         assert da.readout is db.readout
 
     def test_the_optimizer_sees_one_charge_head(self):
-        """Unique parameters = everything of one theory + the other theory's energy head."""
+        """Unique parameters: all of one theory, plus the other theory's
+        energy head."""
         models, wrapper, _ = build()
         n_dft = len(list(models["ttt_dft"].parameters()))
-        n_mace_fitting = len(list(models["ttt_mace"].atomic_model.fitting_net.parameters()))
+        n_mace_fitting = len(
+            list(models["ttt_mace"].atomic_model.fitting_net.parameters())
+        )
         assert len(list(wrapper.parameters())) == n_dft + n_mace_fitting
 
 
@@ -192,7 +211,9 @@ class TestGradients:
         (out["energy"].sum() + out["force"].square().sum()).backward()
 
     def _has_grad(self, module):
-        return any(p.grad is not None and p.grad.abs().sum() > 0 for p in module.parameters())
+        return any(
+            p.grad is not None and p.grad.abs().sum() > 0 for p in module.parameters()
+        )
 
     def _clear(self, models):
         for m in models.values():
@@ -227,17 +248,24 @@ class TestPhysics:
     def test_the_long_range_energy_is_one_and_the_short_range_differs(self):
         models, _, _ = build()
         coord, atype, cell = frame()
-        a, b = models["ttt_dft"](coord, atype, box=cell), models["ttt_mace"](coord, atype, box=cell)
-        assert torch.allclose(a["energy_long_range"], b["energy_long_range"], atol=1e-10)
-        # two freshly seeded energy heads with the same seed give the same short-range energy;
-        # perturb one to show they are independent modules
+        a, b = (
+            models["ttt_dft"](coord, atype, box=cell),
+            models["ttt_mace"](coord, atype, box=cell),
+        )
+        assert torch.allclose(
+            a["energy_long_range"], b["energy_long_range"], atol=1e-10
+        )
+        # Two energy heads seeded alike give the same short-range energy;
+        # perturb one to show they are independent modules.
         with torch.no_grad():
             for p in models["ttt_mace"].atomic_model.fitting_net.parameters():
                 p.add_(0.01)
         b2 = models["ttt_mace"](coord, atype, box=cell)
         a2 = models["ttt_dft"](coord, atype, box=cell)
         assert not torch.allclose(a2["energy_short_range"], b2["energy_short_range"])
-        assert torch.allclose(a2["energy_short_range"], a["energy_short_range"], atol=1e-10)
+        assert torch.allclose(
+            a2["energy_short_range"], a["energy_short_range"], atol=1e-10
+        )
 
     def test_boundary_links_differ_by_the_slab_correction_only(self):
         models, _, _ = build()
@@ -245,7 +273,9 @@ class TestPhysics:
         for theory in ("dft", "mace"):
             bulk = models["ttt_" + theory](coord, atype, box=cell)
             slab = models["ttf_" + theory](coord, atype, box=cell)
-            assert torch.allclose(bulk["energy_short_range"], slab["energy_short_range"], atol=1e-10)
+            assert torch.allclose(
+                bulk["energy_short_range"], slab["energy_short_range"], atol=1e-10
+            )
             assert torch.allclose(bulk["charge"], slab["charge"], atol=1e-12)
 
 
@@ -260,6 +290,13 @@ class TestRoundTrip:
         wrapper2.load_state_dict(state)
         head = models2["ttt_dft"].charge_fitting
         assert all(models2[k].charge_fitting is head for k in HEADS)
-        for p, q in zip(models["ttt_dft"].charge_fitting.parameters(), head.parameters()):
+        for p, q in zip(
+            models["ttt_dft"].charge_fitting.parameters(),
+            head.parameters(),
+            strict=True,
+        ):
             assert torch.equal(p, q)
-        assert models2["ttt_dft"].atomic_model.fitting_net is not models2["ttt_mace"].atomic_model.fitting_net
+        assert (
+            models2["ttt_dft"].atomic_model.fitting_net
+            is not models2["ttt_mace"].atomic_model.fitting_net
+        )
