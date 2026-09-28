@@ -117,8 +117,10 @@ def build_evaluator(model: Any, atoms: Any, devices: Any = None,
     for NPT, ``efield`` for a field run, and so on.
 
     ``long_range`` replaces the reciprocal-space settings the checkpoint was
-    trained with, which is how one set of weights runs a bulk cell and a slab:
-    the term holds no parameters, so the choice belongs to the simulation.
+    trained with, for this evaluator only: the term holds no parameters, so
+    the choice belongs to the simulation. The structure's ``pbc`` already
+    picks the 3D or the slab sum, so this is rarely needed. A model passed in
+    is never changed, and may serve several evaluators.
 
     ``compress=True`` (or a float table stride) rides ``kwargs`` into the
     evaluator and compresses the DPA4C backbone before the device replicas are
@@ -130,12 +132,7 @@ def build_evaluator(model: Any, atoms: Any, devices: Any = None,
     file's symbols would be a second source of truth that agrees only by
     coincidence.
     """
-    if isinstance(model, str):
-        loaded = load_model(model, head=head, long_range=long_range)
-    else:
-        loaded = model
-        if long_range is not None:
-            loaded.set_long_range(long_range)
+    loaded = load_model(model, head=head) if isinstance(model, str) else model
     type_map = list(loaded.get_type_map())
     atype = np.array(
         [type_map.index(s) for s in atoms.get_chemical_symbols()], dtype=np.int64
@@ -144,5 +141,10 @@ def build_evaluator(model: Any, atoms: Any, devices: Any = None,
         devices = [str(next(loaded.parameters()).device)]
     kwargs.setdefault("pbc", tuple(bool(p) for p in atoms.pbc))
     return DistributedEvaluator(
-        loaded, atype, np.asarray(atoms.get_cell()), devices=devices, **kwargs
+        loaded,
+        atype,
+        np.asarray(atoms.get_cell()),
+        devices=devices,
+        long_range=long_range,
+        **kwargs,
     )

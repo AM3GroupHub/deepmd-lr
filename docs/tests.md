@@ -72,7 +72,8 @@ the model first.
   4 partitions, its pbc switches the slab sum on, and an atom near an open
   face is refused; a slab term on a bulk cell takes the 3D sum, and an
   `isolated` term is refused. A supercell gets the mesh its cell needs and
-  reproduces its unit cell.
+  reproduces its unit cell. Evaluators sharing one model, for different cells
+  and boundaries, each keep their own term, and none changes the model.
 - `test_thermo.py` — `Thermo`'s measurements, warp aliasing, cell sync, the
   guards that make one evaluator safe to share (`fresh`,
   `cell_is_current`, `set_state`), and fixed atoms: read from `FixAtoms` by
@@ -86,11 +87,12 @@ the model first.
   the kernels transposed, the relaxations' refusals, the cell relaxation
   (its force against finite differences of the enthalpy, every mode reaching
   the target pressure), the dipole current, and slabs: NVT keeps one in its
-  cell, while barostats and cell relaxation refuse it, and frames keep its
-  pbc. Fixed atoms stay exactly in place in every integrator and relaxation,
-  the temperature and the Nosé–Hoover target count three degrees of freedom
-  per mobile atom, NVE matches ASE's own `VelocityVerlet` with the same
-  `FixAtoms`, and output, checkpoints and refusals carry the constraint.
+  cell, while barostats and cell relaxation refuse it, frames keep its pbc,
+  and a checkpoint restores only onto the boundary it ran with. Fixed atoms
+  stay exactly in place in every integrator and relaxation, the temperature
+  and the Nosé–Hoover target count three degrees of freedom per mobile atom,
+  NVE matches ASE's own `VelocityVerlet` with the same `FixAtoms`, and
+  output, checkpoints and refusals carry the constraint.
 - `test_compress.py`, `test_compress_arguments.py`,
   `test_compress_atomic_state.py`, `test_compress_required.py` — compressed
   DPA4C inference: every refusal, the graph-lower guard, argument validation,

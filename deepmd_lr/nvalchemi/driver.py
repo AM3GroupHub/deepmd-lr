@@ -361,9 +361,10 @@ def partition_graph(
     return graph, node_type.reshape(-1), node_coord
 
 
-def check_long_range_boundary(model: Any, pbc) -> None:
+def check_long_range_boundary(model: Any, pbc, term: Any = None) -> None:
     """Refuse a long-range term whose boundary is not the system's.
 
+    ``term`` is the one about to be evaluated, by default the model's own.
     The check :class:`~deepmd_lr.ase.LongRangeCalculator` makes. Without it the
     term simply runs: an ``isolated`` term on a periodic cell sums no images,
     and a slab term corrects a cell that is periodic along z. On the 192-atom
@@ -371,7 +372,8 @@ def check_long_range_boundary(model: Any, pbc) -> None:
     """
     if not getattr(model, "has_long_range", False):
         return
-    term = model.long_range_energy
+    if term is None:
+        term = model.long_range_energy
     expected = (
         tuple(bool(p) for p in term.pbc) if term.needs_cell else (False, False, False)
     )
@@ -379,10 +381,12 @@ def check_long_range_boundary(model: Any, pbc) -> None:
     if have != expected:
         method = getattr(term, "method", getattr(term, "METHOD", "?"))
         raise ValueError(
-            f"this model's long-range term ('{method}', pbc {list(expected)}) does "
-            f"not match the system's pbc {list(have)}. Partitioned MD is for "
-            "3D-periodic cells; molecules, clusters and slabs run through the "
-            "ASE calculator, deepmd_lr.ase.LongRangeCalculator"
+            f"the long-range term ('{method}', pbc {list(expected)}) does not "
+            f"match the system's pbc {list(have)}. DistributedEvaluator builds "
+            "the term a bulk cell or a slab needs; evaluate_partitioned takes "
+            "one as long_range_energy=model.long_range_energy_for(cell, pbc). "
+            "An `isolated` term, and molecules and clusters, belong to the ASE "
+            "calculator, deepmd_lr.ase.LongRangeCalculator"
         )
 
 
@@ -402,6 +406,7 @@ def evaluate_partitioned(
     compute_born: bool = False,
     eps_inf: float = 1.0,
     pair_skin: float = 0.0,
+    long_range_energy: Any = None,
 ) -> dict[str, Any]:
     """Run ``model`` over spatial partitions and assemble the global result.
 
@@ -434,6 +439,10 @@ def evaluate_partitioned(
         pair_skin`` (see :func:`partition_graph`). ``0``, the default, searches
         afresh; only a caller that tracks displacement between calls -- the
         evaluator -- can promise the list is still complete.
+    long_range_energy
+        The long-range term to evaluate, by default ``model.long_range_energy``.
+        :class:`~deepmd_lr.nvalchemi.evaluator.DistributedEvaluator` passes
+        the one it built for its cell and pbc, which leaves the model alone.
     Returns
     -------
     dict
@@ -444,7 +453,7 @@ def evaluate_partitioned(
         -- the last is what :func:`_charge_response_force` backpropagates
         through each partition's charge head.
     """
-    check_long_range_boundary(model, pbc)
+    check_long_range_boundary(model, pbc, long_range_energy)
     rcut = float(model.get_rcut())
     coord_np = (
         None if isinstance(coord, torch.Tensor) else np.asarray(coord, dtype=np.float64)
@@ -623,6 +632,7 @@ def evaluate_partitioned(
             compute_virial=compute_virial,
             atype=atype,
             charge_spin=charge_spin,
+            term=long_range_energy,
         )
     )
     result["energy"] = result["energy_short_range"] + result["energy_long_range"]
@@ -828,8 +838,11 @@ def _long_range_global(
     *,
     atype,
     charge_spin=None,
+    term=None,
 ) -> dict:
     """The global half: project the charges, then evaluate the reciprocal sum.
+
+    ``term`` is the long-range term to evaluate, by default the model's own.
 
     Returns the direct force ``-dE/dr`` at fixed charge, and ``dE/dq``. The
     remaining *charge-response* force, ``-sum_j (dE/dq_j) dq_j/dr_i``, is
@@ -865,7 +878,9 @@ def _long_range_global(
     charge = project_to_total_charge(
         charge_t, total_charge, mask=charge_mask(model, types)
     )
-    atom_energy = model.long_range_energy(coord_in, charge, cell_in)
+    if term is None:
+        term = model.long_range_energy
+    atom_energy = term(coord_in, charge, cell_in)
     total = atom_energy.sum()
     targets = [coord_t, charge_t] if eps is None else [coord_t, charge_t, eps]
     grads = torch.autograd.grad(total, targets)

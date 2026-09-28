@@ -166,7 +166,8 @@ class DistributedEvaluator:
     Parameters
     ----------
     model
-        A ``dp_lr`` model, already on its home device.
+        A ``dp_lr`` model, already on its home device. It is never changed,
+        so several evaluators, and ASE calculators, may share it.
     atype, cell
         Atom types ``(natoms,)`` and the cell ``(3, 3)``. The types are fixed
         for the life of the driver; a barostat changes the cell through
@@ -175,10 +176,15 @@ class DistributedEvaluator:
         Which cell axes are periodic; all three by default. One open axis is
         a slab: no periodic images along it, and the long-range term takes its
         slab form (the Yeh-Berkowitz correction). The term's PME mesh is set
-        from ``cell`` as well, once, for the life of the driver
-        (:meth:`~deepmd_lr.model.lr_model.LongRangeEnergyModel.adapt_long_range`).
+        from ``cell`` as well, once, for the life of the driver. The term is
+        this evaluator's own, :attr:`long_range_energy`
+        (:meth:`~deepmd_lr.model.lr_model.LongRangeEnergyModel.long_range_energy_for`).
         A slab's atoms must stay inside the cell along the open axis; see
         :meth:`_check_open_axes`.
+    long_range
+        Reciprocal-space settings to adapt instead of the model's, as
+        ``set_long_range`` takes them (alpha is the model's and cannot
+        change). For this evaluator only.
     devices
         One device per partition. Repeats are accepted and exercise the
         partitioning arithmetic, but only distinct devices test placement.
@@ -273,6 +279,7 @@ class DistributedEvaluator:
         *,
         devices: list[Any],
         pbc: Any = (True, True, True),
+        long_range: dict | None = None,
         skin: float | str = "auto",
         repartition_every: int | None = None,
         pair_skin: float | str = "auto",
@@ -301,18 +308,25 @@ class DistributedEvaluator:
                 f"memory_headroom must be in (0, 1], got {memory_headroom}"
             )
 
-        # Partitions are built 3D-periodic, so the term must be too. Checked
-        # here as well as per call, to fail before the memory probe.
         self.cell = np.asarray(cell, dtype=np.float64).reshape(3, 3)
         self.pbc = _checked_pbc(pbc)
-        # The term holds no weights, so it is set for this system: its pbc
+        # The term holds no weights, so this evaluator builds its own: its pbc
         # picks the 3D or the slab sum, its cell the PME mesh. The mesh is
         # fixed here for the life of the driver, so the small cell changes of
-        # a barostat keep the energy smooth. Before the replicas are made, so
-        # they carry it.
+        # a barostat keep the energy smooth. The model is left alone: another
+        # evaluator built from it, for another cell or boundary, would
+        # otherwise change the term under this one.
+        #: The long-range term this evaluator evaluates, or None for a model
+        #: without one.
+        self.long_range_energy = None
         if getattr(model, "has_long_range", False):
-            model.adapt_long_range(self.cell, self.pbc)
-        check_long_range_boundary(model, self.pbc)
+            self.long_range_energy = model.long_range_energy_for(
+                self.cell, self.pbc, long_range
+            )
+        elif long_range is not None:
+            raise ValueError("long_range= needs a model with a long-range block")
+        # Checked here as well as per call, to fail before the memory probe.
+        check_long_range_boundary(model, self.pbc, self.long_range_energy)
         self.model = model
         self.devices = list(devices)
         self.repartition_every = repartition_every
@@ -732,6 +746,7 @@ class DistributedEvaluator:
                     eps_inf=self.eps_inf,
                     pair_skin=self.pair_skin,
                     pbc=self.pbc,
+                    long_range_energy=self.long_range_energy,
                 )
             except Exception as exc:
                 if not _is_out_of_memory(exc) or not self._skin_is_auto:

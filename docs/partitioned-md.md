@@ -166,6 +166,12 @@ it between stages is safe by construction:
 - **PME mesh.** Set from the cell when the evaluator is built, at least
   `ceil(2 alpha L)` points per axis, and kept for the run
   ([alpha and mesh](alpha-and-mesh.md)).
+- **The model.** Each evaluator builds its own long-range term for its cell
+  and boundary (`ev.long_range_energy`) and never changes the model, so
+  evaluators for different systems, and ASE calculators, can share one.
+- **Checkpoints** record the boundary with the rest of the physics, so a
+  bulk run's checkpoint does not restore onto a slab evaluator, or the
+  reverse.
 - **Virial.** `set_compute_virial` switches it on for the stage that needs
   it; it is refused under a field.
 

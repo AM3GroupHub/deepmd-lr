@@ -82,8 +82,10 @@ box it left 0.49 meV/atom and 0.0077 eV/Å rms of error. So both inference
 paths give each axis at least `ceil(2 alpha L)` points, the `1/(2 alpha)`
 spacing of the table above, and never fewer than the model asks for; that
 supercell gets `[40, 40, 40]` and is exact. The GPU evaluator sets the mesh
-once, when it is built, so NPT keeps the smooth energy a fixed mesh buys. The
-ASE calculator sets it per frame. Training is unchanged.
+once, when it is built, so NPT keeps the smooth energy a fixed mesh buys. It
+builds a long-range term of its own for that, and never changes the model, so
+evaluators for different cells can share one. The ASE calculator sets the
+model's own mesh per frame. Training is unchanged.
 
 ## `pme` or `ewald`
 

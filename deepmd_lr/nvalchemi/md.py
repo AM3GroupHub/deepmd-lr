@@ -339,9 +339,14 @@ def _fingerprint(evaluator: Any, masses: np.ndarray, fixed: Any = ()) -> dict:
         ),
         "compute_virial": bool(evaluator.compute_virial),
     }
+    pbc = [bool(p) for p in getattr(evaluator, "pbc", (True, True, True))]
+    if not all(pbc):
+        # The boundary is physics, as the field is: a slab sums its images
+        # differently. Recorded for a slab only, so checkpoints from before
+        # slabs ran here still restore.
+        fingerprint["pbc"] = pbc
     if len(fixed):
-        # Only when there are any, so checkpoints from before fixed atoms
-        # existed still restore.
+        # Likewise only when there are any.
         fingerprint["fixed_sha1"] = hashlib.sha1(
             np.asarray(fixed, dtype=np.int64).tobytes()
         ).hexdigest()
@@ -849,11 +854,12 @@ class MolecularDynamics:
         """Continue a run exactly where :meth:`save_checkpoint` left it.
 
         The checkpoint must come from this class, on this system (atom
-        order, masses) and on an evaluator with the same physics (cutoff,
-        field, eps_inf, charge/spin, virial). The state is written into
-        ``atoms``, the evaluator's cell set, and the log and trajectory are
-        trimmed back to the checkpoint after a hard kill. Only output
-        settings may be overridden; ``extra_columns`` has to be passed again.
+        order, masses, fixed atoms) and on an evaluator with the same physics
+        (cutoff, boundary, field, eps_inf, charge/spin, virial); a mismatch is
+        refused before anything changes. The state is written into ``atoms``,
+        the evaluator's cell set, and the log and trajectory are trimmed back
+        to the checkpoint after a hard kill. Only output settings may be
+        overridden; ``extra_columns`` has to be passed again.
         """
         _check_evaluator(evaluator)
         with np.load(path, allow_pickle=False) as z:
@@ -886,12 +892,9 @@ class MolecularDynamics:
                 f"only output settings can be overridden on restore: "
                 f"{sorted(set(io_overrides) - allowed)}"
             )
-        atoms.set_cell(arrays["cell"], scale_atoms=False)
-        atoms.set_positions(arrays["positions"], apply_constraint=False)
-        atoms.set_velocities(arrays["velocities"])
+        # Checked before anything is written, so a refusal leaves atoms and
+        # the evaluator as they were.
         want = _fingerprint(evaluator, atoms.get_masses(), _fixed_atoms(atoms))
-        if not np.array_equal(np.asarray(evaluator.cell), arrays["cell"]):
-            evaluator.set_cell(arrays["cell"])
         if meta["fingerprint"] != want:
             had = meta["fingerprint"]
             diff = {
@@ -903,6 +906,11 @@ class MolecularDynamics:
                 f"{path} belongs to a different system or evaluator: "
                 f"(checkpoint, now) = {diff}"
             )
+        atoms.set_cell(arrays["cell"], scale_atoms=False)
+        atoms.set_positions(arrays["positions"], apply_constraint=False)
+        atoms.set_velocities(arrays["velocities"])
+        if not np.array_equal(np.asarray(evaluator.cell), arrays["cell"]):
+            evaluator.set_cell(arrays["cell"])
         io = {k: v for k, v in meta["io"].items() if v is not None}
         io.update(io_overrides)
         for key, size_key in (("logfile", "log_bytes"), ("trajectory", "traj_bytes")):

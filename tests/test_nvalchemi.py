@@ -16,6 +16,7 @@ import os
 import numpy as np
 import pytest
 import torch
+from ase import Atoms
 from ase import units as ase_units
 from deepmd.pt_expt.utils.env import DEVICE
 
@@ -1124,7 +1125,8 @@ class TestLongRangeBoundary:
         ev = DistributedEvaluator(
             slab_model(), atype, cell, devices=[DEVICE], memory_headroom=None
         )
-        assert ev.model.long_range_energy.slab_correction is False
+        assert ev.long_range_energy.slab_correction is False
+        assert ev.model.long_range_energy.slab_correction is True  # left alone
         bulk = DistributedEvaluator(
             build(), atype, cell, devices=[DEVICE], memory_headroom=None
         )
@@ -1184,7 +1186,7 @@ class TestSlab:
         ev = DistributedEvaluator(
             build(), atype, cell, devices=[DEVICE], pbc=SLAB_PBC, memory_headroom=None
         )
-        term = ev.model.long_range_energy
+        term = ev.long_range_energy
         assert term.slab_correction is True
         assert term.pbc == SLAB_PBC
         # The mesh covers the vacuum too: at least ceil(2 alpha L) along z.
@@ -1240,12 +1242,67 @@ class TestMeshFollowsTheCell:
         t2, h2 = np.tile(t, len(shifts)), 2.0 * h
         big = DistributedEvaluator(model((8, 8, 8)), t2, h2, devices=[DEVICE],
                                    memory_headroom=None)
-        assert big.model.long_range_energy.mesh_dimensions == (16, 16, 16)
+        assert big.long_range_energy.mesh_dimensions == (16, 16, 16)
         e2, f2 = big(c2)
         assert float(e2) / len(t2) == pytest.approx(float(e1) / len(t), abs=1e-10)
         np.testing.assert_allclose(
             f2.cpu().numpy(), np.tile(f1.cpu().numpy(), (len(shifts), 1)), atol=1e-9
         )
+
+
+class TestSharedModel:
+    """One model, several evaluators: each builds the term its own cell and
+    boundary need, and leaves the model alone. They used to adapt the model
+    itself. A slab evaluator then broke the bulk one built before it, and a
+    small cell's evaluator silently took a supercell's mesh away."""
+
+    def test_each_evaluator_keeps_its_own_term(self):
+        from deepmd_lr.ase import LongRangeCalculator
+
+        model = build()
+        before = model.long_range_energy.serialize()
+        coord, atype, cell = frame(n_mol=8, box=10.0)
+        c, t, h = coord[0].cpu().numpy(), atype[0].cpu().numpy(), cell[0].cpu().numpy()
+        shifts = np.array(
+            [[i, j, k] for i in range(2) for j in range(2) for k in range(2)]
+        )
+        systems = {
+            "supercell": (np.concatenate([c + s @ h for s in shifts]),
+                          np.tile(t, len(shifts)), 2.0 * h, (True, True, True)),
+            "unit": (c, t, h, (True, True, True)),
+            "slab": (*slab(n_mol=8, box=10.0), SLAB_PBC),
+        }
+        evs, first = {}, {}
+        for name, (x, types, box, pbc) in systems.items():
+            evs[name] = DistributedEvaluator(model, types, box, devices=[DEVICE],
+                                             pbc=pbc, memory_headroom=None)
+            first[name] = float(evs[name](x)[0])
+        assert model.long_range_energy.serialize() == before
+        mesh = {n: ev.long_range_energy.mesh_dimensions for n, ev in evs.items()}
+        assert mesh["supercell"] > mesh["unit"]  # the larger cell needs more
+        assert evs["slab"].long_range_energy.slab_correction is True
+        # An ASE calculator on the same model adapts the model itself, here
+        # to the unit cell's bulk sum; no evaluator notices.
+        atoms = Atoms(numbers=[8, 1, 1] * 8, positions=c, cell=h, pbc=True)
+        atoms.calc = LongRangeCalculator(model)
+        atoms.get_potential_energy()
+        for name, (x, *_rest) in systems.items():
+            assert float(evs[name](x)[0]) == pytest.approx(first[name], abs=1e-9)
+
+    def test_long_range_settings_are_the_evaluators_alone(self):
+        model = build()
+        before = model.long_range_energy.serialize()
+        coord, atype, cell = frame(n_mol=8, box=10.0)
+        t, h = atype[0].cpu().numpy(), cell[0].cpu().numpy()
+        ev = DistributedEvaluator(
+            model, t, h, devices=[DEVICE], memory_headroom=None,
+            long_range={"method": "pme", "mesh_dimensions": [20, 20, 20]},
+        )
+        assert ev.long_range_energy.mesh_dimensions == (20, 20, 20)
+        assert model.long_range_energy.serialize() == before
+        with pytest.raises(ValueError, match="alpha is fixed"):
+            DistributedEvaluator(model, t, h, devices=[DEVICE],
+                                 long_range={"method": "pme", "alpha": 0.1})
 
 
 class TestBackboneCapture:

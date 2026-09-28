@@ -1570,6 +1570,38 @@ class TestSlabs:
                 assert written.pbc.tolist() == list(SLAB)
         assert md.thermo.atoms().pbc.tolist() == list(SLAB)
 
+    def test_a_checkpoint_keeps_its_boundary(self, model, tmp_path):
+        """The boundary is physics, as the field is. A checkpoint restores
+        only onto the boundary it ran with, and a refusal changes nothing;
+        a slab's own continues exactly."""
+        slab_atoms = make_slab(model)
+        bulk_atoms = slab_atoms.copy()
+        bulk_atoms.pbc = True  # the same layer, summed as 3D-periodic
+        runs = {"bulk": (bulk_atoms, (True, True, True)), "slab": (slab_atoms, SLAB)}
+        paths = {}
+        for name, (atoms, pbc) in runs.items():
+            md = VelocityVerlet(make_ev(model, atoms, pbc=pbc), atoms.copy(), DT)
+            md.run(3)
+            paths[name] = md.save_checkpoint(tmp_path / f"{name}.npz")
+        for written, (atoms, pbc) in (("bulk", runs["slab"]), ("slab", runs["bulk"])):
+            target = atoms.copy()
+            with pytest.raises(ValueError, match="'pbc'"):
+                VelocityVerlet.from_checkpoint(
+                    make_ev(model, target, pbc=pbc), target, paths[written]
+                )
+            np.testing.assert_array_equal(target.positions, atoms.positions)
+        straight = VelocityVerlet(make_ev(model, slab_atoms, pbc=SLAB),
+                                  slab_atoms.copy(), DT)
+        straight.run(6)
+        again = VelocityVerlet.from_checkpoint(
+            make_ev(model, slab_atoms, pbc=SLAB), slab_atoms.copy(), paths["slab"]
+        )
+        again.run(3)
+        np.testing.assert_allclose(
+            again.thermo.positions.numpy(), straight.thermo.positions.numpy(),
+            atol=1e-10,
+        )
+
 
 # --- fixed atoms ------------------------------------------------------------------
 

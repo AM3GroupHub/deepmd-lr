@@ -148,7 +148,9 @@ class LongRangeCalculator(Calculator):
     ----------
     model
         A path to a training checkpoint (``model.ckpt.pt``), or an already
-        constructed model.
+        constructed model. A model passed in is used, not copied, and before
+        each frame its long-range term is adapted to that frame's cell and
+        pbc. GPU evaluators build terms of their own, so they may share it.
     device
         Torch device; defaults to DeePMD-kit's own choice.
     charge_spin
@@ -159,10 +161,10 @@ class LongRangeCalculator(Calculator):
         Omit when passing an already constructed model.
     long_range
         Optional replacement for the reciprocal-space settings, e.g.
-        ``{"method": "pme", "slab_correction": True, "pbc": [True, True,
-        False]}``. The long-range term carries no weights, so the boundary
-        treatment is a property of the simulation rather than of the
-        checkpoint.
+        ``{"method": "isolated"}`` for a molecule. The frame's pbc already
+        picks the 3D or the slab sum. The long-range term carries no weights,
+        so the boundary treatment is a property of the simulation rather than
+        of the checkpoint.
     compress
         ``True`` to compress the DPA4C backbone for inference at DeePMD-kit's
         default table stride, or a float stride in angstrom. Needs a
