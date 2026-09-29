@@ -6,8 +6,11 @@ stepping, ASE-style -- parameters in `__init__`, then `run(steps)` -- so each
 script is mostly the physics worth knowing about its ensemble. Between them
 the classes cover every integrator nvalchemiops ships;
 [`07_custom_berendsen.py`](07_custom_berendsen.py) adds one of your own as a
-subclass. Trajectories, observers and checkpoints are arguments of every class
-(`trajectory=`, `attach()`, `checkpoint=` and `Cls.from_checkpoint`).
+subclass, and [example 08](../08-nemd) a larger one: Langevin baths on named
+atom groups, with the heat each injects accounted on the device, for
+thermal-conductance NEMD. Trajectories, observers and checkpoints are
+arguments of every class (`trajectory=`, `attach()`, `checkpoint=` and
+`Cls.from_checkpoint`).
 
 ## Prerequisite
 

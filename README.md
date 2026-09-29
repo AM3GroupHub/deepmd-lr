@@ -111,6 +111,7 @@ match ([dataset layout](docs/dataset-layout.md)).
 | [05](examples/05-pseudo-head) | bulk + slab, one weight set | `same_as`, and setting the long-range type at load |
 | [06](examples/06-md_nvalchemi) | MD with nvalchemiops | NVE, NVT, NPT and NPH, one script each; a field run on every visible GPU; a thermostat of your own |
 | [07](examples/07-ase-calculator) | the ASE calculator | single points, charges and Born tensors, ASE's optimizers and MD |
+| [08](examples/08-nemd) | interfacial thermal conductance by NEMD | a region thermostat of your own with an exact heat account, fixed layers, a slab on the GPU path, resume, and the fits that give G |
 
 `scripts/xyz_to_deepmd.py` converts a trajectory ASE can read into a DeePMD
 dataset, including the `--split-by-composition` and `--vacuum` cases the
