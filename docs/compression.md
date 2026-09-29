@@ -41,7 +41,7 @@ caller can correct the inputs and retry.
 
 | | |
 |---|---|
-| charge state | folded into the tables; the calculator/evaluator fold in the run's `charge_spin`, and a forward with a different one is refused |
+| charge state | folded into the tables; the calculator/evaluator fold in the run's `charge_spin`, and a forward with a different one is refused. The descriptor records the folded state, so the refusal holds however the tables were built: through upstream's `enable_compression` (which folds `default_chg_spin`), a later `apply_charge_state`, or a model with no `long_range` block |
 | persistence | none — tables are rebuilt at load; a `state_dict` saved from a compressed model is rejected by `load_model` |
 | multi-GPU | the evaluator compresses once, before making replicas |
 | precision | none: the fp32 descriptor already sees fp32 edge vectors; the only new error is the tabulation, measured above |

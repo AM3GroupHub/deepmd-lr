@@ -76,6 +76,10 @@ from deepmd_lr.born import (
     born_charges,
     screening_factor,
 )
+from deepmd_lr.compress import (
+    FOLDED_ATTR,
+    folded_charge_spin,
+)
 from deepmd_lr.fitting.charge import (
     charge_mask,
     project_to_total_charge,
@@ -228,10 +232,22 @@ class LongRangeEnergyModel(EnergyModel):
         #: is allowed only inside one -- that is where the long-range term
         #: gets added -- and captures nest, so this is a count, not a flag.
         self._capture_depth = 0
-        #: The (charge, multiplicity) folded into the compressed tables, or
-        #: None. The compressed kernel ignores the runtime condition, so a
-        #: forward with a different one is refused (`resolve_charge_spin`).
-        self._compressed_charge_spin: tuple[float, float] | None = None
+
+    @property
+    def _compressed_charge_spin(self) -> tuple[float, float] | None:
+        """The (charge, multiplicity) folded into the compressed tables, or None.
+
+        The compressed kernel ignores the runtime condition, so a forward with
+        a different one is refused (`resolve_charge_spin`). Read from the
+        descriptor, which records it whichever method folded the tables --
+        this class's `enable_compression`, upstream's, or a later
+        `apply_charge_state` (see `deepmd_lr.compress`).
+        """
+        return folded_charge_spin(self.atomic_model.descriptor)
+
+    @_compressed_charge_spin.setter
+    def _compressed_charge_spin(self, value: tuple[float, float] | None) -> None:
+        setattr(self.atomic_model.descriptor, FOLDED_ATTR, value)
 
     def change_out_bias(
         self, merged: Any, bias_adjust_mode: str = "change-by-statistic"
@@ -823,6 +839,11 @@ class LongRangeEnergyModel(EnergyModel):
         # was 18% of the forward at 6520 atoms.
         if self.has_long_range:
             charge_spin = resolve_charge_spin(self, charge_spin, atype.shape[0], coord)
+        elif self._compressed_charge_spin is not None:
+            # Check only, so the short-range model passes its input on exactly
+            # as the standard one does: the kernel reads the folded state, and
+            # a different request would be silently dropped.
+            resolve_charge_spin(self, charge_spin, atype.shape[0], coord)
         with self._capturing_backbone() as captured:
             short_range = super().forward(
                 coord,
@@ -1063,6 +1084,8 @@ class LongRangeEnergyModel(EnergyModel):
         was_compressed = descriptor.compress
         had_scalars = hasattr(descriptor, "_compression_scalars")
         scalars = getattr(descriptor, "_compression_scalars", None)
+        had_folded = FOLDED_ATTR in descriptor.__dict__
+        folded = descriptor.__dict__.get(FOLDED_ATTR)
         try:
             super().enable_compression(
                 table_extrapolate, table_stride_1, table_stride_2, check_frequency
@@ -1079,9 +1102,11 @@ class LongRangeEnergyModel(EnergyModel):
                 descriptor._compression_scalars = scalars
             elif hasattr(descriptor, "_compression_scalars"):
                 del descriptor._compression_scalars
+            if had_folded:
+                setattr(descriptor, FOLDED_ATTR, folded)
+            else:
+                descriptor.__dict__.pop(FOLDED_ATTR, None)
             raise
-        if state is not None:
-            self._compressed_charge_spin = (state[0], state[1])
         # Only successful compression changes the process-wide inference level.
         if level == 0:
             os.environ["DP_CUDA_INFER"] = "1"

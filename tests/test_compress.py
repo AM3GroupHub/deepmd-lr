@@ -135,6 +135,44 @@ class TestSeam:
         with pytest.raises(ValueError, match="float32"):
             build().atomic_model.descriptor.enable_compression(0.0)
 
+    def test_charge_state_wrappers_are_patched_and_idempotent(self):
+        patched = (DescrptDPA4C.enable_compression, DescrptDPA4C.apply_charge_state)
+        assert all(getattr(f, "_deepmd_lr_patched", False) for f in patched)
+        compress_module.install()
+        assert (
+            DescrptDPA4C.enable_compression,
+            DescrptDPA4C.apply_charge_state,
+        ) == patched
+
+    @pytest.mark.parametrize("route", ["descriptor", "upstream_model"])
+    def test_every_route_records_the_folded_state(self, route):
+        """Upstream folds `default_chg_spin`; before the record lived on the
+        descriptor, only the plugin's own `enable_compression` armed the
+        check, and a model compressed any other way took any runtime
+        condition while the kernel read the default."""
+        from deepmd.pt_expt.model.ener_model import EnergyModel
+
+        model = build32(chg_ebd=True)
+        descriptor = model.atomic_model.descriptor
+        if route == "descriptor":
+            descriptor.enable_compression(0.0, table_stride_1=0.01)
+        else:
+            EnergyModel.enable_compression(model)
+        assert model._compressed_charge_spin == (0.0, 1.0)
+        ref = torch.empty((), dtype=torch.float64, device=DEVICE)
+        with pytest.raises(ValueError, match="folded"):
+            resolve_charge_spin(model, (1.0, 2.0), 1, ref)
+        descriptor.apply_charge_state([1.0, 2.0])
+        assert model._compressed_charge_spin == (1.0, 2.0)
+        assert resolve_charge_spin(model, (1.0, 2.0), 1, ref).tolist() == [[1.0, 2.0]]
+        with pytest.raises(ValueError, match="folded"):
+            resolve_charge_spin(model, (0.0, 1.0), 1, ref)
+
+    def test_no_charge_conditioning_records_nothing(self):
+        model = build32()
+        model.atomic_model.descriptor.enable_compression(0.0, table_stride_1=0.01)
+        assert model._compressed_charge_spin is None
+
 
 class TestRefusedWithoutTheKernel:
     """Every door into compression names the missing operator and the fix."""
@@ -417,6 +455,27 @@ class TestKernel:
                     [[0.0, 1.0]], dtype=torch.float64, device=DEVICE
                 ),
             )
+
+    @pytest.mark.parametrize("long_range", [True, False])
+    def test_upstream_compression_refuses_another_charge_state(self, long_range):
+        """The case measured on the water SR baseline: upstream's method,
+        a forward at [1, 2], and the default state's energy back without a
+        word (18 meV on 1,536 atoms). Now refused; the folded state runs and
+        matches the uncompressed model."""
+        from deepmd.pt_expt.model.ener_model import EnergyModel
+
+        plain, packed = twins(chg_ebd=True, long_range=long_range)
+        EnergyModel.enable_compression(packed)
+        coord, atype, cell = frame()
+
+        def cond(q, m):
+            return torch.tensor([[q, m]], dtype=torch.float64, device=DEVICE)
+
+        with pytest.raises(ValueError, match="folded"):
+            packed(coord, atype, box=cell, charge_spin=cond(1.0, 2.0))
+        a = plain(coord, atype, box=cell, charge_spin=cond(0.0, 1.0))
+        b = packed(coord, atype, box=cell, charge_spin=cond(0.0, 1.0))
+        assert float((a["energy"] - b["energy"]).abs()) <= 1e-3
 
     @pytest.mark.parametrize("n_part", [1, 2, 4])
     def test_partitioned_equals_serial_compressed(self, n_part):
