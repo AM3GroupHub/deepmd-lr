@@ -83,6 +83,7 @@ from deepmd_lr.compress import (
 from deepmd_lr.fitting.charge import (
     charge_mask,
     project_to_total_charge,
+    projection_shift,
     resolve_charge_spin,
 )
 from deepmd_lr.lr.term import (
@@ -481,7 +482,9 @@ class LongRangeEnergyModel(EnergyModel):
         charge_spin: torch.Tensor | None,
         mask: torch.Tensor | None,
         strain: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        *,
+        return_raw: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Per-atom charges satisfying the frame's total-charge constraint.
 
         Runs the shared descriptor and the charge head on the graph route,
@@ -535,7 +538,9 @@ class LongRangeEnergyModel(EnergyModel):
         # The same head and projection a captured backbone goes through. Column
         # 0 of charge_spin is the frame's total charge; absent it, the frame is
         # assumed neutral, the common case in training data.
-        return self._charges_from_features(gg, rot_mat, atype, charge_spin, mask)
+        return self._charges_from_features(
+            gg, rot_mat, atype, charge_spin, mask, return_raw=return_raw
+        )
 
     @contextlib.contextmanager
     def _capturing_backbone(self) -> Any:
@@ -782,8 +787,14 @@ class LongRangeEnergyModel(EnergyModel):
                     "selecting a fused energy/force kernel; unset it (or set "
                     "it below 2) for field simulations."
                 )
-            charge = self._predict_charges(
-                leaf_coord, atype, base_box, charge_spin, mask, strain=strain
+            charge, raw_charge = self._predict_charges(
+                leaf_coord,
+                atype,
+                base_box,
+                charge_spin,
+                mask,
+                strain=strain,
+                return_raw=True,
             )
             atom_energy = self.long_range_energy(
                 strained_coord, charge, strained_box, mask=mask
@@ -808,6 +819,7 @@ class LongRangeEnergyModel(EnergyModel):
             # above was evaluated with the model's own `charge`, which is what
             # it was trained with; only the diagnostic output is rescaled.
             "charge": charge * screening_factor(self.eps_inf),
+            "charge_projection_shift": projection_shift(charge, raw_charge, mask),
         }
         if born is not None:
             out["born_charge"] = born
@@ -885,6 +897,9 @@ class LongRangeEnergyModel(EnergyModel):
         # Diagnostics: the pieces a user needs to see whether the long-range
         # term is doing anything, without re-running the model.
         out["charge"] = long_range["charge"]
+        # What the neutrality projection added to every atom of each frame,
+        # (nf,); the `ener_lr` loss can penalise it (`deepmd_lr.loss`).
+        out["charge_projection_shift"] = long_range["charge_projection_shift"]
         if "born_charge" in long_range:
             out["born_charge"] = long_range["born_charge"]
         out["energy_long_range"] = long_range["energy"]

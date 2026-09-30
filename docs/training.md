@@ -91,6 +91,54 @@ What to know:
 
 The examples write both keys explicitly so a reader sees what will run.
 
+### Keeping the raw charges neutral: the `ener_lr` loss
+
+The charge head's raw charges are made to sum to the frame's total charge by
+adding one constant to every atom. So a constant in the raw charges costs
+nothing, and a frame of a single material never sets it: each material ends
+training with a raw offset of its own. A C/Si interface model came out with
++0.84963 e per atom in bulk diamond and +0.84664 e in bulk silicon. At the
+interface the projection removes their common mean, and the 0.3 % difference
+is left as +q on every C atom and -q on every Si atom. That charge grows with
+the thickness of each material, not with the interface area, and on longer
+cells its forces broke MD.
+
+`ener_lr` is DeePMD-kit's `ener` loss plus a term on the shift the projection
+applied to every atom of a frame, `delta_f = (Q_f - sum_i raw_i) / N_f`:
+
+```jsonc
+"loss": {
+  "type": "ener_lr",
+  "start_pref_e": 1, "limit_pref_e": 1, "start_pref_f": 1000, "limit_pref_f": 1,
+  "start_pref_qn": 1, "limit_pref_qn": 1
+}
+```
+
+The term is `pref_qn * mean_f delta_f^2`, or `mean_f |delta_f|` under
+`loss_func: "mae"`, on the usual prefactor schedule. It drives the raw charges
+to satisfy the constraint by themselves. Every single-material frame then pins
+its material's offset near zero, and two materials can no longer disagree by
+more than the term allows. Nothing in the architecture changes, and inference
+does not either: the projection still enforces the total charge exactly. Every
+other `ener` argument works as before. In a multi-task run, set it in each
+branch's `loss_dict` entry.
+
+- **Watch `rmse_qn`** in `lcurve.out`, the rms shift in e per atom. It bounds
+  the offset difference between materials. The bulk charge of an interface
+  scales with that difference, and the long-range energy with its square: at
+  1e-4 e against the 3e-3 e above, the energy is about 1,000 times smaller.
+- **Choosing the prefactor.** Match the energy term's scale. Under `mae`,
+  `pref_qn = 1` weighs a 1e-3 e shift like a 1e-3 eV/atom energy error. Under
+  `mse`, take `pref_qn` of the order of `pref_e`. Measured on example 01's
+  water, `pref_qn = 100` took `rmse_qn` from 0.23 to 0.005 e in 300 steps,
+  with energies and forces improving alongside.
+- **Fine-tuning an existing model** with `--init-model` is enough; its offset
+  starts large (about 0.85 e above) and falls within the first few hundred
+  steps.
+- **Limits.** `validating.full_validation` is DeePMD-kit's and accepts only
+  `ener` and `ener_spin`. A penalty-only loss (every `ener` prefactor zero)
+  fails inside DeePMD-kit's own loss; keep an energy term.
+
 ## What to watch
 
 The model returns three diagnostics beyond the usual outputs:

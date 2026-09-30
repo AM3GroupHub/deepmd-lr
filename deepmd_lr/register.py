@@ -18,10 +18,11 @@ input-normalization time -- both strictly after the backend import that
 brings us here.
 """
 
-from deepmd_lr import (  # schema args; `same_as`, EMA, compression hooks
+from deepmd_lr import (  # schema args; `same_as`, EMA, compression, loss hooks
     argcheck,
     compress,
     ema_default,
+    loss,
     same_as,
 )
 from deepmd_lr.fitting import (  # registers the `charge` fitting head
@@ -45,4 +46,15 @@ ema_default.install()
 # `get_geo_compress` never does for DPA4C. One boolean, see `compress.py`.
 compress.install()
 
-__all__ = ["argcheck", "charge", "compress", "ema_default", "lr_model", "same_as"]
+# `ener_lr`: upstream's loss factory is a fixed if/elif over its own types.
+loss.install()
+
+__all__ = [
+    "argcheck",
+    "charge",
+    "compress",
+    "ema_default",
+    "loss",
+    "lr_model",
+    "same_as",
+]

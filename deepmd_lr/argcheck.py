@@ -16,11 +16,16 @@ from deepmd.utils.argcheck import (
     descrpt_variant_type_args,
     fitting_args_plugin,
     fitting_variant_type_args,
+    loss_args_plugin,
+    loss_ener,
     model_args_plugin,
 )
 
 from deepmd_lr.fitting.charge import (
     CHARGE_VAR_NAME,
+)
+from deepmd_lr.loss import (
+    LOSS_TYPE,
 )
 from deepmd_lr.model.lr_model import (
     _LEGACY_RECIPROCAL_KEY,
@@ -350,3 +355,25 @@ def _long_range_args() -> Argument:
         doc="The long-range electrostatic term. Omit for a pure short-range "
         "model identical to the standard energy model.",
     )
+
+
+@loss_args_plugin.register(LOSS_TYPE)
+def ener_lr_loss_args() -> list[Argument]:
+    """The ``ener`` loss's arguments plus the charge-neutrality prefactors."""
+    doc = (
+        "Prefactor of the charge-neutrality term, the mean over frames of the "
+        "squared shift the total-charge projection applied to every atom "
+        "(absolute shift under `loss_func: mae`). It drives the raw charges "
+        "to satisfy the constraint by themselves, so that a constant the "
+        "projection would remove cannot differ between materials and charge "
+        "an interface's bulks. Needs a `dp_lr` model with a `long_range` "
+        "block. Scheduled as the other prefactors: limit + (start - limit) * "
+        "lr / start_lr."
+    )
+    return [
+        *loss_ener(),
+        Argument("start_pref_qn", [float, int], optional=True, default=0.0,
+                 doc=f"{doc} This is the value at the start of training."),
+        Argument("limit_pref_qn", [float, int], optional=True, default=0.0,
+                 doc=f"{doc} This is the value at the end of training."),
+    ]

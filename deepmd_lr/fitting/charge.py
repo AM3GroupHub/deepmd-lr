@@ -81,6 +81,31 @@ def resolve_charge_spin(
     return condition
 
 
+def projection_shift(
+    charge: torch.Tensor, raw_charge: torch.Tensor, mask: torch.Tensor | None
+) -> torch.Tensor:
+    """The uniform shift the total-charge projection applied, per frame.
+
+    :func:`project_to_total_charge` adds the same amount to every real atom
+    of a frame, ``(Q - sum_j raw_j) / N``; this returns it, shape ``(nf,)``,
+    measured from the two charge sets so it holds for any mask. It is the
+    per-atom gap between the raw and the projected charges, and the quantity
+    the ``ener_lr`` loss penalises.
+
+    Why it needs penalising: a constant added to every raw charge of a frame
+    is removed exactly by the projection, so single-material training frames
+    leave each material's raw offset free. Two materials then carry offsets
+    that differ slightly, and at an interface the projection spreads that
+    difference over both bulks as a charge that grows with the thickness.
+    """
+    diff = charge - raw_charge
+    if mask is None:
+        return diff.mean(dim=-1)
+    weight = mask.to(diff.dtype)
+    n_real = weight.sum(dim=-1)
+    return (diff * weight).sum(dim=-1) / torch.clamp(n_real, min=1.0)
+
+
 def charge_mask(model: Any, atype: torch.Tensor) -> torch.Tensor:
     """Atoms eligible to carry charge, including fitting-type exclusions."""
     mask = model.atomic_model.make_atom_mask(atype).bool()

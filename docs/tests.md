@@ -104,4 +104,7 @@ the model first.
 - `test_plugin_registration.py`, `test_import_order.py` — entry-point
   registration, schema acceptance, and that each module imports cleanly first.
 - `test_ema_default.py` — EMA enforcement for training.
+- `test_neutrality_loss.py` — the `ener_lr` loss: the shift the model reports
+  is the projection's, the term and its schedule, its gradient reaching the
+  head and backbone, the schema, the trainer's factory and serialization.
 - `test_xyz_to_deepmd.py`, `test_graft_short_range.py` — the two scripts.
