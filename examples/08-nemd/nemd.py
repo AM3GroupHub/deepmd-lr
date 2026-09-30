@@ -336,6 +336,7 @@ def assign_groups(atoms, a):
         fixed=fixed, mobile=mobile, free=free,
         hot=np.flatnonzero(masks["hot"]), cold=np.flatnonzero(masks["cold"]),
         left=free[z[free] < interface_z], right=free[z[free] > interface_z],
+        lower_side=np.flatnonzero(z < interface_z),
         interface_z=float(interface_z),
         area=float(np.linalg.norm(np.cross(cell[0], cell[1]))),
         source=source,
@@ -453,8 +454,25 @@ def extra_columns(g, has_charge):
             np.abs(md.thermo.get_forces(apply_constraint=False)).max()),
     }
     if has_charge:
-        cols["q_sum"] = lambda md: float(np.sum(md.results["charge"]))
-        cols["q_absmax"] = lambda md: float(np.abs(md.results["charge"]).max())
+        # The early warning for a charge head that does not keep the bulk
+        # neutral: Q_lower and M_z then grow with the material thickness and
+        # E_lr/N with its square, and the run fails some picoseconds later.
+        lower = g["lower_side"]
+
+        def charge(md):
+            return np.asarray(md.results["charge"]).reshape(-1)
+
+        def m_z(md):
+            dz = md.atoms.positions[:, 2] - g["interface_z"]
+            return float((charge(md) * dz).sum())
+
+        n = len(g["mobile"]) + len(g["fixed"])
+        cols["q_sum"] = lambda md: float(charge(md).sum())
+        cols["q_absmax"] = lambda md: float(np.abs(charge(md)).max())
+        cols["Q_lower[e]"] = lambda md: float(charge(md)[lower].sum())
+        cols["M_z[eA]"] = m_z
+        cols["E_lr/N[meV]"] = lambda md: 1e3 * float(
+            md.results["energy_long_range"]) / n
     return cols
 
 
@@ -499,6 +517,10 @@ def parse_args():
     ap.add_argument("--traj-every", type=int, default=5000, help="steps")
     ap.add_argument("--checkpoint-ps", type=float, default=5.0,
                     help="a multiple of --block-ps")
+    ap.add_argument("--compress", type=float, default=0.0,
+                    help="table stride in A for the compressed DPA4C backbone "
+                         "(0.01 is DeePMD-kit's default; 0 runs uncompressed). "
+                         "Needs deepmd-kit built with its CUDA operators")
     ap.add_argument("--resume", action="store_true",
                     help="continue from <out>/checkpoint.npz")
     return ap.parse_args()
@@ -519,7 +541,8 @@ def main():
                          f"{atoms.pbc.tolist()}")
     g = assign_groups(atoms, a)
     atoms.set_constraint(FixAtoms(indices=g["fixed"]) if len(g["fixed"]) else [])
-    ev = build_evaluator(a.model, atoms, devices=devices, head=a.head)
+    ev = build_evaluator(a.model, atoms, devices=devices, head=a.head,
+                         compress=a.compress if a.compress > 0 else False)
     has_charge = bool(getattr(ev.model, "has_long_range", False))
 
     dt, friction = a.dt * units.fs, 1.0 / (a.tau * units.fs)
@@ -560,6 +583,13 @@ def main():
     else:
         thermalize_momenta(atoms, temperature_K=a.t0,
                            rng=np.random.default_rng(a.seed))   # fixed atoms rest
+        # The mobile atoms' centre-of-mass momentum, removed once here and
+        # never during the run (a running correction would alter the heat).
+        p, m = atoms.get_momenta(), atoms.get_masses()
+        mob = g["mobile"]
+        p[mob] -= m[mob, None] * p[mob].sum(0) / m[mob].sum()
+        p[g["fixed"]] = 0.0
+        atoms.set_momenta(p, apply_constraint=False)
         if n_equil:
             eq = Langevin(ev, atoms, dt, temperature_K=a.t0, friction=friction,
                           seed=a.seed, logfile=out / "equil.log",

@@ -100,7 +100,7 @@ puts G in W m⁻² K⁻¹ (printed in MW m⁻² K⁻¹).
 
 | file | what |
 |---|---|
-| `thermo.log` | every `--log-every` steps: `T[K]` of the mobile atoms, `Epot`, `Ekin`, `Etot`, then `T_hot[K] Q_hot[eV] T_cold[K] Q_cold[eV]`, `T_left[K]`/`T_right[K]` (the free region on each side of the interface), `v_com[A/fs]`, `maxF[eV/A]`, and `q_sum`/`q_absmax` for a model with a charge head; `numpy.loadtxt` reads it |
+| `thermo.log` | every `--log-every` steps: `T[K]` of the mobile atoms, `Epot`, `Ekin`, `Etot`, then `T_hot[K] Q_hot[eV] T_cold[K] Q_cold[eV]`, `T_left[K]`/`T_right[K]` (the free region on each side of the interface), `v_com[A/fs]`, `maxF[eV/A]`, and for a model with a charge head `q_sum`, `q_absmax`, `Q_lower[e]` (the charge below the interface), `M_z[eA]` (the dipole about the interface) and `E_lr/N[meV]`; `numpy.loadtxt` reads it |
 | `profile.csv` | one row per z-bin (`--bin`) per block (`--block-ps`): the block's mean kinetic temperature of the mobile atoms in that bin, and the number of samples (every `--profile-every` steps) |
 | `trajectory.extxyz` | every `--traj-every` steps, with energy, forces, velocities, the charges, and the `FixAtoms` as `move_mask` |
 | `checkpoint.npz` | every `--checkpoint-ps`, atomically, plus one right after the heat reset |
@@ -152,6 +152,27 @@ wrong, and what they look like:
 - **`maxF` spikes or the run stops with `MDInstabilityError`.** The model is
   outside its training data; the run refuses to continue past five times
   `--t-hot`.
+
+## Charges: the columns that catch a bulk-charged model
+
+A charge head that leaves each bulk material slightly charged fails here
+first. The neutrality projection spreads any per-material offset of the raw
+charges over the whole cell, so every atom of one material carries a small
+positive charge and every atom of the other a small negative one. The
+separation then grows with the thickness, not with the interface area:
+`Q_lower[e]` and `M_z[eA]` grow with the length, `E_lr/N[meV]` roughly with
+its square, and the charge-response forces at the interface and the free
+surfaces grow with them until the run fails. Check the three columns on two
+lengths of the same cell before a length series: a physical transfer keeps
+`Q_lower` fixed at fixed area.
+
+## Compression
+
+`--compress 0.01` runs the compressed DPA4C backbone, DeePMD-kit's default
+table stride. On the 2,960-atom L1 cell it made a force call 9.5x faster
+(23 ms against 220 ms on one GB10) with the same long-range energy and
+charges to 1e-7 e. It needs deepmd-kit built with its CUDA operators
+([compression](../../docs/compression.md)).
 
 ## Several GPUs
 
