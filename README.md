@@ -112,6 +112,7 @@ match ([dataset layout](docs/dataset-layout.md)).
 | [06](examples/06-md_nvalchemi) | MD with nvalchemiops | NVE, NVT, NPT and NPH, one script each; a field run on every visible GPU; a thermostat of your own |
 | [07](examples/07-ase-calculator) | the ASE calculator | single points, charges and Born tensors, ASE's optimizers and MD |
 | [08](examples/08-nemd) | interfacial thermal conductance by NEMD | a region thermostat of your own with an exact heat account, fixed layers, a slab on the GPU path, resume, and the fits that give G |
+| [09](examples/09-fire-swap) | B-site order in PMN by FIRE-Swap Monte Carlo | relaxed-swap Metropolis on one evaluator, cell relaxation after a local change, rollback and resume |
 
 `scripts/xyz_to_deepmd.py` converts a trajectory ASE can read into a DeePMD
 dataset, including the `--split-by-composition` and `--vacuum` cases the
