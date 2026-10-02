@@ -51,6 +51,7 @@ from deepmd_lr.born import (
 from deepmd_lr.compress import (
     compress_model,
 )
+from deepmd_lr.fitting.charge import check_charge_filter
 from deepmd_lr.nvalchemi.driver import (
     _to_host,
     check_long_range_boundary,
@@ -259,6 +260,17 @@ class DistributedEvaluator:
         ``q~ = sqrt(eps_inf) q``. The field force, built from ``Z``, scales with
         it; energies and field-free forces do not change.
 
+    charge_filter
+        ``(c_t, delta)`` in e, or None (the default). Charges whose magnitude
+        is below ``c_t - delta`` are set exactly to zero, those above
+        ``c_t + delta`` kept, with a C^3 polynomial between, and the total
+        charge is restored on the atoms that keep charge
+        (:func:`~deepmd_lr.fitting.charge.filter_charges`). A simulation-only
+        remedy for a model that leaves a small charge on every bulk atom,
+        which adds up over a thick slab. The model was not trained with it:
+        validate it on a cell where the unfiltered model is trusted. Refused
+        with Born charges and fields.
+
     Notes
     -----
     The reciprocal sum is gathered onto one device rather than decomposed,
@@ -286,6 +298,7 @@ class DistributedEvaluator:
         compress: bool | float = False,
         eps_inf: float = 1.0,
         memory_headroom: float | None = 0.8,
+        charge_filter: tuple[float, float] | None = None,
     ) -> None:
         if not devices:
             raise ValueError("DistributedEvaluator needs at least one device")
@@ -348,6 +361,16 @@ class DistributedEvaluator:
             # The field force is built from Z, so Z has to be assembled.
             self.compute_born = True
         self.charge_spin = charge_spin
+        #: ``(c_t, delta)`` or None; see the class docstring.
+        self.charge_filter = check_charge_filter(charge_filter)
+        if self.charge_filter is not None:
+            if not getattr(model, "has_long_range", False):
+                raise ValueError("charge_filter needs a model with a long_range block")
+            if self.compute_born:
+                raise ValueError(
+                    "charge_filter cannot be combined with Born charges or an "
+                    "efield yet: the Born tensor is built from unfiltered charges"
+                )
         #: High-frequency dielectric constant. ``results['charge']`` and
         #: ``results['born_charge']`` -- and therefore the field force -- are
         #: scaled by sqrt(eps_inf); energies and field-free forces are not.
@@ -741,6 +764,7 @@ class DistributedEvaluator:
                     pair_skin=self.pair_skin,
                     pbc=self.pbc,
                     long_range_energy=self.long_range_energy,
+                    charge_filter=self.charge_filter,
                 )
             except Exception as exc:
                 if not _is_out_of_memory(exc) or not self._skin_is_auto:

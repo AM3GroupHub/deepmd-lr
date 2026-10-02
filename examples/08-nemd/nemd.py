@@ -521,6 +521,10 @@ def parse_args():
                     help="table stride in A for the compressed DPA4C backbone "
                          "(0.01 is DeePMD-kit's default; 0 runs uncompressed). "
                          "Needs deepmd-kit built with its CUDA operators")
+    ap.add_argument("--charge-filter", type=float, nargs=2, default=None,
+                    metavar=("C_T", "DELTA"),
+                    help="e; switch charges below about C_T off in simulation "
+                         "(deepmd_lr.fitting.charge.filter_charges)")
     ap.add_argument("--resume", action="store_true",
                     help="continue from <out>/checkpoint.npz")
     return ap.parse_args()
@@ -542,7 +546,8 @@ def main():
     g = assign_groups(atoms, a)
     atoms.set_constraint(FixAtoms(indices=g["fixed"]) if len(g["fixed"]) else [])
     ev = build_evaluator(a.model, atoms, devices=devices, head=a.head,
-                         compress=a.compress if a.compress > 0 else False)
+                         compress=a.compress if a.compress > 0 else False,
+                         charge_filter=a.charge_filter)
     has_charge = bool(getattr(ev.model, "has_long_range", False))
 
     dt, friction = a.dt * units.fs, 1.0 / (a.tau * units.fs)
@@ -627,6 +632,7 @@ def main():
                                           ("fixed", "hot", "free", "cold", "mobile")},
         "group_source": g["source"], "z_range": g["z_range"],
         "interface_z": g["interface_z"], "area": g["area"],
+        "charge_filter": a.charge_filter, "compress": a.compress,
         "dt_fs": a.dt, "tau_fs": a.tau, "T0": a.t0, "T_hot": a.t_hot,
         "T_cold": a.t_cold, "seed": a.seed, "equil_ps": a.equil_ps,
         "steady_ps": a.steady_ps, "run_ps": a.run_ps, "bin_A": a.bin,

@@ -46,6 +46,8 @@ from deepmd_lr.born import (
 )
 from deepmd_lr.fitting.charge import (
     charge_mask,
+    check_charge_filter,
+    filter_charges,
     project_to_total_charge,
     resolve_charge_spin,
 )
@@ -390,6 +392,14 @@ def check_long_range_boundary(model: Any, pbc, term: Any = None) -> None:
         )
 
 
+#: Born tensors differentiate the raw charges (``deepmd_lr.born``); the filter
+#: would need its own chain through them, which does not exist yet.
+_FILTER_WITH_BORN = (
+    "charge_filter cannot be combined with Born charges (compute_born or an "
+    "efield) yet: the Born tensor is built from the unfiltered charges"
+)
+
+
 def evaluate_partitioned(
     model: Any,
     coord: np.ndarray,
@@ -407,6 +417,7 @@ def evaluate_partitioned(
     eps_inf: float = 1.0,
     pair_skin: float = 0.0,
     long_range_energy: Any = None,
+    charge_filter: tuple[float, float] | None = None,
 ) -> dict[str, Any]:
     """Run ``model`` over spatial partitions and assemble the global result.
 
@@ -443,6 +454,10 @@ def evaluate_partitioned(
         The long-range term to evaluate, by default ``model.long_range_energy``.
         :class:`~deepmd_lr.nvalchemi.evaluator.DistributedEvaluator` passes
         the one it built for its cell and pbc, which leaves the model alone.
+    charge_filter
+        ``(c_t, delta)``: switch charges below about ``c_t`` off, smoothly,
+        after the projection (:func:`~deepmd_lr.fitting.charge.filter_charges`).
+        A simulation-only setting; refused with Born charges.
     Returns
     -------
     dict
@@ -454,6 +469,9 @@ def evaluate_partitioned(
         through each partition's charge head.
     """
     check_long_range_boundary(model, pbc, long_range_energy)
+    charge_filter = check_charge_filter(charge_filter)
+    if charge_filter is not None and compute_born:
+        raise NotImplementedError(_FILTER_WITH_BORN)
     rcut = float(model.get_rcut())
     coord_np = (
         None if isinstance(coord, torch.Tensor) else np.asarray(coord, dtype=np.float64)
@@ -633,6 +651,7 @@ def evaluate_partitioned(
             atype=atype,
             charge_spin=charge_spin,
             term=long_range_energy,
+            charge_filter=charge_filter,
         )
     )
     result["energy"] = result["energy_short_range"] + result["energy_long_range"]
@@ -839,6 +858,7 @@ def _long_range_global(
     atype,
     charge_spin=None,
     term=None,
+    charge_filter=None,
 ) -> dict:
     """The global half: project the charges, then evaluate the reciprocal sum.
 
@@ -875,9 +895,13 @@ def _long_range_global(
     condition = _condition_on(model, charge_spin, device, dtype)
     total_charge = 0.0 if condition is None else condition[:, 0]
     types = torch.as_tensor(atype, dtype=torch.int64, device=device).reshape(1, -1)
-    charge = project_to_total_charge(
-        charge_t, total_charge, mask=charge_mask(model, types)
-    )
+    mask = charge_mask(model, types)
+    charge = project_to_total_charge(charge_t, total_charge, mask=mask)
+    if charge_filter is not None:
+        # After the projection, inside this graph: dE/dq below is taken with
+        # respect to the raw charges, so the filter reaches the charge-response
+        # force with no other change.
+        charge = filter_charges(charge, total_charge, charge_filter, mask=mask)
     if term is None:
         term = model.long_range_energy
     atom_energy = term(coord_in, charge, cell_in)

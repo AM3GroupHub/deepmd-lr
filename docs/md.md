@@ -50,6 +50,59 @@ shows the workflow and class API; [example 06](../examples/06-md_nvalchemi)
 has a script per ensemble. [Example 07](../examples/07-ase-calculator)
 covers the ASE calculator.
 
+## Switching small charges off: `charge_filter`
+
+A charge head can leave a small charge on every atom of a bulk material:
++2e-4 e per C and -6e-4 e per Si in a C/Si model. Each is negligible, but in a
+slab periodic in x and y every atomic layer acts as an infinite charged sheet,
+and their fields add up instead of cancelling. The separated charge, and with
+it the potential drop across the slab, grows with the thickness. On a 32 nm
+C/Si cell the drop reached 80-280 V, and the charge-response forces broke MD
+within a picosecond.
+
+`charge_filter=(c_t, delta)` removes such charge in simulation. After the
+usual projection, every charge with `|q| <= c_t - delta` is set exactly to
+zero, every charge with `|q| >= c_t + delta` is kept, and a C^3 polynomial
+joins the two, so forces and the Hessian stay continuous. The total charge is
+then restored on the atoms that keep charge, in proportion to their weight,
+so an atom switched off stays at zero:
+
+```python
+ev = build_evaluator("model.ckpt.pt", atoms, charge_filter=(3.5e-3, 1.5e-3))
+atoms.calc = LongRangeCalculator("model.ckpt.pt", charge_filter=(3.5e-3, 1.5e-3))
+```
+
+Measured on that C/Si model (`ener_lr`, `pref_qn` 100) with (3.5e-3, 1.5e-3):
+
+| cell | filter | bulk q per C / Si (e) | charge below the interface | E_lr per atom | 2 ps+ MD at 300 K |
+|---|---|---|---:|---:|---|
+| 11 nm | off | +2.1e-4 / -6.1e-4 | 2.19 e | 0.63 meV | stable |
+| 32 nm | off | +1.9e-4 / -6.2e-4 | 5.25 e | 6.33 meV | blew up near 0.8 ps |
+| 11 nm | on | 0 / 0 | 0.47 e | 0.056 meV | |
+| 32 nm | on | 0 / 0 | 0.47 e | 0.061 meV | stable for 5 ps |
+
+- **It is a simulation setting, not part of the model.** It is never saved,
+  and training refuses it. The model was trained without it, so it changes
+  the interface electrostatics the model saw: on the 11 nm cell the forces
+  moved by 0.09 eV/A rms at the interface and 0.06 at the surfaces (bulk
+  0.003). Validate it on a cell where the unfiltered model is trusted, for
+  example by comparing the property you are after with and without it.
+- **It can change that property.** On the 11 nm cell, four NEMD seeds each
+  way gave an interfacial conductance of 131 +- 7 MW m^-2 K^-1 without the
+  filter and 106 +- 8 with it: the same temperature jump, 20 % less heat
+  flux. Switching off most of the interfacial charge changed how the
+  interface carries heat. So there it stabilises the long cells but is not
+  fit for a published conductance; the fix belongs in the model.
+- **Choose `c_t` from the bulk charges at the temperature you run.** At
+  300 K the C/Si bulk charges reached 2-2.5e-3 e, so the switch-off point
+  `c_t - delta` sits at 2e-3. Too low, and thermal fluctuations switch bulk
+  atoms on with the bulk's bias; too high, and most of the interfacial
+  charge goes too. A model whose bulk charges sit inside the transition
+  (the same C/Si model before `ener_lr`, at -2.5e-3 e on Si) is not cleaned
+  by it.
+- **Born charges and fields are refused with it** for now: the Born tensor
+  is built from the unfiltered charges.
+
 ## Traps
 
 Each of these has cost a run.

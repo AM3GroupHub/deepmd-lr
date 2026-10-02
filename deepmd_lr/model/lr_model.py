@@ -82,6 +82,8 @@ from deepmd_lr.compress import (
 )
 from deepmd_lr.fitting.charge import (
     charge_mask,
+    check_charge_filter,
+    filter_charges,
     project_to_total_charge,
     projection_shift,
     resolve_charge_spin,
@@ -225,6 +227,10 @@ class LongRangeEnergyModel(EnergyModel):
         #: turns the model's Coulomb charges into screened ones; the energy
         #: and forces are untouched. 1.0 is vacuum. See `deepmd_lr.born`.
         self.eps_inf = 1.0
+        #: ``(c_t, delta)`` or None. Simulation only: charges below about c_t
+        #: are switched off after the projection (`filter_charges`). Set on the
+        #: model by the ASE calculator, never saved, refused in training.
+        self.charge_filter: tuple[float, float] | None = None
         #: True on the non-base members of a `same_as` group, whose
         #: `atomic_model` is the base's very object. A plain bool, not a
         #: module: see `deepmd_lr.same_as`.
@@ -700,6 +706,28 @@ class LongRangeEnergyModel(EnergyModel):
         mask = charge_mask(self, atype)
         create_graph = self.training
         born = None
+        charge_filter = check_charge_filter(self.charge_filter)
+        if charge_filter is not None:
+            if self.training:
+                raise RuntimeError(
+                    "charge_filter is a simulation-only setting; clear it "
+                    "(model.charge_filter = None) before training"
+                )
+            if self.compute_born:
+                raise NotImplementedError(
+                    "charge_filter cannot be combined with Born charges yet: "
+                    "the Born tensor is built from the unfiltered charges"
+                )
+            total = (
+                charge_spin[:, 0].to(coord.dtype)
+                if charge_spin is not None
+                else torch.zeros(nf, dtype=coord.dtype, device=device)
+            )
+
+        def filtered(projected: torch.Tensor) -> torch.Tensor:
+            if charge_filter is None:
+                return projected
+            return filter_charges(projected, total, charge_filter, mask=mask)
 
         if shared is not None:
             # SHARED BACKBONE. The energy head already ran the descriptor; its
@@ -714,7 +742,7 @@ class LongRangeEnergyModel(EnergyModel):
             # converts the short-range energy's edge gradient. Its backward
             # sets `retain_graph=True`, which is what leaves the captured
             # graph traversable here.
-            charge, raw_charge = self._charges_from_features(
+            projected, raw_charge = self._charges_from_features(
                 shared["features"],
                 shared["rot_mat"],
                 atype,
@@ -722,6 +750,7 @@ class LongRangeEnergyModel(EnergyModel):
                 mask,
                 return_raw=True,
             )
+            charge = filtered(projected)
             atom_energy = self.long_range_energy(
                 strained_coord, charge, strained_box, mask=mask
             )
@@ -787,7 +816,7 @@ class LongRangeEnergyModel(EnergyModel):
                     "selecting a fused energy/force kernel; unset it (or set "
                     "it below 2) for field simulations."
                 )
-            charge, raw_charge = self._predict_charges(
+            projected, raw_charge = self._predict_charges(
                 leaf_coord,
                 atype,
                 base_box,
@@ -796,6 +825,7 @@ class LongRangeEnergyModel(EnergyModel):
                 strain=strain,
                 return_raw=True,
             )
+            charge = filtered(projected)
             atom_energy = self.long_range_energy(
                 strained_coord, charge, strained_box, mask=mask
             )
@@ -819,7 +849,7 @@ class LongRangeEnergyModel(EnergyModel):
             # above was evaluated with the model's own `charge`, which is what
             # it was trained with; only the diagnostic output is rescaled.
             "charge": charge * screening_factor(self.eps_inf),
-            "charge_projection_shift": projection_shift(charge, raw_charge, mask),
+            "charge_projection_shift": projection_shift(projected, raw_charge, mask),
         }
         if born is not None:
             out["born_charge"] = born
