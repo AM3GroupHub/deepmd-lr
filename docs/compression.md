@@ -32,9 +32,10 @@ caller can correct the inputs and retry.
   the uncompressed math without saying so, so on the wheel `compress=True` is
   refused: `RuntimeError: compression needs the compiled operator
   torch.ops.deepmd.dpa4c_graph_compress ...`
-- `DP_CUDA_INFER=1`. Set for you if unset. Level 2 is refused: its fused
-  energy/force path bypasses the shared backbone, the charge response and the
-  Born charges.
+- `DP_CUDA_INFER=1`. Set for you if unset. Level 2 is refused for a model
+  with `long_range`: its fused energy/force path bypasses the shared backbone,
+  the charge response and the Born charges. A model without `long_range` may
+  set `DP_CUDA_INFER=2` for that fused path (force as a value, no autograd).
 - A `float32` descriptor with no `exclude_types` (upstream's rule).
 
 **What it changes**

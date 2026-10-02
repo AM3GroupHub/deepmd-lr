@@ -993,12 +993,20 @@ class LongRangeEnergyModel(EnergyModel):
                 raise RuntimeError(_NO_KERNEL)
             # Level before CSR: at level 0 upstream builds no CSR at all, so
             # the missing views are the symptom and the level is the cause.
+            # A long-range model needs level 1: at 2 a fused kernel bypasses the
+            # backbone the charge head shares. A short-range model has no charge
+            # head, so level 2 -- DeePMD-kit's fused energy/force pipeline, force
+            # as a value with no autograd tape -- is allowed and is the faster one.
             level = cuda_infer_level()
-            if level != 1:
+            allowed = (1,) if self.has_long_range else (1, 2)
+            if level not in allowed:
                 raise RuntimeError(
                     f"DP_CUDA_INFER={level} on a compressed model: at 0 the "
-                    "tables are built and never used, at 2 a fused kernel "
-                    "bypasses the shared backbone. Set DP_CUDA_INFER=1."
+                    "tables are built and never used"
+                    + (", at 2 a fused kernel bypasses the shared backbone the "
+                       "charge head needs. Set DP_CUDA_INFER=1."
+                       if self.has_long_range else
+                       ". Set DP_CUDA_INFER=1 or 2 (2: the fused energy/force path).")
                 )
             if destination_order is None or destination_row_ptr is None:
                 raise RuntimeError(
@@ -1070,12 +1078,13 @@ class LongRangeEnergyModel(EnergyModel):
                 "compressed DPA4C cannot re-enter training mode."
             )
         level = cuda_infer_level()
-        if level >= 2:
+        if level >= 2 and self.has_long_range:
             raise RuntimeError(
                 "DP_CUDA_INFER=2 selects the fused energy/force kernel, which "
                 "bypasses `descriptor.call_graph`: the charge head could no "
                 "longer share the backbone and Born charges would be refused. "
-                "Set DP_CUDA_INFER=1, the level compression needs."
+                "Set DP_CUDA_INFER=1, the level compression needs. (A model "
+                "without `long_range` may use 2.)"
             )
         descriptor = self.atomic_model.descriptor
         state = None

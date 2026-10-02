@@ -191,8 +191,9 @@ Three things to know, each refused rather than warned about when violated:
   uncompressed math — so on the wheel `compress=True` raises, naming the fix.
   The build takes about two minutes:
   [docs/compression.md](docs/compression.md#building-the-cuda-operators).
-- **It is inference-only**, and `DP_CUDA_INFER` becomes `1` (level 2 is
-  refused: it bypasses the shared backbone).
+- **It is inference-only**, and `DP_CUDA_INFER` becomes `1`. Level 2 is
+  refused for a long-range model (it bypasses the shared backbone) and allowed
+  for a short-range one, where its fused energy/force path is faster.
 - **The charge state is folded into the tables**: the calculator/evaluator fold
   in the run's `charge_spin`; a forward with a different one is refused.
 
