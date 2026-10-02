@@ -209,7 +209,7 @@ drift.
 | Energies fine, forces bad | `alpha`/mesh mismatch | check the mesh resolves `1/(2·alpha)` |
 | CUDA OOM during statistics | `data_stat_nbatch` default of 10 on large frames | set `data_stat_nbatch: 1` in the model block |
 | `RuntimeError: compression needs the compiled operator ...` | the PyPI wheel has no `dpa4c_graph_compress` kernel | [build the CUDA operators](compression.md#building-the-cuda-operators), or drop `compress=` |
-| `RuntimeError: DP_CUDA_INFER=2 selects the fused energy/force kernel ...` when compressing, or `DP_CUDA_INFER=2 on a compressed model` at run time | level 2 bypasses `call_graph` and the shared backbone | `export DP_CUDA_INFER=1` |
+| `RuntimeError: DP_CUDA_INFER=2 selects the fused energy/force kernel ...` when compressing, or `DP_CUDA_INFER=2 on a compressed model` at run time | level 2 bypasses `call_graph` and the shared backbone (refused only with `long_range`) | `export DP_CUDA_INFER=1` |
 | `RuntimeError: ... needs the destination CSR views` | a hand-built graph reached a compressed model | build it with `with_csr=True`, or `attach_edge_csr` |
 | `ValueError: charge_spin ... differs from the state ... folded into the compressed tables` | the run's condition is not the one compressed with | pass that `charge_spin` to the calculator/evaluator, which folds it in |
 | `NotImplementedError: The graph-lower interface (DeepPot, dp test, ...)` | a long-range checkpoint evaluated through DeepPot/`dp test` | use `LongRangeCalculator` or the nvalchemi evaluator; only they see the cell |

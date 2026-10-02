@@ -602,14 +602,22 @@ def test_direct_model_api_rejects_bad_stride_before_mutation(monkeypatch, value)
     assert os.environ["DP_CUDA_INFER"] == "0"
 
 
-@pytest.mark.parametrize("long_range", [False, True])
-def test_level_two_is_rejected_for_both_model_types(monkeypatch, long_range):
+def test_level_two_is_rejected_for_a_long_range_model(monkeypatch):
     monkeypatch.setattr(lr_model, "_kernel_available", lambda: True)
     monkeypatch.setenv("DP_CUDA_INFER", "2")
-    model = build32(long_range=long_range)
+    model = build32(long_range=True)
     with pytest.raises(RuntimeError, match="DP_CUDA_INFER=2"):
         model.enable_compression()
     assert not model.atomic_model.descriptor.compress
+
+
+def test_level_two_compresses_a_short_range_model(monkeypatch):
+    # No charge head shares the backbone, so the fused energy/force path is allowed.
+    monkeypatch.setattr(lr_model, "_kernel_available", lambda: True)
+    monkeypatch.setenv("DP_CUDA_INFER", "2")
+    model = build32(long_range=False)
+    model.enable_compression()
+    assert model.atomic_model.descriptor.compress
 
 
 # --- a failed compression leaves the model as it was ---------------------------
