@@ -371,6 +371,10 @@ class TestSkinIsFittedToMemory:
     on this machine. So the first evaluation is a probe at the floor skin, and
     the skin the rest of the run uses is the largest one whose extrapolated
     footprint fits the budget -- never more than the geometry rule asks for.
+
+    Halo semantics, so two partitions of one device: on one device the GPU
+    list has no halo, the node count is the atom count whatever the skin, and
+    the probe does not run.
     """
 
     @pytest.fixture(scope="class")
@@ -390,11 +394,11 @@ class TestSkinIsFittedToMemory:
         from deepmd_lr.nvalchemi.evaluator import MIN_AUTO_SKIN
 
         coord, atype, cell, *_ = system
-        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE])
+        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE] * 2)
         assert ev.skin == pytest.approx(MIN_AUTO_SKIN)
         ev(coord)
         # This device has room to spare, so the geometry rule still decides.
-        assert ev.skin == pytest.approx(default_skin(cell, ev._rcut, 1))
+        assert ev.skin == pytest.approx(default_skin(cell, ev._rcut, 2))
         assert ev.bytes_per_node is not None and ev.bytes_per_node > 0
         rebuilds = ev.rebuild_count
         ev(coord)
@@ -405,12 +409,12 @@ class TestSkinIsFittedToMemory:
 
         coord, atype, cell, *_ = system
         ev = DistributedEvaluator(
-            model, atype, cell, devices=[DEVICE], memory_headroom=1e-6
+            model, atype, cell, devices=[DEVICE] * 2, memory_headroom=1e-6
         )
         with pytest.warns(RuntimeWarning, match="does not fit"):
             ev(coord)
         assert ev.skin == pytest.approx(MIN_AUTO_SKIN)
-        assert ev.skin < default_skin(cell, ev._rcut, 1)
+        assert ev.skin < default_skin(cell, ev._rcut, 2)
 
     def test_the_fitted_skin_is_the_arithmetic_it_claims(
         self, system, model, monkeypatch
@@ -426,44 +430,44 @@ class TestSkinIsFittedToMemory:
         peak, free = 8 * 2**30, 20 * 2**30
         headroom = 0.8
         ev = DistributedEvaluator(
-            model, atype, cell, devices=[DEVICE], memory_headroom=headroom
+            model, atype, cell, devices=[DEVICE] * 2, memory_headroom=headroom
         )
         self._pin_memory(monkeypatch, peak=peak, free=free)
         ev(coord)
         ratio = headroom * free / peak
         expected = min(
-            skin_for_node_ratio(cell, ev._rcut, 1, ratio, skin_from=MIN_AUTO_SKIN),
-            default_skin(cell, ev._rcut, 1),
+            skin_for_node_ratio(cell, ev._rcut, 2, ratio, skin_from=MIN_AUTO_SKIN),
+            default_skin(cell, ev._rcut, 2),
         )
         assert ev.skin == pytest.approx(expected, rel=1e-6)
         # and the prediction that skin encodes: at most `ratio` times the
         # nodes the probe actually counted.
-        got = halo_node_ratio(cell, ev._rcut, 1, ev.skin, MIN_AUTO_SKIN)
+        got = halo_node_ratio(cell, ev._rcut, 2, ev.skin, MIN_AUTO_SKIN)
         assert got <= ratio + 1e-9
 
     def test_a_tight_budget_binds_before_the_geometry_rule(
         self, system, model, monkeypatch
     ):
         coord, atype, cell, *_ = system
-        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE])
+        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE] * 2)
         self._pin_memory(monkeypatch, peak=8 * 2**30, free=int(8.5 * 2**30))
         with pytest.warns(RuntimeWarning, match="does not fit"):
             ev(coord)
-        assert ev.skin < default_skin(cell, ev._rcut, 1)
+        assert ev.skin < default_skin(cell, ev._rcut, 2)
 
     def test_none_skips_the_probe_entirely(self, system, model):
         coord, atype, cell, *_ = system
         ev = DistributedEvaluator(
-            model, atype, cell, devices=[DEVICE], memory_headroom=None
+            model, atype, cell, devices=[DEVICE] * 2, memory_headroom=None
         )
-        assert ev.skin == pytest.approx(default_skin(cell, ev._rcut, 1))
+        assert ev.skin == pytest.approx(default_skin(cell, ev._rcut, 2))
         ev(coord)
         assert ev.bytes_per_node is None
-        assert ev.skin == pytest.approx(default_skin(cell, ev._rcut, 1))
+        assert ev.skin == pytest.approx(default_skin(cell, ev._rcut, 2))
 
     def test_an_explicit_skin_is_never_probed(self, system, model):
         coord, atype, cell, *_ = system
-        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE], skin=2.5)
+        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE] * 2, skin=2.5)
         assert ev.skin == 2.5
         ev(coord)
         assert ev.skin == 2.5
@@ -473,11 +477,11 @@ class TestSkinIsFittedToMemory:
         """A halo only has to cover the cutoff; its thickness is a cost knob."""
         coord, atype, cell, *_ = system
         plain = DistributedEvaluator(
-            model, atype, cell, devices=[DEVICE], memory_headroom=None
+            model, atype, cell, devices=[DEVICE] * 2, memory_headroom=None
         )
         want_e, want_f = plain(coord)
         want_f = want_f.clone()
-        probed = DistributedEvaluator(model, atype, cell, devices=[DEVICE])
+        probed = DistributedEvaluator(model, atype, cell, devices=[DEVICE] * 2)
         probed(coord)
         energy, forces = probed(coord)
         assert energy == pytest.approx(want_e, abs=1e-9)
@@ -490,7 +494,7 @@ class TestSkinIsFittedToMemory:
         for bad in (0.0, -0.5, 1.5):
             with pytest.raises(ValueError, match="memory_headroom"):
                 DistributedEvaluator(
-                    model, atype, cell, devices=[DEVICE], memory_headroom=bad
+                    model, atype, cell, devices=[DEVICE] * 2, memory_headroom=bad
                 )
 
 
@@ -503,6 +507,9 @@ class TestSkinBacksOffWhenMemoryRunsOut:
     difference between running and an out-of-memory, where the old fixed 1 A
     skin fitted. Predicting the footprint means guessing bytes per node for a
     model this class never inspects; reacting to it does not.
+
+    Two partitions of one device: on one device there is no halo to give
+    back, and an out-of-memory is raised as it is.
     """
 
     @pytest.fixture(scope="class")
@@ -533,13 +540,13 @@ class TestSkinBacksOffWhenMemoryRunsOut:
     ):
         coord, atype, cell, *_ = system
         reference = DistributedEvaluator(
-            model, atype, cell, devices=[DEVICE], memory_headroom=None
+            model, atype, cell, devices=[DEVICE] * 2, memory_headroom=None
         )
         want_energy, want_forces = reference(coord)
         want_forces = want_forces.clone()
 
         ev = DistributedEvaluator(
-            model, atype, cell, devices=[DEVICE], memory_headroom=None
+            model, atype, cell, devices=[DEVICE] * 2, memory_headroom=None
         )
         before = ev.skin
         self._fail_n_times(monkeypatch, 1)
@@ -555,7 +562,7 @@ class TestSkinBacksOffWhenMemoryRunsOut:
     def test_it_keeps_halving_until_it_fits(self, system, model, monkeypatch):
         coord, atype, cell, *_ = system
         ev = DistributedEvaluator(
-            model, atype, cell, devices=[DEVICE], memory_headroom=None
+            model, atype, cell, devices=[DEVICE] * 2, memory_headroom=None
         )
         before = ev.skin
         self._fail_n_times(monkeypatch, 3)
@@ -568,7 +575,7 @@ class TestSkinBacksOffWhenMemoryRunsOut:
         """`set_cell` re-runs the geometry rule, which must not climb back."""
         coord, atype, cell, *_ = system
         ev = DistributedEvaluator(
-            model, atype, cell, devices=[DEVICE], memory_headroom=None
+            model, atype, cell, devices=[DEVICE] * 2, memory_headroom=None
         )
         self._fail_n_times(monkeypatch, 1)
         with pytest.warns(RuntimeWarning):
@@ -576,13 +583,13 @@ class TestSkinBacksOffWhenMemoryRunsOut:
         capped = ev.skin
         ev.set_cell(cell * 2.0)
         assert ev.skin == pytest.approx(capped)
-        assert default_skin(cell * 2.0, ev._rcut, 1) > capped
+        assert default_skin(cell * 2.0, ev._rcut, 2) > capped
 
     def test_an_explicit_skin_is_the_callers_and_is_not_touched(
         self, system, model, monkeypatch
     ):
         coord, atype, cell, *_ = system
-        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE], skin=2.5)
+        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE] * 2, skin=2.5)
         self._fail_n_times(monkeypatch, 1)
         with pytest.raises(torch.cuda.OutOfMemoryError):
             ev(coord)
@@ -597,7 +604,7 @@ class TestSkinBacksOffWhenMemoryRunsOut:
 
         coord, atype, cell, *_ = system
         ev = DistributedEvaluator(
-            model, atype, cell, devices=[DEVICE], memory_headroom=None
+            model, atype, cell, devices=[DEVICE] * 2, memory_headroom=None
         )
         self._fail_n_times(monkeypatch, 10**6)
         with (
@@ -610,7 +617,7 @@ class TestSkinBacksOffWhenMemoryRunsOut:
     def test_any_other_failure_is_not_swallowed(self, system, model, monkeypatch):
         coord, atype, cell, *_ = system
         ev = DistributedEvaluator(
-            model, atype, cell, devices=[DEVICE], memory_headroom=None
+            model, atype, cell, devices=[DEVICE] * 2, memory_headroom=None
         )
         before = ev.skin
         self._fail_n_times(monkeypatch, 1, error=ValueError("not a memory problem"))
@@ -625,7 +632,7 @@ class TestSkinBacksOffWhenMemoryRunsOut:
         """warp and the allocator behind the search raise a bare RuntimeError."""
         coord, atype, cell, *_ = system
         ev = DistributedEvaluator(
-            model, atype, cell, devices=[DEVICE], memory_headroom=None
+            model, atype, cell, devices=[DEVICE] * 2, memory_headroom=None
         )
         self._fail_n_times(
             monkeypatch, 1, error=RuntimeError("Failed to allocate 4 GiB on cuda:0")
@@ -1200,14 +1207,27 @@ class TestSlab:
             # Each half spans the whole thickness: the cut is in-plane.
             assert np.ptp(coord[part.owned, 2]) > 0.8 * np.ptp(coord[:, 2])
 
-    def test_an_atom_near_an_open_face_is_refused(self):
+    def test_an_atom_at_an_open_face_is_refused(self):
+        """Two partitions check on the host at every rebuild, so an atom must
+        stay half a skin inside the face; one device checks on the device at
+        every step, so only an atom actually past the face is refused."""
         coord, atype, cell = slab()
-        coord[0, 2] = cell[2, 2] - 0.1        # 0.1 A under the top face
+        near = coord.copy()
+        near[0, 2] = cell[2, 2] - 0.1  # 0.1 A under the top face
+        ev = DistributedEvaluator(
+            build(), atype, cell, devices=[DEVICE] * 2, pbc=SLAB_PBC,
+            memory_headroom=None,
+        )
+        with pytest.raises(ValueError, match="inside a face"):
+            ev(near)
         ev = DistributedEvaluator(
             build(), atype, cell, devices=[DEVICE], pbc=SLAB_PBC, memory_headroom=None
         )
-        with pytest.raises(ValueError, match="inside a face"):
-            ev(coord)
+        ev(near)  # fine: still inside the cell
+        past = coord.copy()
+        past[0, 2] = cell[2, 2] + 0.1  # 0.1 A above the top face
+        with pytest.raises(ValueError, match="outside the cell along the open axis"):
+            ev(past)
 
     def test_two_open_axes_are_refused(self):
         coord, atype, cell = slab()
@@ -1484,7 +1504,7 @@ class TestUnwrappedCoordinates:
         """An atom walks out through a face while the partitioning is reused:
         every step must match a fresh evaluation of the wrapped positions."""
         coord, atype, cell, *_ = system
-        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE], skin=3.0,
+        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE] * 2, skin=3.0,
                                   memory_headroom=None)
         walk = np.array(coord, copy=True)
         i = int(np.argmax(walk[:, 0]))
@@ -1506,7 +1526,7 @@ class TestUnwrappedCoordinates:
         wraps an atom moves it by a lattice vector, and the halo built around
         its old image must not be reused."""
         coord, atype, cell, *_ = system
-        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE], skin=2.0,
+        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE] * 2, skin=2.0,
                                   memory_headroom=None)
         e0, _ = ev(torch.as_tensor(coord, device=DEVICE))
         rebuilds = ev.rebuild_count
@@ -1515,6 +1535,21 @@ class TestUnwrappedCoordinates:
         e1, _ = ev(torch.as_tensor(jumped, device=DEVICE))
         assert ev.rebuild_count == rebuilds + 1
         assert e1 == pytest.approx(e0, abs=1e-9)
+
+    def test_one_device_is_image_blind(self, system, model):
+        """On one device the list is searched every step in the real cell:
+        lattice jumps change nothing and need no rebuild."""
+        coord, atype, cell, *_ = system
+        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE],
+                                  memory_headroom=None)
+        e0, f0 = ev(torch.as_tensor(coord, device=DEVICE))
+        f0 = f0.clone()
+        rebuilds = ev.rebuild_count
+        jumped = self.shifted(coord, cell)
+        e1, f1 = ev(torch.as_tensor(jumped, device=DEVICE))
+        assert ev.rebuild_count == rebuilds
+        assert e1 == pytest.approx(e0, abs=1e-9)
+        np.testing.assert_allclose(f1.cpu().numpy(), f0.cpu().numpy(), atol=1e-9)
 
     @pytest.mark.skipif(
         not os.environ.get("DEEPMD_LR_WATER_MODEL"),
@@ -1619,9 +1654,9 @@ class TestReusedNeighbourhoods:
 
     @pytest.mark.parametrize("n", [1, 2, 4])
     def test_each_kind_of_change_rebuilds_only_what_it_must(self, system, model, n):
-        """A halo of 2 A, pair lists of 0.5 A: a small shear reuses both, a
-        0.3 A step (past half the pair skin) rebuilds the pair lists only,
-        and a 10 % strain repartitions."""
+        """A halo of 2 A: a small shear reuses it, a 0.3 A step reuses it
+        (the GPU list is searched every step, so nothing else can go stale),
+        and a 10 % strain repartitions -- on two or more devices."""
         coord, atype, cell, *_ = system
         ev = self.evaluator(model, atype, cell, n, skin=2.0, pair_skin=0.5)
         x, h = coord.copy(), cell.copy()
@@ -1635,11 +1670,19 @@ class TestReusedNeighbourhoods:
         assert (ev.rebuild_count, ev.pair_rebuild_count) == counts
         x[3] += [0.3, 0.0, 0.0]
         self.assert_same(self.reused(ev, x), self.fresh(model, x, atype, h, n))
-        assert (ev.rebuild_count, ev.pair_rebuild_count) == (counts[0], counts[1] + 1)
+        # The GPU list searches every step and caches no pair list, so a
+        # step past the old pair skin rebuilds nothing; and on one device
+        # there is no halo, so nothing is ever rebuilt.
+        assert (ev.rebuild_count, ev.pair_rebuild_count) == counts
         h, x = h * 1.1, x * 1.1
         ev.set_cell(h)
         self.assert_same(self.reused(ev, x), self.fresh(model, x, atype, h, n))
-        assert ev.rebuild_count == counts[0] + 1
+        assert ev.rebuild_count == counts[0] + (0 if n == 1 else 1)
+        # A shrink as well: on one device a 14 A box is small enough that the
+        # cell list's search radius is re-estimated for the new cell.
+        h, x = h * 0.85, x * 0.85
+        ev.set_cell(h)
+        self.assert_same(self.reused(ev, x), self.fresh(model, x, atype, h, n))
 
     @pytest.mark.parametrize("n", PARTITION_COUNTS)
     def test_a_walk_under_a_barostat_matches_fresh_evaluations(self, system, model, n):
@@ -1659,38 +1702,53 @@ class TestReusedNeighbourhoods:
             self.assert_same(self.reused(ev, x), self.fresh(model, x, atype, h, n))
         assert ev.rebuild_count < 5
 
-    def test_the_cached_graph_is_the_fresh_one(self, system, model):
-        """Same edges as a fresh search, and CSR views equal to what
-        ``attach_edge_csr`` computes from the payload, without its sorts."""
-        from deepmd.dpmodel.utils.neighbor_graph.csr import attach_edge_csr
+    def test_the_graph_is_the_dense_search_with_valid_csr(self, system, model):
+        """The GPU list searches each partition's node set with only the
+        owned atoms as centres: the edges a dense search keeps for owned
+        destinations, with CSR views that address them correctly."""
+        from deepmd.dpmodel.utils.neighbor_graph import build_neighbor_graph
+        from deepmd.pt_expt.utils.graph_csr import validate_graph_csr_for_export
 
         coord, atype, cell, *_ = system
         for part in partition_system(coord, cell, RCUT, 2, skin=1.0):
-            fresh, _, _ = partition_graph(part, coord, atype, RCUT, DEVICE)
-            cached, _, _ = partition_graph(
-                part, coord, atype, RCUT, DEVICE, pair_skin=0.5, with_csr=True
+            graph, _, _ = partition_graph(
+                part, coord, atype, RCUT, DEVICE, with_csr=True
             )
-            assert part.pairs_on(DEVICE) is not None
+            assert part.neighbor_list_on(DEVICE) is not None
+            nodes = torch.as_tensor(part.coordinates(coord), device=DEVICE)
+            nodes = nodes.unsqueeze(0)
+            types = part.types_on(atype, DEVICE).unsqueeze(0)
+            dense = build_neighbor_graph(nodes, types, None, RCUT)
+            keep = dense.edge_mask & (dense.edge_index[1] < part.n_owned)
 
-            def edges(g):
-                src, dst = (g.edge_index[k][g.edge_mask].tolist() for k in (0, 1))
+            def edges(index, mask):
+                src, dst = (index[k][mask].tolist() for k in (0, 1))
                 return set(zip(src, dst, strict=True))
 
-            assert edges(cached) == edges(fresh)
-            want = attach_edge_csr(cached, part.n_node)
-            for name in ("destination_order", "destination_row_ptr",
-                         "source_order", "source_row_ptr"):
-                assert torch.equal(getattr(cached, name), getattr(want, name)), name
-            part.drop_pairs()
-            assert part.pairs_on(DEVICE) is None
+            got = edges(graph.edge_index, graph.edge_mask)
+            want = edges(dense.edge_index, keep)
+            assert got == want
+            validate_graph_csr_for_export(
+                graph.edge_index, graph.edge_mask, graph.destination_order,
+                graph.destination_row_ptr, graph.source_order, graph.source_row_ptr,
+                part.n_node, destination_sorted=graph.destination_sorted,
+            )
+            rp, sp = graph.destination_row_ptr.tolist(), graph.source_row_ptr.tolist()
+            index, order = graph.edge_index, graph.source_order
+            for i in range(part.n_node):
+                assert bool((index[1, rp[i]:rp[i + 1]] == i).all()), f"dst row {i}"
+                srcs = index[0, order[sp[i]:sp[i + 1]]]
+                assert bool((srcs == i).all()), f"src row {i}"
 
-    def test_no_pair_skin_searches_every_call(self, system, model):
+    def test_pair_skin_has_no_effect(self, system, model):
+        """Accepted for the callers of the old path, ignored by the GPU list."""
         coord, atype, cell, *_ = system
-        ev = self.evaluator(model, atype, cell, 2, pair_skin=0)
         want = self.fresh(model, coord, atype, cell, 2)
-        self.assert_same(self.reused(ev, coord), want)
-        assert ev.pair_skin == 0 and ev.pair_rebuild_count == 0
-        assert all(p.pairs_on(DEVICE) is None for p in ev._partitions)
+        for pair_skin in (0, 0.5, "auto"):
+            ev = self.evaluator(model, atype, cell, 2, pair_skin=pair_skin)
+            self.assert_same(self.reused(ev, coord), want)
+            assert ev.pair_skin == 0 and ev.pair_rebuild_count == 0
+            assert all(p.neighbor_list_on(DEVICE) is not None for p in ev._partitions)
 
 
 # --- charge_spin and exclude_types, serial against partitioned --------------

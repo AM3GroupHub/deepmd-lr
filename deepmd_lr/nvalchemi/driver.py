@@ -32,13 +32,6 @@ from typing import (
 
 import numpy as np
 import torch
-from deepmd.dpmodel.utils.neighbor_graph.csr import (
-    attach_edge_csr,
-)
-from deepmd.dpmodel.utils.neighbor_graph.graph import (
-    NeighborGraph,
-    pad_and_guard_edges,
-)
 
 from deepmd_lr.born import (
     edge_born_response,
@@ -56,8 +49,8 @@ from deepmd_lr.model.lr_model import (
     _run_backbone,
     _symmetric_strain,
 )
-from deepmd_lr.neighbors import (
-    build_neighbor_graph_fast,
+from deepmd_lr.nvalchemi.nlist import (
+    GpuNeighborList,
 )
 from deepmd_lr.nvalchemi.partition import (
     Partition,
@@ -198,73 +191,6 @@ def partition_charges(model, graph, node_type, n_owned: int, charge_spin=None):
     return raw.reshape(-1)[:n_owned]
 
 
-def _build_pairs(coord: torch.Tensor, node_type, cutoff: float, n_owned: int) -> dict:
-    """One partition's Verlet list: every (neighbour, owned centre) pair
-    within ``cutoff``, sorted by centre, with the order grouping it by
-    neighbour. A centre-sorted list makes each step's filtered edges
-    centre-major, so their CSR views come from prefix sums, never a sort."""
-    g = build_neighbor_graph_fast(coord, node_type, None, cutoff)
-    keep = g.edge_mask & (g.edge_index[1] < n_owned)
-    src, dst = g.edge_index[0][keep], g.edge_index[1][keep]
-    order = torch.argsort(dst, stable=True)
-    src, dst = src[order].contiguous(), dst[order].contiguous()
-    return {"src": src, "dst": dst, "by_src": torch.argsort(src, stable=True)}
-
-
-def _graph_from_pairs(
-    pairs: dict, coord: torch.Tensor, rcut: float, n_node: int, with_csr: bool
-) -> NeighborGraph:
-    """This step's graph from a cached pair list: the pairs within ``rcut``,
-    in the layout DeePMD-kit's builders emit -- real edges, then two masked
-    guard edges -- with ``edge_vec`` differentiable in ``coord``.
-
-    With ``with_csr`` the destination and source views are attached from the
-    cached orders. They equal what ``attach_edge_csr`` would compute from this
-    payload (a test pins that), without its two stable sorts.
-    """
-    x = coord.reshape(-1, 3)
-    src, dst = pairs["src"], pairs["dst"]
-    # Which pairs are in range, without a gradient; then the differentiable
-    # vectors of those alone, so the force backward is as small as a fresh
-    # search's rather than the whole skin list's.
-    with torch.no_grad():
-        d = x[src] - x[dst]
-        keep = (d * d).sum(dim=1) < rcut * rcut
-    idx = keep.nonzero().squeeze(1)
-    real_index = torch.stack([src[idx], dst[idx]])
-    vec = x[real_index[0]] - x[real_index[1]]  # r_src - r_dst, NeighborGraph's sign
-    edge_index, edge_vec, edge_mask = pad_and_guard_edges(real_index, vec, None)
-    n_real, device = idx.shape[0], x.device
-    csr = {}
-    if with_csr:
-        zero = torch.zeros(1, dtype=torch.int64, device=device)
-        guards = torch.arange(n_real, edge_index.shape[1], device=device)
-
-        def row_ptr(ends):
-            counts = torch.bincount(ends, minlength=n_node)
-            return torch.cat([zero, torch.cumsum(counts, 0)])
-
-        new_position = torch.cumsum(keep, 0) - 1
-        by_src = pairs["by_src"]
-        csr = {
-            "destination_order": torch.arange(
-                edge_index.shape[1], dtype=edge_index.dtype, device=device
-            ),
-            "destination_row_ptr": row_ptr(real_index[1]),
-            "source_order": torch.cat(
-                [new_position[by_src[keep[by_src]]], guards]
-            ).to(edge_index.dtype),
-            "source_row_ptr": row_ptr(real_index[0]),
-        }
-    return NeighborGraph(
-        n_node=torch.tensor([n_node], dtype=torch.int64, device=device),
-        edge_index=edge_index,
-        edge_vec=edge_vec,
-        edge_mask=edge_mask,
-        **csr,
-    )
-
-
 def partition_graph(
     part: Partition,
     coord: np.ndarray,
@@ -277,48 +203,43 @@ def partition_graph(
     pair_skin: float = 0.0,
     with_csr: bool = False,
 ):
-    """Build one partition's neighbour graph, keeping only owned destinations.
+    """Build one partition's neighbour graph: every edge into an owned atom.
 
-    Built with ``box=None`` -- non-periodic. The halo already carries explicit
-    periodic images, so applying the boundary again inside the partition would
-    double-count it.
-
-    Edges whose destination is a ghost are masked out. That is what makes the
-    assembled sum exact: each edge survives in exactly one partition, the one
-    owning its destination.
+    The search is :class:`~deepmd_lr.nvalchemi.nlist.GpuNeighborList`, cached
+    on the partition and run at every call: nvalchemiops' cell list over the
+    node set with only the owned atoms as centres, compacted on the device
+    into DeePMD-kit's graph with no host synchronisation. Searching only from
+    owned atoms is what makes the assembled sum exact -- each edge survives in
+    exactly one partition, the one owning its destination -- without an
+    ownership mask. The whole system on one device
+    (:func:`~deepmd_lr.nvalchemi.partition.whole_system`) is searched in the
+    real cell with the real periodicity, the images carried as integer shifts;
+    a partition's node set (owned atoms plus explicit ghost images) is searched
+    non-periodically.
 
     With ``requires_grad``, the node coordinates are tracked and returned so a
-    later backward can reach them. That lets the charge-response term reuse
-    this graph instead of rebuilding it -- the search is the expensive part,
-    and it is identical either way.
-
-    With ``strain`` (a ``(3, 3)`` matrix, typically ``I + sym(eps)``), the
-    node coordinates are deformed by it before the search. That is all the
-    virial needs here: a ghost's Cartesian offset is a lattice-vector
-    combination ``n A``, which deforms as ``n A (I+eps)^T`` -- the same
-    transform as a coordinate -- so straining the assembled node set is
-    exact, and the strain reaches ``edge_vec`` through the coordinates rather
-    than through a box. That is why the partitioned virial does not need a
-    cell-differentiable neighbour builder -- nor does the serial path, which
-    strains its finished edge vectors instead.
+    later backward can reach them: the charge-response term differentiates
+    through this graph's ``edge_vec`` instead of rebuilding it. With ``strain``
+    (a ``(3, 3)`` matrix, typically ``I + sym(eps)``) the finished vectors are
+    deformed by it, which is all the virial needs: an edge vector is
+    ``x_j + S H - x_i``, every term of which deforms alike, so the strain
+    reaches ``edge_vec`` without a cell-differentiable search.
 
     Returns ``(graph, node_type_flat, node_coord)``. ``node_coord`` is the
     unstrained leaf, so a backward reaches both it and the strain.
 
     ``coord`` may be a device tensor or a numpy array; either way the node
     set is gathered on ``device`` with :meth:`Partition.views`, never
-    concatenated on the host.
-
-    With ``pair_skin`` the search runs once, at ``rcut + pair_skin``, and is
-    cached on the partition (:meth:`Partition.pairs_on`); every later call
-    only filters the cached pairs to ``rcut``. The caller keeps the list
-    honest by dropping it once any node may have moved ``pair_skin / 2`` --
-    :class:`~deepmd_lr.nvalchemi.evaluator.DistributedEvaluator` does. At
-    12,288 water atoms that turned 19.4 ms of search and CSR into 3.6.
-
-    ``with_csr`` attaches the destination/source CSR views the compressed
-    kernel needs, after the ownership mask.
+    concatenated on the host. ``with_csr`` asks for the destination and source
+    CSR views the compressed kernel needs; a compressed model then takes the
+    kernel's float32 vectors over the list's fixed-capacity buffers (its
+    kernels walk the CSR rows and never see the tail), unless the charge
+    response needs ``edge_vec`` differentiable. An uncompressed model gets
+    vectors in its own precision on a compact edge axis, since its array-API
+    descriptor processes every edge it is handed. ``pair_skin`` is accepted
+    for compatibility and has no effect.
     """
+    del pair_skin
     # One gather, on the device: owned nodes plus ghosts shifted into place,
     # taken from the global coordinate tensor with this partition's cached
     # index tensors. A numpy argument is uploaded once, here, so there is no
@@ -330,36 +251,57 @@ def partition_graph(
     )
     v = part.views(device, dtype)
     c = coord_t.detach().to(device=device, dtype=dtype)
-    nodes = torch.cat([c[v["owned"]] + v["owned_shift"], c[v["ghost"]] + v["shift"]])
+    if part.is_whole_system:
+        # The nodes ARE the atoms, in order: no gather, no shift.
+        nodes = c
+    else:
+        nodes = torch.cat(
+            [c[v["owned"]] + v["owned_shift"], c[v["ghost"]] + v["shift"]]
+        )
     node_coord = nodes.unsqueeze(0).clone().requires_grad_(requires_grad)
     node_type = part.types_on(atype, device).unsqueeze(0)
 
-    search_coord = (
-        node_coord
-        if strain is None
-        else torch.bmm(node_coord, strain.transpose(-1, -2).unsqueeze(0))
-    )
-    if pair_skin > 0:
-        pairs = part.pairs_on(device)
-        if pairs is None:
-            pairs = _build_pairs(
-                search_coord.detach(), node_type, rcut + pair_skin, part.n_owned
+    nlist = part.neighbor_list_on(device)
+    if nlist is None:
+        # Float64 vectors from the kernel when they will be differentiated
+        # (the charge response) or the model runs uncompressed; the
+        # compressed short-range model takes the float32 ones.
+        keep64 = requires_grad or not with_csr
+        if part.is_whole_system:
+            # The real cell and periodicity; `v["cell"]` is the tensor
+            # `Partition.set_cell` keeps current, read at every search.
+            nlist = GpuNeighborList(
+                part.n_node,
+                rcut,
+                device,
+                cell=v["cell"],
+                pbc=part.periodic,
+                float64_vectors=keep64,
             )
-            part.store_pairs(device, pairs)
-        graph = _graph_from_pairs(pairs, search_coord, rcut, part.n_node, with_csr)
-        return graph, node_type.reshape(-1), node_coord
-
-    graph = build_neighbor_graph_fast(search_coord, node_type, None, rcut)
-    owned_dst = graph.edge_index[1] < part.n_owned
-    graph.edge_mask = graph.edge_mask & owned_dst
-    if with_csr:
-        # AFTER the ownership mask: `build_edge_csr` routes masked edges into
-        # a padding segment using the mask it is shown, so attaching inside
-        # the builder would leave ghost-destination edges in owned rows.
-        # `canonicalize=False` leaves `edge_vec` the very tensor the search
-        # produced, so the charge-response backward still reaches
-        # `node_coord` through it.
-        graph = attach_edge_csr(graph, part.n_node)
+        else:
+            nlist = GpuNeighborList(
+                part.n_node,
+                rcut,
+                device,
+                cell=None,
+                targets=torch.arange(
+                    part.n_owned, dtype=torch.int32, device=torch.device(device)
+                ),
+                float64_vectors=keep64,
+            )
+        part.store_neighbor_list(device, nlist)
+    nlist.search(nodes)
+    if with_csr and not requires_grad:
+        graph = nlist.graph()
+    elif with_csr:
+        graph = nlist.graph(node_coord, strain, dtype=torch.float32)
+    else:
+        graph = nlist.graph(node_coord, strain, dtype=dtype, compact=True)
+        # Without the CSR views the uncompressed path assembles forces the way
+        # it always has (the array-API scatter).
+        graph.destination_order = graph.source_order = None
+        graph.destination_row_ptr = graph.source_row_ptr = None
+        graph.destination_sorted = False
     return graph, node_type.reshape(-1), node_coord
 
 
@@ -418,6 +360,7 @@ def evaluate_partitioned(
     pair_skin: float = 0.0,
     long_range_energy: Any = None,
     charge_filter: tuple[float, float] | None = None,
+    atype_device: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     """Run ``model`` over spatial partitions and assemble the global result.
 
@@ -446,10 +389,8 @@ def evaluate_partitioned(
         evaluated with the model's own charges and are unchanged. ``1.0`` is
         vacuum. See :func:`deepmd_lr.born.screening_factor`.
     pair_skin
-        Reuse each partition's cached pair list, searched at ``rcut +
-        pair_skin`` (see :func:`partition_graph`). ``0``, the default, searches
-        afresh; only a caller that tracks displacement between calls -- the
-        evaluator -- can promise the list is still complete.
+        Accepted for compatibility; no effect. The GPU list searches every
+        call (see :func:`partition_graph`).
     long_range_energy
         The long-range term to evaluate, by default ``model.long_range_energy``.
         :class:`~deepmd_lr.nvalchemi.evaluator.DistributedEvaluator` passes
@@ -458,6 +399,10 @@ def evaluate_partitioned(
         ``(c_t, delta)``: switch charges below about ``c_t`` off, smoothly,
         after the projection (:func:`~deepmd_lr.fitting.charge.filter_charges`).
         A simulation-only setting; refused with Born charges.
+    atype_device
+        ``atype`` already on the gather device, for the long-range term. A
+        caller that evaluates every step keeps one copy rather than paying a
+        pageable upload per call; ``cell`` may likewise be a device tensor.
     Returns
     -------
     dict
@@ -613,8 +558,6 @@ def evaluate_partitioned(
             virial += out["energy_derv_c_redu"].reshape(3, 3).detach().to(home, dtype)
         # Energy: owned atoms only. Each atom is scored by exactly one owner.
         per_atom = out["energy"].reshape(-1).detach().to(home, dtype)
-        atom_energy.index_add_(0, v["owned"], per_atom[: part.n_owned])
-
         # Force: every node, ghosts included. A ghost carries the reaction to
         # an owned atom's edge, and that belongs to the ghost's owner --
         # scatter-add, exactly as ghost-force reverse communication in a
@@ -625,6 +568,14 @@ def evaluate_partitioned(
         node_force = (
             out["energy_derv_r"].reshape(part.n_node, 3).detach().to(home, dtype)
         )
+        if part.is_whole_system:
+            # Nodes are the atoms in order: the sums have one term each.
+            atom_energy.copy_(per_atom)
+            force.copy_(node_force)
+            if long_range:
+                raw_charge.copy_(raw.detach().to(home, dtype))
+            continue
+        atom_energy.index_add_(0, v["owned"], per_atom[: part.n_owned])
         force.index_add_(0, v["ids"], node_force)
 
         if long_range:
@@ -648,7 +599,7 @@ def evaluate_partitioned(
             home,
             dtype,
             compute_virial=compute_virial,
-            atype=atype,
+            atype=atype if atype_device is None else atype_device,
             charge_spin=charge_spin,
             term=long_range_energy,
             charge_filter=charge_filter,

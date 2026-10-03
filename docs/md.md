@@ -45,7 +45,9 @@ short step — and is nothing to do with the long-range term.)
 
 The calculator above runs on one device, and every step copies the positions
 to the host and back. For MD that never leaves the GPU, and for several GPUs,
-use the classes in `deepmd_lr.nvalchemi`. [Partitioned MD](partitioned-md.md#the-md-classes)
+use the classes in `deepmd_lr.nvalchemi`: on one GPU the nodes are the atoms,
+the neighbour list is built on the device every step, and the only thing a
+step downloads is the energy (with the virial and a few status flags). [Partitioned MD](partitioned-md.md#the-md-classes)
 shows the workflow and class API; [example 06](../examples/06-md_nvalchemi)
 has a script per ensemble. [Example 07](../examples/07-ase-calculator)
 covers the ASE calculator.

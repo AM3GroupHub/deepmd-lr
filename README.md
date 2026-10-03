@@ -215,7 +215,7 @@ persistence: [docs/compression.md](docs/compression.md).
 | [compression.md](docs/compression.md) | compressed backbone: requirements, what changes, building the CUDA operators |
 | [born-charges.md](docs/born-charges.md) | Born effective charges and MD in an external field |
 | [partitioned-md.md](docs/partitioned-md.md) | `DistributedEvaluator`, the MD classes and one shared evaluator, your own kernel loop, what is conserved, scaling |
-| [neighbour-lists.md](docs/neighbour-lists.md) | which neighbour list runs, and the measured thresholds |
+| [neighbour-lists.md](docs/neighbour-lists.md) | which neighbour list runs: the serial model's, and the MD engine's GPU-direct one |
 | [tests.md](docs/tests.md) | what the suite pins |
 
 ```bash

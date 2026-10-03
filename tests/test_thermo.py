@@ -25,12 +25,12 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def setup(n_mol=8, **kwargs):
+def setup(n_mol=8, devices=None, **kwargs):
     model = build()
     coord, atype, cell = frame(n_mol=n_mol)
     ev = DistributedEvaluator(
         model, atype[0].cpu().numpy(), cell[0].cpu().numpy(),
-        devices=[DEVICE], **kwargs,
+        devices=[DEVICE] if devices is None else devices, **kwargs,
     )
     return ev, coord[0].cpu().numpy()
 
@@ -171,8 +171,9 @@ class TestCell:
     def test_set_cell_keeps_the_partitioning_while_the_halo_holds(self):
         """A small deformation re-expresses the nodes and repartitions nothing;
         a large one fails the Verlet bound and rebuilds at the next call. (No
-        memory probe: its first step rebuilds on purpose, at the fitted skin.)"""
-        ev, pos = setup(compute_virial=True, memory_headroom=None)
+        memory probe: its first step rebuilds on purpose, at the fitted skin.)
+        Halo semantics, hence two partitions of one device."""
+        ev, pos = setup(compute_virial=True, memory_headroom=None, devices=[DEVICE] * 2)
         th = make_thermo(ev, pos)
         th.evaluate()
         kept, rebuilds = ev._partitions, ev.rebuild_count

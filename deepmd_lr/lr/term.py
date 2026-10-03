@@ -104,6 +104,7 @@ from nvalchemiops.torch.interactions.electrostatics.ewald import (
 )
 from nvalchemiops.torch.interactions.electrostatics.k_vectors import (
     generate_k_vectors_ewald_summation,
+    generate_k_vectors_pme,
 )
 from nvalchemiops.torch.interactions.electrostatics.pme import (
     pme_reciprocal_space,
@@ -305,6 +306,13 @@ class LongRangeEnergy(torch.nn.Module):
         self.method = method
         self.slab_correction = slab_correction
         self.pbc = pbc
+        #: Refuse a degenerate cell at every call. That check reads the device,
+        #: so a driver that validates the cell on the host when it changes
+        #: (``DistributedEvaluator``) switches it off for its own term.
+        self.check_cell = True
+        #: PME k-vectors fixed by :meth:`set_k_vectors`, or None to generate
+        #: them at every call.
+        self._k_cache: tuple[torch.Tensor, torch.Tensor] | None = None
         self.mesh_spacing = mesh_spacing
         self.mesh_dimensions = mesh_dimensions
         self.spline_order = int(spline_order)
@@ -345,6 +353,40 @@ class LongRangeEnergy(torch.nn.Module):
     @classmethod
     def deserialize(cls, data: dict[str, Any]) -> "LongRangeEnergy":
         return cls(**data)
+
+    def _pbc_on(self, device) -> torch.Tensor:
+        """The periodicity flags as a device tensor, uploaded once per device.
+
+        Building them from the Python tuple at every call is a pageable
+        host-to-device copy, which blocks the host until the device has
+        drained -- one of the per-step synchronisations the MD engine removes.
+        """
+        cache = self.__dict__.setdefault("_pbc_cache", {})
+        key = str(torch.device(device))
+        pbc = cache.get(key)
+        if pbc is None:
+            pbc = torch.tensor(self.pbc, dtype=torch.bool, device=device)
+            cache[key] = pbc
+        return pbc
+
+    def set_k_vectors(self, cell: torch.Tensor | None) -> None:
+        """Fix the PME k-vectors for ``cell`` until the next call.
+
+        nvalchemiops regenerates them at every evaluation, which includes a
+        small upload from host memory that stalls the host until the device
+        has drained. A driver that evaluates the same cell step after step --
+        the MD engine -- computes them once here, when it sets the cell, and
+        the term reuses them. The caller owns the cell: it must call again
+        whenever the cell changes (``DistributedEvaluator.set_cell`` does),
+        and pass ``None`` to go back to per-call generation. ``cell`` is
+        ``(3, 3)`` or ``(1, 3, 3)`` on the device the term runs on. Only the
+        PME method has them; the Ewald sum builds its own vectors per call.
+        """
+        if cell is None or self.method != "pme":
+            self._k_cache = None
+            return
+        cell = cell.detach().reshape(1, 3, 3)
+        self._k_cache = generate_k_vectors_pme(cell, mesh_dimensions=self._mesh(cell))
 
     def _mesh(self, cell: torch.Tensor) -> tuple[int, int, int]:
         """PME mesh dimensions for this cell."""
@@ -396,29 +438,38 @@ class LongRangeEnergy(torch.nn.Module):
         nf, nloc = coord.shape[0], coord.shape[1]
         cell = box.reshape(nf, 3, 3)
 
-        volume = torch.abs(torch.linalg.det(cell.detach()))
-        if bool((volume <= 0).any()):
-            raise ValueError(
-                "The long-range term requires a non-degenerate cell, but at "
-                "least one frame has zero volume. A collapsed or unset box "
-                "cannot define periodic images."
-            )
+        if self.check_cell:
+            volume = torch.abs(torch.linalg.det(cell.detach()))
+            if bool((volume <= 0).any()):
+                raise ValueError(
+                    "The long-range term requires a non-degenerate cell, but at "
+                    "least one frame has zero volume. A collapsed or unset box "
+                    "cannot define periodic images."
+                )
 
         positions = coord.reshape(nf * nloc, 3)
         charges = charge.reshape(nf * nloc)
         if mask is not None:
             charges = charges * mask.reshape(nf * nloc).to(charges.dtype)
+        # The energy is quadratic in the charges, so the unit conversion goes
+        # onto them rather than onto the energy afterwards. Not cosmetic: the
+        # MD driver differentiates the summed energy, and nvalchemiops'
+        # backward takes its fast, read-free path only when the cotangent it
+        # receives is a plain expanded constant. A multiply after the sum
+        # turns that into a tensor it inspects on the host at every step.
+        charges = charges * math.sqrt(ELECTROSTATIC_CONVERSION)
 
         batch_idx = torch.repeat_interleave(
             torch.arange(nf, dtype=torch.int32, device=coord.device), nloc
         )
-        pbc = torch.tensor(self.pbc, dtype=torch.bool, device=coord.device)
+        pbc = self._pbc_on(coord.device)
 
         # Both backends return the k-space sum MINUS the Ewald self term,
         # which is what we want: the bare k-space sum counts each Gaussian
         # interacting with itself, an artifact of the smearing rather than a
         # physical interaction. See the module docstring.
         if self.method == "pme":
+            cached = self._k_cache
             energy = pme_reciprocal_space(
                 positions,
                 charges,
@@ -428,6 +479,8 @@ class LongRangeEnergy(torch.nn.Module):
                 spline_order=self.spline_order,
                 batch_idx=batch_idx,
                 energy_reduction="atom",
+                k_vectors=None if cached is None else cached[0],
+                k_squared=None if cached is None else cached[1],
             )
         else:
             # The explicit sum wants alpha per system as a tensor, not a
@@ -463,7 +516,6 @@ class LongRangeEnergy(torch.nn.Module):
                 energy_reduction="atom",
             )
 
-        energy = energy * ELECTROSTATIC_CONVERSION
         return energy.reshape(nf, nloc, 1)
 
 

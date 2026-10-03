@@ -114,8 +114,8 @@ def main():
           f"T {np.mean([r['T[K]'] for r in half]):.1f} K")
     net = np.abs(ev.results["field_force"].sum(axis=0)).max()
     print(f"  net field force {net:.2e} eV/A  (zero for a neutral cell)")
-    print(f"  halo skin {ev.skin:.2f} A: {ev.rebuild_count} repartitions and "
-          f"{ev.pair_rebuild_count} pair-list searches in {md.nsteps} steps")
+    print(f"  {ev.rebuild_count} repartitions in {md.nsteps} steps (one device: "
+          "the list is searched on the GPU every step, nothing to rebuild)")
     print("  If maxZ climbs above a few, the field is distorting the structure")
     print("  into configurations the model never saw -- raise the friction or")
     print("  lower the field.")

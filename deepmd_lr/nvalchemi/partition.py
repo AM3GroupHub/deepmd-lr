@@ -47,6 +47,7 @@ __all__ = [
     "halo_node_ratio",
     "partition_system",
     "skin_for_node_ratio",
+    "whole_system",
 ]
 
 
@@ -82,6 +83,14 @@ class Partition:
     owned_shift: np.ndarray | None = None
     ghost_image: np.ndarray | None = None
     owned_image: np.ndarray | None = None
+    #: Set for the whole system on one device (:func:`whole_system`): its
+    #: per-axis periodicity, which the GPU list applies through image shifts.
+    #: ``None`` for a halo partition, whose node set carries its images
+    #: explicitly and is searched non-periodically.
+    periodic: tuple[bool, bool, bool] | None = None
+    #: The cell a whole-system partition lives in, host copy; :meth:`set_cell`
+    #: keeps it and the device copy in :meth:`views` current.
+    cell: np.ndarray | None = None
     #: Device-resident index tensors, built once per device (see :meth:`views`).
     _views: dict = field(default_factory=dict, repr=False, compare=False)
 
@@ -97,6 +106,11 @@ class Partition:
     def n_node(self) -> int:
         return len(self.owned) + len(self.ghost)
 
+    @property
+    def is_whole_system(self) -> bool:
+        """Whether this is the undivided periodic system (see :func:`whole_system`)."""
+        return self.periodic is not None
+
     def global_ids(self) -> np.ndarray:
         """Global atom index of every node, owned then ghost."""
         return np.concatenate([self.owned, self.ghost])
@@ -109,7 +123,9 @@ class Partition:
     def types(self, atype: np.ndarray) -> np.ndarray:
         return np.concatenate([atype[self.owned], atype[self.ghost]])
 
-    def set_cell(self, cell: np.ndarray) -> None:
+    def set_cell(
+        self, cell: np.ndarray, device_cell: torch.Tensor | None = None
+    ) -> None:
         """Re-express the node shifts in a new cell, keeping the nodes.
 
         The nodes stay the same atoms and lattice images; only their Cartesian
@@ -117,6 +133,10 @@ class Partition:
         Whether the halo still covers every neighbour after the change is the
         caller's to judge: the evaluator's Verlet bound counts the cell's
         change as well as the atoms'.
+
+        ``device_cell``, a ``(3, 3)`` float64 tensor already holding the new
+        cell on a device, lets the cached views copy device-to-device instead
+        of uploading from pageable host memory, which would block the host.
         """
         if self.ghost_image is None or self.owned_image is None:
             raise ValueError(
@@ -126,12 +146,20 @@ class Partition:
         cell = np.asarray(cell, dtype=np.float64).reshape(3, 3)
         self.ghost_shift = self.ghost_image @ cell
         self.owned_shift = self.owned_image @ cell
+        if self.periodic is not None:
+            self.cell = cell.copy()
         for v in self._views.values():
             if isinstance(v, dict) and "ghost_image" in v:
                 shift = v["shift"]
-                h = torch.as_tensor(cell, dtype=shift.dtype, device=shift.device)
+                if device_cell is not None and device_cell.device == shift.device:
+                    h = device_cell.to(shift.dtype)
+                else:
+                    h = torch.as_tensor(cell, dtype=shift.dtype, device=shift.device)
                 shift.copy_(v["ghost_image"] @ h)
                 v["owned_shift"].copy_(v["owned_image"] @ h)
+                if "cell" in v:
+                    # The GPU list reads this tensor at every search.
+                    v["cell"].copy_(h.to(torch.float64).reshape(1, 3, 3))
 
     def views(self, device, dtype=torch.float64) -> dict:
         """This partition's index tensors on ``device``, built once and cached.
@@ -171,25 +199,27 @@ class Partition:
                     v[name] = torch.as_tensor(
                         np.asarray(image).reshape(-1, 3), dtype=dtype, device=dev
                     )
+            if self.periodic is not None:
+                # float64 whatever `dtype` is: the GPU list searches in float64.
+                v["cell"] = torch.as_tensor(
+                    np.asarray(self.cell, dtype=np.float64).reshape(1, 3, 3),
+                    device=dev,
+                )
             self._views[key] = v
         return v
 
-    def pairs_on(self, device) -> dict | None:
-        """This partition's cached pair list on ``device``, if one is live.
+    def neighbor_list_on(self, device):
+        """This partition's GPU neighbour list on ``device``, if one exists.
 
-        Built by :func:`~deepmd_lr.nvalchemi.driver.partition_graph` at
-        ``rcut`` plus a skin and filtered to ``rcut`` every step; the
-        evaluator drops it (:meth:`drop_pairs`) once the atoms or the cell
-        have moved far enough to invalidate it.
+        Built on first use by :func:`~deepmd_lr.nvalchemi.driver.partition_graph`
+        (a :class:`~deepmd_lr.nvalchemi.nlist.GpuNeighborList` over this node
+        set with the owned atoms as centres) and kept for the partition's
+        life: its buffers are sized once and overwritten by every search.
         """
-        return self._views.get(("pairs", str(torch.device(device))))
+        return self._views.get(("nlist", str(torch.device(device))))
 
-    def store_pairs(self, device, pairs: dict) -> None:
-        self._views[("pairs", str(torch.device(device)))] = pairs
-
-    def drop_pairs(self) -> None:
-        for key in [k for k in self._views if isinstance(k, tuple) and k[0] == "pairs"]:
-            del self._views[key]
+    def store_neighbor_list(self, device, nlist) -> None:
+        self._views[("nlist", str(torch.device(device)))] = nlist
 
     def types_on(self, atype: np.ndarray, device) -> torch.Tensor:
         """Node types on ``device``, cached (the type of an atom never changes)."""
@@ -220,6 +250,37 @@ class Partition:
             )
             self._views[key] = c
         return c
+
+
+def whole_system(n_atoms: int, pbc, cell: np.ndarray) -> Partition:
+    """The undivided system as one partition: every atom owned, no ghosts.
+
+    What one device runs with the GPU-direct list. There is no halo because
+    there is nothing to exchange with: the list searches the real cell with
+    the real periodicity and records each pair's lattice image as an integer
+    shift, so the nodes are the atoms -- 1.96M of them instead of the 2.76M
+    the periodic-image halo used to add on one H200 -- and
+    :func:`partition_system`'s host-side spatial sort never runs. The
+    coordinates may be unwrapped; nvalchemiops folds the images into the
+    shifts itself.
+
+    ``owned_image`` and ``ghost_image`` are present (all zero, and empty) so
+    :meth:`Partition.set_cell` works unchanged under a barostat.
+    """
+    n = int(n_atoms)
+    if n < 1:
+        raise ValueError(f"the system needs at least one atom, got {n}")
+    flags = tuple(bool(p) for p in np.broadcast_to(np.asarray(pbc, dtype=bool), (3,)))
+    return Partition(
+        owned=np.arange(n),
+        ghost=np.zeros(0, dtype=int),
+        ghost_shift=np.zeros((0, 3)),
+        owned_shift=np.zeros((n, 3)),
+        ghost_image=np.zeros((0, 3), dtype=int),
+        owned_image=np.zeros((n, 3), dtype=int),
+        periodic=flags,
+        cell=np.asarray(cell, dtype=np.float64).reshape(3, 3).copy(),
+    )
 
 
 def _image_shifts(cell: np.ndarray, pbc, rcut: float) -> np.ndarray:

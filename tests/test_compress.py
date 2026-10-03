@@ -503,10 +503,10 @@ class TestKernel:
         )
 
     @pytest.mark.parametrize("n_part", [1, 2, 4])
-    def test_cached_pairs_feed_the_compressed_kernel(self, n_part):
-        """A partition's cached pair list hands the compressed kernel CSR views
-        made from prefix sums rather than sorts. The first call searches and
-        caches, the second reuses; both give the fresh search's answer."""
+    def test_the_gpu_list_feeds_the_compressed_kernel(self, n_part):
+        """Each partition's GPU list hands the compressed kernel CSR views made
+        on the device, without a sort; repeated calls on the same partitions
+        give the same answer as the first, and `pair_skin` changes nothing."""
         from deepmd_lr.nvalchemi.partition import partition_system
 
         model = build32()
@@ -528,7 +528,7 @@ class TestKernel:
             assert abs(cached["energy"] - fresh["energy"]) < 1e-6
             for key in ("force", "born_charge"):
                 np.testing.assert_allclose(cached[key], fresh[key], atol=1e-6)
-        assert all(part.pairs_on(DEVICE) is not None for part in parts)
+        assert all(part.neighbor_list_on(DEVICE) is not None for part in parts)
 
     def test_a_replica_carries_the_tables(self):
         model = build32()

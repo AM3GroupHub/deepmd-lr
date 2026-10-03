@@ -52,6 +52,13 @@ the model first.
 - `test_multi_task.py`, `test_same_as.py` — multi-head sharing and the
   `same_as` expansion.
 - `test_neighbors.py` — the cell-list graph against the dense builder.
+- `test_nlist.py` — the MD engine's GPU-direct list against the dense oracle:
+  periodic, small (several images of one pair), triclinic and slab cells,
+  unwrapped positions, a partition's halo node set with owned centres and a
+  set that drifts past its box; both CSR views valid; a matrix or an edge
+  buffer that is too small reported and grown; a poisoned tail never read; a
+  warm search without a synchronising op and correct on a side stream; the
+  differentiable vectors reaching the coordinates and the strain.
 
 **Running it**
 
@@ -63,9 +70,10 @@ the model first.
   the vacuum, centred, and made whole when the file wrapped it; fixed atoms
   read back and moved with the slab; molecules and wires refused.
 - `test_nvalchemi.py` — the partitioner and halo (including unwrapped
-  coordinates), the skin rules and memory probe, the device gather, the
-  gathered long-range term and virial, and `DistributedEvaluator`, whose
-  reused partitions (across cell changes) and cached pair lists must match a
+  coordinates), the skin rules and memory probe (two partitions of one
+  device: on one device there is no halo), the device gather, the gathered
+  long-range term and virial, and `DistributedEvaluator`, whose one-device
+  whole-system list and reused partitions (across cell changes) must match a
   fresh evaluation at every call. A slab matches the serial model at 1, 2 and
   4 partitions, its pbc switches the slab sum on, and an atom near an open
   face is refused; a slab term on a bulk cell takes the 3D sum, and an
@@ -73,6 +81,10 @@ the model first.
   reproduces its unit cell. Evaluators sharing one model, for different cells
   and boundaries, each keep their own term, and none changes the model.
   `charge_spin` and `exclude_types` hold serially and partitioned alike.
+- `test_sync.py` — one download per evaluation: the energy word on one device
+  (compressed, short- or long-range, with or without the virial), one bool
+  more on two partitions, one more for an uncompressed model's compact edge
+  count; no pageable upload, no `nonzero`, no `bincount`.
 - `test_thermo.py` — `Thermo`'s measurements, warp aliasing, cell sync, the
   guards that make one evaluator safe to share (`fresh`,
   `cell_is_current`, `set_state`), and fixed atoms: read from `FixAtoms` by
@@ -96,8 +108,9 @@ the model first.
   graph-lower guard, argument validation, state left intact by a failed
   compression, the strict mode's refusal to collect without a kernel, and,
   with the operator, kernel dispatch, compressed-vs-uncompressed agreement,
-  and the cached pair lists' CSR driving the kernel to the fresh search's
-  answer.
+  and the GPU list's CSR views driving the kernel to the serial model's
+  answer at 1, 2 and 4 partitions.
+
 
 **Plumbing**
 

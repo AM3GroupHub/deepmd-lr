@@ -329,6 +329,14 @@ conservation checks.
 
 ### How the atoms are split
 
+**On one device they are not.** The node set is the system itself
+(`partition.whole_system`): every atom owned, no ghosts, and the GPU-direct
+neighbour list below searches the real cell with the real periodicity,
+recording each pair's lattice image as an integer shift. The nodes are the
+atoms -- 1.96M of them where the periodic-image halo used to add 0.8M more
+on one H200 -- and the host-side spatial sort never runs. The rest of this
+section is about two or more devices.
+
 Into a grid of blocks, not slabs. What a device has to hold is its owned block
 plus a shell of ghosts `rcut + skin` deep on every side, and that shell is the
 part that does not shrink when the block does. Slabs keep two faces at full
@@ -349,7 +357,9 @@ their neighbours: 1.1 eV/Å on water once the unwrapped cloud spanned L + 12 Å,
 which a few picoseconds of diffusion reaches. Nothing needs folding between
 rebuilds: a node moves with its atom, and the Verlet check below reads raw
 displacement, so a caller that does wrap an atom (a jump by a lattice vector)
-simply triggers a rebuild.
+simply triggers a rebuild. On one device the question does not arise: the
+cell-list kernel folds the images into the pair shifts itself, at every step,
+and a lattice jump changes nothing.
 
 What that buys, as nodes on the busiest device, water at the auto skin:
 
@@ -411,34 +421,104 @@ With the cell fixed that is the raw displacement, as before. Before this,
 41,472. It now rebuilds when the atoms or the cell have moved enough, about
 as often as NVT does.
 
-### Reusing each partition's neighbour search
+The bound is evaluated on the device and read back as one bool per step (it
+used to download two reductions); the cell goes to the device through pinned
+memory, so a barostat's `set_cell` does not stall the host either. On one
+device nothing is reused and nothing is rebuilt: `rebuild_count` only counts
+the rebuilds `repartition_every` forces, and `pair_rebuild_count` stays zero.
 
-Every step each partition used to search its nodes for pairs within `rcut`
-afresh and sort the edges twice for the compressed kernel's CSR views: half
-of every evaluation at 12,288 atoms and up (27 % search, 23 % sorting). Each
-partition now keeps a pair list searched at `rcut + pair_skin`, sorted by
-centre. Every step filters it to `rcut` and derives both CSR views from
-prefix sums, with no search and no sort, until some node may have moved
-`pair_skin / 2`. `pair_skin="auto"` is 1 Å, capped by the halo's skin, and
-`pair_skin=0` searches every step. The edge set is the fresh search's (a
-test compares them, and the CSR against `attach_edge_csr`). Only the edge
-order differs, which moves results by summation-order rounding. With the
-float32 water model, 200 steps of NVE drifted 1.6e-6 Å from the fresh-search
-run, against 1.2e-6 Å between two fresh-search runs.
+### The neighbour list lives on the device
 
-Both together, compressed water on one GB10, ms/step:
+Every step, each node set is searched afresh at `rcut` by
+`GpuNeighborList` (`deepmd_lr/nvalchemi/nlist.py`): nvalchemiops' cell list
+over the nodes, with only the owned atoms as search centres, so no ownership
+mask is needed and every edge lands in exactly one partition. The kernel
+leaves a neighbour matrix -- row `i` holds centre `i`'s neighbours and their
+image shifts -- and two small Warp kernels turn it into DeePMD-kit's graph
+without a sort: the destination CSR is a prefix sum of the row counts and a
+fill kernel compacts the rows into `edge_index`; the source CSR is built the
+way LAMMPS-Kokkos builds it, a per-node count, a prefix sum and an atomic
+cursor. The pair vector is `x[j] − x[i] + S·H`, nvalchemiops' and
+DeePMD-kit's convention at once, so the shifts pass straight through, and
+unwrapped coordinates are fine: the kernel folds the images into `S`.
 
-| atoms | NVT, search every step | NVT | NPT, repartitioning every step | NPT |
-|---:|---:|---:|---:|---:|
-| 192 | 13.1 | 10.6 | 14.7 | 12.9 |
-| 12,288 | 35.6 | 24.9 | 66.3 | 26.9 |
-| 41,472 | 97.0 | 67.9 | 154.5 | 70.4 |
+Nothing is cached between steps and nothing reads the host: the buffers are
+allocated once (sized by the first search, which is the one that
+synchronises), the edge count stays a device scalar, `edge_mask` marks where
+the real edges end, and a device status word reports a matrix row or an edge
+buffer that overflowed, in which case the evaluator widens it and repeats the
+step (on the first steps of a run, if at all). A compressed model takes the
+kernel's float32 vectors over the full buffers -- its kernels walk the CSR
+rows and never see the tail -- unless the charge response needs `edge_vec`
+differentiable, in which case the vectors are recomputed from the node
+coordinates and the strain; an uncompressed model gets vectors in its own
+precision on a compact edge axis, at the cost of one more download (the edge
+count), because its descriptor processes every edge it is handed.
+
+What this replaced: DeePMD-kit's builder over every node, ghosts included,
+then a dense-matrix decode, float64 vectors for every candidate pair, two
+stable argsorts and a per-step `nonzero`/`bincount` filter of a cached pair
+list, about ten host synchronisations per step. On one H200 at 1.96M water
+atoms that was 649 ms per search and 61 ms per step for the graph, against
+9.7 and 17.7 for LAMMPS-Kokkos, and on one GPU the periodic-image halo made
+the model run on 2.76M nodes instead of 1.96M. nvalchemiops' search itself
+scales linearly -- 0.96, 6.6 and 56 ms at 10k, 169k and 1.96M atoms on a
+GB10, whose memory is some fifteen times slower than an H200's -- so a
+stateless search every step costs less than the bookkeeping a reusable list
+needs. A Verlet-reuse variant (search at `rcut + skin`, filter per step) is
+measured against it in `experiments/scaling/profile_nlist.py` and will be
+added only if the per-step search turns out to matter on the H200.
+
+`pair_skin` therefore does nothing any more; the argument is accepted for
+the callers of the old pair-list path, which is gone.
+
+Measured 2026-10-02, water, the compressed SR model (`DP_CUDA_INFER=2`),
+ms per MD step and per piece (the old path's 1.96M numbers are the H200
+profile the brief was written from; its profiler ran out of the H200's 139 GB
+at that size):
+
+| GPU | atoms | path | step | graph (+ search) | forward | nodes | peak GiB |
+|---|---:|---|---:|---:|---:|---:|---:|
+| GB10 | 10,368 | pair list | 10.2 | 4.0 (+17 per rebuild, every ~13 steps) | 4.2 | 23,529 | 0.9 |
+| GB10 | 10,368 | GPU list | 3.6 | 1.2 | 2.1 | 10,368 | 0.1 |
+| GB10 | 169,344 | pair list | 146 | 68.5 (+227 per rebuild) | 57.5 | 277,074 | 11.1 |
+| GB10 | 169,344 | GPU list | 53 | 13.6 | 39.1 | 169,344 | 1.9 |
+| H200 | 10,368 | pair list | 4.3 | 0.7 (+3.7 per rebuild, 28 ms repartition) | 1.2 | 23,422 | — |
+| H200 | 10,368 | GPU list | 2.6 | 0.8 | 1.2 | 10,368 | 0.2 |
+| H200 | 1,956,864 | pair list | 213 | 61 (+704 per rebuild, 3.8 s repartition) | 95 | 2,757,158 | 115 |
+| H200 | 1,956,864 | GPU list | 97 | 26 | 68 | 1,956,864 | 22 |
+
+The list's own stages on the H200 at 1.96M: query 12.8 ms, fill 7.1, source
+CSR 6.2, 26 ms in all for 175M edges (89 per atom), the same standalone,
+inside the evaluator and after 50 MD steps on the moved, unwrapped positions
+(hopper-29; one earlier run on hopper-26 had the query kernel at 54 ms and the
+step at 139 ms with the same binary and inputs -- a node, not the code; if a
+step looks slow, compare nodes before anything else). The step is then 97 ms
+against LAMMPS-Kokkos's 90 on the same problem, with the model's kernels at
+68 ms. A search at `rcut + 1 A`, what a Verlet variant would pay per rebuild,
+costs 44 ms for 280M pairs; with the per-step query at 12 ms, a Verlet list
+would save a few ms per step at the price of reference positions, fold
+images, a rebuild bound and the cell-change bookkeeping, so it is not built.
+
+A graph that is differentiated -- the charge response, the virial strain --
+or a model that runs in float64 asks the list for `float64_vectors`: the fill
+kernel then keeps its float64 vectors too, and `edge_vec` hands them out
+through an autograd function whose backward is the exact adjoint of the two
+gathers, a scatter-add onto the source and its negative onto the destination.
+The strain product has its own backward as well, because autograd's version
+reduces `vec^T @ g` with a `(3, E) x (E, 3)` GEMM that cuBLAS mishandles at
+tens of millions of edges. On the GB10 at 169k atoms the long-range path's
+vectors, strain and backward went from 141 ms (recomputed in torch, with a
+`(E, 3) x (3, 3)` float64 matmul on a bad kernel) to 64 ms in float64 and
+36 ms in float32; without the strain, 13 ms.
 
 ### The knob that decides multi-GPU scaling
 
-**`skin` (default `"auto"`).** The decomposition is reused until an atom has
-moved half the skin, then rebuilt on the host by a spatial sort whose cost
-grows with the atom count. Measured on two A40s at 98,304 atoms:
+**`skin` (default `"auto"`).** Two or more devices only: on one device
+there is no halo to size, the node count is the atom count whatever the
+skin, and the memory probe below does not run. The decomposition is reused
+until an atom has moved half the skin, then rebuilt on the host by a spatial
+sort whose cost grows with the atom count. Measured on two A40s at 98,304 atoms:
 
 | skin (Å) | ms/step | rebuild | serial fraction | 2-GPU Amdahl ceiling |
 |---|---|---|---|---|
@@ -538,8 +618,12 @@ to_numpy(out)["force"]            # numpy (N, 3), one explicit download
 `DistributedEvaluator` keeps the tensor path: the forces go straight into the
 buffer the warp integrator aliases, so they never leave the GPU between steps,
 and `results` converts an entry to numpy only when it is read. One download
-per step remains, the energy scalar, because the call returns it as a Python
-float.
+per step remains, because the call returns the energy as a Python float: the
+energy, the neighbour list's status flags and, with `compute_virial`, the
+virial come back in one small copy. On one device that is the step's only
+host synchronisation; two or more devices add the one bool of the halo's
+Verlet check; an uncompressed model adds its compact edge count.
+`tests/test_sync.py` pins these counts.
 
 ## Limits
 
@@ -577,8 +661,8 @@ float.
 
   So compressed runs below roughly 100,000 atoms belong on one GPU, and an
   uncompressed run overlaps at 80–86 % across two. The fixed per-partition
-  host cost -- the neighbour search and eager-PyTorch dispatch -- is what more
-  partitions multiply.
+  host cost -- eager-PyTorch dispatch; the neighbour search no longer reads
+  the host -- is what more partitions multiply.
 
 - **Neighbour lists.** Which builder runs for the descriptor and for the
   charge head, why a rebuilt model must re-resolve `neighbor_graph_method`,

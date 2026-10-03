@@ -203,8 +203,9 @@ affected.
 
 ## NPT moves the cell, and the evaluator has to be told
 
-`DistributedEvaluator` partitions the atoms against its cell, and NPT moves
-the cell every step. So after the barostat runs, the NPT and NPH classes push
+With two or more devices `DistributedEvaluator` partitions the atoms against
+its cell (on one device nothing is partitioned: the list searches the real
+cell every step), and NPT moves the cell every step. So after the barostat runs, the NPT and NPH classes push
 the new cell to the evaluator (`Thermo.set_cell`). The partitions keep their
 nodes -- the same atoms and lattice images -- and re-express the images'
 offsets in the new cell. The evaluator's Verlet bound counts the cell's change

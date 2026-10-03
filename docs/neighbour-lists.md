@@ -1,6 +1,8 @@
 # Which neighbour list runs
 
-Two neighbour graphs are built per step, chosen independently.
+Three neighbour graphs exist, chosen independently: the descriptor's and the
+charge head's for the serial model (training, the ASE calculator), and the MD
+engine's own, which lives on the device.
 
 **The descriptor's**, which DeePMD-kit owns, is selected by
 `neighbor_graph_method`. It resolves once at *training* startup — default
@@ -25,8 +27,8 @@ the atom count clears the threshold for its boundary condition.
 | with a cell (`box` given) | `CELL_LIST_MIN_ATOMS_PBC = 0` | **always** — any size |
 | no cell (`box=None`) | `CELL_LIST_MIN_ATOMS_FREE = 1024` | 1024 atoms and up |
 
-Partitions are the second case: the halo already carries the images, so the
-partitioned driver builds its graph with `box=None`.
+The partitioned driver used to be the second case (a halo with explicit
+images, searched with `box=None`); it now has its own list, below.
 
 The thresholds come from measurement, median of 7 after warm-up on one GB10
 (ms):
@@ -63,4 +65,26 @@ Only the *search* is taken from nvalchemiops: its edge vectors come out of a
 Warp kernel with no gradient, so they are discarded and DeePMD-kit's
 `neighbor_graph_from_ijs` recomputes `edge_vec` from `coord`/`box`. Using the
 kernel's vectors directly would produce a model with no forces.
+
+**The MD engine's**, `GpuNeighborList` in `deepmd_lr/nvalchemi/nlist.py`,
+which `DistributedEvaluator` uses for every node set. It calls nvalchemiops'
+cell list directly, every step at `rcut`, into preallocated buffers, and
+compacts the neighbour matrix into DeePMD-kit's graph with two Warp kernels
+(the destination CSR by a prefix sum, the source CSR by an atomic cursor as
+LAMMPS-Kokkos does), with no sort and no host synchronisation after the
+first, sizing search. The kernel's `r = x[j] − x[i] + S·cell` is DeePMD-kit's
+`edge_index = [j, i]`, `edge_vec = r_src − r_dst`, so the integer shifts pass
+through; unwrapped positions are folded into `S` by the kernel. On one device
+the list searches the real cell with the real periodicity (no halo, nodes =
+atoms); on a partition it searches the owned atoms plus their explicit ghost
+images non-periodically, with only the owned atoms as centres. Here the
+kernel's float32 vectors *are* used when nothing differentiates through them
+(a compressed short-range model: DeePMD-kit assembles forces from the edge
+gradients through the CSR views); the charge response and the virial, which
+do, get vectors recomputed from the node coordinates and the strain. The
+mechanics, the measured costs and the one-download-per-step contract are in
+[Running MD over partitions](partitioned-md.md#the-neighbour-list-lives-on-the-device).
+Small boxes (several images of one pair, an atom seeing its own image),
+slabs, triclinic cells and lattice jumps are checked against the dense oracle
+in `tests/test_nlist.py`.
 
