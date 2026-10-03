@@ -424,7 +424,7 @@ as often as NVT does.
 The bound is evaluated on the device and read back as one bool per step (it
 used to download two reductions). On one device nothing is reused and nothing
 is rebuilt: `rebuild_count` only counts the rebuilds `repartition_every`
-forces, and `pair_rebuild_count` stays zero.
+forces.
 
 **A barostat never touches the host.** The cell it integrates is a device
 tensor, and `Thermo.set_cell_device` hands it on as one: the evaluator copies
@@ -489,9 +489,6 @@ stateless search every step costs less than the bookkeeping a reusable list
 needs. A Verlet-reuse variant (search at `rcut + skin`, filter per step) is
 measured against it in `experiments/scaling/profile_nlist.py` and will be
 added only if the per-step search turns out to matter on the H200.
-
-`pair_skin` therefore does nothing any more; the argument is accepted for
-the callers of the old pair-list path, which is gone.
 
 Measured 2026-10-02, water, the compressed SR model (`DP_CUDA_INFER=2`),
 ms per MD step and per piece (the old path's 1.96M numbers are the H200

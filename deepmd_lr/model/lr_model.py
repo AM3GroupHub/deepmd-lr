@@ -1045,7 +1045,7 @@ class LongRangeEnergyModel(EnergyModel):
                     "would silently fall back to the uncompressed math. Graphs "
                     "built by DeePMD-kit's own forward get them from "
                     "`get_geo_compress()`; a hand-built graph needs "
-                    "`attach_edge_csr`."
+                    "`build_neighbor_graph_fast(..., with_csr=True)`."
                 )
         return super().forward_common_lower_graph(
             atype,

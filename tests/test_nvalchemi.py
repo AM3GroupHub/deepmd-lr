@@ -1611,9 +1611,9 @@ class TestUnwrappedCoordinates:
 
 class TestReusedNeighbourhoods:
     """Between calls the evaluator reuses the partitions -- across cell
-    changes too -- and each partition's pair list. Neither may change an
-    answer: every check compares with a fresh evaluation of the same positions
-    and cell, with new partitions and a fresh neighbour search."""
+    changes too. That may not change an answer: every check compares with a
+    fresh evaluation of the same positions and cell, with new partitions and
+    a fresh neighbour search."""
 
     KEYS = ("energy", "force", "charge", "born_charge", "virial")
 
@@ -1658,26 +1658,26 @@ class TestReusedNeighbourhoods:
         (the GPU list is searched every step, so nothing else can go stale),
         and a 10 % strain repartitions -- on two or more devices."""
         coord, atype, cell, *_ = system
-        ev = self.evaluator(model, atype, cell, n, skin=2.0, pair_skin=0.5)
+        ev = self.evaluator(model, atype, cell, n, skin=2.0)
         x, h = coord.copy(), cell.copy()
         self.assert_same(self.reused(ev, x), self.fresh(model, x, atype, h, n))
-        counts = (ev.rebuild_count, ev.pair_rebuild_count)
+        count = ev.rebuild_count
         shear = np.eye(3)
         shear[1, 0] = shear[0, 1] = 1e-3
         h, x = h @ shear, x @ shear
         ev.set_cell(h)
         self.assert_same(self.reused(ev, x), self.fresh(model, x, atype, h, n))
-        assert (ev.rebuild_count, ev.pair_rebuild_count) == counts
+        assert ev.rebuild_count == count
         x[3] += [0.3, 0.0, 0.0]
         self.assert_same(self.reused(ev, x), self.fresh(model, x, atype, h, n))
-        # The GPU list searches every step and caches no pair list, so a
-        # step past the old pair skin rebuilds nothing; and on one device
-        # there is no halo, so nothing is ever rebuilt.
-        assert (ev.rebuild_count, ev.pair_rebuild_count) == counts
+        # The GPU list searches every step, so a 0.3 A step within the halo
+        # rebuilds nothing; and on one device there is no halo, so nothing
+        # is ever rebuilt.
+        assert ev.rebuild_count == count
         h, x = h * 1.1, x * 1.1
         ev.set_cell(h)
         self.assert_same(self.reused(ev, x), self.fresh(model, x, atype, h, n))
-        assert ev.rebuild_count == counts[0] + (0 if n == 1 else 1)
+        assert ev.rebuild_count == count + (0 if n == 1 else 1)
         # A shrink as well: on one device a 14 A box is small enough that the
         # cell list's search radius is re-estimated for the new cell.
         h, x = h * 0.85, x * 0.85
@@ -1739,16 +1739,6 @@ class TestReusedNeighbourhoods:
                 assert bool((index[1, rp[i]:rp[i + 1]] == i).all()), f"dst row {i}"
                 srcs = index[0, order[sp[i]:sp[i + 1]]]
                 assert bool((srcs == i).all()), f"src row {i}"
-
-    def test_pair_skin_has_no_effect(self, system, model):
-        """Accepted for the callers of the old path, ignored by the GPU list."""
-        coord, atype, cell, *_ = system
-        want = self.fresh(model, coord, atype, cell, 2)
-        for pair_skin in (0, 0.5, "auto"):
-            ev = self.evaluator(model, atype, cell, 2, pair_skin=pair_skin)
-            self.assert_same(self.reused(ev, coord), want)
-            assert ev.pair_skin == 0 and ev.pair_rebuild_count == 0
-            assert all(p.neighbor_list_on(DEVICE) is not None for p in ev._partitions)
 
 
 # --- charge_spin and exclude_types, serial against partitioned --------------

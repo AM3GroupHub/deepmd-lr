@@ -506,7 +506,7 @@ class TestKernel:
     def test_the_gpu_list_feeds_the_compressed_kernel(self, n_part):
         """Each partition's GPU list hands the compressed kernel CSR views made
         on the device, without a sort; repeated calls on the same partitions
-        give the same answer as the first, and `pair_skin` changes nothing."""
+        give the same answer as the first."""
         from deepmd_lr.nvalchemi.partition import partition_system
 
         model = build32()
@@ -516,15 +516,15 @@ class TestKernel:
         c, a, h = (t[0].cpu().numpy() for t in (coord, atype, cell))
         parts = partition_system(c, h, float(model.get_rcut()), n_part, skin=1.0)
 
-        def run(pair_skin):
+        def run():
             return DRV.to_numpy(DRV.evaluate_partitioned(
                 model, c, a, h, n_partitions=n_part, compute_born=True,
-                partitions=parts, pair_skin=pair_skin,
+                partitions=parts,
             ))
 
-        fresh = run(0.0)
+        fresh = run()
         for _ in range(2):
-            cached = run(0.5)
+            cached = run()
             assert abs(cached["energy"] - fresh["energy"]) < 1e-6
             for key in ("force", "born_charge"):
                 np.testing.assert_allclose(cached[key], fresh[key], atol=1e-6)

@@ -90,11 +90,6 @@ STATUS_OPEN_FACE = 2
 #: before giving up: each widening is 1.25x, so this is a factor of about 3.
 MAX_LIST_GROWTHS = 5
 
-#: Kept for compatibility: the pair-list skin of the path the GPU list
-#: replaced. A ``pair_skin`` argument is accepted and ignored; the list is
-#: searched every step (see ``docs/partitioned-md.md``).
-AUTO_PAIR_SKIN = 1.0
-
 
 def _is_out_of_memory(exc: BaseException) -> bool:
     """Whether ``exc`` is a device that ran out of memory.
@@ -218,9 +213,6 @@ class DistributedEvaluator:
     repartition_every
         Force a rebuild every N calls regardless. ``None`` uses the skin
         criterion alone, which is exact rather than merely usually right.
-    pair_skin
-        Accepted for compatibility; no effect. The neighbour list is built on
-        the device at every step (see :attr:`pair_skin`).
     compute_born
         Also assemble Born effective charge tensors, available afterwards as
         ``results["born_charge"]`` with shape ``(natoms, 3, 3)``. The global
@@ -300,7 +292,6 @@ class DistributedEvaluator:
         long_range: dict | None = None,
         skin: float | str = "auto",
         repartition_every: int | None = None,
-        pair_skin: float | str = "auto",
         compute_virial: bool = False,
         compute_born: bool = False,
         efield: Any = None,
@@ -317,11 +308,6 @@ class DistributedEvaluator:
                 raise ValueError(f"skin must be a number or 'auto', got {skin!r}")
         elif skin < 0:
             raise ValueError(f"skin must be non-negative, got {skin}")
-        if pair_skin != "auto" and not (
-            isinstance(pair_skin, (int, float)) and pair_skin >= 0
-        ):
-            raise ValueError(f"pair_skin must be 'auto' or >= 0, got {pair_skin!r}")
-        del pair_skin
         if memory_headroom is not None and not 0.0 < memory_headroom <= 1.0:
             raise ValueError(
                 f"memory_headroom must be in (0, 1], got {memory_headroom}"
@@ -490,10 +476,6 @@ class DistributedEvaluator:
         self._reference_cell = None
         self._images = None
         self._reach = 0.0
-        #: Always zero: the GPU list caches no pair list. Kept, with
-        #: :attr:`pair_rebuild_count`, for callers written for the old path.
-        self.pair_skin = 0.0
-        self.pair_rebuild_count = 0
 
         self.rebuild_count = 0
         #: Completed evaluations. Several MD objects may share this evaluator,
@@ -919,7 +901,6 @@ class DistributedEvaluator:
                     compute_born=self.compute_born,
                     charge_spin=self.charge_spin,
                     eps_inf=self.eps_inf,
-                    pair_skin=self.pair_skin,
                     pbc=self.pbc,
                     long_range_energy=self.long_range_energy,
                     charge_filter=self.charge_filter,

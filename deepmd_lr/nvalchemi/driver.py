@@ -203,7 +203,6 @@ def partition_graph(
     dtype=torch.float64,
     requires_grad: bool = False,
     strain: torch.Tensor | None = None,
-    pair_skin: float = 0.0,
     with_csr: bool = False,
 ):
     """Build one partition's neighbour graph: every edge into an owned atom.
@@ -239,10 +238,8 @@ def partition_graph(
     kernels walk the CSR rows and never see the tail), unless the charge
     response needs ``edge_vec`` differentiable. An uncompressed model gets
     vectors in its own precision on a compact edge axis, since its array-API
-    descriptor processes every edge it is handed. ``pair_skin`` is accepted
-    for compatibility and has no effect.
+    descriptor processes every edge it is handed.
     """
-    del pair_skin
     # One gather, on the device: owned nodes plus ghosts shifted into place,
     # taken from the global coordinate tensor with this partition's cached
     # index tensors. A numpy argument is uploaded once, here, so there is no
@@ -360,7 +357,6 @@ def evaluate_partitioned(
     charge_spin: torch.Tensor | tuple[float, float] | None = None,
     compute_born: bool = False,
     eps_inf: float = 1.0,
-    pair_skin: float = 0.0,
     long_range_energy: Any = None,
     charge_filter: tuple[float, float] | None = None,
     atype_device: torch.Tensor | None = None,
@@ -391,9 +387,6 @@ def evaluate_partitioned(
         ``q~_i q~_j / (4 pi eps_0 eps_inf r)``. Energies and forces are
         evaluated with the model's own charges and are unchanged. ``1.0`` is
         vacuum. See :func:`deepmd_lr.born.screening_factor`.
-    pair_skin
-        Accepted for compatibility; no effect. The GPU list searches every
-        call (see :func:`partition_graph`).
     long_range_energy
         The long-range term to evaluate, by default ``model.long_range_energy``.
         :class:`~deepmd_lr.nvalchemi.evaluator.DistributedEvaluator` passes
@@ -502,7 +495,6 @@ def evaluate_partitioned(
                 dtype,
                 requires_grad=long_range,
                 strain=strain,
-                pair_skin=pair_skin,
                 with_csr=_is_compressed(local),
             )
             n_node, n_local = part.counts_on(device)
