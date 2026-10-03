@@ -422,10 +422,26 @@ With the cell fixed that is the raw displacement, as before. Before this,
 as often as NVT does.
 
 The bound is evaluated on the device and read back as one bool per step (it
-used to download two reductions); the cell goes to the device through pinned
-memory, so a barostat's `set_cell` does not stall the host either. On one
-device nothing is reused and nothing is rebuilt: `rebuild_count` only counts
-the rebuilds `repartition_every` forces, and `pair_rebuild_count` stays zero.
+used to download two reductions). On one device nothing is reused and nothing
+is rebuilt: `rebuild_count` only counts the rebuilds `repartition_every`
+forces, and `pair_rebuild_count` stays zero.
+
+**A barostat never touches the host.** The cell it integrates is a device
+tensor, and `Thermo.set_cell_device` hands it on as one: the evaluator copies
+it device-to-device, inverts it there (a 3 x 3 inverse written out, since
+`torch.linalg.inv` reads the device to check its result), re-expresses the
+partitions' image shifts and the long-range term's k-vectors on the device,
+and leaves its host copy stale until a log row, a checkpoint or a repartition
+reads `evaluator.cell`. The pressure kernel reads the evaluator's device
+virial instead of a re-upload of the host copy, and `cell_is_current` is a
+version counter rather than a comparison of host copies. An NPT step thus
+downloads exactly what an NVE step does (the energy word; one more for an
+uncompressed model's compact edge count), where it used to download the cell
+twice, upload it once and re-upload the virial. `set_cell` with a host cell
+still works for everything else (relaxations, tests, `read_structure`).
+`tests/test_sync.py` pins the NPT count too; a periodic box under five
+cutoffs wide is the exception, since a cell change there re-estimates the
+cell list's search radius, which reads the device.
 
 ### The neighbour list lives on the device
 

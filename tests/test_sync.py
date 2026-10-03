@@ -13,7 +13,9 @@ or `bincount`, and `cudaStreamSynchronize` only for that one copy.
 
 Measured with torch.profiler on a warm step. `aten::item` is not counted:
 the readback's own `float()`/`int()` calls on the downloaded CPU tensor
-record as `aten::item` too, and they are not synchronisations.
+record as `aten::item` too, and they are not synchronisations. The same
+contract holds for a barostat step, which used to download and upload the
+cell twice and re-upload the virial every step.
 """
 
 import collections
@@ -29,6 +31,7 @@ from .test_joint_model import build, frame
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="the evaluator runs on the GPU"
 )
+
 
 def compressed_available() -> bool:
     from deepmd.kernels.cuda.dpa4c.graph_compress import op_available
@@ -104,6 +107,89 @@ class TestOneDevice:
         model.enable_compression()
         ev = DistributedEvaluator(model, a, h, devices=[DEVICE], memory_headroom=None)
         assert_downloads(count_syncs(ev, x), 1)
+
+
+def count_md_syncs(md) -> dict[str, int]:
+    """One bare step of an MD class, after three warm-up steps."""
+    from torch.profiler import ProfilerActivity, profile
+
+    md.run(3)
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        md.step()
+    torch.cuda.synchronize()
+    names = collections.Counter()
+    for e in prof.events():
+        n = e.name
+        if n.startswith("Memcpy DtoH"):
+            names["dtoh"] += 1
+        elif n.startswith("Memcpy HtoD") and "Pageable" in n:
+            names["pageable_htod"] += 1
+        elif n == "cudaStreamSynchronize":
+            names["stream_sync"] += 1
+        elif n in ("aten::nonzero", "aten::bincount"):
+            names[n] += 1
+    return dict(names)
+
+
+class TestBarostat:
+    """An NPT step downloads what an NVE step does, nothing more: the
+    barostat integrates the cell on the device and hands it over there
+    (`Thermo.set_cell_device`), the pressure kernel reads the evaluator's
+    device virial, and the host copy of the cell is refreshed only when a log
+    row or a checkpoint asks for it. The cell is above five cutoffs wide: a
+    smaller periodic box re-estimates its cell list's search radius at every
+    cell change, which reads the device (small systems can afford that)."""
+
+    @staticmethod
+    def npt(model, compress):
+        from ase import Atoms, units
+
+        from deepmd_lr.nvalchemi import MTKNPT
+
+        coord, atype, cell = frame(n_mol=128, box=32.0)
+        c, a, h = (t[0].cpu().numpy() for t in (coord, atype, cell))
+        atoms = Atoms(
+            numbers=[8 if t == 0 else 1 for t in a], positions=c, cell=h, pbc=True
+        )
+        ev = DistributedEvaluator(
+            model,
+            a,
+            h,
+            devices=[DEVICE],
+            memory_headroom=None,
+            compute_virial=True,
+            compress=compress,
+        )
+        return MTKNPT(
+            ev,
+            atoms,
+            0.5 * units.fs,
+            temperature_K=300.0,
+            pressure_au=1e-4 * units.GPa,
+            tdamp=100 * units.fs,
+            pdamp=1000 * units.fs,
+            cell="isotropic",
+            logfile=None,
+            loginterval=10**6,
+        )
+
+    def test_uncompressed_long_range(self):
+        md = self.npt(build(), False)
+        try:
+            assert_downloads(count_md_syncs(md), 2)
+        finally:
+            md.close()
+
+    @pytest.mark.skipif(not compressed_available(), reason="needs the CUDA kernel")
+    def test_compressed_long_range(self):
+        from .test_compress import build32
+
+        md = self.npt(build32(), 0.01)
+        try:
+            assert_downloads(count_md_syncs(md), 1)
+        finally:
+            md.close()
 
 
 class TestTwoPartitions:

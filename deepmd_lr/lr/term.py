@@ -104,7 +104,6 @@ from nvalchemiops.torch.interactions.electrostatics.ewald import (
 )
 from nvalchemiops.torch.interactions.electrostatics.k_vectors import (
     generate_k_vectors_ewald_summation,
-    generate_k_vectors_pme,
 )
 from nvalchemiops.torch.interactions.electrostatics.pme import (
     pme_reciprocal_space,
@@ -112,6 +111,8 @@ from nvalchemiops.torch.interactions.electrostatics.pme import (
 from nvalchemiops.torch.interactions.electrostatics.slab import (
     compute_slab_correction,
 )
+
+from deepmd_lr.cell import inverse_3x3
 
 #: Ewald's default truncation: ``exp(-k^2 / 4 alpha^2)`` falls to this at
 #: ``k_cutoff``.
@@ -385,8 +386,37 @@ class LongRangeEnergy(torch.nn.Module):
         if cell is None or self.method != "pme":
             self._k_cache = None
             return
-        cell = cell.detach().reshape(1, 3, 3)
-        self._k_cache = generate_k_vectors_pme(cell, mesh_dimensions=self._mesh(cell))
+        self._k_cache = self._k_vectors_for(cell.detach().reshape(1, 3, 3))
+
+    def _k_vectors_for(
+        self, cell: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """nvalchemiops' ``generate_k_vectors_pme``, without its host upload.
+
+        The Miller-index grid depends only on the mesh and is cached per mesh,
+        device and dtype; the reciprocal cell is a 3 x 3 inverse written out
+        (:func:`deepmd_lr.cell.inverse_3x3`); and the floor under ``k^2`` is a
+        clamp rather than a scalar tensor built from a Python float at every
+        call, which is the pageable upload a barostat step would otherwise
+        pay. Same convention as nvalchemiops: ``k = h @ (2 pi inv(H))^T``
+        with ``H`` rows as lattice vectors and ``h`` the Miller indices.
+        """
+        mesh = tuple(int(m) for m in self._mesh(cell))
+        key = (mesh, str(cell.device), cell.dtype)
+        cache = self.__dict__.setdefault("_miller_cache", {})
+        grid = cache.get(key)
+        if grid is None:
+            nx, ny, nz = mesh
+            kx = torch.fft.fftfreq(nx, d=1.0, device=cell.device, dtype=cell.dtype) * nx
+            ky = torch.fft.fftfreq(ny, d=1.0, device=cell.device, dtype=cell.dtype) * ny
+            kz = torch.fft.rfftfreq(nz, d=1.0, device=cell.device, dtype=cell.dtype)
+            kz = kz * nz
+            grid = torch.stack(torch.meshgrid(kx, ky, kz, indexing="ij"), dim=-1)
+            cache[key] = grid
+        reciprocal = 2.0 * math.pi * inverse_3x3(cell.reshape(3, 3))
+        k_vectors = grid @ reciprocal.transpose(0, 1)
+        k_squared = (k_vectors * k_vectors).sum(-1)
+        return k_vectors, k_squared.clamp(min=1e-12)
 
     def _mesh(self, cell: torch.Tensor) -> tuple[int, int, int]:
         """PME mesh dimensions for this cell."""

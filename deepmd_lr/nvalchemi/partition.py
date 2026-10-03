@@ -33,6 +33,9 @@ from dataclasses import (
 from itertools import (
     product,
 )
+from typing import (
+    Any,
+)
 
 import numpy as np
 import torch
@@ -93,6 +96,9 @@ class Partition:
     cell: np.ndarray | None = None
     #: Device-resident index tensors, built once per device (see :meth:`views`).
     _views: dict = field(default_factory=dict, repr=False, compare=False)
+    #: The cell last set from a device tensor (:meth:`set_cell_device`), which
+    #: then leads the host copies.
+    _device_cell: Any = field(default=None, repr=False, compare=False)
 
     def __post_init__(self):
         if self.owned_shift is None:
@@ -117,8 +123,9 @@ class Partition:
 
     def coordinates(self, coord: np.ndarray) -> np.ndarray:
         """Node coordinates, owned then ghost, each shifted into place."""
-        return np.concatenate([coord[self.owned] + self.owned_shift,
-                               coord[self.ghost] + self.ghost_shift])
+        return np.concatenate(
+            [coord[self.owned] + self.owned_shift, coord[self.ghost] + self.ghost_shift]
+        )
 
     def types(self, atype: np.ndarray) -> np.ndarray:
         return np.concatenate([atype[self.owned], atype[self.ghost]])
@@ -161,6 +168,31 @@ class Partition:
                     # The GPU list reads this tensor at every search.
                     v["cell"].copy_(h.to(torch.float64).reshape(1, 3, 3))
 
+    def set_cell_device(self, cell: torch.Tensor) -> None:
+        """Re-express the node shifts from a cell that lives on a device.
+
+        The barostats' path: the cell they integrate is a device tensor and
+        changes every step, and copying it to the host and back would stall
+        the step twice. Only the cached device views are rewritten here,
+        device-to-device; the host-side shifts and ``cell`` lag until
+        :meth:`set_cell` is next called with a host cell. The driver reads
+        only the device views.
+        """
+        if self.ghost_image is None or self.owned_image is None:
+            raise ValueError(
+                "this partition carries no lattice images; rebuild it for the "
+                "new cell instead"
+            )
+        self._device_cell = cell.detach()
+        for v in self._views.values():
+            if isinstance(v, dict) and "ghost_image" in v:
+                shift = v["shift"]
+                h = self._device_cell.to(device=shift.device, dtype=shift.dtype)
+                shift.copy_(v["ghost_image"] @ h)
+                v["owned_shift"].copy_(v["owned_image"] @ h)
+                if "cell" in v:
+                    v["cell"].copy_(h.to(torch.float64).reshape(1, 3, 3))
+
     def views(self, device, dtype=torch.float64) -> dict:
         """This partition's index tensors on ``device``, built once and cached.
 
@@ -201,10 +233,18 @@ class Partition:
                     )
             if self.periodic is not None:
                 # float64 whatever `dtype` is: the GPU list searches in float64.
-                v["cell"] = torch.as_tensor(
-                    np.asarray(self.cell, dtype=np.float64).reshape(1, 3, 3),
-                    device=dev,
-                )
+                # A device cell set after construction leads the host copy.
+                if self._device_cell is not None:
+                    v["cell"] = (
+                        self._device_cell.to(device=dev, dtype=torch.float64)
+                        .reshape(1, 3, 3)
+                        .clone()
+                    )
+                else:
+                    v["cell"] = torch.as_tensor(
+                        np.asarray(self.cell, dtype=np.float64).reshape(1, 3, 3),
+                        device=dev,
+                    )
             self._views[key] = v
         return v
 
@@ -598,9 +638,7 @@ def partition_system(
         #      `halo`, which is exactly the set a ball query would return.
         lo = frac[owned].min(axis=0) - reach
         hi = frac[owned].max(axis=0) + reach
-        boxed = np.flatnonzero(
-            np.all((image_frac >= lo) & (image_frac <= hi), axis=1)
-        )
+        boxed = np.flatnonzero(np.all((image_frac >= lo) & (image_frac <= hi), axis=1))
         if len(owned) and len(boxed):
             nearest, _ = cKDTree(coord[owned]).query(
                 images[boxed], k=1, distance_upper_bound=bound, workers=-1

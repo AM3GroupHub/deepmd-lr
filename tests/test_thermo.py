@@ -29,8 +29,11 @@ def setup(n_mol=8, devices=None, **kwargs):
     model = build()
     coord, atype, cell = frame(n_mol=n_mol)
     ev = DistributedEvaluator(
-        model, atype[0].cpu().numpy(), cell[0].cpu().numpy(),
-        devices=[DEVICE] if devices is None else devices, **kwargs,
+        model,
+        atype[0].cpu().numpy(),
+        cell[0].cpu().numpy(),
+        devices=[DEVICE] if devices is None else devices,
+        **kwargs,
     )
     return ev, coord[0].cpu().numpy()
 
@@ -96,12 +99,12 @@ class TestMeasurements:
         th.update_pressure()
         ke_w, press_w = th.ke_w.numpy().copy(), th.press_w.numpy().copy()
         ke = th.kinetic_energy
-        wp.to_torch(th.velocities).mul_(1.1)            # as a velocity kick does
+        wp.to_torch(th.velocities).mul_(1.1)  # as a velocity kick does
         assert th.kinetic_energy == pytest.approx(1.21 * ke, rel=1e-10)
         _ = th.temperature, th.pressure, th.total_energy
         np.testing.assert_array_equal(th.ke_w.numpy(), ke_w)
         np.testing.assert_array_equal(th.press_w.numpy(), press_w)
-        th.update_kinetic_energy()                       # the explicit refresh
+        th.update_kinetic_energy()  # the explicit refresh
         assert float(th.ke_w.numpy()[0]) == pytest.approx(1.21 * ke, rel=1e-10)
 
     def test_pressure_without_the_virial_is_refused(self):
@@ -120,7 +123,9 @@ class TestAliasing:
         th = make_thermo(ev, pos)
         before = th.positions.numpy().copy()
         wp.launch(
-            kernel=_shift, dim=th.n_atoms, inputs=[th.positions],
+            kernel=_shift,
+            dim=th.n_atoms,
+            inputs=[th.positions],
             device=th.device,
         )
         after = th.positions.numpy()
@@ -183,6 +188,34 @@ class TestCell:
         th.set_cell(np.asarray(ev.cell) * 1.1)
         th.evaluate()
         assert ev._partitions is not kept and ev.rebuild_count == rebuilds + 1
+
+    def test_set_cell_device_agrees_with_the_host_path(self):
+        """The barostats' seam hands the cell over on the device: Thermo's
+        cell, the evaluator's cell and inverse, the device volume and the
+        long-range k-vectors all follow, and the host copy catches up when
+        read. `cell_is_current` is a version, not a comparison."""
+        ev, pos = setup(compute_virial=True, memory_headroom=None)
+        th = make_thermo(ev, pos)
+        th.evaluate()
+        e_ref, f_ref = ev(pos)
+        f_ref = f_ref.clone()
+        h = np.asarray(ev.cell) * 1.02
+        th.set_cell_device(torch.as_tensor(h, device=DEVICE))
+        assert th.cell_is_current
+        assert ev._cell_host_stale  # nothing read back yet
+        np.testing.assert_allclose(th.cell.numpy()[0], h, atol=1e-12)
+        np.testing.assert_allclose(ev.cell, h, atol=1e-12)  # refreshed on read
+        assert th.volume_w.numpy()[0] == pytest.approx(abs(np.linalg.det(h)), rel=1e-12)
+        assert th.volume == pytest.approx(abs(np.linalg.det(h)), rel=1e-12)
+        got_e, got_f = ev(pos * 1.02)
+        twin = setup(compute_virial=True, memory_headroom=None)[0]
+        twin.set_cell(h)
+        want_e, want_f = twin(pos * 1.02)
+        assert got_e == pytest.approx(want_e, abs=1e-9)
+        np.testing.assert_allclose(got_f.cpu().numpy(), want_f.cpu().numpy(), atol=1e-9)
+        other = make_thermo(ev, pos)
+        other.set_cell(np.asarray(ev.cell) * 1.01)
+        assert not th.cell_is_current and other.cell_is_current
 
     def test_set_cell_syncs_volume_and_evaluator(self):
         ev, pos = setup(compute_virial=True)
@@ -262,8 +295,7 @@ class TestFixedAtoms:
         start moving and Thermo has to stop them."""
         atoms = Atoms(numbers=np.ones(len(positions), dtype=int), positions=positions)
         atoms.set_masses(ev.masses())
-        thermalize_momenta(atoms, temperature_K=300.0,
-                           rng=np.random.default_rng(0))
+        thermalize_momenta(atoms, temperature_K=300.0, rng=np.random.default_rng(0))
         atoms.set_constraint(FixAtoms(indices=indices))
         return Thermo.from_atoms(ev, atoms)
 
@@ -275,7 +307,7 @@ class TestFixedAtoms:
         assert th.velocities.numpy()[1].any()
         np.testing.assert_array_equal(th.positions.numpy(), pos)
         np.testing.assert_array_equal(th.masses.numpy(), ev.masses())
-        assert not len(Thermo(ev, pos).fixed)       # arrays carry no constraint
+        assert not len(Thermo(ev, pos).fixed)  # arrays carry no constraint
 
     def test_evaluate_puts_them_back_at_rest(self):
         """A kernel that moves every atom -- Langevin's noise does -- cannot

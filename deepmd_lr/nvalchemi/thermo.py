@@ -49,6 +49,8 @@ from nvalchemiops.dynamics.utils import (
     remove_com_motion,
 )
 
+from deepmd_lr.cell import det_3x3
+
 __all__ = ["Thermo"]
 
 #: Keywords the constructor used to take, and where each went.
@@ -122,9 +124,7 @@ class Thermo:
         # then mutate a temporary while the real positions never moved.
         x = np.ascontiguousarray(np.asarray(positions, dtype=np.float64))
         if x.shape != (self.n_atoms, 3):
-            raise ValueError(
-                f"positions must be ({self.n_atoms}, 3), got {x.shape}"
-            )
+            raise ValueError(f"positions must be ({self.n_atoms}, 3), got {x.shape}")
         self._x = torch.tensor(x, dtype=torch.float64, device=self.device)
         self._v = torch.zeros_like(self._x)
         if velocities is not None:
@@ -175,8 +175,8 @@ class Thermo:
             dtype=wp.mat33d,
             device=self.device,
         )
-        #: Host copy of the cell this object last agreed on with the evaluator.
-        self._cell_host = np.array(evaluator.cell, dtype=np.float64)
+        #: The evaluator's cell version this object last set or agreed on.
+        self._cell_version_seen = evaluator.cell_version
         self.natoms = self.scalar(self.n_atoms, dtype=wp.int32)
 
         # --- scratch, allocated once ------------------------------------
@@ -304,16 +304,34 @@ class Thermo:
             self.cell.assign(np.asarray(cell, dtype=np.float64).reshape(1, 3, 3))
         self.evaluator.set_cell(self.cell.numpy()[0])
         self.volume_w.fill_(self.evaluator.volume)
-        self._cell_host = np.array(self.evaluator.cell, dtype=np.float64)
+        self._cell_version_seen = self.evaluator.cell_version
+
+    def set_cell_device(self, cell: torch.Tensor) -> None:
+        """:meth:`set_cell` from a device tensor, reading nothing back.
+
+        The barostats' seam: ``cell`` is the ``(3, 3)`` cell they integrate,
+        lattice vectors as rows, on this device. It is copied into
+        :attr:`cell`, handed to the evaluator (:meth:`DistributedEvaluator.
+        set_cell_device`) and its volume computed into :attr:`volume_w`, all
+        on the device. The old seam downloaded the cell, uploaded it, and
+        downloaded it again, every step.
+        """
+        h = cell.detach().to(device=self.device, dtype=torch.float64).reshape(3, 3)
+        wp.to_torch(self.cell).reshape(3, 3).copy_(h)
+        self.evaluator.set_cell_device(h)
+        wp.to_torch(self.volume_w).reshape(1).copy_(det_3x3(h).abs().reshape(1))
+        self._cell_version_seen = self.evaluator.cell_version
 
     @property
     def cell_is_current(self) -> bool:
         """Whether the evaluator still has the cell this object last set.
 
         An NPT stage on the shared evaluator moves its cell; a Thermo built
-        before that describes a box the evaluator no longer partitions.
+        before that describes a box the evaluator no longer partitions. A
+        version counter, not a comparison of host copies: under a barostat
+        the host copy is refreshed only on demand.
         """
-        return bool(np.array_equal(self._cell_host, self.evaluator.cell))
+        return self._cell_version_seen == self.evaluator.cell_version
 
     def set_state(self, positions: Any = None, velocities: Any = None) -> None:
         """Copy new positions and/or velocities into the bound buffers.
@@ -409,7 +427,8 @@ class Thermo:
             vec9d,
         )
 
-        if self.evaluator.virial is None:
+        virial = getattr(self.evaluator, "virial_dev", None)
+        if virial is None:
             raise ValueError(
                 "no virial available; build the evaluator with "
                 "compute_virial=True (or call set_compute_virial(True)) and "
@@ -422,15 +441,25 @@ class Thermo:
             self._press_probe = wp.zeros(1, dtype=vec9d, device=self.device)
             self._kin_probe = wp.zeros((1, 9), dtype=wp.float64, device=self.device)
         # Shared by both paths: it only ever holds the evaluator's virial, so
-        # either path rewrites it with the same numbers.
-        self._virial_w.assign(
-            np.asarray(self.evaluator.virial, dtype=np.float64).reshape(1, 9)
+        # either path rewrites it with the same numbers. Device to device: the
+        # evaluator keeps the virial on the device, and re-uploading its host
+        # copy was a pageable copy that stalled every barostat step.
+        wp.to_torch(self._virial_w).reshape(9).copy_(
+            virial.detach().reshape(9).to(torch.float64)
         )
-        kinetic, pressure = ((self._kin_probe, self._press_probe) if probe
-                             else (self._kin_w, self.press_w))
+        kinetic, pressure = (
+            (self._kin_probe, self._press_probe)
+            if probe
+            else (self._kin_w, self.press_w)
+        )
         compute_pressure_tensor(
-            self.velocities, self.masses, self._virial_w, self.cell,
-            kinetic, pressure, self.volume_w,
+            self.velocities,
+            self.masses,
+            self._virial_w,
+            self.cell,
+            kinetic,
+            pressure,
+            self.volume_w,
         )
 
     def update_kinetic_energy(self) -> None:
@@ -463,8 +492,9 @@ class Thermo:
                 "centre-of-mass motion to remove; removing it would set them "
                 "moving"
             )
-        remove_com_motion(self.velocities, self.masses, self._momentum,
-                          self._total_mass, self._com)
+        remove_com_motion(
+            self.velocities, self.masses, self._momentum, self._total_mass, self._com
+        )
 
     def atoms(self) -> Any:
         """A snapshot as an ASE ``Atoms`` -- the way state leaves this object.
@@ -497,8 +527,9 @@ def _fixed_atoms(atoms: Any) -> np.ndarray:
     """
     from ase.constraints import FixAtoms
 
-    other = sorted({type(c).__name__ for c in atoms.constraints
-                    if not isinstance(c, FixAtoms)})
+    other = sorted(
+        {type(c).__name__ for c in atoms.constraints if not isinstance(c, FixAtoms)}
+    )
     if other:
         raise ValueError(
             f"atoms carries {', '.join(other)}: of ASE's constraints the GPU "

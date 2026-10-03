@@ -1323,7 +1323,10 @@ class _MTKBarostat(MolecularDynamics):
             th.positions, th.velocities, self._h, self.cell_v, self.dt
         )
         k.npt_cell_update(self._h, self.cell_v, self.dt)
-        th.set_cell(self._h.numpy()[0].T)  # evaluator, volume, host copy
+        import warp as wp
+
+        # The kernels hold the cell transposed; hand it over on the device.
+        th.set_cell_device(wp.to_torch(self._h).reshape(3, 3).T)
 
     def _barostat_energy(self) -> float:
         """P V + W |eps_dot|^2 / 2."""

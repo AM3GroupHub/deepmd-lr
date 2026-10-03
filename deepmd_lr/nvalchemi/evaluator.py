@@ -48,6 +48,7 @@ from deepmd_lr.born import (
     field_force,
     screening_factor,
 )
+from deepmd_lr.cell import inverse_3x3
 from deepmd_lr.compress import (
     compress_model,
 )
@@ -326,7 +327,13 @@ class DistributedEvaluator:
                 f"memory_headroom must be in (0, 1], got {memory_headroom}"
             )
 
-        self.cell = np.asarray(cell, dtype=np.float64).reshape(3, 3)
+        self._cell_host = np.asarray(cell, dtype=np.float64).reshape(3, 3)
+        self._cell_host_stale = False
+        #: Bumped by every cell change, host or device path, so that a
+        #: :class:`~deepmd_lr.nvalchemi.thermo.Thermo` can tell whether the
+        #: cell is still the one it set without comparing host copies.
+        self.cell_version = 0
+        self._skin_stale = False
         self.pbc = _checked_pbc(pbc)
         # The term holds no weights, so this evaluator builds its own: its pbc
         # picks the 3D or the slab sum, its cell the PME mesh. The mesh is
@@ -495,6 +502,7 @@ class DistributedEvaluator:
         self.calls = 0
         self.results: dict[str, Any] = {}
         self.virial: np.ndarray | None = None
+        self._virial_dev: torch.Tensor | None = None
         self.forces = torch.zeros(
             (len(self.atype), 3), dtype=torch.float64, device=self.home
         )
@@ -502,6 +510,32 @@ class DistributedEvaluator:
     @property
     def n_atoms(self) -> int:
         return len(self.atype)
+
+    @property
+    def cell(self) -> np.ndarray:
+        """The cell ``(3, 3)``, lattice vectors as rows: the host copy.
+
+        Under a barostat the device leads (:meth:`set_cell_device`) and this
+        copy is refreshed on demand, which costs the one read of the device
+        a log row, a checkpoint or a repartition then makes; a step reads
+        nothing.
+        """
+        if self._cell_host_stale:
+            self._cell_host = self._cell_dev.detach().cpu().numpy().reshape(3, 3)
+            self._cell_host_stale = False
+        return self._cell_host
+
+    @cell.setter
+    def cell(self, value) -> None:
+        self._cell_host = np.asarray(value, dtype=np.float64).reshape(3, 3)
+        self._cell_host_stale = False
+
+    @property
+    def virial_dev(self) -> torch.Tensor | None:
+        """The last virial as a ``(3, 3)`` device tensor (``None`` without
+        ``compute_virial``): what a barostat's pressure kernel should read,
+        instead of re-uploading :attr:`virial`."""
+        return self._virial_dev
 
     @property
     def volume(self) -> float:
@@ -574,6 +608,7 @@ class DistributedEvaluator:
         if abs(np.linalg.det(self.cell)) <= 0:
             raise ValueError("the cell is degenerate (zero volume)")
         self._upload_cell()
+        self.cell_version += 1
         if self.long_range_energy is not None:
             self.long_range_energy.set_k_vectors(self._cell_dev)
         if self._partitions is not None:
@@ -584,6 +619,35 @@ class DistributedEvaluator:
                     nlist.cell_changed(self.cell)
         if self._skin_is_auto:
             self.skin = self._auto_skin()
+            self._skin_stale = False
+
+    def set_cell_device(self, cell: torch.Tensor) -> None:
+        """Replace the cell from a device tensor, reading nothing back.
+
+        The barostats' path: the cell they integrate lives on the device and
+        changes every step, and the old seam copied it to the host and back
+        twice per step. This copies it device-to-device into the evaluator's
+        cell, inverts it there, re-expresses the partitions' images and the
+        long-range term's k-vectors on the device, and leaves the host copy
+        stale: :attr:`cell` refreshes it when something on the host asks. An
+        ``"auto"`` skin is recomputed at the next rebuild rather than here.
+        Only a small periodic box re-estimates its cell list's search radius,
+        which does read the device.
+        """
+        h = cell.detach().to(device=self.home, dtype=torch.float64).reshape(3, 3)
+        self._cell_dev.copy_(h)
+        self._cell_inv_dev.copy_(inverse_3x3(self._cell_dev))
+        self._cell_host_stale = True
+        self.cell_version += 1
+        self._skin_stale = self._skin_is_auto
+        if self.long_range_energy is not None:
+            self.long_range_energy.set_k_vectors(self._cell_dev)
+        if self._partitions is not None:
+            for part, device in zip(self._partitions, self.devices, strict=True):
+                part.set_cell_device(self._cell_dev)
+                nlist = part.neighbor_list_on(device)
+                if nlist is not None:
+                    nlist.cell_changed_device()
 
     def _upload_cell(self) -> None:
         """The host cell and its inverse onto the home device, without a stall."""
@@ -649,8 +713,9 @@ class DistributedEvaluator:
         raw displacement. The cell term uses the Frobenius norm of ``dH``,
         which bounds the 2-norm from above and needs no decomposition.
         """
+        del reference_cell  # the device copies decide; no host comparison
         moved = positions - reference
-        if np.any(self.cell != reference_cell) and reference_cell_dev is not None:
+        if reference_cell_dev is not None and self._images is not None:
             dh = self._cell_dev - reference_cell_dev
             moved = moved - self._images @ dh.to(moved.dtype)
             return moved.norm(dim=1).max() + self._reach * dh.norm()
@@ -685,6 +750,11 @@ class DistributedEvaluator:
 
     def _rebuild(self, tracked: torch.Tensor) -> None:
         """Re-partition at the current skin and restart the displacement clock."""
+        if self._skin_stale:
+            # Deferred from `set_cell_device`: the rule reads the host cell,
+            # and a rebuild reads the host anyway.
+            self.skin = self._auto_skin()
+            self._skin_stale = False
         if self._whole_system:
             # Nothing to partition and nothing to copy to the host: the one
             # node set is the system, built once; a forced "rebuild"
@@ -968,6 +1038,7 @@ class DistributedEvaluator:
         # caller that reads nothing pays for none.
         self.results = _LazyNumpy(out)
         self.virial = virial
+        self._virial_dev = out.get("virial")
         # INVARIANT: this writes INTO the preallocated buffer and never
         # rebinds `self.forces`, so a warp view taken once stays live for the
         # life of the object -- which is what lets `Thermo` bind it a single

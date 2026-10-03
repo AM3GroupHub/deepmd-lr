@@ -398,6 +398,9 @@ class GpuNeighborList:
         # needs the positions to size them.
         self._cache = None
         self._box_cells_est = None
+        #: Whether the periodic box is small enough that a cell change can
+        #: invalidate the cell list's search radius (set by the first search).
+        self.small_box = False
         #: The fixed search box of a non-periodic node set, and its origin.
         self._box: torch.Tensor | None = None
         self._lo: torch.Tensor | None = None
@@ -434,6 +437,19 @@ class GpuNeighborList:
         n_cells, radius = estimate_cell_list_sizes(box, self._pbc, self.rcut)
         self._cache = allocate_cell_list(self.n_node, n_cells, radius, self.device)
         self._box_cells_est = n_cells
+        if self.periodic:
+            # Whether a cell change can invalidate the search radius: see
+            # `cell_changed`. Decided once, from the box this estimate saw.
+            h = box.detach().reshape(3, 3).cpu().numpy()
+            volume = abs(np.linalg.det(h))
+            widths = [
+                volume / np.linalg.norm(np.cross(h[(k + 1) % 3], h[(k + 2) % 3]))
+                for k in range(3)
+            ]
+            self.small_box = any(
+                self.pbc[k] and widths[k] < (_SMALL_BOX_CELLS + 1) * self.rcut
+                for k in range(3)
+            )
 
     def _allocate_matrix(self, max_neighbors: int) -> None:
         self.max_neighbors = int(max_neighbors)
@@ -781,19 +797,14 @@ class GpuNeighborList:
         not. A larger box only makes the kernel merge cells, which is safe.
         So only a small periodic box re-estimates. Returns whether it did.
         """
-        if not self.periodic or self._cache is None:
-            return False
-        h = np.asarray(cell, dtype=np.float64).reshape(3, 3)
-        volume = abs(np.linalg.det(h))
-        widths = [
-            volume / np.linalg.norm(np.cross(h[(k + 1) % 3], h[(k + 2) % 3]))
-            for k in range(3)
-        ]
-        small = any(
-            self.pbc[k] and widths[k] < (_SMALL_BOX_CELLS + 1) * self.rcut
-            for k in range(3)
-        )
-        if not small:
+        del cell  # the regime was decided from the box the first estimate saw
+        return self.cell_changed_device()
+
+    def cell_changed_device(self) -> bool:
+        """:meth:`cell_changed` for a cell that changed on the device: nothing
+        to read unless the box is small, in which case the re-estimate reads
+        the device (small systems can afford that)."""
+        if not self.periodic or self._cache is None or not self.small_box:
             return False
         self._estimate(self._cell)
         self.resizes += 1
