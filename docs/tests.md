@@ -58,7 +58,8 @@ the model first.
   set that drifts past its box; both CSR views valid; a matrix or an edge
   buffer that is too small reported and grown; a poisoned tail never read; a
   warm search without a synchronising op and correct on a side stream; the
-  differentiable vectors reaching the coordinates and the strain.
+  differentiable vectors reaching the coordinates and the strain; the Born
+  row-sum kernel equal to the array-API response and deterministic.
 
 **Running it**
 

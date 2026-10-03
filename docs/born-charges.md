@@ -84,6 +84,21 @@ passing, so an atom's charge depends only on edges where it is the centre. A
 single VJP therefore yields every per-edge derivative at once. A naive Born
 implementation is `O(natoms)` backward passes; this is `O(1)`.
 
+**On the GPU-direct list the Born pass is one kernel, and its backward is
+shared with the charge response.** Both start from the same VJP of the raw
+charges onto the edge vectors; because the descriptor is one-hop, the
+weighted cotangent the charge-response force needs is that same gradient
+times each edge's destination weight, so `_charge_response_force` reuses it
+instead of running a second backward through the descriptor. The edge half of
+the tensor, `1/2 (sum_in − sum_out) r ⊗ g`, is then summed along the graph's
+destination and source CSR rows by a Warp kernel
+(`deepmd_lr/nvalchemi/born_csr.py`): one thread per node, float64
+accumulation, no `(E, 3, 3)` temporary and no atomics, so it is
+deterministic. The array-API `edge_born_response` remains the path for the
+uncompressed model and the oracle the kernel is tested against. Measured on
+the GB10 at 169k water atoms, compressed, one device: the long-range
+evaluation costs 104 ms, with Born tensors 120 ms (138 ms before).
+
 **The derivative uses the raw charges, the `q_i d_ab` term uses the constrained
 ones.** `project_to_total_charge` subtracts a global mean, so every charge
 depends on every position — moving an atom 32.9 Å away (rcut 6.0) shifts every

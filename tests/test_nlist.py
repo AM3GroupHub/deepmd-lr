@@ -315,6 +315,39 @@ class TestBuffers:
         assert_matches(lst, x, oracle(x, atype, cell))
 
 
+class TestBornKernel:
+    def test_rows_equal_the_scatter(self):
+        """The CSR Born response equals the array-API one, computed from the
+        same float32 edges but accumulated in float64, and is deterministic."""
+        from deepmd_lr.born import edge_born_response
+        from deepmd_lr.nvalchemi.born_csr import edge_born_response_csr
+
+        coord, _, cell = frame(n_mol=16, box=14.0)
+        lst = searched(coord, cell, float64_vectors=False)
+        g = torch.randn(lst.capacity, 3, device=DEVICE, dtype=torch.float32)
+        g[~lst.edge_mask] = 0.0
+        graph = lst.graph()
+        args = (
+            g,
+            graph.edge_vec,
+            graph.destination_row_ptr,
+            graph.source_order,
+            graph.source_row_ptr,
+            lst.n_node,
+        )
+        rows = edge_born_response_csr(*args)
+        want = edge_born_response(
+            g.double(),
+            graph.edge_vec.double(),
+            graph.edge_index,
+            graph.edge_mask,
+            lst.n_node,
+        )
+        assert rows.dtype == torch.float64
+        torch.testing.assert_close(rows, want, rtol=1e-12, atol=1e-9)
+        assert torch.equal(rows, edge_born_response_csr(*args))
+
+
 class TestGraphViews:
     def test_compact_view_ends_with_two_zero_guards(self):
         coord, _, cell = frame(n_mol=16, box=14.0)

@@ -82,7 +82,9 @@ kernel's float32 vectors *are* used when nothing differentiates through them
 (a compressed short-range model: DeePMD-kit assembles forces from the edge
 gradients through the CSR views); the charge response and the virial, which
 do, get vectors recomputed from the node coordinates and the strain. The
-mechanics, the measured costs and the one-download-per-step contract are in
+same CSR rows let the Born tensor's edge half be summed per node by one
+kernel instead of two scatter-adds over an `(E, 3, 3)` temporary
+([Born charges](born-charges.md#implementation-notes)). The mechanics, the measured costs and the one-download-per-step contract are in
 [Running MD over partitions](partitioned-md.md#the-neighbour-list-lives-on-the-device).
 Small boxes (several images of one pair, an atom seeing its own image),
 slabs, triclinic cells and lattice jumps are checked against the dense oracle

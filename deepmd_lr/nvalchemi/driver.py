@@ -49,6 +49,9 @@ from deepmd_lr.model.lr_model import (
     _run_backbone,
     _symmetric_strain,
 )
+from deepmd_lr.nvalchemi.born_csr import (
+    edge_born_response_csr,
+)
 from deepmd_lr.nvalchemi.nlist import (
     GpuNeighborList,
 )
@@ -472,6 +475,7 @@ def evaluate_partitioned(
         if dev not in coord_on:
             with _current_device(dev):
                 coord_on[dev] = coord_t.to(device=dev, dtype=dtype)
+
     def launch_one(part, device) -> _Launched:
         """One partition's forward, on its own device.
 
@@ -613,7 +617,7 @@ def evaluate_partitioned(
     if compute_born:
         # Before `_charge_response_force`, which backpropagates through the
         # same `raw` tensors without retaining the graph.
-        result["born_charge"] = _born_charges_partitioned(
+        result["born_charge"], born_grads = _born_charges_partitioned(
             launched, n_atoms, result["charge"], home, dtype, eps_inf=eps_inf
         )
     # The energy above used the model's own charges; only the report is
@@ -624,7 +628,13 @@ def evaluate_partitioned(
         result["charge"] = result["charge"] * factor
 
     response_force, response_virial = _charge_response_force(
-        launched, n_atoms, result["dE_dq"], home, dtype, compute_virial=compute_virial
+        launched,
+        n_atoms,
+        result["dE_dq"],
+        home,
+        dtype,
+        compute_virial=compute_virial,
+        born_grads=born_grads if compute_born else None,
     )
     result["force_charge_response"] = response_force
     result["force"] = result["force"] + response_force
@@ -655,9 +665,17 @@ def _to_host(value):
     return float(value) if value.ndim == 0 else value.cpu().numpy()
 
 
+def _csr_views(graph) -> bool:
+    return (
+        graph.destination_row_ptr is not None
+        and graph.source_order is not None
+        and graph.source_row_ptr is not None
+    )
+
+
 def _born_charges_partitioned(
     launched, n_atoms: int, charge, home, dtype, *, eps_inf: float = 1.0
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, list]:
     r"""Born effective charge tensors, assembled across partitions.
 
     The global total-charge projection is not an obstacle here, for the same
@@ -684,9 +702,20 @@ def _born_charges_partitioned(
     live here, but its *source* edges point at neighbours that may be ghosts,
     and those edges live in the neighbour's partition. Neither partition sees
     all of atom i's terms alone; the scatter-add is what completes the sum.
+
+    Returns the assembled tensor and, per partition, the unweighted edge
+    cotangent ``d raw / d edge_vec`` it differentiated (``None`` where no
+    capture was used), for :func:`_charge_response_force` to reuse: the
+    descriptor is one-hop, so the weighted cotangent that force needs is the
+    same gradient scaled by each edge's destination weight, and the second
+    backward through the descriptor is saved. With the GPU list's CSR views
+    and float32 vectors the edge half is summed along the rows by
+    :func:`~deepmd_lr.nvalchemi.born_csr.edge_born_response_csr`; otherwise
+    by the array-API :func:`~deepmd_lr.born.edge_born_response`.
     """
     born = torch.zeros((n_atoms, 3, 3), dtype=dtype, device=home)
     contributions = []
+    unweighted = []
     # Launch every backward before transferring anything, for the same reason
     # the forward pass is staged.
     for part, _out, raw, _node_coord, _eps, graph, cap in launched:
@@ -700,13 +729,28 @@ def _born_charges_partitioned(
             # only the differentiation target changes.
             leaf = cap if cap is not None else graph.edge_vec
             (g,) = torch.autograd.grad(raw.sum(), leaf, retain_graph=True)
-            # The mask is defensive: `partition_graph` masked ghost-destination
-            # edges before the descriptor ran, so those gradients are zero.
-            node = edge_born_response(
-                g, graph.edge_vec.detach(), graph.edge_index, graph.edge_mask,
-                part.n_node,
-            )
+            vec = graph.edge_vec.detach()
+            if (
+                _csr_views(graph)
+                and g.dtype == torch.float32
+                and vec.dtype == torch.float32
+            ):
+                node = edge_born_response_csr(
+                    g,
+                    vec,
+                    graph.destination_row_ptr,
+                    graph.source_order,
+                    graph.source_row_ptr,
+                    part.n_node,
+                )
+            else:
+                # The mask is defensive: only owned-destination edges are in
+                # the graph, and the tail's gradients are zero.
+                node = edge_born_response(
+                    g, vec, graph.edge_index, graph.edge_mask, part.n_node
+                )
             contributions.append((part, node))
+            unweighted.append(g if cap is not None else None)
 
     for part, node in contributions:
         born.index_add_(
@@ -721,11 +765,17 @@ def _born_charges_partitioned(
     born = born + charge.reshape(-1, 1, 1).to(home, dtype) * eye
     # Screened tensor, Z~ = sqrt(eps_inf) Z -- same factor as the serial
     # `born_charges`, applied once to the assembled whole.
-    return born * screening_factor(eps_inf)
+    return born * screening_factor(eps_inf), unweighted
 
 
 def _charge_response_force(
-    launched, n_atoms: int, dE_dq, home, dtype, compute_virial: bool = False
+    launched,
+    n_atoms: int,
+    dE_dq,
+    home,
+    dtype,
+    compute_virial: bool = False,
+    born_grads: list | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     r"""The force from charges shifting as atoms move.
 
@@ -754,6 +804,12 @@ def _charge_response_force(
     search and re-running the descriptor here -- as an earlier version did --
     was a third descriptor evaluation per partition for no additional
     information.
+
+    ``born_grads``, when the Born tensors were just computed, holds each
+    partition's unweighted cotangent ``d raw / d edge_vec``. The descriptor
+    is one-hop -- a raw charge depends only on the edges into its atom -- so
+    ``d (sum_j w_j raw_j) / d edge_vec_e`` is that gradient times
+    ``w_{dst(e)}``, and the backward through the descriptor is not repeated.
     """
     # dE_dq already differentiates through the global, possibly masked projection.
     force = torch.zeros((n_atoms, 3), dtype=dtype, device=home)
@@ -762,7 +818,7 @@ def _charge_response_force(
     # Launch every backward first, then transfer, for the same reason the
     # forward pass is staged: a `.cpu()` between them serialises the devices.
     gradients = []
-    for part, _out, raw, node_coord, eps, graph, cap in launched:
+    for k, (part, _out, raw, node_coord, eps, graph, cap) in enumerate(launched):
         with _current_device(raw.device):
             weights = dE_dq[part.views(home, dtype)["owned"]].to(
                 device=raw.device, dtype=raw.dtype
@@ -778,9 +834,15 @@ def _charge_response_force(
                 # function of both. The leaves are numerically identical, so the
                 # composition is the exact chain rule, and routing through
                 # `graph.edge_vec` keeps the strain derivative the virial needs.
-                (g_e,) = torch.autograd.grad(
-                    (raw * weights).sum(), cap, retain_graph=True
-                )
+                g1 = born_grads[k] if born_grads is not None else None
+                if g1 is not None:
+                    w_node = torch.zeros(part.n_node, dtype=g1.dtype, device=g1.device)
+                    w_node[: part.n_owned] = weights.to(g1.dtype)
+                    g_e = g1 * w_node[graph.edge_index[1]][:, None]
+                else:
+                    (g_e,) = torch.autograd.grad(
+                        (raw * weights).sum(), cap, retain_graph=True
+                    )
                 grads = torch.autograd.grad(
                     (graph.edge_vec * g_e.detach()).sum(), targets
                 )
