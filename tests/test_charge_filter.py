@@ -172,7 +172,9 @@ class TestEvaluator:
             memory_headroom=None,
             charge_filter=None,
         )
-        assert plain(coord)[0] == off(coord)[0]
+        # Not bit-equal: the gather and the reciprocal sum use atomics, so two
+        # identical evaluations differ in the last bit from run to run.
+        assert plain(coord)[0] == pytest.approx(off(coord)[0], abs=1e-9)
 
     def test_born_and_fields_are_refused(self):
         model = build()
