@@ -12,10 +12,13 @@ What is pinned:
 - **Off means off**, and the combinations it cannot honour are refused.
 """
 
+import copy
+
 import numpy as np
 import pytest
 import torch
 from ase import Atoms
+from deepmd.pt_expt.model.get_model import get_model
 
 from deepmd_lr.ase import LongRangeCalculator
 from deepmd_lr.fitting.charge import (
@@ -25,7 +28,7 @@ from deepmd_lr.fitting.charge import (
 )
 from deepmd_lr.nvalchemi import DistributedEvaluator
 
-from .test_joint_model import DEVICE, build, frame
+from .test_joint_model import DESCRIPTOR, DEVICE, FITTING, LONG_RANGE, build, frame
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="the model runs on GPU"
@@ -213,10 +216,100 @@ class TestEvaluator:
             )
 
 
-def test_training_with_the_filter_is_refused():
+def test_a_runtime_override_is_refused_in_training():
+    """A simulation-time override in training would train one model and
+    record another; a filter meant for training goes in the config."""
     model = build()
     model.train()
     model.charge_filter = (1e-3, 5e-4)
     coord, atype, cell = frame()
-    with pytest.raises(RuntimeError, match="simulation-only"):
+    with pytest.raises(RuntimeError, match="long_range.charge_filter"):
         model(coord, atype, box=cell)
+
+
+def build_trained(filt):
+    """The fixture model with `long_range.charge_filter` in its config."""
+    cfg = {
+        "type": "dp_lr",
+        "type_map": ["O", "H"],
+        "descriptor": copy.deepcopy(DESCRIPTOR),
+        "fitting_net": copy.deepcopy(FITTING),
+        "long_range": {**copy.deepcopy(LONG_RANGE), "charge_filter": list(filt)},
+    }
+    model = get_model(cfg)
+    model.eval()
+    return model
+
+
+class TestPartOfTheModel:
+    """`long_range.charge_filter`: applied in training and simulation alike,
+    saved with the model, and the default of every simulation path."""
+
+    def filt(self):
+        model = build()
+        coord, atype, cell = system()
+        return threshold_for(model, coord, atype, cell)
+
+    def test_the_config_sets_it_and_a_round_trip_keeps_it(self):
+        filt = self.filt()
+        model = build_trained(filt)
+        assert model.trained_charge_filter == pytest.approx(filt)
+        again = type(model).deserialize(model.serialize())
+        assert again.trained_charge_filter == pytest.approx(filt)
+
+    def test_simulation_uses_it_by_default_and_false_switches_it_off(self):
+        filt = self.filt()
+        coord, atype, cell = system()
+        trained = build_trained(filt)
+        plain = build()
+        trained.load_state_dict(plain.state_dict())
+
+        def run(model, **kw):
+            ev = DistributedEvaluator(
+                model, atype, cell, devices=[DEVICE], memory_headroom=None, **kw
+            )
+            e, _ = ev(coord)
+            return e, np.asarray(ev.results["charge"])
+
+        e_default, q_default = run(trained)
+        e_explicit, q_explicit = run(plain, charge_filter=filt)
+        assert e_default == pytest.approx(e_explicit, abs=1e-10)
+        np.testing.assert_allclose(q_default, q_explicit, atol=1e-12)
+        assert (q_default == 0).any()
+        e_off, q_off = run(trained, charge_filter=False)
+        e_none, _ = run(plain)
+        assert e_off == pytest.approx(e_none, abs=1e-10)
+        assert not (q_off == 0).any()
+
+    def test_the_ase_calculator_uses_it_by_default(self):
+        filt = self.filt()
+        coord, atype, cell = system()
+        trained = build_trained(filt)
+        trained.load_state_dict(build().state_dict())
+        ev = DistributedEvaluator(
+            trained, atype, cell, devices=[DEVICE], memory_headroom=None
+        )
+        e_ev, _ = ev(coord)
+        type_map = list(trained.get_type_map())
+        atoms = Atoms(
+            [type_map[t] for t in atype], positions=coord, cell=cell, pbc=True
+        )
+        atoms.calc = LongRangeCalculator(trained)
+        assert atoms.get_potential_energy() == pytest.approx(e_ev, abs=1e-8)
+        assert (atoms.calc.results["charges"] == 0).any()
+
+    def test_it_trains(self):
+        """The filter is in the graph a training step differentiates twice
+        (forces in the loss): a backward through it reaches the charge head."""
+        filt = self.filt()
+        model = build_trained(filt)
+        model.train()
+        coord, atype, cell = frame(n_mol=8, box=12.0)
+        out = model(coord, atype, box=cell)
+        q = out["charge"].detach()
+        assert (q == 0).any() and (q != 0).any()
+        (out["force"] ** 2).sum().backward()
+        grads = [
+            p.grad for p in model.charge_fitting.parameters() if p.grad is not None
+        ]
+        assert grads and sum(float(g.abs().sum()) for g in grads) > 0

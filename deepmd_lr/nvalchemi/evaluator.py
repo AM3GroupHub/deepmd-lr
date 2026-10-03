@@ -263,15 +263,16 @@ class DistributedEvaluator:
         it; energies and field-free forces do not change.
 
     charge_filter
-        ``(c_t, delta)`` in e, or None (the default). Charges whose magnitude
-        is below ``c_t - delta`` are set exactly to zero, those above
-        ``c_t + delta`` kept, with a C^3 polynomial between, and the total
-        charge is restored on the atoms that keep charge
-        (:func:`~deepmd_lr.fitting.charge.filter_charges`). A simulation-only
-        remedy for a model that leaves a small charge on every bulk atom,
-        which adds up over a thick slab. The model was not trained with it:
-        validate it on a cell where the unfiltered model is trusted. Refused
-        with Born charges and fields.
+        ``(c_t, delta)`` in e; ``False`` for none; None (the default) for the
+        model's own ``long_range.charge_filter``, if it was trained with one.
+        Charges with ``|q| <= c_t - delta`` are set exactly to zero, those
+        above ``c_t + delta`` kept, with a C^3 polynomial between, and the
+        total is restored on the atoms that keep charge
+        (:func:`~deepmd_lr.fitting.charge.filter_charges`). It removes the
+        small charge a model can leave on every bulk atom, which adds up over
+        a thick slab. Applying it to a model trained without it changes the
+        interface electrostatics that model learned. Refused with Born charges
+        and fields.
 
     Notes
     -----
@@ -299,7 +300,7 @@ class DistributedEvaluator:
         compress: bool | float = False,
         eps_inf: float = 1.0,
         memory_headroom: float | None = 0.8,
-        charge_filter: tuple[float, float] | None = None,
+        charge_filter: Any = None,
     ) -> None:
         if not devices:
             raise ValueError("DistributedEvaluator needs at least one device")
@@ -384,8 +385,13 @@ class DistributedEvaluator:
             # The field force is built from Z, so Z has to be assembled.
             self.compute_born = True
         self.charge_spin = charge_spin
-        #: ``(c_t, delta)`` or None; see the class docstring.
-        self.charge_filter = check_charge_filter(charge_filter)
+        #: ``(c_t, delta)`` or None; see the class docstring. Absent, the
+        #: model's own (``long_range.charge_filter``); ``False``, none.
+        self.charge_filter = (
+            getattr(model, "trained_charge_filter", None)
+            if charge_filter is None
+            else check_charge_filter(charge_filter)
+        )
         if self.charge_filter is not None:
             if not getattr(model, "has_long_range", False):
                 raise ValueError("charge_filter needs a model with a long_range block")

@@ -108,8 +108,10 @@ def projection_shift(
 
 
 def check_charge_filter(charge_filter: Any) -> tuple[float, float] | None:
-    """Validate ``charge_filter = (c_t, delta)``: finite, ``0 < delta <= c_t``."""
-    if charge_filter is None:
+    """Validate ``charge_filter = (c_t, delta)``: finite, ``0 < delta <= c_t``.
+
+    ``None`` and ``False`` both return None (no filter)."""
+    if charge_filter is None or charge_filter is False:
         return None
     try:
         c_t, delta = (float(x) for x in charge_filter)

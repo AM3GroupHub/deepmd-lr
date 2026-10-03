@@ -62,17 +62,38 @@ it the potential drop across the slab, grows with the thickness. On a 32 nm
 C/Si cell the drop reached 80-280 V, and the charge-response forces broke MD
 within a picosecond.
 
-`charge_filter=(c_t, delta)` removes such charge in simulation. After the
-usual projection, every charge with `|q| <= c_t - delta` is set exactly to
-zero, every charge with `|q| >= c_t + delta` is kept, and a C^3 polynomial
-joins the two, so forces and the Hessian stay continuous. The total charge is
-then restored on the atoms that keep charge, in proportion to their weight,
-so an atom switched off stays at zero:
+A charge filter removes such charge. After the usual projection, every charge
+with `|q| <= c_t - delta` is set exactly to zero, every charge with
+`|q| >= c_t + delta` is kept, and a C^3 polynomial joins the two, so forces
+and the Hessian stay continuous. The total charge is then restored on the
+atoms that keep charge, in proportion to their weight, so an atom switched off
+stays at zero.
+
+**Train with it.** Put it in the model, so the model learns its interface with
+the charges it will run with:
+
+```jsonc
+"long_range": {
+  "charge_net": {...},
+  "reciprocal": {...},
+  "charge_filter": [3.5e-3, 1.5e-3]
+}
+```
+
+It is applied in training and saved with the model, and every simulation path
+uses it by default: `build_evaluator` and `LongRangeCalculator` need no
+argument. A `same_as` branch inherits it. Pass `charge_filter=False` to switch
+a trained filter off, or a pair to override it.
+
+**Or apply it to a model trained without it**, in simulation only:
 
 ```python
 ev = build_evaluator("model.ckpt.pt", atoms, charge_filter=(3.5e-3, 1.5e-3))
 atoms.calc = LongRangeCalculator("model.ckpt.pt", charge_filter=(3.5e-3, 1.5e-3))
 ```
+
+Such an override is refused in training. The measurements below are for this
+second route.
 
 Measured on that C/Si model (`ener_lr`, `pref_qn` 100) with (3.5e-3, 1.5e-3):
 
@@ -83,9 +104,9 @@ Measured on that C/Si model (`ener_lr`, `pref_qn` 100) with (3.5e-3, 1.5e-3):
 | 11 nm | on | 0 / 0 | 0.47 e | 0.056 meV | |
 | 32 nm | on | 0 / 0 | 0.47 e | 0.061 meV | stable for 5 ps |
 
-- **It is a simulation setting, not part of the model.** It is never saved,
-  and training refuses it. The model was trained without it, so it changes
-  the interface electrostatics the model saw: on the 11 nm cell the forces
+- **An override changes what the model learned.** The model was trained
+  without it, so it changes the interface electrostatics the model saw: on
+  the 11 nm cell the forces
   moved by 0.09 eV/A rms at the interface and 0.06 at the surfaces (bulk
   0.003). Validate it on a cell where the unfiltered model is trusted, for
   example by comparing the property you are after with and without it.
@@ -93,8 +114,8 @@ Measured on that C/Si model (`ener_lr`, `pref_qn` 100) with (3.5e-3, 1.5e-3):
   way gave an interfacial conductance of 131 +- 7 MW m^-2 K^-1 without the
   filter and 106 +- 8 with it: the same temperature jump, 20 % less heat
   flux. Switching off most of the interfacial charge changed how the
-  interface carries heat. So there it stabilises the long cells but is not
-  fit for a published conductance; the fix belongs in the model.
+  interface carries heat. Applied this way it stabilises the long cells but
+  is not fit for a published conductance; train with it instead.
 - **Choose `c_t` from the bulk charges at the temperature you run.** At
   300 K the C/Si bulk charges reached 2-2.5e-3 e, so the switch-off point
   `c_t - delta` sits at 2e-3. Too low, and thermal fluctuations switch bulk

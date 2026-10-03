@@ -180,8 +180,10 @@ class LongRangeCalculator(Calculator):
         ``q~_i q~_j / (4 pi eps_0 eps_inf r)``. A field force built from those
         tensors scales with it; the energy and field-free forces do not.
     charge_filter
-        ``(c_t, delta)`` in e, or None (the default). Simulation only: charges
-        below ``c_t - delta`` in magnitude are set exactly to zero, those above
+        ``(c_t, delta)`` in e; ``False`` for none; None (the default) for the
+        model's own ``long_range.charge_filter``. As an override, simulation
+        only: charges below ``c_t - delta`` in magnitude are set exactly to
+        zero, those above
         ``c_t + delta`` kept, with a C^3 polynomial between, and the total
         restored on the atoms that keep charge; see
         :func:`~deepmd_lr.fitting.charge.filter_charges`. Refused with a field.
@@ -211,7 +213,7 @@ class LongRangeCalculator(Calculator):
         long_range: dict | None = None,
         compress: bool | float = False,
         eps_inf: float = 1.0,
-        charge_filter: tuple[float, float] | None = None,
+        charge_filter: Any = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -259,8 +261,15 @@ class LongRangeCalculator(Calculator):
         self.eps_inf = float(eps_inf)
         if self._has_long_range:
             self.model.eps_inf = self.eps_inf
-        self.charge_filter = check_charge_filter(charge_filter)
-        if self.charge_filter is not None:
+        # None: the model's own `long_range.charge_filter`; False: none.
+        check_charge_filter(charge_filter)
+        self.charge_filter = charge_filter
+        effective = (
+            getattr(self.model, "trained_charge_filter", None)
+            if charge_filter is None
+            else check_charge_filter(charge_filter)
+        )
+        if charge_filter not in (None, False) or effective is not None:
             if not self._has_long_range:
                 raise ValueError("charge_filter needs a model with a long_range block")
             if self.efield is not None:

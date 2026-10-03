@@ -346,10 +346,23 @@ def _long_range_args() -> Argument:
         "and is left to the network. Parameters belonging to the other "
         "`method` are rejected rather than ignored.",
     )
+    charge_filter = Argument(
+        "charge_filter",
+        [list[float], None],
+        optional=True,
+        default=None,
+        doc="[c_t, delta] in e, or null. After the neutrality projection, charges "
+        "with |q| <= c_t - delta are set exactly to zero and those above c_t + "
+        "delta kept, with a C^3 polynomial between; the total is restored on the "
+        "atoms that keep charge. Part of the model: applied in training and in "
+        "every simulation, and saved with it, so a bulk whose atoms carry a "
+        "little charge each carries none. Born charges and fields are refused "
+        "with it. See deepmd_lr.fitting.charge.filter_charges.",
+    )
     return Argument(
         LONG_RANGE_KEY,
         dict,
-        [charge_net, reciprocal],
+        [charge_net, reciprocal, charge_filter],
         optional=True,
         default=None,
         doc="The long-range electrostatic term. Omit for a pure short-range "

@@ -227,10 +227,13 @@ class LongRangeEnergyModel(EnergyModel):
         #: turns the model's Coulomb charges into screened ones; the energy
         #: and forces are untouched. 1.0 is vacuum. See `deepmd_lr.born`.
         self.eps_inf = 1.0
-        #: ``(c_t, delta)`` or None. Simulation only: charges below about c_t
-        #: are switched off after the projection (`filter_charges`). Set on the
-        #: model by the ASE calculator, never saved, refused in training.
-        self.charge_filter: tuple[float, float] | None = None
+        #: ``(c_t, delta)`` from ``long_range.charge_filter``, or None: part of
+        #: the model, applied in training and simulation, and saved.
+        self.trained_charge_filter: tuple[float, float] | None = None
+        #: A simulation-time override of it: ``(c_t, delta)``, ``False`` for
+        #: off, or None to use the model's own. Never saved; refused in
+        #: training, where only the model's own filter applies.
+        self.charge_filter: Any = None
         #: True on the non-base members of a `same_as` group, whose
         #: `atomic_model` is the base's very object. A plain bool, not a
         #: module: see `deepmd_lr.same_as`.
@@ -239,6 +242,14 @@ class LongRangeEnergyModel(EnergyModel):
         #: is allowed only inside one -- that is where the long-range term
         #: gets added -- and captures nest, so this is a count, not a flag.
         self._capture_depth = 0
+
+    @property
+    def effective_charge_filter(self) -> tuple[float, float] | None:
+        """The filter applied now: the simulation-time override if one is set
+        (``False`` switching the model's own off), else the model's own."""
+        if self.charge_filter is None:
+            return self.trained_charge_filter
+        return check_charge_filter(self.charge_filter)
 
     @property
     def _compressed_charge_spin(self) -> tuple[float, float] | None:
@@ -434,6 +445,8 @@ class LongRangeEnergyModel(EnergyModel):
             )
 
         charge_fitting, long_range_energy = cls._build_long_range(data, descriptor)
+        block = _strip_comments(data.get(LONG_RANGE_KEY) or {})
+        trained_filter = check_charge_filter(block.get("charge_filter"))
 
         model = cls(
             descriptor=descriptor,
@@ -444,6 +457,7 @@ class LongRangeEnergyModel(EnergyModel):
             charge_fitting=charge_fitting,
             long_range_energy=long_range_energy,
         )
+        model.trained_charge_filter = trained_filter
         model.model_def_script = json.dumps(model_params)
         return model
 
@@ -706,13 +720,14 @@ class LongRangeEnergyModel(EnergyModel):
         mask = charge_mask(self, atype)
         create_graph = self.training
         born = None
-        charge_filter = check_charge_filter(self.charge_filter)
+        if self.training and self.charge_filter is not None:
+            raise RuntimeError(
+                "a simulation-time charge_filter override is set; clear it "
+                "(model.charge_filter = None) before training. A filter meant "
+                "for training belongs in the config, long_range.charge_filter"
+            )
+        charge_filter = self.effective_charge_filter
         if charge_filter is not None:
-            if self.training:
-                raise RuntimeError(
-                    "charge_filter is a simulation-only setting; clear it "
-                    "(model.charge_filter = None) before training"
-                )
             if self.compute_born:
                 raise NotImplementedError(
                     "charge_filter cannot be combined with Born charges yet: "
@@ -1246,6 +1261,8 @@ class LongRangeEnergyModel(EnergyModel):
                 "charge_net": self.charge_fitting.serialize(),
                 RECIPROCAL_KEY: self.long_range_energy.serialize(),
             }
+            if self.trained_charge_filter is not None:
+                data[LONG_RANGE_KEY]["charge_filter"] = list(self.trained_charge_filter)
         return data
 
     @classmethod
@@ -1261,4 +1278,7 @@ class LongRangeEnergyModel(EnergyModel):
             # still load.
             settings = block.get(RECIPROCAL_KEY, block.get(_LEGACY_RECIPROCAL_KEY))
             model.long_range_energy = build_long_range_energy(settings)
+            model.trained_charge_filter = check_charge_filter(
+                block.get("charge_filter")
+            )
         return model
