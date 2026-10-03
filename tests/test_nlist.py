@@ -9,6 +9,8 @@ is the centre, how images of a small box are counted, what happens past a
 buffer's end -- is checked here against the oracle rather than trusted.
 """
 
+import math
+
 import numpy as np
 import pytest
 import torch
@@ -240,6 +242,27 @@ class TestBuffers:
         lst.search(coord[0])
         assert int(lst.status.sum()) == 0
         assert_matches(lst, coord, oracle(coord, atype, cell))
+
+    def test_the_matrix_margin_is_applied_above_the_estimate_too(self):
+        """An estimate that already holds the first count, but by less than
+        the 1.2x margin, is widened to the margin; it used to be kept, and a
+        run then overflowed as the per-row maximum crept up."""
+        from deepmd_lr.nvalchemi.nlist import _round_up
+
+        for n_mol in (16, 32, 64, 96):
+            coord, _, cell = frame(n_mol=n_mol, box=14.0)
+            lst = searched(coord, cell)
+            found = int(lst.num_neighbors.max())
+            margin = _round_up(1.2 * found)
+            narrow = _round_up(found + 1)
+            if narrow < margin:
+                break
+        else:
+            raise AssertionError("no frame separates the two widths")
+        sphere = 4.0 / 3.0 * math.pi * RCUT**3
+        kept = searched(coord, cell, density=narrow / (1.3 * sphere))
+        assert kept.max_neighbors == margin
+        assert torch.equal(kept.num_neighbors, lst.num_neighbors)
 
     def test_edge_buffers_too_small_are_reported_and_grown(self):
         coord, atype, cell = frame(n_mol=16, box=14.0)

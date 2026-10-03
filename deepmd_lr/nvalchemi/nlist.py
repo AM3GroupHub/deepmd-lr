@@ -571,9 +571,13 @@ class GpuNeighborList:
                 break
             self._allocate_matrix(_round_up(1.2 * found))
             self.resizes += 1
-        # Tight to what was counted, with room for density fluctuations.
+        # 1.2x what was counted, whichever side of it the estimate landed:
+        # the estimate only has to hold the first search, the margin is what
+        # carries the run. (An estimate between the count and its 1.2x used
+        # to be kept as it was, and a 440-step water run on four partitions
+        # then overflowed at step 395: 113 neighbours against a width of 112.)
         tight = _round_up(1.2 * max(found, 1))
-        if tight < self.max_neighbors:
+        if tight != self.max_neighbors:
             self._allocate_matrix(tight)
             self._query(pos, box)
         n_edges = int(self.num_neighbors.sum())

@@ -452,6 +452,7 @@ class DistributedEvaluator:
         self._skin_cap = float("inf")
         #: How often the halo has been given back to free memory.
         self.skin_backoffs = 0
+        self.list_growths = 0
         #: Fraction of usable device memory the halo may be sized for, or
         #: ``None`` to skip the measurement entirely.
         self.memory_headroom = (
@@ -1119,6 +1120,7 @@ class DistributedEvaluator:
         for nlist, _device in self._lists():
             if bool(nlist.status[:2].any()):
                 nlist.grow()
+        self.list_growths += 1
 
     def _raise_open_face(self, tracked: torch.Tensor) -> None:
         """Name the atom that left the cell along an open axis (the step has

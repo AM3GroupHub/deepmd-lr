@@ -462,8 +462,13 @@ Nothing is cached between steps and nothing reads the host: the buffers are
 allocated once (sized by the first search, which is the one that
 synchronises), the edge count stays a device scalar, `edge_mask` marks where
 the real edges end, and a device status word reports a matrix row or an edge
-buffer that overflowed, in which case the evaluator widens it and repeats the
-step (on the first steps of a run, if at all). A compressed model takes the
+buffer that overflowed, in which case the evaluator widens it by a quarter,
+repeats the step, warns, and counts it in `evaluator.list_growths`. The
+first search sizes the matrix at 1.2x the widest row it counted and the edge
+buffers at 1.15x the edges, so growth is rare: the total edge count moves by
+well under a percent along a water trajectory, while the widest row drifts
+up as the run samples more configurations (101 to 113 neighbours over 440
+steps at 319k atoms, which is what the 1.2x absorbs). A compressed model takes the
 kernel's float32 vectors over the full buffers -- its kernels walk the CSR
 rows and never see the tail -- unless the charge response needs `edge_vec`
 differentiable, in which case the vectors are recomputed from the node
