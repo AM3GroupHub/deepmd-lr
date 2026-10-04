@@ -523,8 +523,11 @@ def parse_args():
                          "Needs deepmd-kit built with its CUDA operators")
     ap.add_argument("--charge-filter", type=float, nargs=2, default=None,
                     metavar=("C_T", "DELTA"),
-                    help="e; switch charges below about C_T off in simulation "
-                         "(deepmd_lr.fitting.charge.filter_charges)")
+                    help="e; switch charges below about C_T off "
+                         "(deepmd_lr.fitting.charge.filter_charges). Default: the "
+                         "model's own long_range.charge_filter, if it has one")
+    ap.add_argument("--no-charge-filter", action="store_true",
+                    help="switch off a filter the model was trained with")
     ap.add_argument("--resume", action="store_true",
                     help="continue from <out>/checkpoint.npz")
     return ap.parse_args()
@@ -547,7 +550,7 @@ def main():
     atoms.set_constraint(FixAtoms(indices=g["fixed"]) if len(g["fixed"]) else [])
     ev = build_evaluator(a.model, atoms, devices=devices, head=a.head,
                          compress=a.compress if a.compress > 0 else False,
-                         charge_filter=a.charge_filter)
+                         charge_filter=False if a.no_charge_filter else a.charge_filter)
     has_charge = bool(getattr(ev.model, "has_long_range", False))
 
     dt, friction = a.dt * units.fs, 1.0 / (a.tau * units.fs)
@@ -632,7 +635,8 @@ def main():
                                           ("fixed", "hot", "free", "cold", "mobile")},
         "group_source": g["source"], "z_range": g["z_range"],
         "interface_z": g["interface_z"], "area": g["area"],
-        "charge_filter": a.charge_filter, "compress": a.compress,
+        "charge_filter": (False if a.no_charge_filter else a.charge_filter),
+        "effective_charge_filter": ev.charge_filter, "compress": a.compress,
         "dt_fs": a.dt, "tau_fs": a.tau, "T0": a.t0, "T_hot": a.t_hot,
         "T_cold": a.t_cold, "seed": a.seed, "equil_ps": a.equil_ps,
         "steady_ps": a.steady_ps, "run_ps": a.run_ps, "bin_A": a.bin,
