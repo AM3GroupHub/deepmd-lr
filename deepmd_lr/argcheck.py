@@ -131,6 +131,30 @@ def dp_lr_model_args() -> Argument:
                     "same alpha; `same_as` links of either branch follow it."
                 ),
             ),
+            Argument(
+                "zbl",
+                dict,
+                [
+                    Argument(
+                        "r_inner",
+                        [int, float],
+                        doc="Full ZBL below this distance (Angstrom).",
+                    ),
+                    Argument(
+                        "r_outer",
+                        [int, float],
+                        doc=(
+                            "Zero ZBL above this distance (Angstrom); "
+                            "no larger than descriptor.rcut."
+                        ),
+                    ),
+                ],
+                optional=True,
+                doc=(
+                    "Fixed additive ZBL prior with a quintic switch; enabled only "
+                    "when provided. Not use_srtab or descriptor clamping."
+                ),
+            ),
             _long_range_args(),
         ],
         doc=(

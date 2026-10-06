@@ -89,13 +89,20 @@ print('ok')
 dp --pt-expt train input.json
 ```
 
-Without the `long_range` block the model is exactly the standard one — and
+Without `long_range` or `zbl`, the model is exactly the standard one — and
 **always train that baseline twin too** (delete `"type": "dp_lr"` and
 `long_range`, change nothing else). It is the only way to know the term
 helped. `alpha` and the mesh are not free parameters: see
 [choosing them](docs/alpha-and-mesh.md). `type_map` is abbreviated above; the
 converter writes the whole periodic table by default and the model's must
 match ([dataset layout](docs/dataset-layout.md)).
+
+## Optional ZBL repulsion
+
+DPA4C and DPA4C-LR can include a fixed, smoothly truncated nuclear-repulsion
+prior through `model.zbl`. Both use `type: "dp_lr"`; omit `long_range` for
+pure DPA4C. ZBL is disabled unless configured and adds no trainable parameters.
+See [configuration, training and limitations](examples/10-zbl/README.md).
 
 ## Examples
 

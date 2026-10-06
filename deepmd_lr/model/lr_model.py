@@ -215,6 +215,7 @@ class LongRangeEnergyModel(EnergyModel):
         super().__init__(*args, **kwargs)
         # Registered as submodules so they move with `.to(device)`, appear in
         # `state_dict()`, and are picked up by the optimizer.
+        self.zbl = None
         self.charge_fitting = charge_fitting
         self.long_range_energy = long_range_energy
         #: Also return Born effective charge tensors from `forward`. Off by
@@ -430,6 +431,8 @@ class LongRangeEnergyModel(EnergyModel):
         """
         data = copy.deepcopy(model_params)
         data.pop("type", None)
+        if data.get("zbl") is not None and data.get("use_srtab") is not None:
+            raise ValueError("zbl and use_srtab are different models; choose one")
 
         descriptor, fitting, fitting_type = get_model_components(
             data,
@@ -458,8 +461,26 @@ class LongRangeEnergyModel(EnergyModel):
             long_range_energy=long_range_energy,
         )
         model.trained_charge_filter = trained_filter
+        model.set_zbl(data.get("zbl"))
         model.model_def_script = json.dumps(model_params)
         return model
+
+    def set_zbl(self, settings: dict[str, Any] | None) -> None:
+        """Attach the fixed repulsive prior to the shared short-range graph."""
+        if settings is None:
+            self.zbl = None
+            return
+        from deepmd_lr.zbl import ZBL
+
+        descriptor = self.atomic_model.descriptor
+        if descriptor.__class__.__name__ != "DescrptDPA4C":
+            raise ValueError("zbl currently supports the dpa4c descriptor only")
+        if self.atomic_model.atom_exclude_types or self.atomic_model.pair_exclude_types:
+            raise ValueError("zbl with atom/pair exclusions is not supported")
+        zbl = ZBL(self.get_type_map(), settings, device=next(self.parameters()).device)
+        if zbl.r_outer > descriptor.get_rcut():
+            raise ValueError("zbl.r_outer must not exceed descriptor.rcut")
+        self.zbl = zbl
 
     @classmethod
     def _build_long_range(
@@ -492,7 +513,6 @@ class LongRangeEnergyModel(EnergyModel):
             _strip_comments(copy.deepcopy(settings))
         )
         return charge_fitting, long_range_energy
-
 
     def _predict_charges(
         self,
@@ -992,12 +1012,21 @@ class LongRangeEnergyModel(EnergyModel):
 
     def forward_lower(self, *args: Any, **kwargs: Any) -> Any:
         """Refuse the dense lower path, which also carries no cell."""
+        if self.zbl is not None:
+            raise NotImplementedError(
+                "ZBL requires the graph lower, not the dense lower"
+            )
         if self.has_long_range:
             self._refuse_export("The lower (neighbour-list) interface")
         return super().forward_lower(*args, **kwargs)
 
     def forward_lower_canonical_graph(self, *args: Any, **kwargs: Any) -> Any:
         """Refuse the compact canonical lower, traced for a compressed export."""
+        if self.zbl is not None:
+            raise NotImplementedError(
+                "Canonical compressed export does not carry ZBL; "
+                "use the graph evaluator"
+            )
         if self.has_long_range:
             self._refuse_export("Canonical graph-lower export (compressed `dp freeze`)")
         return super().forward_lower_canonical_graph(*args, **kwargs)
@@ -1048,10 +1077,13 @@ class LongRangeEnergyModel(EnergyModel):
                 raise RuntimeError(
                     f"DP_CUDA_INFER={level} on a compressed model: at 0 the "
                     "tables are built and never used"
-                    + (", at 2 a fused kernel bypasses the shared backbone the "
-                       "charge head needs. Set DP_CUDA_INFER=1."
-                       if self.has_long_range else
-                       ". Set DP_CUDA_INFER=1 or 2 (2: the fused energy/force path).")
+                    + (
+                        ", at 2 a fused kernel bypasses the shared backbone the "
+                        "charge head needs. Set DP_CUDA_INFER=1."
+                        if self.has_long_range
+                        else ". Set DP_CUDA_INFER=1 or 2 "
+                        "(2: the fused energy/force path)."
+                    )
                 )
             if destination_order is None or destination_row_ptr is None:
                 raise RuntimeError(
@@ -1062,7 +1094,7 @@ class LongRangeEnergyModel(EnergyModel):
                     "`get_geo_compress()`; a hand-built graph needs "
                     "`build_neighbor_graph_fast(..., with_csr=True)`."
                 )
-        return super().forward_common_lower_graph(
+        result = super().forward_common_lower_graph(
             atype,
             n_node,
             n_local,
@@ -1074,6 +1106,40 @@ class LongRangeEnergyModel(EnergyModel):
             *args,
             **kwargs,
         )
+        if self.zbl is not None:
+            options = dict(
+                zip(
+                    (
+                        "source_order",
+                        "source_row_ptr",
+                        "destination_sorted",
+                        "do_atomic_virial",
+                        "fparam",
+                        "aparam",
+                        "charge_spin",
+                        "spin",
+                        "comm_dict",
+                    ),
+                    args,
+                    strict=False,
+                )
+            )
+            options.update(kwargs)
+            extra = self.zbl.graph_output(
+                self,
+                atype,
+                n_node,
+                n_local,
+                edge_index,
+                edge_vec,
+                edge_mask,
+                destination_order,
+                destination_row_ptr,
+                **options,
+            )
+            for key, value in extra.items():
+                result[key] = result[key] + value
+        return result
 
     def enable_compression(
         self,
@@ -1256,6 +1322,8 @@ class LongRangeEnergyModel(EnergyModel):
         """
         data = super().serialize()
         data["type"] = MODEL_TYPE
+        if self.zbl is not None:
+            data["zbl"] = self.zbl.serialize()
         if self.has_long_range:
             data[LONG_RANGE_KEY] = {
                 "charge_net": self.charge_fitting.serialize(),
@@ -1271,7 +1339,9 @@ class LongRangeEnergyModel(EnergyModel):
         data = data.copy()
         data["type"] = _ATOMIC_MODEL_TYPE
         block = data.pop(LONG_RANGE_KEY, None)
+        zbl = data.pop("zbl", None)
         model = super().deserialize(data)
+        model.set_zbl(zbl)
         if block is not None:
             model.charge_fitting = BaseFitting.deserialize(block["charge_net"])
             # Accept the old key so checkpoints written before the rename
