@@ -8,10 +8,14 @@ it for DPA4C-LR. The built-in `standard` model does not consume this plugin's
 Add the following block inside `model` in a working training input:
 
 ```json
-"zbl": {"r_inner": 0.8, "r_outer": 1.5}
+"zbl": {"r_inner": 0.5, "r_outer": 0.8}
 ```
 
-Distances are in Angstrom. These values demonstrate the format, not recommended
+Distances are in Angstrom. An empty `"zbl": {}` block enables the same
+defaults: `r_inner=0.5`, `r_outer=0.8`. Either radius can be overridden
+independently; explicit values in existing inputs and checkpoints are preserved.
+These radii match DeePMD DPA4 bridging defaults; the coupling method remains
+additive and is not equivalent to DPA4 bridging. They are not calibrated
 Si/C or universal radii. Choose and validate them against close-contact data,
 normal bond distances and the intended collision energies. Require
 `0 < r_inner < r_outer <= descriptor.rcut`. Omit the block to disable ZBL.

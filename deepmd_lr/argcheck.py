@@ -138,11 +138,15 @@ def dp_lr_model_args() -> Argument:
                     Argument(
                         "r_inner",
                         [int, float],
+                        optional=True,
+                        default=0.5,
                         doc="Full ZBL below this distance (Angstrom).",
                     ),
                     Argument(
                         "r_outer",
                         [int, float],
+                        optional=True,
+                        default=0.8,
                         doc=(
                             "Zero ZBL above this distance (Angstrom); "
                             "no larger than descriptor.rcut."

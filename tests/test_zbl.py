@@ -140,10 +140,42 @@ def test_normalized_training_configuration():
     assert model.zbl.serialize() == config()["zbl"]
 
 
+@pytest.mark.parametrize("lr", [False, True])
+@pytest.mark.parametrize(
+    "settings, expected",
+    [
+        ({}, {"r_inner": 0.5, "r_outer": 0.8}),
+        ({"r_inner": 0.4}, {"r_inner": 0.4, "r_outer": 0.8}),
+        ({"r_outer": 1.0}, {"r_inner": 0.5, "r_outer": 1.0}),
+        ({"r_inner": 0.8, "r_outer": 1.5}, {"r_inner": 0.8, "r_outer": 1.5}),
+    ],
+)
+def test_default_radii_and_overrides(lr, settings, expected):
+    cfg = config(lr)
+    cfg["zbl"] = settings
+    model = get_model(cfg)
+    assert model.zbl.serialize() == expected
+    restored = BaseModel.deserialize(model.serialize()).eval()
+    x, t = dimer(0.6)
+    for key in ["energy", "force", "virial"]:
+        torch.testing.assert_close(model(x, t)[key], restored(x, t)[key])
+    normalized = normalize(
+        {
+            "model": cfg,
+            "learning_rate": {"start_lr": 1e-3},
+            "loss": {"type": "ener"},
+            "training": {"training_data": {"systems": ["./data"]}, "numb_steps": 3},
+        }
+    )
+    assert get_model(normalized["model"]).zbl.serialize() == expected
+    without_zbl = dict(cfg)
+    without_zbl.pop("zbl")
+    assert get_model(without_zbl).zbl is None
+
+
 @pytest.mark.parametrize(
     "settings",
     [
-        {},
         {"r_inner": 0, "r_outer": 1},
         {"r_inner": 1, "r_outer": 1},
         {"r_inner": True, "r_outer": 1},

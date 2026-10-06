@@ -24,8 +24,9 @@ class ZBL(torch.nn.Module):
         if not isinstance(settings, dict):
             raise ValueError("zbl must be a configuration dictionary")
         settings = {k: v for k, v in settings.items() if not k.startswith("_")}
-        if set(settings) != {"r_inner", "r_outer"}:
-            raise ValueError("zbl requires exactly r_inner and r_outer (Angstrom)")
+        if set(settings) - {"r_inner", "r_outer"}:
+            raise ValueError("zbl accepts only r_inner and r_outer (Angstrom)")
+        settings = {"r_inner": 0.5, "r_outer": 0.8, **settings}
         for key, value in settings.items():
             if (
                 isinstance(value, bool)
