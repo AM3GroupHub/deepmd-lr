@@ -33,9 +33,6 @@ from dataclasses import (
 from itertools import (
     product,
 )
-from typing import (
-    Any,
-)
 
 import numpy as np
 import torch
@@ -98,7 +95,7 @@ class Partition:
     _views: dict = field(default_factory=dict, repr=False, compare=False)
     #: The cell last set from a device tensor (:meth:`set_cell_device`), which
     #: then leads the host copies.
-    _device_cell: Any = field(default=None, repr=False, compare=False)
+    _device_cell: torch.Tensor | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self):
         if self.owned_shift is None:
@@ -135,15 +132,10 @@ class Partition:
     ) -> None:
         """Re-express the node shifts in a new cell, keeping the nodes.
 
-        The nodes stay the same atoms and lattice images; only their Cartesian
-        offsets follow the cell, host copies and cached device views alike.
-        Whether the halo still covers every neighbour after the change is the
-        caller's to judge: the evaluator's Verlet bound counts the cell's
-        change as well as the atoms'.
-
-        ``device_cell``, a ``(3, 3)`` float64 tensor already holding the new
-        cell on a device, lets the cached views copy device-to-device instead
-        of uploading from pageable host memory, which would block the host.
+        Updates host shifts and cached device views. The evaluator's Verlet
+        bound decides whether the halo still covers every neighbour.
+        ``device_cell`` can supply the same cell on a device to avoid a
+        pageable host upload to that device.
         """
         if self.ghost_image is None or self.owned_image is None:
             raise ValueError(
@@ -155,28 +147,19 @@ class Partition:
         self.owned_shift = self.owned_image @ cell
         if self.periodic is not None:
             self.cell = cell.copy()
+        self._device_cell = None
         for v in self._views.values():
             if isinstance(v, dict) and "ghost_image" in v:
-                shift = v["shift"]
-                if device_cell is not None and device_cell.device == shift.device:
-                    h = device_cell.to(shift.dtype)
-                else:
-                    h = torch.as_tensor(cell, dtype=shift.dtype, device=shift.device)
-                shift.copy_(v["ghost_image"] @ h)
-                v["owned_shift"].copy_(v["owned_image"] @ h)
-                if "cell" in v:
-                    # The GPU list reads this tensor at every search.
-                    v["cell"].copy_(h.to(torch.float64).reshape(1, 3, 3))
+                source = cell
+                if device_cell is not None and device_cell.device == v["shift"].device:
+                    source = device_cell
+                self._set_view_cell(v, source)
 
     def set_cell_device(self, cell: torch.Tensor) -> None:
         """Re-express the node shifts from a cell that lives on a device.
 
-        The barostats' path: the cell they integrate is a device tensor and
-        changes every step, and copying it to the host and back would stall
-        the step twice. Only the cached device views are rewritten here,
-        device-to-device; the host-side shifts and ``cell`` lag until
-        :meth:`set_cell` is next called with a host cell. The driver reads
-        only the device views.
+        Updates cached device views without a host transfer. Later views use
+        this cell too; host shifts and ``cell`` lag until :meth:`set_cell`.
         """
         if self.ghost_image is None or self.owned_image is None:
             raise ValueError(
@@ -186,12 +169,19 @@ class Partition:
         self._device_cell = cell.detach()
         for v in self._views.values():
             if isinstance(v, dict) and "ghost_image" in v:
-                shift = v["shift"]
-                h = self._device_cell.to(device=shift.device, dtype=shift.dtype)
-                shift.copy_(v["ghost_image"] @ h)
-                v["owned_shift"].copy_(v["owned_image"] @ h)
-                if "cell" in v:
-                    v["cell"].copy_(h.to(torch.float64).reshape(1, 3, 3))
+                self._set_view_cell(v, self._device_cell)
+
+    @staticmethod
+    def _set_view_cell(v: dict, cell) -> None:
+        """Update bound tensors in place; the neighbour list needs a float64 cell."""
+        shift = v["shift"]
+        dtype = torch.float64 if "cell" in v else shift.dtype
+        h = torch.as_tensor(cell, dtype=dtype, device=shift.device)
+        h_shift = h.to(shift.dtype)
+        shift.copy_(v["ghost_image"] @ h_shift)
+        v["owned_shift"].copy_(v["owned_image"] @ h_shift)
+        if "cell" in v:
+            v["cell"].copy_(h.reshape(1, 3, 3))
 
     def views(self, device, dtype=torch.float64) -> dict:
         """This partition's index tensors on ``device``, built once and cached.
@@ -212,17 +202,19 @@ class Partition:
                 "ids": ids,
                 "owned": ids[: self.n_owned],
                 "ghost": ids[self.n_owned :],
-                "shift": torch.as_tensor(
-                    np.asarray(self.ghost_shift, dtype=np.float64).reshape(-1, 3),
-                    dtype=dtype,
-                    device=dev,
-                ),
-                "owned_shift": torch.as_tensor(
-                    np.asarray(self.owned_shift, dtype=np.float64).reshape(-1, 3),
-                    dtype=dtype,
-                    device=dev,
-                ),
             }
+            for name, shift in (
+                ("shift", self.ghost_shift), ("owned_shift", self.owned_shift)
+            ):
+                v[name] = (
+                    torch.empty((len(shift), 3), dtype=dtype, device=dev)
+                    if self._device_cell is not None
+                    else torch.as_tensor(
+                        np.asarray(shift, dtype=np.float64).reshape(-1, 3),
+                        dtype=dtype,
+                        device=dev,
+                    )
+                )
             if self.ghost_image is not None and self.owned_image is not None:
                 for name, image in (
                     ("ghost_image", self.ghost_image),
@@ -232,19 +224,16 @@ class Partition:
                         np.asarray(image).reshape(-1, 3), dtype=dtype, device=dev
                     )
             if self.periodic is not None:
-                # float64 whatever `dtype` is: the GPU list searches in float64.
-                # A device cell set after construction leads the host copy.
-                if self._device_cell is not None:
-                    v["cell"] = (
-                        self._device_cell.to(device=dev, dtype=torch.float64)
-                        .reshape(1, 3, 3)
-                        .clone()
-                    )
-                else:
-                    v["cell"] = torch.as_tensor(
+                v["cell"] = (
+                    torch.empty((1, 3, 3), dtype=torch.float64, device=dev)
+                    if self._device_cell is not None
+                    else torch.as_tensor(
                         np.asarray(self.cell, dtype=np.float64).reshape(1, 3, 3),
                         device=dev,
                     )
+                )
+            if self._device_cell is not None:
+                self._set_view_cell(v, self._device_cell)
             self._views[key] = v
         return v
 

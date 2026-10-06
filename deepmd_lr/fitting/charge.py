@@ -143,9 +143,9 @@ def filter_charges(
 ) -> torch.Tensor:
     r"""Switch small charges off, smoothly, and restore the total on the rest.
 
-    A simulation-only device against charge that a model leaves spread over a
-    bulk: below a threshold an atom's charge is set exactly to zero, so a
-    bulk whose atoms each carry a little charge carries none.
+    Used in training and inference when configured on the model, or as a
+    simulation override. Below a threshold an atom's charge is exactly zero,
+    so a bulk whose atoms each carry a little charge carries none.
 
     With ``x = |q_i|`` and ``u = (x - c_t + delta) / (2 delta)`` clipped to
     [0, 1], the weight is

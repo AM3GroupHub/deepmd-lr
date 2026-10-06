@@ -107,10 +107,12 @@ class TestMeasurements:
         th.update_kinetic_energy()  # the explicit refresh
         assert float(th.ke_w.numpy()[0]) == pytest.approx(1.21 * ke, rel=1e-10)
 
-    def test_pressure_without_the_virial_is_refused(self):
-        ev, pos = setup()
+    @pytest.mark.parametrize("disable_after_eval", [False, True])
+    def test_pressure_without_the_virial_is_refused(self, disable_after_eval):
+        ev, pos = setup(compute_virial=disable_after_eval)
         th = make_thermo(ev, pos)
         th.evaluate()
+        ev.set_compute_virial(False)
         with pytest.raises(ValueError, match="compute_virial"):
             _ = th.pressure
 

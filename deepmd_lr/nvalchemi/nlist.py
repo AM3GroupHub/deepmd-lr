@@ -55,7 +55,6 @@ import math
 from contextlib import nullcontext
 from typing import Any
 
-import numpy as np
 import torch
 import warp as wp
 from deepmd.dpmodel.utils.neighbor_graph.graph import NeighborGraph
@@ -87,10 +86,6 @@ STATUS_LEN = 4
 #: cells; a margin keeps the binning even as ghosts move between rebuilds.
 _BOX_MARGIN_FACTOR = 0.5
 
-#: Below this a cell list's search radius depends on the box in a way that a
-#: barostat can invalidate (see :meth:`GpuNeighborList.cell_changed`).
-_SMALL_BOX_CELLS = 4
-
 
 def _torch_stream_scope(device: torch.device):
     """Make Warp launch on PyTorch's current stream for the block.
@@ -113,8 +108,26 @@ def _torch_stream_scope(device: torch.device):
 
 
 # ----------------------------------------------------------------------------
-# The two kernels
+# Graph assembly and cell updates
 # ----------------------------------------------------------------------------
+
+
+@wp.kernel(enable_backward=False)
+def _update_search_radius(
+    cell: wp.array(dtype=wp.mat33d),
+    pbc: wp.array(dtype=wp.bool),
+    bins: wp.array(dtype=wp.int32),
+    radius: wp.array(dtype=wp.int32),
+    cutoff: wp.float64,
+):
+    """Use the build's actual bin counts and nvalchemiops' radius formula."""
+    axis = wp.tid()
+    inverse_t = wp.transpose(wp.inverse(cell[0]))
+    face = wp.float64(1.0) / wp.length(inverse_t[axis])
+    r = int(wp.ceil(cutoff * wp.float64(bins[axis]) / face))
+    if bins[axis] == 1 and not pbc[axis]:
+        r = 0
+    radius[axis] = r
 
 
 @wp.kernel(enable_backward=False)
@@ -297,8 +310,8 @@ class GpuNeighborList:
         rows are the lattice vectors. The list keeps a reference and reads it
         at every search, so a barostat updates it in place and never through
         this object. ``None`` for a non-periodic node set (a partition's halo
-        carries its images explicitly): the box is then the set's bounding box,
-        recomputed on the device each step.
+        carries its images explicitly): the box is fixed at the first search's
+        bounding box plus a margin.
     pbc
         Per-axis periodicity; ignored without a cell.
     targets
@@ -397,10 +410,7 @@ class GpuNeighborList:
         # Cell-list cache and matrix: allocated by the first search, which
         # needs the positions to size them.
         self._cache = None
-        self._box_cells_est = None
-        #: Whether the periodic box is small enough that a cell change can
-        #: invalidate the cell list's search radius (set by the first search).
-        self.small_box = False
+        self._cell_changed = False
         #: The fixed search box of a non-periodic node set, and its origin.
         self._box: torch.Tensor | None = None
         self._lo: torch.Tensor | None = None
@@ -436,20 +446,14 @@ class GpuNeighborList:
         """Size the cell-list cache for ``box`` (synchronises)."""
         n_cells, radius = estimate_cell_list_sizes(box, self._pbc, self.rcut)
         self._cache = allocate_cell_list(self.n_node, n_cells, radius, self.device)
-        self._box_cells_est = n_cells
         if self.periodic:
-            # Whether a cell change can invalidate the search radius: see
-            # `cell_changed`. Decided once, from the box this estimate saw.
-            h = box.detach().reshape(3, 3).cpu().numpy()
-            volume = abs(np.linalg.det(h))
-            widths = [
-                volume / np.linalg.norm(np.cross(h[(k + 1) % 3], h[(k + 2) % 3]))
-                for k in range(3)
+            self._radius_inputs = [
+                wp.from_torch(box, dtype=wp.mat33d, requires_grad=False),
+                wp.from_torch(self._pbc, dtype=wp.bool, requires_grad=False),
+                wp.from_torch(self._cache[0], dtype=wp.int32, requires_grad=False),
+                wp.from_torch(radius, dtype=wp.int32, requires_grad=False),
+                self.rcut,
             ]
-            self.small_box = any(
-                self.pbc[k] and widths[k] < (_SMALL_BOX_CELLS + 1) * self.rcut
-                for k in range(3)
-            )
 
     def _allocate_matrix(self, max_neighbors: int) -> None:
         self.max_neighbors = int(max_neighbors)
@@ -485,7 +489,6 @@ class GpuNeighborList:
         self.edge_mask = torch.zeros(cap, dtype=torch.bool, device=dev)
         self.source_order = torch.zeros(cap, dtype=torch.int64, device=dev)
         self.destination_order = torch.arange(cap, dtype=torch.int64, device=dev)
-        self._arange = self.destination_order  # the same identity, read-only
         self._wp_src = wp.from_torch(
             self.edge_index[0], dtype=wp.int64, requires_grad=False
         )
@@ -544,6 +547,14 @@ class GpuNeighborList:
     def _query(self, pos: torch.Tensor, box: torch.Tensor) -> None:
         with _torch_stream_scope(self.device):
             build_cell_list(pos, self.rcut, box, self._pbc, *self._cache)
+            if self._cell_changed:
+                wp.launch(
+                    _update_search_radius,
+                    dim=3,
+                    inputs=self._radius_inputs,
+                    device=str(self.device),
+                )
+                self._cell_changed = False
             self.num_neighbors.zero_()
             query_cell_list(
                 pos,
@@ -690,7 +701,9 @@ class GpuNeighborList:
                 device=str(self.device),
             )
         mark("source")
-        torch.lt(self._arange, self.destination_row_ptr[-1], out=self.edge_mask)
+        torch.lt(
+            self.destination_order, self.destination_row_ptr[-1], out=self.edge_mask
+        )
         mark("mask")
 
     # ------------------------------------------------------------------ graph
@@ -788,28 +801,19 @@ class GpuNeighborList:
     # ------------------------------------------------------------- cell change
 
     def cell_changed(self, cell) -> bool:
-        """Re-size the cell-list cache for a new cell when the box is small
-        enough for that to matter (synchronises when it does).
+        """Notify a cell update; return whether the cache was resized.
 
-        ``cell`` is the host copy the caller keeps, so deciding costs no
-        device readback. nvalchemiops recomputes the number of cells per axis
-        on the device at every build, but the search radius -- how many
-        cells out a query looks -- is fixed when the cache is sized. With at
-        least four cells per axis forced, a box whose face is under ``4 rcut``
-        has cells narrower than the cutoff and a radius above one; shrink it
-        a little and the radius it needs can grow while the stored one does
-        not. A larger box only makes the kernel merge cells, which is safe.
-        So only a small periodic box re-estimates. Returns whether it did.
+        Accepts the host ``cell`` for compatibility. The search reads the
+        shared device cell, which the caller must have already updated.
         """
-        del cell  # the regime was decided from the box the first estimate saw
         return self.cell_changed_device()
 
     def cell_changed_device(self) -> bool:
-        """:meth:`cell_changed` for a cell that changed on the device: nothing
-        to read unless the box is small, in which case the re-estimate reads
-        the device (small systems can afford that)."""
-        if not self.periodic or self._cache is None or not self.small_box:
-            return False
-        self._estimate(self._cell)
-        self.resizes += 1
-        return True
+        """Refresh the radius at the next search, without resizing or syncing.
+
+        The build recomputes bin counts within the existing allocation; the
+        query must use a radius derived from those counts and the new cell.
+        An initially large box can contract into the small-box regime too.
+        """
+        self._cell_changed = self.periodic and self._cache is not None
+        return False

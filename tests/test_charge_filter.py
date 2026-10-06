@@ -1,4 +1,4 @@
-"""The simulation-only charge filter: small charges switched off, smoothly.
+"""The trained or simulation-time charge filter: small charges switched off.
 
 What is pinned:
 - **The filter itself**: exactly zero below c_t - delta, the input above
@@ -138,10 +138,11 @@ class TestEvaluator:
                 fd = -(ev(plus)[0] - ev(minus)[0]) / (2 * h)
                 assert force[i, a] == pytest.approx(fd, abs=2e-6)
 
-    def test_serial_partitioned_and_ase_agree(self):
+    @pytest.mark.parametrize("pair", [tuple, np.asarray])
+    def test_serial_partitioned_and_ase_agree(self, pair):
         model = build()
         coord, atype, cell = system()
-        filt = threshold_for(model, coord, atype, cell)
+        filt = pair(threshold_for(model, coord, atype, cell))
         ev = DistributedEvaluator(
             model,
             atype,

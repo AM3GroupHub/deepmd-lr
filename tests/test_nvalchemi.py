@@ -28,7 +28,7 @@ from deepmd_lr.nvalchemi import (
     partition_system,
     to_numpy,
 )
-from deepmd_lr.nvalchemi.partition import default_skin
+from deepmd_lr.nvalchemi.partition import default_skin, whole_system
 
 from .test_joint_model import DESCRIPTOR, FITTING, LONG_RANGE, build, frame, get_model
 
@@ -55,6 +55,35 @@ def system():
 
 
 class TestPartitioner:
+    @pytest.mark.parametrize("whole", [False, True])
+    def test_late_views_follow_the_latest_cell(self, system, whole):
+        coord, _, cell, *_ = system
+        part = (
+            whole_system(len(coord), True, cell)
+            if whole
+            else partition_system(coord + cell[0], cell, RCUT, 2)[0]
+        )
+        early = part.views(DEVICE, torch.float32)
+        h = torch.as_tensor(cell * 1.0017, device=DEVICE)
+        part.set_cell_device(h)
+        for view in (early, part.views(DEVICE)):
+            for shift, image in (
+                ("shift", "ghost_image"), ("owned_shift", "owned_image")
+            ):
+                torch.testing.assert_close(
+                    view[shift], view[image] @ h.to(view[shift].dtype)
+                )
+            if whole:
+                torch.testing.assert_close(view["cell"], h[None], rtol=0, atol=0)
+        # A host update supersedes the previous device cell, including for
+        # views first requested afterwards on another device.
+        new_cell = cell * 1.0023
+        part.set_cell(new_cell)
+        late = part.views("cpu")
+        np.testing.assert_allclose(late["shift"], part.ghost_image @ new_cell)
+        if whole:
+            np.testing.assert_array_equal(late["cell"][0], new_cell)
+
     def test_owned_sets_tile_the_system(self, system):
         """Every atom owned exactly once -- no gaps, no duplicates."""
         coord, _, cell, *_ = system

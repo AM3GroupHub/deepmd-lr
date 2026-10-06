@@ -439,9 +439,9 @@ downloads exactly what an NVE step does (the energy word; one more for an
 uncompressed model's compact edge count), where it used to download the cell
 twice, upload it once and re-upload the virial. `set_cell` with a host cell
 still works for everything else (relaxations, tests, `read_structure`).
-`tests/test_sync.py` pins the NPT count too; a periodic box under five
-cutoffs wide is the exception, since a cell change there re-estimates the
-cell list's search radius, which reads the device.
+`tests/test_sync.py` pins the NPT count for both large and small periodic
+boxes. After a cell change, the search radius is refreshed on the device
+from the new cell and the actual bin counts, using the existing buffers.
 
 ### The neighbour list lives on the device
 

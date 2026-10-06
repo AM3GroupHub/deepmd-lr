@@ -39,16 +39,16 @@ def compressed_available() -> bool:
     return bool(op_available())
 
 
-def count_syncs(ev, x) -> dict[str, int]:
+def count_syncs(step, *args) -> dict[str, int]:
     """Device-to-host copies, pageable uploads, stream synchronisations and
     the two syncing torch ops, in one warm step."""
     from torch.profiler import ProfilerActivity, profile
 
     for _ in range(3):
-        ev(x)
+        step(*args)
     torch.cuda.synchronize()
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
-        ev(x)
+        step(*args)
     torch.cuda.synchronize()
     names = collections.Counter()
     for e in prof.events():
@@ -109,45 +109,21 @@ class TestOneDevice:
         assert_downloads(count_syncs(ev, x), 1)
 
 
-def count_md_syncs(md) -> dict[str, int]:
-    """One bare step of an MD class, after three warm-up steps."""
-    from torch.profiler import ProfilerActivity, profile
-
-    md.run(3)
-    torch.cuda.synchronize()
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
-        md.step()
-    torch.cuda.synchronize()
-    names = collections.Counter()
-    for e in prof.events():
-        n = e.name
-        if n.startswith("Memcpy DtoH"):
-            names["dtoh"] += 1
-        elif n.startswith("Memcpy HtoD") and "Pageable" in n:
-            names["pageable_htod"] += 1
-        elif n == "cudaStreamSynchronize":
-            names["stream_sync"] += 1
-        elif n in ("aten::nonzero", "aten::bincount"):
-            names[n] += 1
-    return dict(names)
-
-
 class TestBarostat:
     """An NPT step downloads what an NVE step does, nothing more: the
     barostat integrates the cell on the device and hands it over there
     (`Thermo.set_cell_device`), the pressure kernel reads the evaluator's
     device virial, and the host copy of the cell is refreshed only when a log
-    row or a checkpoint asks for it. The cell is above five cutoffs wide: a
-    smaller periodic box re-estimates its cell list's search radius at every
-    cell change, which reads the device (small systems can afford that)."""
+    row or a checkpoint asks for it. Search radii follow cell changes on the
+    device, including in small periodic boxes."""
 
     @staticmethod
-    def npt(model, compress):
+    def npt(model, compress, box=32.0):
         from ase import Atoms, units
 
         from deepmd_lr.nvalchemi import MTKNPT
 
-        coord, atype, cell = frame(n_mol=128, box=32.0)
+        coord, atype, cell = frame(n_mol=128 if box > 30 else 16, box=box)
         c, a, h = (t[0].cpu().numpy() for t in (coord, atype, cell))
         atoms = Atoms(
             numbers=[8 if t == 0 else 1 for t in a], positions=c, cell=h, pbc=True
@@ -177,17 +153,20 @@ class TestBarostat:
     def test_uncompressed_long_range(self):
         md = self.npt(build(), False)
         try:
-            assert_downloads(count_md_syncs(md), 2)
+            md.run(0)  # Initialise forces; count_syncs warms three bare steps.
+            assert_downloads(count_syncs(md.step), 2)
         finally:
             md.close()
 
     @pytest.mark.skipif(not compressed_available(), reason="needs the CUDA kernel")
-    def test_compressed_long_range(self):
+    @pytest.mark.parametrize("box", [14.0, 32.0])
+    def test_compressed_long_range(self, box):
         from .test_compress import build32
 
-        md = self.npt(build32(), 0.01)
+        md = self.npt(build32(), 0.01, box=box)
         try:
-            assert_downloads(count_md_syncs(md), 1)
+            md.run(0)
+            assert_downloads(count_syncs(md.step), 1)
         finally:
             md.close()
 

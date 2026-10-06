@@ -262,14 +262,13 @@ class LongRangeCalculator(Calculator):
         if self._has_long_range:
             self.model.eps_inf = self.eps_inf
         # None: the model's own `long_range.charge_filter`; False: none.
-        check_charge_filter(charge_filter)
         self.charge_filter = charge_filter
         effective = (
             getattr(self.model, "trained_charge_filter", None)
             if charge_filter is None
             else check_charge_filter(charge_filter)
         )
-        if charge_filter not in (None, False) or effective is not None:
+        if effective is not None:
             if not self._has_long_range:
                 raise ValueError("charge_filter needs a model with a long_range block")
             if self.efield is not None:

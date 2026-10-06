@@ -302,6 +302,7 @@ class TestBuffers:
         torch.cuda.synchronize()
         torch.cuda.set_sync_debug_mode("error")
         try:
+            lst.cell_changed_device()
             lst.search(coord[0] + 1e-3)
             lst.graph(node_coord=coord[0])
             lst.graph()
@@ -318,23 +319,29 @@ class TestBuffers:
         stream = torch.cuda.Stream(device=DEVICE)
         with torch.cuda.stream(stream):
             moved = coord * 1.0 + 0.0  # produced on the side stream
+            lst.cell_changed_device()
             lst.search(moved[0])
             g = lst.graph(node_coord=moved[0])
             got = edge_set(g.edge_index, g.edge_mask, g.edge_vec)
         torch.cuda.synchronize()
         assert got == want
 
-    def test_only_a_small_box_re_estimates_on_a_cell_change(self):
-        big, _, big_cell = frame(n_mol=256, box=36.0)
-        lst = searched(big, big_cell)
-        assert lst.cell_changed(big_cell[0].cpu().numpy() * 0.95) is False
-        coord, atype, cell = frame(n_mol=16, box=14.0)
+    @pytest.mark.parametrize("box,scale", [(14.0, 0.95), (36.0, 0.6), (14.0, 2.0)])
+    @pytest.mark.parametrize("shear", [0.0, 0.3])
+    def test_cell_changes_refresh_the_radius_without_resizing(self, box, scale, shear):
+        coord, atype, cell = frame(n_mol=64, box=box)
         cell = cell.clone()
         lst = searched(coord, cell)
-        cell.mul_(0.95)
-        x = coord * 0.95
-        assert lst.cell_changed(cell[0].cpu().numpy()) is True
+        buffers = [t.data_ptr() for t in lst._cache]
+        cell.mul_(scale)
+        cell[0, 1, 0] += box * shear
+        x = coord * scale
+        assert lst.cell_changed(cell[0].cpu().numpy()) is False
         lst.search(x[0])
+        while bool(lst.status[:2].any()):
+            lst.grow()
+            lst.search(x[0])
+        assert [t.data_ptr() for t in lst._cache] == buffers
         assert_matches(lst, x, oracle(x, atype, cell))
 
 

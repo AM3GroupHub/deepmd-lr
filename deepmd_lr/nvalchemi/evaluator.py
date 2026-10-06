@@ -354,8 +354,6 @@ class DistributedEvaluator:
         #: (:func:`~deepmd_lr.nvalchemi.partition.whole_system`).
         self._whole_system = len(self.devices) == 1
         self._open_axes = [k for k in range(3) if not self.pbc[k]]
-        #: Inverse cell on the home device, for the per-step open-face check.
-        self._cell_inv_dev: torch.Tensor | None = None
         if self._whole_system and np.linalg.det(self.cell) <= 0.0:
             raise ValueError(
                 "the cell is left-handed or degenerate (det <= 0); nvalchemiops' "
@@ -477,9 +475,8 @@ class DistributedEvaluator:
         self._reference_positions = None
         self._calls_since_rebuild = 0
         #: The halo the current partitions were built with, and the cell and
-        #: per-atom fold images they were built in (see :meth:`_drift`).
+        #: per-atom fold images they were built in (see :meth:`_needs_rebuild`).
         self._halo_skin = 0.0
-        self._reference_cell = None
         self._images = None
         self._reach = 0.0
 
@@ -560,6 +557,7 @@ class DistributedEvaluator:
         self.compute_virial = flag
         if not flag:
             self.virial = None
+            self._virial_dev = None
 
     def _auto_skin(self) -> float:
         """The geometry rule, never above a ceiling memory has forced on us.
@@ -620,8 +618,8 @@ class DistributedEvaluator:
         long-range term's k-vectors on the device, and leaves the host copy
         stale: :attr:`cell` refreshes it when something on the host asks. An
         ``"auto"`` skin is recomputed at the next rebuild rather than here.
-        Only a small periodic box re-estimates its cell list's search radius,
-        which does read the device.
+        The neighbour list refreshes its search radius on the device at the
+        next search, using the new cell and bin counts.
         """
         h = cell.detach().to(device=self.home, dtype=torch.float64).reshape(3, 3)
         self._cell_dev.copy_(h)
@@ -674,41 +672,19 @@ class DistributedEvaluator:
         # around each atom's folded position at the last rebuild; a caller that
         # wraps an atom moves it by a lattice vector, and a minimum-image check
         # would call that no motion and keep a halo built around the old image.
-        drift = self._drift(
-            positions,
-            self._reference_positions,
-            self._reference_cell,
-            self._reference_cell_dev,
-        )
+        # A node moves by df_i + S dH: folded atom motion plus its image's
+        # share of the cell deformation. Include one extra lattice step for
+        # images just outside the halo. The Frobenius norm bounds ||dH||_2
+        # without a decomposition.
+        moved = positions - self._reference_positions
+        if self._reference_cell_dev is not None and self._images is not None:
+            dh = self._cell_dev - self._reference_cell_dev
+            moved = moved - self._images @ dh.to(moved.dtype)
+            drift = moved.norm(dim=1).max() + self._reach * dh.norm()
+        else:
+            drift = moved.norm(dim=1).max()
         # The one host read the halo needs: a bool, not the positions.
         return bool(2.0 * drift > self._halo_skin)
-
-    def _drift(
-        self,
-        positions: torch.Tensor,
-        reference: torch.Tensor,
-        reference_cell,
-        reference_cell_dev: torch.Tensor | None,
-    ) -> torch.Tensor:
-        """How far any node -- or any image that could become one -- may have
-        moved since ``reference``, in angstrom, as a 0-d device tensor.
-
-        A node is an atom's folded position plus a lattice shift ``S``:
-        ``f_i + S H``, with ``f_i = r_i - n_i H`` and ``n_i`` the fold image
-        of the last rebuild. It moves by ``df_i + S dH``. So the bound is each
-        atom's motion in its folded frame, exactly, plus the largest shift's
-        share of the cell's change -- the ghosts' ``S``, one more lattice step
-        for the images just outside the halo. With the cell unchanged it is the
-        raw displacement. The cell term uses the Frobenius norm of ``dH``,
-        which bounds the 2-norm from above and needs no decomposition.
-        """
-        del reference_cell  # the device copies decide; no host comparison
-        moved = positions - reference
-        if reference_cell_dev is not None and self._images is not None:
-            dh = self._cell_dev - reference_cell_dev
-            moved = moved - self._images @ dh.to(moved.dtype)
-            return moved.norm(dim=1).max() + self._reach * dh.norm()
-        return moved.norm(dim=1).max()
 
     def _check_open_axes(self, coord: np.ndarray) -> None:
         """Keep every atom inside the cell along an open axis.
@@ -750,11 +726,7 @@ class DistributedEvaluator:
             # (`repartition_every`) only restarts the counters.
             if self._partitions is None:
                 self._partitions = [whole_system(self.n_atoms, self.pbc, self.cell)]
-                self._cell_inv_dev = torch.as_tensor(
-                    np.linalg.inv(self.cell), dtype=torch.float64, device=self.home
-                )
             self._reference_positions = tracked
-            self._reference_cell = self.cell.copy()
             self._halo_skin = float("inf")
             self._images, self._reach = None, 0.0
             self._calls_since_rebuild = 0
@@ -773,7 +745,6 @@ class DistributedEvaluator:
             skin=self.skin,
         )
         self._reference_positions = tracked.clone()
-        self._reference_cell = self.cell.copy()
         self._reference_cell_dev = self._cell_dev.clone()
         self._halo_skin = self.skin
         # Every atom is owned once, and its owned node is its fold image undone.
@@ -1070,7 +1041,7 @@ class DistributedEvaluator:
         flags = torch.zeros(STATUS_LEN, dtype=torch.int64, device=self.home)
         for nlist, _device in self._lists():
             flags |= nlist.status.to(self.home)
-        if self._whole_system and self._open_axes and self._cell_inv_dev is not None:
+        if self._whole_system and self._open_axes:
             # Nothing folds an open axis, and the reciprocal sum is taken over
             # the whole cell: an atom past a face would be summed as its image
             # at the opposite face, across the vacuum. The halo path checks
