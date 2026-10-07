@@ -144,7 +144,8 @@ def test_normalized_training_configuration():
     }
     normalized = normalize(cfg)
     model = get_model(normalized["model"])
-    assert model.zbl.serialize() == config()["zbl"]
+    # The schema switches the clamp on; a bare dict leaves it off.
+    assert model.zbl.serialize() == {**config()["zbl"], "clamp": True}
 
 
 @pytest.mark.parametrize("lr", [False, True])
@@ -161,7 +162,7 @@ def test_default_radii_and_overrides(lr, settings, expected):
     cfg = config(lr)
     cfg["zbl"] = settings
     model = get_model(cfg)
-    assert model.zbl.serialize() == expected
+    assert model.zbl.serialize() == {**expected, "clamp": False}
     restored = BaseModel.deserialize(model.serialize()).eval()
     x, t = dimer(0.6)
     for key in ["energy", "force", "virial"]:
@@ -174,7 +175,7 @@ def test_default_radii_and_overrides(lr, settings, expected):
             "training": {"training_data": {"systems": ["./data"]}, "numb_steps": 3},
         }
     )
-    assert get_model(normalized["model"]).zbl.serialize() == expected
+    assert get_model(normalized["model"]).zbl.serialize() == {**expected, "clamp": True}
     without_zbl = dict(cfg)
     without_zbl.pop("zbl")
     assert get_model(without_zbl).zbl is None
@@ -278,7 +279,7 @@ def test_real_cli_training_checkpoint_restart(tmp_path, lr):
     assert proc.returncode == 0, proc.stdout + proc.stderr
     checkpoint = tmp_path / "model.ckpt.pt"
     model = load_model(str(checkpoint), device="cpu")
-    assert model.zbl.serialize() == cfg["model"]["zbl"]
+    assert model.zbl.serialize() == {**cfg["model"]["zbl"], "clamp": True}
     x, t = (v.cpu() for v in dimer())
     assert torch.isfinite(model(x, t)["force"]).all()
     cfg["training"]["numb_steps"] = 3
@@ -295,7 +296,7 @@ def test_real_cli_training_checkpoint_restart(tmp_path, lr):
     ema = tmp_path / "model_ema.ckpt.pt"
     assert ema.exists()
     restored = load_model(str(ema), device="cpu")
-    assert restored.zbl.serialize() == cfg["model"]["zbl"]
+    assert restored.zbl.serialize() == {**cfg["model"]["zbl"], "clamp": True}
     assert torch.isfinite(restored(x, t)["energy"]).all()
 
 
@@ -442,6 +443,7 @@ class TestCovalentCutoff:
             "cutoff": "covalent",
             "covalent_scale": 1.1,
             "inner_ratio": 0.4,
+            "clamp": False,
         }
 
     def test_model_round_trip_and_forces(self):
@@ -452,6 +454,7 @@ class TestCovalentCutoff:
             "cutoff": "covalent",
             "covalent_scale": 1.0,
             "inner_ratio": 0.5,
+            "clamp": False,
         }
         restored = BaseModel.deserialize(model.serialize()).eval()
         restored.load_state_dict(model.state_dict(), strict=True)
@@ -520,3 +523,99 @@ class TestWarpKernel:
         assert (want_edge > 0).sum() > 100  # the sample does reach inside the switch
         assert grad[~valid].eq(0).all()
         assert energy[~args[4]].eq(0).all()  # ghosts own nothing
+
+
+class TestClamp:
+    """``clamp: true``: the descriptor is shown a frozen length below r_inner
+    and a C^3 remap up to r_outer, so the network's energy and charges stop
+    changing where ZBL takes over; every derivative goes through the remap."""
+
+    def test_remap_is_monotone_c3_and_never_below_r_outer(self):
+        ro = torch.tensor(1.5, dtype=torch.float64)
+        rt = torch.tensor(2.2, dtype=torch.float64)
+        r = torch.linspace(0.2, 2.6, 2401, dtype=torch.float64)
+        h = ZBL.clamp_distance(r, ro, rt)
+        assert torch.all(h[r <= ro] == ro)
+        assert torch.all(h[r >= rt] == r[r >= rt])
+        assert torch.all(h >= ro)
+        assert torch.all(h[1:] >= h[:-1])
+        for boundary in (ro, rt):
+            d = []
+            for side in (-1e-6, 1e-6):
+                x = torch.tensor(
+                    float(boundary) + side, dtype=torch.float64, requires_grad=True
+                )
+                y = ZBL.clamp_distance(x, ro, rt)
+                (g1,) = torch.autograd.grad(y, x, create_graph=True)
+                (g2,) = torch.autograd.grad(g1, x, create_graph=True)
+                (g3,) = torch.autograd.grad(g2, x)
+                d.append(torch.stack([y, g1, g2, g3]).detach())
+            # the third derivative grows at ~1e3 per A right after a join;
+            # 1e-6 away it is ~1e-3.
+            torch.testing.assert_close(d[0], d[1], atol=1e-2, rtol=0)
+
+    @pytest.mark.parametrize("lr", [False, True])
+    def test_network_frozen_below_r_outer(self, lr):
+        cfg = config(lr)
+        cfg["zbl"]["clamp"] = True
+        model = get_model(cfg).eval()
+        plain = get_model({k: v for k, v in cfg.items() if k != "zbl"}).eval()
+        plain.load_state_dict(model.state_dict(), strict=True)
+        learned = {}
+        # radii 0.8/1.5: frozen up to 1.5, transition to 2.2, itself beyond
+        assert model.zbl.clamp_width == pytest.approx(0.7)
+        for r in (0.5, 0.7, 0.8, 1.5, 2.3, 2.6):
+            x, t = dimer(r)
+            out = model(x, t)
+            # The learned part: total minus ZBL, minus the Coulomb term when
+            # there is one -- the charges freeze, their interaction keeps the
+            # true geometry.
+            learned[r] = (
+                out["energy_short_range"] if lr else out["energy"]
+            ).item() - pair_reference(r)
+            if lr:
+                learned[r, "q"] = out["charge"].detach().cpu().numpy().ravel().tolist()
+            if r >= 2.3:  # outside the clamp the model IS the plain one
+                torch.testing.assert_close(out["energy"], plain(x, t)["energy"])
+        for r in (0.5, 0.7, 0.8):
+            assert learned[r] == pytest.approx(learned[1.5], abs=1e-9)
+            if lr:
+                assert learned[r, "q"] == pytest.approx(learned[1.5, "q"], abs=1e-9)
+        assert model.zbl.serialize()["clamp"] is True
+        restored = BaseModel.deserialize(model.serialize()).eval()
+        restored.load_state_dict(model.state_dict(), strict=True)
+        assert restored.zbl.clamp is True
+        x, t = dimer(0.6)
+        torch.testing.assert_close(model(x, t)["force"], restored(x, t)["force"])
+
+    @pytest.mark.parametrize("lr", [False, True])
+    @pytest.mark.parametrize("r", [0.6, 1.1, 1.9])
+    def test_forces_differentiate_through_the_remap(self, lr, r):
+        cfg = config(lr)
+        cfg["zbl"]["clamp"] = True
+        model = get_model(cfg).eval()
+        x, t = dimer(r)
+        out = model(x, t)
+        h = 1e-5
+        plus, minus = x.clone(), x.clone()
+        plus[0, 1, 0] += h
+        minus[0, 1, 0] -= h
+        fd = -(model(plus, t)["energy"] - model(minus, t)["energy"]) / (2 * h)
+        torch.testing.assert_close(
+            out["force"][0, 1, 0], fd.squeeze(), rtol=1e-5, atol=1e-4
+        )
+        vir = -(model(x * (1 + h), t)["energy"] - model(x * (1 - h), t)["energy"]) / (
+            2 * h
+        )
+        torch.testing.assert_close(
+            out["virial"][0, 0], vir.squeeze(), rtol=1e-5, atol=1e-4
+        )
+
+    def test_descriptor_hook_is_removed_after_the_pass(self):
+        cfg = config()
+        cfg["zbl"]["clamp"] = True
+        model = get_model(cfg).eval()
+        descriptor = model.atomic_model.descriptor
+        x, t = dimer(0.6)
+        model(x, t)
+        assert "call_graph" not in descriptor.__dict__

@@ -178,16 +178,15 @@ def _run_backbone(model, graph, atype_flat, charge_spin):
     """
     descriptor = model.atomic_model.descriptor
     kwargs = (
-        {"charge_spin": charge_spin}
-        if model.atomic_model.supports_charge_spin
-        else {}
+        {"charge_spin": charge_spin} if model.atomic_model.supports_charge_spin else {}
     )
-    return descriptor.call_graph(
-        graph,
-        atype_flat,
-        type_embedding=descriptor.graph_type_embedding_table(),
-        **kwargs,
-    )
+    with model._clamping_descriptor():
+        return descriptor.call_graph(
+            graph,
+            atype_flat,
+            type_embedding=descriptor.graph_type_embedding_table(),
+            **kwargs,
+        )
 
 
 def _is_compressed(model) -> bool:
@@ -297,9 +296,7 @@ class LongRangeEnergyModel(EnergyModel):
         energy model, which is what makes "Phase 4 reduces to Phase 1" a
         testable property rather than an aspiration.
         """
-        return (
-            self.charge_fitting is not None and self.long_range_energy is not None
-        )
+        return self.charge_fitting is not None and self.long_range_energy is not None
 
     def long_range_energy_for(
         self, cell: Any, pbc: Any, settings: dict[str, Any] | None = None
@@ -478,9 +475,19 @@ class LongRangeEnergyModel(EnergyModel):
         if self.atomic_model.atom_exclude_types or self.atomic_model.pair_exclude_types:
             raise ValueError("zbl with atom/pair exclusions is not supported")
         zbl = ZBL(self.get_type_map(), settings, device=next(self.parameters()).device)
-        if zbl.max_r_outer > descriptor.get_rcut():
-            raise ValueError("zbl's outer radius must not exceed descriptor.rcut")
+        reach = zbl.clamp_reach if zbl.clamp else zbl.max_r_outer
+        if reach > descriptor.get_rcut():
+            raise ValueError(
+                "zbl's outer radius (plus the clamp's transition) must not exceed "
+                "descriptor.rcut"
+            )
         self.zbl = zbl
+
+    def _clamping_descriptor(self):
+        """The ZBL clamp on the descriptor for one backbone pass, or nothing."""
+        if self.zbl is not None and self.zbl.clamp:
+            return self.zbl.clamping(self.atomic_model.descriptor)
+        return contextlib.nullcontext()
 
     @classmethod
     def _build_long_range(
@@ -672,9 +679,7 @@ class LongRangeEnergyModel(EnergyModel):
         """
         nf, nloc = atype.shape[0], atype.shape[1]
         atype_flat = atype.reshape(-1)
-        raw = self.charge_fitting.call_graph(features, atype_flat, gr=rot_mat)[
-            "charge"
-        ]
+        raw = self.charge_fitting.call_graph(features, atype_flat, gr=rot_mat)["charge"]
         raw = raw.reshape(nf, nloc)
         total = (
             charge_spin[:, 0].to(raw.dtype)
@@ -1094,18 +1099,31 @@ class LongRangeEnergyModel(EnergyModel):
                     "`get_geo_compress()`; a hand-built graph needs "
                     "`build_neighbor_graph_fast(..., with_csr=True)`."
                 )
-        result = super().forward_common_lower_graph(
-            atype,
-            n_node,
-            n_local,
-            edge_index,
-            edge_vec,
-            edge_mask,
-            destination_order,
-            destination_row_ptr,
-            *args,
-            **kwargs,
-        )
+        if (
+            self.zbl is not None
+            and self.zbl.clamp
+            and not self.training
+            and cuda_infer_level() >= 2
+        ):
+            # Level 2 is DeePMD-kit's fused energy/force pipeline, which never
+            # calls the descriptor's `call_graph` and so would skip the clamp.
+            raise RuntimeError(
+                "DP_CUDA_INFER=2 bypasses the descriptor the ZBL clamp wraps; "
+                "set DP_CUDA_INFER=1"
+            )
+        with self._clamping_descriptor():
+            result = super().forward_common_lower_graph(
+                atype,
+                n_node,
+                n_local,
+                edge_index,
+                edge_vec,
+                edge_mask,
+                destination_order,
+                destination_row_ptr,
+                *args,
+                **kwargs,
+            )
         if self.zbl is not None:
             options = dict(
                 zip(

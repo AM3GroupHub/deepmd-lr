@@ -175,6 +175,32 @@ def dp_lr_model_args() -> Argument:
                         ),
                     ),
                     Argument(
+                        "clamp",
+                        bool,
+                        optional=True,
+                        default=True,
+                        doc=(
+                            "Show the descriptor nothing below the switch: a pair "
+                            "closer than r_outer looks like one at r_outer, and the "
+                            "true length returns smoothly (C^3) over clamp_width "
+                            "beyond it. Without it the network keeps extrapolating "
+                            "below the data and a few eV of ZBL change nothing "
+                            "there. A checkpoint without the key is reproduced "
+                            "with the clamp off."
+                        ),
+                    ),
+                    Argument(
+                        "clamp_width",
+                        [int, float, type(None)],
+                        optional=True,
+                        default=None,
+                        doc=(
+                            "Width (Angstrom) of the clamp's transition beyond "
+                            "r_outer; default each pair's r_outer - r_inner. r_outer + "
+                            "clamp_width must not exceed descriptor.rcut."
+                        ),
+                    ),
+                    Argument(
                         "inner_ratio",
                         [int, float],
                         optional=True,

@@ -28,10 +28,13 @@ for it). On a CUDA device one Warp kernel produces the per-edge energy and
 derivative; elsewhere the same arithmetic runs as torch ops.
 """
 
+import contextlib
+import dataclasses
 import math
 from numbers import Real
 from typing import Any
 
+import numpy as np
 import torch
 from ase.data import atomic_numbers, covalent_radii
 from deepmd.dpmodel.model.edge_transform_output import node_ownership_mask
@@ -58,14 +61,47 @@ _PHI_A = (0.18175, 0.50986, 0.28022, 0.02817)
 _PHI_B = (3.19980, 0.94229, 0.40290, 0.20162)
 
 _CUTOFFS = ("fixed", "covalent")
-_KEYS = {"cutoff", "r_inner", "r_outer", "covalent_scale", "inner_ratio"}
+_KEYS = {
+    "cutoff",
+    "r_inner",
+    "r_outer",
+    "covalent_scale",
+    "inner_ratio",
+    "clamp",
+    "clamp_width",
+}
+#: ``clamp`` absent means off: checkpoints written before it existed are
+#: reproduced as trained. The schema default for a new input is on.
 _DEFAULTS = {
     "cutoff": "fixed",
     "r_inner": 0.5,
     "r_outer": 0.8,
     "covalent_scale": 1.0,
     "inner_ratio": 0.5,
+    "clamp": False,
+    "clamp_width": None,
 }
+
+
+def _septic_remap_coefficients() -> tuple[float, float, float, float]:
+    """``q(t) = a4 t^4 + a5 t^5 + a6 t^6 + a7 t^7`` on [0, 1], flat to third
+    order at 0 (``q = q' = q'' = q''' = 0``) and joining the identity to third
+    order at 1 (``q = 1, q' = 1, q'' = q''' = 0``): the clamp's transition
+    from a frozen length to the true one, C^3 at both ends like DPA4's
+    ``InnerClamp``."""
+    rows = [
+        [1, 1, 1, 1],
+        [4, 5, 6, 7],
+        [12, 20, 30, 42],
+        [24, 60, 120, 210],
+    ]
+    a = np.linalg.solve(
+        np.array(rows, dtype=np.float64), np.array([1.0, 1.0, 0.0, 0.0])
+    )
+    return tuple(float(x) for x in a)
+
+
+_REMAP = _septic_remap_coefficients()
 
 
 def _tracing(t: torch.Tensor) -> bool:
@@ -105,6 +141,18 @@ class ZBL(torch.nn.Module):
         if settings["cutoff"] not in _CUTOFFS:
             raise ValueError(f"zbl.cutoff must be one of {_CUTOFFS}")
         self.cutoff = settings["cutoff"]
+        if not isinstance(settings["clamp"], bool):
+            raise ValueError("zbl.clamp must be true or false")
+        #: Show the descriptor nothing below the switch: a pair closer than
+        #: r_outer looks like one at r_outer, and the true length returns over
+        #: ``clamp_width`` beyond it (:meth:`clamping`).
+        self.clamp = settings["clamp"]
+        width = settings["clamp_width"]
+        if width is not None and (
+            isinstance(width, bool) or not isinstance(width, Real) or not width > 0
+        ):
+            raise ValueError("zbl.clamp_width must be a positive distance (Angstrom)")
+        self._clamp_width_setting = None if width is None else float(width)
         self.r_inner = _check_distance("r_inner", settings["r_inner"])
         self.r_outer = _check_distance("r_outer", settings["r_outer"])
         self.covalent_scale = _check_distance(
@@ -146,6 +194,21 @@ class ZBL(torch.nn.Module):
             if self.cutoff == "covalent"
             else self.r_inner / self.r_outer
         )
+        #: The transition back to the true length, in Angstrom beyond r_outer.
+        #: ``None`` means each pair's own switch width, r_outer - r_inner.
+        if self._clamp_width_setting is not None:
+            self.clamp_width = self._clamp_width_setting
+        elif self.cutoff == "fixed":
+            self.clamp_width = self.r_outer - self.r_inner
+        else:
+            self.clamp_width = None
+
+    @property
+    def clamp_reach(self) -> float:
+        """How far out the clamp still alters a pair: the largest r_trans."""
+        if self.clamp_width is None:
+            return self.max_r_outer * (2.0 - self.inner_fraction)
+        return self.max_r_outer + self.clamp_width
 
     @property
     def max_r_outer(self) -> float:
@@ -155,12 +218,90 @@ class ZBL(torch.nn.Module):
 
     def serialize(self) -> dict[str, Any]:
         if self.cutoff == "covalent":
-            return {
+            data = {
                 "cutoff": "covalent",
                 "covalent_scale": self.covalent_scale,
                 "inner_ratio": self.inner_ratio,
             }
-        return {"r_inner": self.r_inner, "r_outer": self.r_outer}
+        else:
+            data = {"r_inner": self.r_inner, "r_outer": self.r_outer}
+        data["clamp"] = self.clamp
+        if self._clamp_width_setting is not None:
+            data["clamp_width"] = self._clamp_width_setting
+        return data
+
+    # ------------------------------------------------------------- clamp
+
+    @staticmethod
+    def clamp_distance(
+        r: torch.Tensor, r_outer: torch.Tensor, r_trans: torch.Tensor
+    ) -> torch.Tensor:
+        """The length the descriptor is shown for a pair at ``r``: ``r_outer``
+        from ``r_outer`` in, ``r`` itself from ``r_trans`` out, a C^3 septic
+        remap between. Monotone, and never below ``r_outer``: the network is
+        shown nothing of the region ZBL governs, which is also the region the
+        data never sampled -- a frozen length *inside* the switch (DPA4's
+        choice) would still show it distances it has never seen, and this
+        descriptor extrapolates there by thousands of eV."""
+        t = ((r - r_outer) / (r_trans - r_outer)).clamp(0.0, 1.0)
+        a4, a5, a6, a7 = _REMAP
+        q = t.pow(4) * (a4 + t * (a5 + t * (a6 + t * a7)))
+        return torch.where(r >= r_trans, r, r_outer + (r_trans - r_outer) * q)
+
+    def clamp_edges(
+        self, edge_vec: torch.Tensor, atype: torch.Tensor, edge_index: torch.Tensor
+    ) -> torch.Tensor:
+        """Edge vectors rescaled radially to their clamped lengths, as a
+        differentiable function of ``edge_vec``: whatever is differentiated
+        through the descriptor picks the clamp's Jacobian up on the way."""
+        ti = atype.clamp(0, self.numbers.numel() - 1).long()
+        half = self.half_outer[ti]
+        ro = (half[edge_index[0]] + half[edge_index[1]]).to(edge_vec.dtype)
+        width = (
+            ro * (1.0 - self.inner_fraction)
+            if self.clamp_width is None
+            else self.clamp_width
+        )
+        rt = ro + width
+        r = edge_vec.norm(dim=1)
+        # A padded edge is a zero vector; its scale is irrelevant but must be
+        # finite.
+        safe = torch.where(r > 0, r, torch.ones_like(r))
+        scale = torch.where(
+            r >= rt, torch.ones_like(r), self.clamp_distance(safe, ro, rt) / safe
+        )
+        return edge_vec * scale.unsqueeze(-1)
+
+    @contextlib.contextmanager
+    def clamping(self, descriptor):
+        """Make ``descriptor.call_graph`` see clamped edge vectors for the block.
+
+        Wrapping the descriptor rather than the model's lower keeps DeePMD's
+        own ``edge_vec`` leaf in charge: the clamp sits between the leaf and
+        the descriptor as ordinary torch ops, so forces, the charge response
+        and the virial all differentiate through it with no further code. A
+        capture opened outside this block (``_capturing_backbone``) records
+        the raw vectors, which is what its consumers assume.
+        """
+        if not self.clamp:
+            yield
+            return
+        unhooked = descriptor.call_graph
+
+        def clamped(graph, atype_flat, *args, **kwargs):
+            vec = self.clamp_edges(graph.edge_vec, atype_flat, graph.edge_index)
+            graph = dataclasses.replace(graph, edge_vec=vec)
+            return unhooked(graph, atype_flat, *args, **kwargs)
+
+        had_own = "call_graph" in descriptor.__dict__
+        descriptor.call_graph = clamped
+        try:
+            yield
+        finally:
+            if had_own:
+                descriptor.call_graph = unhooked
+            else:
+                del descriptor.call_graph
 
     # ------------------------------------------------------------ per edge
 

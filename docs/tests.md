@@ -127,7 +127,10 @@ the model first.
   covalent radii), a C^2 switch at both radii, analytic force and virial as
   derivatives, serialization and `dp train` restart, `same_as` inheritance, the
   refused export paths, the Warp kernel equal to the torch arithmetic edge for
-  edge; on the GPU, serial = compressed = two partitions for DPA4C and DPA4C-LR.
+  edge, the clamp (monotone C^3 remap, learned energy and charges frozen below
+  r_inner, forces through the remap, hook removed afterwards); on the GPU,
+  serial = compressed = two partitions for DPA4C and DPA4C-LR, clamp on and
+  off, and level 2 refused with the clamp.
 - `test_neutrality_loss.py` — the `ener_lr` loss: the shift the model reports
   is the projection's, the term and its schedule, its gradient reaching the
   head and backbone, the schema, the trainer's factory and serialization.

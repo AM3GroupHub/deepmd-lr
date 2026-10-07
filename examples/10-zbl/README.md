@@ -48,6 +48,36 @@ Two conventions exist, and they answer different questions:
 Whichever you choose, validate against close-contact data, normal bond
 distances and the intended collision energies.
 
+### The clamp, and why ZBL alone does not make a wall
+
+`clamp: true` (the schema default for a new input) shows the descriptor
+nothing below the switch: a pair closer than `r_outer` looks to the network
+like one at `r_outer`, and the true length returns over `clamp_width` beyond
+it (default: the pair's own `r_outer - r_inner`) through a C^3 septic remap. The charge head
+reads the same descriptor, so it is frozen too. Below `r_outer` the learned
+energy and the charges are constant in that pair's distance and ZBL alone
+carries it inward.
+
+Without the clamp the term is a prior and nothing more. Compressing one O-H
+pair in a liquid-water frame, both the plain water model and its ZBL twin run
+to -10^3 .. -10^5 eV below 0.75 A -- the DPA4C features and the charge head
+extrapolate there with arbitrary sign -- and a few eV of ZBL do not register.
+Freezing at `r_inner` instead, DPA4's choice, does not help this descriptor:
+the network is still shown lengths in `[r_inner, r_outer]` it never saw, and
+the same model gave -3600 eV at 0.8 A that way. Hence the freeze at `r_outer`.
+
+Two consequences for choosing radii with the clamp on. `r_outer` should sit
+at or below the data's closest distance for that pair, or the model is
+trained on remapped geometry there (the covalent cutoff puts `r_outer` at the
+bond, so the clamp blinds the network to bond compression: use fixed radii
+with the clamp). And `r_outer + clamp_width` must stay below `descriptor.rcut`.
+`tests/test_zbl.py::TestClamp` pins the frozen energy, the frozen charges and
+the finite-difference forces through the remap.
+
+A checkpoint written before the key existed is reproduced with the clamp off.
+`DP_CUDA_INFER=2` is refused with the clamp: that fused pipeline never calls
+the descriptor the clamp wraps.
+
 The energy is `E_learned + E_ZBL` (DPA4C), or
 `E_learned + E_ZBL + E_long_range` (DPA4C-LR). ZBL uses the element's atomic
 number, not the learned charge. It adds no trainable parameters. Its settings

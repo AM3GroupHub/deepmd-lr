@@ -19,11 +19,17 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
 
 @pytest.mark.parametrize("lr,level", [(False, 1), (False, 2), (True, 1)])
 @pytest.mark.parametrize("compressed", [False, True])
-def test_serial_compression_and_partition_parity(monkeypatch, lr, compressed, level):
+@pytest.mark.parametrize("clamp", [False, True])
+def test_serial_compression_and_partition_parity(
+    monkeypatch, lr, compressed, level, clamp
+):
     monkeypatch.setenv("DP_CUDA_INFER", str(level))
     if compressed and not op_available():
         pytest.skip("compiled DPA4C compression operator required")
+    if clamp and level == 2:
+        pytest.skip("level 2 bypasses the descriptor; refused, tested below")
     cfg = config(lr)
+    cfg["zbl"]["clamp"] = clamp
     cfg["descriptor"]["precision"] = "float32"
     cfg["fitting_net"]["precision"] = "float32"
     if lr:
@@ -60,3 +66,16 @@ def test_serial_compression_and_partition_parity(monkeypatch, lr, compressed, le
         np.testing.assert_allclose(
             np.asarray(partitioned[key]).reshape(-1), target, atol=2e-4, rtol=2e-5
         )
+
+
+def test_level_2_is_refused_with_the_clamp(monkeypatch):
+    monkeypatch.setenv("DP_CUDA_INFER", "2")
+    cfg = config(False)
+    cfg["zbl"]["clamp"] = True
+    model = get_model(cfg).eval()
+    x = torch.tensor(
+        [[[0.0, 0.0, 0.0], [1.1, 0.0, 0.0]]], dtype=torch.float64, device=DEVICE
+    )
+    t = torch.tensor([[0, 1]], device=DEVICE)
+    with pytest.raises(RuntimeError, match="DP_CUDA_INFER=2"):
+        model(x, t, box=torch.eye(3, dtype=torch.float64, device=DEVICE)[None] * 14)
