@@ -305,10 +305,29 @@ def test_same_as_inherits_zbl_and_shares_weights():
     assert models["slab"].atomic_model is models["bulk"].atomic_model
 
 
-def test_invalid_element_and_conflicting_table_rejected():
+def test_dummy_type_has_no_nucleus():
+    # The repository's periodic-table type maps start with ASE's dummy "X":
+    # it must be accepted, and a pair involving it must contribute nothing.
+    zbl = ZBL(["X", "Si", "C"], config()["zbl"])
+    assert zbl.numbers.tolist() == [0.0, 14.0, 6.0]
+    edges = torch.tensor([[0, 1, 1, 2], [1, 0, 2, 1]])
+    vec = torch.tensor(
+        [[1.1, 0, 0], [-1.1, 0, 0], [1.1, 0, 0], [-1.1, 0, 0]], dtype=torch.float64
+    )
+    energy = zbl.atomic_energy(
+        torch.tensor([0, 1, 2]), edges, vec, torch.ones(4).bool()
+    )
+    assert energy[0].item() == 0.0
+    assert energy[1:].sum().item() == pytest.approx(pair_reference(1.1), abs=1e-10)
     cfg = config()
-    cfg["type_map"] = ["X", "C"]
-    with pytest.raises(ValueError, match="real element"):
+    cfg["type_map"] = ["X", "Si", "C"]
+    get_model(cfg)
+
+
+def test_no_element_and_conflicting_table_rejected():
+    cfg = config()
+    cfg["type_map"] = ["X", "Y0"]
+    with pytest.raises(ValueError, match="at least one element"):
         get_model(cfg)
     cfg = config()
     cfg["use_srtab"] = "unused.table"

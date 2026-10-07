@@ -36,20 +36,18 @@ class ZBL(torch.nn.Module):
                 raise ValueError(f"zbl.{key} must be a finite real distance")
         if not 0 < settings["r_inner"] < settings["r_outer"]:
             raise ValueError("zbl requires 0 < r_inner < r_outer")
-        if not type_map or any(
-            s not in atomic_numbers or atomic_numbers[s] <= 0 for s in type_map
-        ):
-            raise ValueError("zbl requires real element symbols in type_map")
+        # A type that is not an element -- ASE's dummy "X" heads this
+        # repository's periodic-table type maps -- has no nucleus: Z = 0, and
+        # every pair it is in contributes nothing.
+        numbers = [atomic_numbers.get(s, 0) for s in type_map]
+        if not any(z > 0 for z in numbers):
+            raise ValueError("zbl requires at least one element symbol in type_map")
         self.r_inner = float(settings["r_inner"])
         self.r_outer = float(settings["r_outer"])
         # Derived entirely from serialized type_map; not an optimizer parameter.
         self.register_buffer(
             "numbers",
-            torch.tensor(
-                [atomic_numbers[s] for s in type_map],
-                dtype=torch.float64,
-                device=device,
-            ),
+            torch.tensor(numbers, dtype=torch.float64, device=device),
             persistent=False,
         )
 
