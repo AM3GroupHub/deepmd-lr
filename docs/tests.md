@@ -123,10 +123,11 @@ the model first.
   gradient of the filtered energy on one and two partitions, serial =
   partitioned = ASE, serialization, training gradients, overrides and refusals.
 - `test_zbl.py`, `test_zbl_gpu.py` — the fixed ZBL prior: no parameters, the
-  screened pair energy against the formula, a C^2 switch at both radii, force
-  and virial as derivatives, serialization and `dp train` restart, `same_as`
-  inheritance, the refused export paths; on the GPU, serial = compressed =
-  two partitions for DPA4C and DPA4C-LR.
+  screened pair energy against the formula for both cutoffs (fixed radii, per-pair
+  covalent radii), a C^2 switch at both radii, analytic force and virial as
+  derivatives, serialization and `dp train` restart, `same_as` inheritance, the
+  refused export paths, the Warp kernel equal to the torch arithmetic edge for
+  edge; on the GPU, serial = compressed = two partitions for DPA4C and DPA4C-LR.
 - `test_neutrality_loss.py` — the `ener_lr` loss: the shift the model reports
   is the projection's, the term and its schedule, its gradient reaching the
   head and backbone, the schema, the trainer's factory and serialization.

@@ -1,4 +1,4 @@
-# Fixed ZBL repulsion for DPA4C and DPA4C-LR
+# ZBL repulsion for DPA4C and DPA4C-LR
 
 Both variants use the plugin's `model.type: "dp_lr"` construction path with a
 `dpa4c` descriptor. Omit `long_range` for a pure short-range DPA4C model; retain
@@ -13,16 +13,40 @@ it for DPA4C-LR. The built-in `standard` model does not consume this plugin's
 ```
 
 Distances are in Angstrom. An empty `"zbl": {}` block enables the same
-defaults: `r_inner=0.5`, `r_outer=0.8`. Either radius can be overridden
-independently; explicit values in existing inputs and checkpoints are preserved.
-These radii match DeePMD DPA4 bridging defaults; the coupling method remains
-additive and is not equivalent to DPA4 bridging. They are not calibrated
-Si/C or universal radii. With the defaults the term is inert in ordinary MD:
-for Si-C (bond 1.89 A) or O-H (0.97 A) nothing ever comes within 0.8 A, and
-the regime that wrecks a trajectory -- a pair at 1.0-1.4 A the training data
-never sampled -- is left to the network. Choose and validate the radii against
-close-contact data, normal bond distances and the intended collision energies. Require
-`0 < r_inner < r_outer <= descriptor.rcut`. Omit the block to disable ZBL.
+defaults: `cutoff: "fixed"`, `r_inner=0.5`, `r_outer=0.8`. Either radius can
+be overridden independently; explicit values in existing inputs and
+checkpoints are preserved. Require `0 < r_inner < r_outer <= descriptor.rcut`.
+Omit the block to disable ZBL.
+
+### Where to put the switch
+
+Two conventions exist, and they answer different questions:
+
+- **`cutoff: "fixed"`** (the default), one `r_inner`/`r_outer` for every
+  pair, is DPA4's bridging convention and `0.5/0.8` are its defaults. DPA4
+  pairs those radii with a *descriptor clamp* that blinds the network below
+  `r_outer`, so ZBL alone governs there. This plugin has no clamp -- the
+  network stays active -- and with radii this short the term is inert at
+  ordinary bond lengths: for Si-C (bond 1.89 A), C-C (1.54) or O-H (0.97)
+  nothing comes within 0.8 A, and the regime that wrecks a trajectory, a
+  pair at 1.0-1.4 A the data never sampled, is left to the network. Water
+  cannot go higher (O-H sits at 0.97, the data reaches 0.93); Si/diamond
+  can take `r_outer` ~ 1.2 A, the floor of its data's C-C distances.
+- **`cutoff: "covalent"`** is MACE's convention: per pair,
+  `r_outer = covalent_scale * (R_i + R_j)` with ASE's covalent radii
+  (Si 1.11, C 0.76, O 0.66, H 0.31 A) and `r_inner = inner_ratio * r_outer`
+  (defaults 1.0 and 0.5). The wall reaches each bond and training absorbs
+  what it adds there -- a few eV per bond with the standard screening, which
+  MACE softens (its screening length is about half the ZBL one; this
+  implementation keeps the standard value). Expect the baseline twin to be
+  needed to see what it costs in accuracy.
+
+```json
+"zbl": {"cutoff": "covalent", "covalent_scale": 1.0, "inner_ratio": 0.5}
+```
+
+Whichever you choose, validate against close-contact data, normal bond
+distances and the intended collision energies.
 
 The energy is `E_learned + E_ZBL` (DPA4C), or
 `E_learned + E_ZBL + E_long_range` (DPA4C-LR). ZBL uses the element's atomic
@@ -70,11 +94,18 @@ Between the radii multiply it by `1 - 10*t**3 + 15*t**4 - 6*t**5`, where
 convention is not LAMMPS's switching polynomial. Energy, force and curvature
 are continuous at the endpoints. Exact overlapping real atoms remain singular.
 
-The directed graph contributes half the pair energy to each destination.
-DeePMD's edge derivatives and owned/ghost reductions assemble conservative forces
-and virials. The current implementation adds a separate tensor evaluation and
-edge-derivative pass; it is not a fused ZBL CUDA kernel, and no MD throughput
-percentage is claimed.
+The directed graph contributes half the pair energy to each destination,
+and a ghost destination's half belongs to the rank that owns it. The term has
+no parameters and no network between it and the edge vectors, so its forces
+and virial are assembled analytically from the per-edge derivative -- no
+second autograd pass -- through the same edge-to-node reduction DeePMD uses
+for the learned energy (its fused CUDA kernel under `DP_CUDA_INFER>=1`). On
+a CUDA device one Warp kernel produces the per-edge energy and derivative in
+a single pass; on the CPU, and inside a trace (export, compiled training),
+the same arithmetic runs as torch ops. Measured on a 33k-atom SiC slab,
+compressed, one GB10: 54.9 ms/step without the term, 59.0 with it (either
+cutoff -- the radius does not change the work), against 156 ms for the
+autograd version this replaced.
 
 Atom/pair exclusions and non-DPA4C descriptors are rejected when ZBL is enabled.
 Dense-lower and compact canonical compressed export are rejected rather than

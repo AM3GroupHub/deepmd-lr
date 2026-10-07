@@ -478,8 +478,8 @@ class LongRangeEnergyModel(EnergyModel):
         if self.atomic_model.atom_exclude_types or self.atomic_model.pair_exclude_types:
             raise ValueError("zbl with atom/pair exclusions is not supported")
         zbl = ZBL(self.get_type_map(), settings, device=next(self.parameters()).device)
-        if zbl.r_outer > descriptor.get_rcut():
-            raise ValueError("zbl.r_outer must not exceed descriptor.rcut")
+        if zbl.max_r_outer > descriptor.get_rcut():
+            raise ValueError("zbl's outer radius must not exceed descriptor.rcut")
         self.zbl = zbl
 
     @classmethod

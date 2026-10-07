@@ -136,11 +136,24 @@ def dp_lr_model_args() -> Argument:
                 dict,
                 [
                     Argument(
+                        "cutoff",
+                        str,
+                        optional=True,
+                        default="fixed",
+                        doc=(
+                            "Where the switch sits: 'fixed' uses r_inner/r_outer "
+                            "for every pair (DPA4's bridging radii); 'covalent' "
+                            "places each pair's r_outer at covalent_scale * "
+                            "(R_i + R_j), ASE covalent radii, and its r_inner at "
+                            "inner_ratio * r_outer (MACE's convention)."
+                        ),
+                    ),
+                    Argument(
                         "r_inner",
                         [int, float],
                         optional=True,
                         default=0.5,
-                        doc="Full ZBL below this distance (Angstrom).",
+                        doc="cutoff 'fixed': full ZBL below this distance (Angstrom).",
                     ),
                     Argument(
                         "r_outer",
@@ -148,8 +161,27 @@ def dp_lr_model_args() -> Argument:
                         optional=True,
                         default=0.8,
                         doc=(
-                            "Zero ZBL above this distance (Angstrom); "
+                            "cutoff 'fixed': zero ZBL above this distance (Angstrom); "
                             "no larger than descriptor.rcut."
+                        ),
+                    ),
+                    Argument(
+                        "covalent_scale",
+                        [int, float],
+                        optional=True,
+                        default=1.0,
+                        doc=(
+                            "cutoff 'covalent': r_outer = covalent_scale * (R_i + R_j)."
+                        ),
+                    ),
+                    Argument(
+                        "inner_ratio",
+                        [int, float],
+                        optional=True,
+                        default=0.5,
+                        doc=(
+                            "cutoff 'covalent': r_inner = inner_ratio * r_outer, "
+                            "in (0, 1)."
                         ),
                     ),
                 ],
@@ -413,8 +445,18 @@ def ener_lr_loss_args() -> list[Argument]:
     )
     return [
         *loss_ener(),
-        Argument("start_pref_qn", [float, int], optional=True, default=0.0,
-                 doc=f"{doc} This is the value at the start of training."),
-        Argument("limit_pref_qn", [float, int], optional=True, default=0.0,
-                 doc=f"{doc} This is the value at the end of training."),
+        Argument(
+            "start_pref_qn",
+            [float, int],
+            optional=True,
+            default=0.0,
+            doc=f"{doc} This is the value at the start of training.",
+        ),
+        Argument(
+            "limit_pref_qn",
+            [float, int],
+            optional=True,
+            default=0.0,
+            doc=f"{doc} This is the value at the end of training.",
+        ),
     ]

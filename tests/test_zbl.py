@@ -39,8 +39,8 @@ def dimer(r=1.1):
     )
 
 
-def pair_reference(r):
-    a = 0.46850 / (14**0.23 + 6**0.23)
+def pair_energy(r, zi, zj, r_inner, r_outer):
+    a = 0.46850 / (zi**0.23 + zj**0.23)
     phi = sum(
         c * math.exp(-b * r / a)
         for c, b in [
@@ -50,8 +50,12 @@ def pair_reference(r):
             (0.02817, 0.20162),
         ]
     )
-    t = min(1.0, max(0.0, (r - 0.8) / 0.7))
-    return 14.3996454784255 * 14 * 6 / r * phi * (1 - 10 * t**3 + 15 * t**4 - 6 * t**5)
+    t = min(1.0, max(0.0, (r - r_inner) / (r_outer - r_inner)))
+    return 14.3996454784255 * zi * zj / r * phi * (1 - 10 * t**3 + 15 * t**4 - 6 * t**5)
+
+
+def pair_reference(r):
+    return pair_energy(r, 14, 6, 0.8, 1.5)
 
 
 @pytest.mark.parametrize("lr", [False, True])
@@ -405,3 +409,114 @@ def test_pure_dpa4c_graph_export_retains_zbl():
         torch.testing.assert_close(
             output[key].reshape(-1), reference[public].reshape(-1)
         )
+
+
+class TestCovalentCutoff:
+    """``cutoff: "covalent"``: each pair's switch sits at the sum of its
+    covalent radii, scaled; the inner radius is a fraction of that."""
+
+    def test_per_pair_radii_and_energy(self):
+        from ase.data import covalent_radii
+
+        zbl = ZBL(
+            ["X", "Si", "C"],
+            {"cutoff": "covalent", "covalent_scale": 1.1, "inner_ratio": 0.4},
+        )
+        edges = torch.tensor([[0, 1], [1, 0]])
+        mask = torch.ones(2, dtype=torch.bool)
+        for zi, zj in [(14, 6), (6, 6), (14, 14)]:
+            ro = 1.1 * (covalent_radii[zi] + covalent_radii[zj])
+            # atoms 0 and 1 are the pair; atom 2 is the dummy type, unbonded
+            t = torch.tensor([1 if z == 14 else 2 for z in (zi, zj)] + [0])
+            for f in (0.3, 0.6, 0.9):
+                r = f * ro
+                vec = torch.tensor([[r, 0, 0], [-r, 0, 0]], dtype=torch.float64)
+                got = zbl.atomic_energy(t, edges, vec, mask).sum().item()
+                assert got == pytest.approx(
+                    pair_energy(r, zi, zj, 0.4 * ro, ro), abs=1e-10
+                )
+            vec = torch.tensor([[ro, 0, 0], [-ro, 0, 0]], dtype=torch.float64) * 1.001
+            assert zbl.atomic_energy(t, edges, vec, mask).sum().item() == 0.0
+        assert zbl.max_r_outer == pytest.approx(2 * 1.1 * covalent_radii[14])
+        assert zbl.serialize() == {
+            "cutoff": "covalent",
+            "covalent_scale": 1.1,
+            "inner_ratio": 0.4,
+        }
+
+    def test_model_round_trip_and_forces(self):
+        cfg = config()
+        cfg["zbl"] = {"cutoff": "covalent"}
+        model = get_model(cfg).eval()
+        assert model.zbl.serialize() == {
+            "cutoff": "covalent",
+            "covalent_scale": 1.0,
+            "inner_ratio": 0.5,
+        }
+        restored = BaseModel.deserialize(model.serialize()).eval()
+        restored.load_state_dict(model.state_dict(), strict=True)
+        x, t = dimer(1.3)  # inside the Si-C switch (covalent sum 1.87 A)
+        out = model(x, t)
+        for key in ["energy", "force", "virial"]:
+            torch.testing.assert_close(out[key], restored(x, t)[key])
+        h = 1e-5
+        plus, minus = x.clone(), x.clone()
+        plus[0, 1, 0] += h
+        minus[0, 1, 0] -= h
+        fd = -(model(plus, t)["energy"] - model(minus, t)["energy"]) / (2 * h)
+        torch.testing.assert_close(
+            out["force"][0, 1, 0], fd.squeeze(), rtol=2e-7, atol=1e-6
+        )
+
+    @pytest.mark.parametrize(
+        "settings, match",
+        [
+            ({"cutoff": "covalent", "covalent_scale": 10.0}, "descriptor.rcut"),
+            ({"cutoff": "covalent", "inner_ratio": 1.0}, "inner_ratio"),
+            ({"cutoff": "nearest"}, "cutoff"),
+        ],
+    )
+    def test_refusals(self, settings, match):
+        cfg = config()
+        cfg["zbl"] = settings
+        with pytest.raises(ValueError, match=match):
+            get_model(cfg)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the Warp kernel needs CUDA")
+class TestWarpKernel:
+    """The one-pass Warp kernel equals the torch arithmetic, edge for edge:
+    padded nodes, masked edges, ghosts and both edge precisions."""
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+    @pytest.mark.parametrize(
+        "settings", [{"r_inner": 0.5, "r_outer": 1.5}, {"cutoff": "covalent"}]
+    )
+    def test_matches_torch(self, dtype, settings):
+        g = torch.Generator().manual_seed(0)
+        n, n_edge = 64, 4000
+        zbl = ZBL(["X", "Si", "C"], settings, device=DEVICE)
+        atype = torch.randint(0, 3, (n,), generator=g)
+        atype[-4:] = -1  # padded nodes
+        edge_index = torch.randint(0, n, (2, n_edge), generator=g)
+        r = 0.3 + 2.0 * torch.rand(n_edge, 1, generator=g, dtype=torch.float64)
+        direction = torch.randn(n_edge, 3, generator=g, dtype=torch.float64)
+        edge_vec = (r * direction / direction.norm(dim=1, keepdim=True)).to(dtype)
+        edge_mask = torch.rand(n_edge, generator=g) > 0.1
+        owned = torch.arange(n) < 40
+        args = [t.to(DEVICE) for t in (atype, edge_index, edge_vec, edge_mask, owned)]
+        energy, grad = zbl.edge_terms(*args)
+        src, dst = args[1][0], args[1][1]
+        real = (args[0] >= 0) & (args[0] < 3)
+        valid = args[3].bool() & real[src] & real[dst] & args[4][dst]
+        want_edge, want_g = zbl._edge_terms_torch(args[0], src, dst, args[2], valid)
+        want_e = torch.zeros(n, dtype=torch.float64, device=DEVICE).index_add(
+            0, dst, want_edge
+        )
+        assert energy.dtype == torch.float64 and grad.dtype == dtype
+        torch.testing.assert_close(energy, want_e, rtol=1e-12, atol=1e-12)
+        tol = 1e-5 if dtype == torch.float32 else 1e-11
+        torch.testing.assert_close(grad, want_g, rtol=tol, atol=tol * grad.abs().max())
+        assert (want_edge > 0).sum() > 100  # the sample does reach inside the switch
+        assert grad[~valid].eq(0).all()
+        assert energy[~args[4]].eq(0).all()  # ghosts own nothing
