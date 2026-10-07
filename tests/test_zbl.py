@@ -7,6 +7,7 @@ import pytest
 import torch
 from deepmd.pt_expt.model.get_model import get_model
 from deepmd.pt_expt.model.model import BaseModel
+from deepmd.pt_expt.utils.env import DEVICE
 from deepmd.utils.argcheck import normalize
 
 from deepmd_lr.zbl import ZBL
@@ -31,8 +32,10 @@ def config(lr=False):
 
 def dimer(r=1.1):
     return (
-        torch.tensor([[[0.0, 0.0, 0.0], [r, 0.0, 0.0]]], dtype=torch.float64),
-        torch.tensor([[0, 1]], dtype=torch.int64),
+        torch.tensor(
+            [[[0.0, 0.0, 0.0], [r, 0.0, 0.0]]], dtype=torch.float64, device=DEVICE
+        ),
+        torch.tensor([[0, 1]], dtype=torch.int64, device=DEVICE),
     )
 
 
@@ -102,7 +105,7 @@ def test_force_and_virial_are_derivatives(lr):
     torch.testing.assert_close(out["virial"][0, 0], vir.squeeze(), rtol=2e-7, atol=1e-6)
     torch.testing.assert_close(
         out["force"].sum(1),
-        torch.zeros((1, 3), dtype=torch.float64),
+        torch.zeros((1, 3), dtype=torch.float64, device=DEVICE),
         atol=1e-10,
         rtol=0,
     )
@@ -272,7 +275,7 @@ def test_real_cli_training_checkpoint_restart(tmp_path, lr):
     checkpoint = tmp_path / "model.ckpt.pt"
     model = load_model(str(checkpoint), device="cpu")
     assert model.zbl.serialize() == cfg["model"]["zbl"]
-    x, t = dimer()
+    x, t = (v.cpu() for v in dimer())
     assert torch.isfinite(model(x, t)["force"]).all()
     cfg["training"]["numb_steps"] = 3
     inp.write_text(json.dumps(cfg))
@@ -359,7 +362,7 @@ def test_pure_dpa4c_graph_export_retains_zbl():
     from deepmd.dpmodel.utils.neighbor_graph import attach_edge_csr
 
     graph = attach_edge_csr(build_neighbor_graph_fast(x, t, None, model.get_rcut()), 2)
-    counts = torch.tensor([2])
+    counts = torch.tensor([2], device=DEVICE)
     args = (
         t.reshape(-1),
         counts,

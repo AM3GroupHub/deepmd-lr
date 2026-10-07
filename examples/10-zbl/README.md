@@ -5,7 +5,8 @@ Both variants use the plugin's `model.type: "dp_lr"` construction path with a
 it for DPA4C-LR. The built-in `standard` model does not consume this plugin's
 `zbl` block. This example does not change that upstream registry.
 
-Add the following block inside `model` in a working training input:
+[`input.json`](input.json) is the bulk-water input of
+[example 01](../01-bulk) with one addition inside `model`:
 
 ```json
 "zbl": {"r_inner": 0.5, "r_outer": 0.8}
@@ -16,8 +17,11 @@ defaults: `r_inner=0.5`, `r_outer=0.8`. Either radius can be overridden
 independently; explicit values in existing inputs and checkpoints are preserved.
 These radii match DeePMD DPA4 bridging defaults; the coupling method remains
 additive and is not equivalent to DPA4 bridging. They are not calibrated
-Si/C or universal radii. Choose and validate them against close-contact data,
-normal bond distances and the intended collision energies. Require
+Si/C or universal radii. With the defaults the term is inert in ordinary MD:
+for Si-C (bond 1.89 A) or O-H (0.97 A) nothing ever comes within 0.8 A, and
+the regime that wrecks a trajectory -- a pair at 1.0-1.4 A the training data
+never sampled -- is left to the network. Choose and validate the radii against
+close-contact data, normal bond distances and the intended collision energies. Require
 `0 < r_inner < r_outer <= descriptor.rcut`. Omit the block to disable ZBL.
 
 The energy is `E_learned + E_ZBL` (DPA4C), or
@@ -74,8 +78,12 @@ percentage is claimed.
 
 Atom/pair exclusions and non-DPA4C descriptors are rejected when ZBL is enabled.
 Dense-lower and compact canonical compressed export are rejected rather than
-silently dropping ZBL. Ordinary graph inference remains available. Existing
+silently dropping ZBL, so a ZBL model cannot be exported for LAMMPS; LAMMPS's
+own `pair_style zbl` under `hybrid/overlay` is not a substitute, since its
+switching polynomial differs from this one. Ordinary graph inference remains
+available. Existing
 LR graph-export restrictions remain in force. Extending this implementation to
 DPA4-style descriptor clamping or table blending requires a separate design.
 
-Validation commands and results: [ZBL validation](../../docs/zbl-validation.md).
+`tests/test_zbl.py` and `tests/test_zbl_gpu.py` pin all of this; see
+[the test map](../../docs/tests.md).

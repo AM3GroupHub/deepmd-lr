@@ -115,7 +115,9 @@ class ZBL(torch.nn.Module):
             model.atomic_output_def(),
             graph,
             do_atomic_virial=kwargs.get("do_atomic_virial", False),
-            create_graph=model.training,
+            # No parameters and a detached leaf: nothing upstream needs a
+            # second-order graph, in training or out of it.
+            create_graph=False,
             force_precision=edge_vec.dtype,
             node_capacity=atype.shape[0],
             n_local=n_local,

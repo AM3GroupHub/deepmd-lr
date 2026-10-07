@@ -1,0 +1,268 @@
+{
+  "_comment": [
+    "examples/01-bulk/input.json with one addition, model.zbl: the fixed",
+    "screened nuclear repulsion below r_outer. Everything else is unchanged;",
+    "see examples/01-bulk for the meaning of the other values."
+  ],
+  "model": {
+    "type": "dp_lr",
+    "_comment_type_map": [
+      "The whole periodic table, indexed so that a type IS the atomic",
+      "number: hydrogen 1, oxygen 8. Index 0 is ASE's dummy \"X\", never",
+      "assigned to an atom -- the price of indices being the numbers you",
+      "already know. scripts/xyz_to_deepmd.py writes this by default, so",
+      "this list and every dataset's type_map.raw are the same list.",
+      "",
+      "Only H and O appear in this data. The other 116 types simply never",
+      "receive a gradient; they cost a row each in the type embedding and the",
+      "energy bias, and nothing else. What they buy is that this model and",
+      "this dataset are not welded to each other: either can meet another",
+      "one later without renumbering anything.",
+      "",
+      "DeePMD-kit refuses any element a system's type_map.raw has and this",
+      "list does not, so shortening this means re-converting with",
+      "--type-map present."
+    ],
+    "type_map": [
+      "X",
+      "H",
+      "He",
+      "Li",
+      "Be",
+      "B",
+      "C",
+      "N",
+      "O",
+      "F",
+      "Ne",
+      "Na",
+      "Mg",
+      "Al",
+      "Si",
+      "P",
+      "S",
+      "Cl",
+      "Ar",
+      "K",
+      "Ca",
+      "Sc",
+      "Ti",
+      "V",
+      "Cr",
+      "Mn",
+      "Fe",
+      "Co",
+      "Ni",
+      "Cu",
+      "Zn",
+      "Ga",
+      "Ge",
+      "As",
+      "Se",
+      "Br",
+      "Kr",
+      "Rb",
+      "Sr",
+      "Y",
+      "Zr",
+      "Nb",
+      "Mo",
+      "Tc",
+      "Ru",
+      "Rh",
+      "Pd",
+      "Ag",
+      "Cd",
+      "In",
+      "Sn",
+      "Sb",
+      "Te",
+      "I",
+      "Xe",
+      "Cs",
+      "Ba",
+      "La",
+      "Ce",
+      "Pr",
+      "Nd",
+      "Pm",
+      "Sm",
+      "Eu",
+      "Gd",
+      "Tb",
+      "Dy",
+      "Ho",
+      "Er",
+      "Tm",
+      "Yb",
+      "Lu",
+      "Hf",
+      "Ta",
+      "W",
+      "Re",
+      "Os",
+      "Ir",
+      "Pt",
+      "Au",
+      "Hg",
+      "Tl",
+      "Pb",
+      "Bi",
+      "Po",
+      "At",
+      "Rn",
+      "Fr",
+      "Ra",
+      "Ac",
+      "Th",
+      "Pa",
+      "U",
+      "Np",
+      "Pu",
+      "Am",
+      "Cm",
+      "Bk",
+      "Cf",
+      "Es",
+      "Fm",
+      "Md",
+      "No",
+      "Lr",
+      "Rf",
+      "Db",
+      "Sg",
+      "Bh",
+      "Hs",
+      "Mt",
+      "Ds",
+      "Rg",
+      "Cn",
+      "Nh",
+      "Fl",
+      "Mc",
+      "Lv",
+      "Ts",
+      "Og"
+    ],
+    "descriptor": {
+      "_comment": [
+        "rcut must stay below half the cell length (12.429/2 = 6.21 A), or an",
+        "atom sees two images of the same neighbour. 6.0 is inside that, but",
+        "only just -- a smaller cell would need a smaller rcut."
+      ],
+      "type": "dpa4c",
+      "rcut": 6.0,
+      "channels": 32,
+      "lmax": 2,
+      "basis_type": "bessel",
+      "n_radial": 16,
+      "radial_modes": 4,
+      "precision": "float32",
+      "seed": 1
+    },
+    "fitting_net": {
+      "neuron": [
+        128,
+        128,
+        128
+      ],
+      "resnet_dt": false,
+      "activation_function": "silu",
+      "precision": "float32",
+      "seed": 1
+    },
+    "zbl": {
+      "_comment": [
+        "Full ZBL below r_inner, zero above r_outer, a quintic switch",
+        "between. Water's closest pair in this data is 0.93 A and the O-H",
+        "bond 0.97 A, so r_outer must sit below the bond: at 0.8 A the",
+        "term shapes only the collision wall the data never samples.",
+        "Choose the radii for YOUR system -- the defaults are not",
+        "calibrated for anything."
+      ],
+      "r_inner": 0.5,
+      "r_outer": 0.8
+    },
+    "long_range": {
+      "_comment": [
+        "The charge head predicts a per-atom charge from the SAME descriptor",
+        "features the energy head reads, so the backbone runs once. Charges are",
+        "projected to the frame's total charge (0 here), which is what keeps",
+        "the reciprocal sum convergent."
+      ],
+      "charge_net": {
+        "neuron": [
+          64,
+          64
+        ],
+        "activation_function": "silu",
+        "precision": "float32",
+        "seed": 1
+      },
+      "reciprocal": {
+        "_comment": [
+          "alpha 0.4 pairs with rcut 6.0: erfc(0.4*6) = 7e-4, so the part left",
+          "to the network has died inside its own cutoff.",
+          "mesh spacing must beat 1/(2*alpha) = 1.25 A, so ceil(12.429/1.25) = 10.",
+          "Fixed dimensions, NOT mesh_spacing: a spacing-derived mesh is a step",
+          "function of the cell and makes the energy discontinuous under strain.",
+          "3D-periodic bulk, so no slab correction and no open axis."
+        ],
+        "alpha": 0.4,
+        "mesh_dimensions": [
+          10,
+          10,
+          10
+        ],
+        "spline_order": 6,
+        "slab_correction": false,
+        "pbc": [
+          true,
+          true,
+          true
+        ]
+      }
+    }
+  },
+  "learning_rate": {
+    "type": "exp",
+    "start_lr": 0.001,
+    "stop_lr": 1e-05
+  },
+  "loss": {
+    "_comment": [
+      "Forces dominate the objective: there are 3*natoms of them per frame",
+      "against one energy, and they carry the local information the descriptor",
+      "must learn. start_pref_v 0 -- these labels have no virial."
+    ],
+    "type": "ener",
+    "start_pref_e": 1,
+    "limit_pref_e": 1,
+    "start_pref_f": 1000,
+    "limit_pref_f": 1,
+    "start_pref_v": 0,
+    "limit_pref_v": 0
+  },
+  "training": {
+    "training_data": {
+      "systems": [
+        "./data/train"
+      ],
+      "batch_size": 4
+    },
+    "validation_data": {
+      "systems": [
+        "./data/valid"
+      ],
+      "batch_size": 4,
+      "numb_btch": 5
+    },
+    "numb_steps": 200000,
+    "enable_ema": true,
+    "ema_decay": 0.999,
+    "save_freq": 2000,
+    "disp_file": "lcurve.out",
+    "disp_freq": 200,
+    "seed": 1
+  }
+}
