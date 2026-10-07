@@ -170,6 +170,14 @@ def _checked_pbc(pbc: Any) -> tuple[bool, bool, bool]:
     return flags
 
 
+def _indexed_device(device) -> str:
+    """``"cuda"`` -> ``"cuda:<current>"``; anything else unchanged."""
+    d = torch.device(device)
+    if d.type == "cuda" and d.index is None:
+        d = torch.device("cuda", torch.cuda.current_device())
+    return str(d)
+
+
 class DistributedEvaluator:
     """Evaluate a ``dp_lr`` model over spatial partitions, one per device.
 
@@ -347,7 +355,9 @@ class DistributedEvaluator:
         # Checked here as well as per call, to fail before the memory probe.
         check_long_range_boundary(model, self.pbc, self.long_range_energy)
         self.model = model
-        self.devices = list(devices)
+        # A bare "cuda" means the current device; spelled out here so the
+        # list, the partition views and the model agree on one device object.
+        self.devices = [_indexed_device(d) for d in devices]
         #: One device and the GPU-direct list: the node set is the system
         #: itself, periodic through the list's image shifts, and nothing is
         #: partitioned, probed or rebuilt
