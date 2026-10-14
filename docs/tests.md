@@ -125,4 +125,4 @@ the model first.
 - `test_neutrality_loss.py` — the `ener_lr` loss: the shift the model reports
   is the projection's, the term and its schedule, its gradient reaching the
   head and backbone, the schema, the trainer's factory and serialization.
-- `test_xyz_to_deepmd.py`, `test_graft_short_range.py`, `test_calibrate_born.py` — the three scripts; the last checks that the Born calibration recovers a planted scale and sign exactly.
+- `test_xyz_to_deepmd.py`, `test_graft_short_range.py`, `test_calibrate_born.py` — the three scripts.
