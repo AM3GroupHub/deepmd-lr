@@ -44,6 +44,32 @@ and reproduces the old numbers exactly. Non-positive or non-finite values are
 refused at construction. A compressed model is unaffected: the scaling is
 applied to the outputs, after the tables.
 
+### Calibrating the scale and sign against DFPT labels
+
+Nothing in training supervises the charges, so a trained model's Born tensors
+carry two factors the energy fit leaves free: the overall scale, which is the
+screening `sqrt(eps_inf)` above, and the overall sign, because the long-range
+energy depends on `q_i q_j` and a training lands on either charge branch. Both
+are read off *after* training, never trained on, by one least-squares fit of
+the raw tensors onto DFPT labels over every frame, atom and component,
+`s = sum(Z_raw * Z_dft) / sum(Z_raw * Z_raw)`. `scripts/calibrate_born.py`
+does that fit on a validation set and reports the errors on a held-out set at
+the fitted `s`:
+
+```bash
+python scripts/calibrate_born.py model.pt --fit valid_BEC.xyz --test test_BEC.xyz \
+    --eps-key epsilon --plot figure_bec
+```
+
+The frames carry the DFPT tensor as nine numbers per atom under `BEC`
+(`[polarization, displacement]`, the same axis order as `results["born_charge"]`).
+For the water model this gives `sqrt(eps_inf) = 1.754`, charge sign +1, and a
+test-set RMSE of 0.049 e over all nine components. The fitted factor is a
+calibration of the model's tensors, not the physical dielectric constant: the
+DFPT electronic dielectric constant of the same frames is 1.84, the fit 3.08.
+Pass the fitted value as `eps_inf` to any later IR or field run so the reported
+charges, Born tensors and field forces are on the DFPT scale.
+
 ### Read this before interpreting a field run
 
 The first axis of `Z_iab` is polarization and the second is displacement,
