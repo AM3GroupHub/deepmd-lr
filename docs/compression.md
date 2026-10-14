@@ -1,51 +1,44 @@
 # Compressed backbone
 
-DeePMD-kit can compress DPA4C — radial tables plus one fused CUDA kernel —
-and the descriptor is where the time goes, so the long-range model gets the
-full benefit: **13.7× per step, 19× less memory** ([Cost](cost.md#with-the-compressed-backbone)).
-The charge head and the reciprocal term are untouched.
-
-**How to compress**
+DeePMD-kit compresses DPA4C into radial tables plus one fused CUDA kernel. The
+descriptor is where the time goes, so the long-range model gets the full
+benefit, **13.7× per step and 19× less memory**
+([Cost](cost.md#with-the-compressed-backbone)); the charge head and the
+reciprocal term are untouched.
 
 ```python
-# ASE
-atoms.calc = LongRangeCalculator("model.ckpt.pt", compress=True)
-
-# nvalchemi MD (examples/06-md_nvalchemi)
-ev = build_evaluator("model.ckpt.pt", atoms, compress=True)
-
-# a model you already hold, on the GPU and in eval mode
-model.enable_compression(table_stride_1=0.01)
+atoms.calc = LongRangeCalculator("model.ckpt.pt", compress=True)   # ASE
+ev = build_evaluator("model.ckpt.pt", atoms, compress=True)        # nvalchemi MD
+model.enable_compression(table_stride_1=0.01)                      # a loaded model, on the GPU, in eval mode
 ```
 
-`compress=True` is DeePMD-kit's default 0.01 Å table stride; pass a float for
-another; a numeric stride must be finite and strictly positive (`0.0` is
-invalid). Only the boolean `False` disables compression. Compress once per
-process, after loading. It is inference-only. Failed compression preserves
-the original descriptor state and leaves `DP_CUDA_INFER` unchanged, so the
-caller can correct the inputs and retry.
+`compress=True` is DeePMD-kit's default 0.01 Å table stride; a float sets
+another (finite and positive, `0.0` is invalid) and only `False` disables it.
+Compress once per process, after loading; it is inference-only. A failed
+compression leaves the descriptor and `DP_CUDA_INFER` as they were, so the
+inputs can be corrected and retried.
 
 **Requirements**
 
-- A deepmd-kit **built from source with the CUDA operators** — see below. The
-  PyPI wheel lacks the kernel, and DeePMD-kit's compressed branch then runs
-  the uncompressed math without saying so, so on the wheel `compress=True` is
-  refused: `RuntimeError: compression needs the compiled operator
-  torch.ops.deepmd.dpa4c_graph_compress ...`
-- `DP_CUDA_INFER=1`. Set for you if unset. Level 2 is refused for a model
-  with `long_range`: its fused energy/force path bypasses the shared backbone,
-  the charge response and the Born charges. A model without `long_range` may
-  set `DP_CUDA_INFER=2` for that fused path (force as a value, no autograd).
+- A deepmd-kit **built from source with the CUDA operators** (below). The PyPI
+  wheel lacks the kernel and DeePMD-kit's compressed branch would then run the
+  uncompressed math without saying so, so on the wheel `compress=True` raises
+  `RuntimeError: compression needs the compiled operator
+  torch.ops.deepmd.dpa4c_graph_compress ...`.
+- `DP_CUDA_INFER=1`, set for you if unset. Level 2 is refused for a model with
+  `long_range`: its fused energy/force path bypasses the shared backbone, the
+  charge response and the Born charges. A model without `long_range` may set
+  `DP_CUDA_INFER=2` (force as a value, no autograd).
 - A `float32` descriptor with no `exclude_types` (upstream's rule).
 
 **What it changes**
 
 | | |
 |---|---|
-| charge state | folded into the tables; the calculator/evaluator fold in the run's `charge_spin`, and a forward with a different one is refused. The descriptor records the folded state, so the refusal holds however the tables were built: through upstream's `enable_compression` (which folds `default_chg_spin`), a later `apply_charge_state`, or a model with no `long_range` block |
-| persistence | none — tables are rebuilt at load; a `state_dict` saved from a compressed model is rejected by `load_model` |
+| charge state | folded into the tables: the calculator and evaluator fold in the run's `charge_spin`, and a forward with a different one is refused. The descriptor records the folded state, so the refusal holds however the tables were built (upstream's `enable_compression`, which folds `default_chg_spin`; a later `apply_charge_state`; a model with no `long_range` block) |
+| persistence | none: tables are rebuilt at load, and a `state_dict` saved from a compressed model is rejected by `load_model` |
 | multi-GPU | the evaluator compresses once, before making replicas |
-| precision | none: the fp32 descriptor already sees fp32 edge vectors; the only new error is the tabulation, measured above |
+| precision | none: the fp32 descriptor already sees fp32 edge vectors; the only new error is the tabulation |
 
 ## Building the CUDA operators
 
@@ -63,15 +56,16 @@ pip install --no-build-isolation --no-deps -v .
 pip install --no-deps -e /path/to/deepmd-lr
 ```
 
-Each of these silently yields a kernel-less build if omitted: `--no-build-isolation`
-(else a CPU torch is found and no CUDA is compiled); the arch triple (torch's
-CMake resets `CMAKE_CUDA_ARCHITECTURES`, after which DeePMD-kit compiles every
-architecture or PTX only — use your GPU's `sm_`); MPI off (a pip `mpich` gets
-auto-linked and the library fails to load); `--no-deps` on both installs (else
-the `==3.2.0` pin pulls the wheel back).
+Each of these silently yields a kernel-less build if omitted:
+`--no-build-isolation` (a CPU torch is found and no CUDA is compiled); the
+arch triple (torch's CMake resets `CMAKE_CUDA_ARCHITECTURES`, after which
+DeePMD-kit compiles every architecture or PTX only; use your GPU's `sm_`); MPI
+off (a pip `mpich` gets auto-linked and the library fails to load); `--no-deps`
+on both installs (the `==3.2.0` pin pulls the wheel back).
 
-Verify: `python -c "import deepmd.pt_expt; from deepmd.kernels.cuda.dpa4c.graph_compress import op_available; print(op_available())"`
-prints `True`, and `DEEPMD_LR_REQUIRE_COMPRESS=1 pytest tests/` passes — that
-variable fails collection if either CUDA or the operator is unavailable.
-Without it, CPU-capable checks still run and only CUDA execution tests skip.
+Verify:
 
+```bash
+python -c "import deepmd.pt_expt; from deepmd.kernels.cuda.dpa4c.graph_compress import op_available; print(op_available())"   # True
+DEEPMD_LR_REQUIRE_COMPRESS=1 pytest tests/      # fails collection if CUDA or the operator is missing
+```
