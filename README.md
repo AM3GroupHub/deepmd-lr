@@ -121,6 +121,11 @@ into a consistent element order. Choose a new or empty output directory:
 the converter refuses to overwrite existing datasets, preventing stale charge
 labels or boundary markers from being mixed into a new conversion.
 
+`scripts/calibrate_born.py` fits the scale and sign of a trained model's Born
+tensors to DFPT labels on a validation set and scores a held-out set at that
+scale: the one post-training calibration a `dp_lr` model's charges need
+([why](docs/born-charges.md)).
+
 ## Running MD
 
 Only this package's own paths see the cell, so only they evaluate the
