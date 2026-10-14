@@ -46,29 +46,21 @@ applied to the outputs, after the tables.
 
 ### Calibrating the scale and sign against DFPT labels
 
-Nothing in training supervises the charges, so a trained model's Born tensors
-carry two factors the energy fit leaves free: the overall scale, which is the
-screening `sqrt(eps_inf)` above, and the overall sign, because the long-range
-energy depends on `q_i q_j` and a training lands on either charge branch. Both
-are read off *after* training, never trained on, by one least-squares fit of
-the raw tensors onto DFPT labels over every frame, atom and component,
-`s = sum(Z_raw * Z_dft) / sum(Z_raw * Z_raw)`. `scripts/calibrate_born.py`
-does that fit on a validation set and reports the errors on a held-out set at
-the fitted `s`:
+Training never supervises the charges, so a model's Born tensors are fixed
+only up to a scale, the `sqrt(eps_inf)` above, and a sign, the charge branch
+the training landed on. Both come from one least-squares fit of the raw
+tensors onto DFPT labels, `s = sum(Z_raw * Z_dft) / sum(Z_raw * Z_raw)`, made
+after training and never trained on:
 
 ```bash
-python scripts/calibrate_born.py model.pt --fit valid_BEC.xyz --test test_BEC.xyz \
-    --eps-key epsilon --plot figure_bec
+python scripts/calibrate_born.py model.pt valid_BEC.xyz test_BEC.xyz
 ```
 
-The frames carry the DFPT tensor as nine numbers per atom under `BEC`
-(`[polarization, displacement]`, the same axis order as `results["born_charge"]`).
-For the water model this gives `sqrt(eps_inf) = 1.754`, charge sign +1, and a
-test-set RMSE of 0.049 e over all nine components. The fitted factor is a
-calibration of the model's tensors, not the physical dielectric constant: the
-DFPT electronic dielectric constant of the same frames is 1.84, the fit 3.08.
-Pass the fitted value as `eps_inf` to any later IR or field run so the reported
-charges, Born tensors and field forces are on the DFPT scale.
+The scale is fitted on the first file and the second is scored at it. Atoms
+carry the DFPT tensor as nine numbers under `BEC`, `[polarization, displacement]`
+like `results["born_charge"]`. For the water model: `s = 1.754`, so
+`eps_inf = 3.08` where DFPT's own electronic dielectric constant is 1.84, and a
+test RMSE of 0.049 e. Pass the fitted value as `eps_inf` to later field runs.
 
 ### Read this before interpreting a field run
 
