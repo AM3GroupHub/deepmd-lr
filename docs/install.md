@@ -1,20 +1,21 @@
 # Installing
 
-Into an environment with `deepmd-kit==3.2.0` and a matching `torch`:
+Use Python 3.11–3.13. From the repository root, after installing the
+dependencies below:
 
 ```bash
 pip install -e . --no-deps
 ```
 
-`--no-deps` is deliberate: the dependency pins in `pyproject.toml` are
-documentation, and the environment is built explicitly below (a CUDA-13
-aarch64 `torch` from the PyTorch index, which pip should not try to
-re-resolve).
+The requirements in [`pyproject.toml`](../pyproject.toml) are enforced by pip
+unless `--no-deps` is given. Here dependencies are installed explicitly so pip
+does not replace a selected CUDA build of torch or DeePMD-kit.
 
 ## Building the environment
 
-`deepmd-kit==3.2.0` pins `torch==2.11.0.*`, and an sm_121 GPU needs a CUDA
-12.8+/13 build, so torch comes from the cu130 index rather than PyPI:
+The recipe below is for the tested aarch64 GB10 environment with CUDA 13.
+Use a torch build compatible with your hardware and DeePMD-kit; version
+3.2.0 requires `torch==2.11.0.*`.
 
 ```bash
 # 1. PyTorch 2.11.0 + CUDA 13 -- the version is pinned by deepmd-kit 3.2.0
@@ -33,23 +34,24 @@ pip install "nvalchemi-toolkit-ops>=0.4.1" "warp-lang>=1.13.0"
 pip install "dpdata>=0.2.7" "ase>=3.29" pytest pytest-cov ruff
 ```
 
-**`mpich` is required, not optional.** The PyPI wheel is cibuildwheel-built,
+**The tested PyPI wheel needs `mpich`.** It is cibuildwheel-built,
 so `deepmd/pt/cxx_op.py` calls `load_mpi_library()` unconditionally at import
 and resolves `libmpi.so` through mpich's package metadata. Without it,
 `import deepmd.pt_expt.descriptor` raises `PackageNotFoundError`.
 
-The PyPI wheel is a CPU-only operator build, which is fine for training and
-MD. The one thing it cannot do is the compressed backbone, whose CUDA kernel
+That wheel has CPU-only DeePMD operators, which suffice for the uncompressed
+path even when torch and nvalchemiops run on CUDA. The compressed backbone
 needs a [source build](compression.md#building-the-cuda-operators).
 
 ## Smoke test
 
-The riskiest part is warp compiling for sm_121; if it fails, `warp.init()`
-says so:
+Check imports and GPU discovery. This does not compile or exercise the PME
+or compressed descriptor kernels; see [tests](tests.md) for runtime checks.
 
 ```bash
 python -c "
-import torch, warp, deepmd
+import torch, warp, deepmd, deepmd_lr
+warp.init()
 print('torch', torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0))
 from nvalchemiops.torch.interactions.electrostatics.pme import particle_mesh_ewald
 from deepmd.pt_expt.descriptor.dpa4c import DescrptDPA4C

@@ -43,7 +43,9 @@ inputs can be corrected and retried.
 ## Building the CUDA operators
 
 Verified on an aarch64 GB10 (cc 12.1), CUDA 13.0, cmake 3.28, gcc 13,
-torch 2.11.0+cu130; about two minutes on 20 cores.
+torch 2.11.0+cu130; about two minutes on 20 cores. This assumes a prepared
+environment named `dpmd` ([installation](install.md)); adjust the environment
+name, CUDA path and architecture flags for your machine.
 
 ```bash
 conda create --clone dpmd -n dpmd-cuda && conda activate dpmd-cuda
@@ -53,17 +55,16 @@ export DP_VARIANT=cuda CUDAToolkit_ROOT=/usr/local/cuda DP_ENABLE_TENSORFLOW=0 \
        TORCH_CUDA_ARCH_LIST="12.0" SETUPTOOLS_SCM_PRETEND_VERSION=3.2.0 \
        SKBUILD_CMAKE_DEFINE="CMAKE_CUDA_ARCHITECTURES=120;DEEPMD_CUDA_PORTABLE_PTX=OFF;CMAKE_DISABLE_FIND_PACKAGE_MPI=ON;CMAKE_CUDA_FLAGS=-gencode arch=compute_120,code=sm_120"
 pip install --no-build-isolation --no-deps -v .
-pip install --no-deps -e /path/to/deepmd-lr
+cd /path/to/deepmd-lr
+pip install --no-deps -e .
 ```
 
-Each of these silently yields a kernel-less build if omitted:
-`--no-build-isolation` (a CPU torch is found and no CUDA is compiled); the
-arch triple (torch's CMake resets `CMAKE_CUDA_ARCHITECTURES`, after which
-DeePMD-kit compiles every architecture or PTX only; use your GPU's `sm_`); MPI
-off (a pip `mpich` gets auto-linked and the library fails to load); `--no-deps`
-on both installs (the `==3.2.0` pin pulls the wheel back).
+`--no-build-isolation` uses the selected CUDA torch. The architecture flags
+keep torch's CMake and DeePMD-kit's compiler targets consistent; disabling
+MPI avoids linking the pip `mpich` library in this setup. `--no-deps` keeps
+pip from replacing the selected builds.
 
-Verify:
+Verify from the `deepmd-lr` repository root:
 
 ```bash
 python -c "import deepmd.pt_expt; from deepmd.kernels.cuda.dpa4c.graph_compress import op_available; print(op_available())"   # True

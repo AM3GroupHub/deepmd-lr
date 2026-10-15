@@ -2,7 +2,8 @@
 
 A trained `dp_lr` model predicts geometry-dependent charges, and the
 derivative of those charges is what a Born effective charge tensor is made of.
-No extra training, no extra labels:
+Raw tensors need no extra training labels; comparison with DFPT can use the
+[calibration below](#calibrating-the-scale-and-sign-against-dfpt-labels):
 
 ```python
 calc = LongRangeCalculator(model, efield=[0.0, 0.0, 0.05])   # V/angstrom
@@ -36,22 +37,21 @@ evaluate_partitioned(model, coord, atype, cell, compute_born=True, eps_inf=1.78)
 born_charges(charge, raw, edge_vec, edge_index, edge_mask, eps_inf=1.78)
 ```
 
-Scaled by `sqrt(eps_inf)`: `results["charges"]`, `results["born_charge"]`,
+Scaled by `sqrt(eps_inf)`: charges (`results["charges"]` in ASE,
+`results["charge"]` in the evaluator), `results["born_charge"]`,
 hence the field force `F = Z~.T E` and anything built from `Z~`, such as the
 IR dipole rate `Ṁ = Σ_i Z~_i v_i`. Not scaled: the energy, the field-free
 forces, the stress, and the model itself (tables, checkpoint, training), since
-this is a change of units on the reported charges, not on the fitted
-interaction. The default `1.0` is vacuum; non-positive or non-finite values
+this rescales the reported response without changing the fitted interaction.
+The default `1.0` leaves it unscaled; non-positive or non-finite values
 are refused. A compressed model is unaffected, as the scaling comes after the
 tables.
 
 ### Calibrating the scale and sign against DFPT labels
 
-Training never supervises the charges, so a model's Born tensors are fixed
-only up to that scale and a sign, the charge branch training landed on. One
-least-squares fit of the raw tensors onto DFPT labels gives both,
-`s = sum(Z_raw * Z_dft) / sum(Z_raw * Z_raw)`, made after training and never
-trained on:
+Training does not supervise Born tensors. Fit a signed scalar to DFPT labels
+after training, then assess the remaining error on held-out data:
+`s = sum(Z_raw * Z_dft) / sum(Z_raw * Z_raw)`.
 
 ```bash
 python scripts/calibrate_born.py model.pt valid_BEC.xyz test_BEC.xyz
@@ -61,8 +61,15 @@ The scale is fitted on the first file and the second is scored at it; atoms
 carry the DFPT tensor as nine numbers under `BEC`, laid out
 `[polarization, displacement]` like `results["born_charge"]`. For the water
 model `s = 1.754`, so `eps_inf = 3.08` where DFPT's own electronic dielectric
-constant is 1.84, at a test RMSE of 0.049 e. Pass the fitted value as
-`eps_inf` to later field runs.
+constant is 1.84, at a test RMSE of 0.049 e. This fitted scale need not equal
+the independently computed dielectric constant.
+
+The script reports `s`, `eps_inf = s²`, the sign and errors; it does not modify
+the checkpoint. For positive `s`, use `eps_inf=s*s` in later field runs.
+**For negative `s`, `eps_inf` applies only the magnitude:** the APIs multiply
+by the positive square root and do not flip the charge branch. The script's
+reported errors use the full signed tensor `s * Z_raw`; using `eps_inf` alone
+will not reproduce that calibration when `s < 0`.
 
 ### Read this before interpreting a field run
 

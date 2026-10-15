@@ -2,27 +2,30 @@
 
 A charge head on the shared DPA4C descriptor and a reciprocal-space Ewald/PME
 term from `nvalchemi-toolkit-ops`, trained jointly with the short-range model.
-A **plugin, not a fork**: it registers through DeePMD-kit's `deepmd.pt_expt`
-entry point and works against a stock `pip install deepmd-kit==3.2.0`.
+It registers through DeePMD-kit's `deepmd.pt_expt` entry point and works with
+stock `deepmd-kit==3.2.0`.
 
-On the periodic water benchmark the joint model beats the strictly local
-baseline by **4.9× in force RMSE**, the floor a 6 Å cutoff imposes; with the
-compressed backbone MD runs **13.7× faster** than uncompressed.
+On the periodic water benchmark the joint model improves force RMSE by
+**4.9×** over the local baseline ([training](docs/training.md)). The compressed
+backbone gives **13.7× faster MD** in the
+[6,144-atom GB10 benchmark](docs/cost.md#with-the-compressed-backbone).
 
 ## Install
 
-Into an environment with `deepmd-kit==3.2.0` and a matching `torch`:
+From this repository, with the dependencies installed in a compatible environment:
 
 ```bash
 pip install -e . --no-deps
 ```
 
-Building that environment, the `mpich` trap of the PyPI wheel and the smoke
-test: [docs/install.md](docs/install.md). The wheel's CPU-only operators
-suffice for training and MD; only the
-[compressed backbone](#compressed-backbone) needs a source build.
+See [installation](docs/install.md) for dependencies and an import check.
+The [compressed backbone](#compressed-backbone) needs a CUDA source build of
+DeePMD-kit.
 
 ## Train
+
+The plugin adds `type: "dp_lr"` and `long_range` to the model configuration.
+This is a **model fragment**, not a complete training input:
 
 ```json
 {
@@ -43,18 +46,16 @@ suffice for training and MD; only the
 dp --pt-expt train input.json
 ```
 
-Without the `long_range` block the model is exactly the standard one, and
-**always train that baseline twin too** (delete `"type": "dp_lr"` and
-`long_range`, change nothing else): it is the only way to know the term
-helped. `alpha` and the mesh are not free parameters
-([choosing them](docs/alpha-and-mesh.md)). `type_map` is abbreviated above;
-the converter writes the whole periodic table by default and the model's must
-match ([dataset layout](docs/dataset-layout.md)).
+Use [example 01](examples/01-bulk) for data preparation and a complete
+`input.json`. Train a baseline with `"type": "dp_lr"` and `long_range` removed
+to measure the improvement. Choose [alpha and the mesh](docs/alpha-and-mesh.md)
+together. The abbreviated `type_map` above must be expanded if using the
+converter's default full periodic table ([dataset layout](docs/dataset-layout.md)).
 
 ## Examples
 
-Each case in `examples/` was run and comes with its data preparation, an
-annotated `input.json` and a README.
+Each directory has a README with its inputs and commands; training examples
+include `input.json`, and simulation examples include runnable scripts.
 
 | | case | teaches |
 |---|---|---|
@@ -75,23 +76,16 @@ long-range term: `dp freeze`, `DeepPot`, `dp test` and LAMMPS are **refused**
 for a long-range model rather than allowed to return the short-range energy
 silently ([why](docs/md.md)).
 
+For GPU integration, share one evaluator across relaxation and MD. Supply a
+trained checkpoint and a bulk or slab structure:
+
 ```python
-from ase.md.verlet import VelocityVerlet
 from ase import units
-from deepmd_lr.ase import LongRangeCalculator
-
-atoms.calc = LongRangeCalculator("run_joint/model.ckpt.pt")
-VelocityVerlet(atoms, timestep=0.5 * units.fs).run(10000)
-```
-
-For MD that never leaves the GPU, on one or several, the same pattern runs on
-nvalchemiops kernels through one evaluator shared by every stage:
-
-```python
 from ase.md.velocitydistribution import Stationary, thermalize_momenta
-from deepmd_lr.nvalchemi import FIRE2, Langevin, build_evaluator
+from deepmd_lr.nvalchemi import FIRE2, Langevin, build_evaluator, read_structure
 
-ev = build_evaluator("run_joint/model.ckpt.pt", atoms, devices=["cuda:0", "cuda:1"])
+atoms = read_structure("start.xyz")
+ev = build_evaluator("run_joint/model.ckpt.pt", atoms)  # one GPU by default
 FIRE2(ev, atoms).run(fmax=0.05)
 thermalize_momenta(atoms, temperature_K=300)
 Stationary(atoms)
@@ -99,32 +93,24 @@ Langevin(ev, atoms, 0.5 * units.fs, temperature_K=300, friction=0.01 / units.fs,
          logfile="md.log", loginterval=100).run(10000)
 ```
 
-`VelocityVerlet`, `Langevin`, `NoseHooverChainNVT`, `VelocityRescaling`,
-`MTKNPT`, `MTKNPH`, `FIRE` and `FIRE2` all work this way, with trajectories,
-observers and checkpoints ([partitioned MD](docs/partitioned-md.md)). A field
-run, Born effective charges and their screening by ε∞:
-[born-charges](docs/born-charges.md).
+NVE, NVT, NPT, NPH, cell relaxation, multiple GPUs and checkpoints are covered
+in [partitioned MD](docs/partitioned-md.md). For ASE integrators and optimizers,
+attach `LongRangeCalculator` instead ([ASE workflow](docs/md.md)). For an
+external electric field, see [Born charges](docs/born-charges.md).
 
 ### Compressed backbone
 
-DeePMD-kit's DPA4C compression (radial tables + one fused CUDA kernel) covers
-the backbone, about 90% of a step. At 6,144 atoms:
-
-| | ms/step | ns/day | peak GiB |
-|---|---:|---:|---:|
-| long-range | 373.3 | 0.116 | 6.41 |
-| long-range, compressed | **27.2** | **1.590** | **0.34** |
+DeePMD-kit's DPA4C compression replaces the backbone with radial tables and a
+fused CUDA kernel:
 
 ```python
-atoms.calc = LongRangeCalculator("model.ckpt.pt", compress=True)     # ASE
-ev = build_evaluator("model.ckpt.pt", atoms, compress=True)          # nvalchemi MD
+ev = build_evaluator("model.ckpt.pt", atoms, compress=True)
 ```
 
-The tabulation error (1e-5 eV/Å in force, 1e-7 e in charge) is three orders
-below the model's error against DFT. Compression needs a deepmd-kit built from
-source with the CUDA operators, is inference-only, and folds the run's
-`charge_spin` into the tables; each rule is refused rather than warned about
-when violated ([docs/compression.md](docs/compression.md)).
+`LongRangeCalculator` also accepts `compress=True`. Compression is for
+inference and fixes the run's `charge_spin` in the tables. See
+[requirements and build instructions](docs/compression.md) and
+[measured speed, memory and tabulation error](docs/cost.md#with-the-compressed-backbone).
 
 ## Scripts
 
@@ -135,27 +121,26 @@ when violated ([docs/compression.md](docs/compression.md)).
   initial state of a joint model, with the charge head scaled down
   ([training](docs/training.md)).
 - `scripts/calibrate_born.py` fits the scale and sign of a trained model's
-  Born tensors to DFPT labels, the one post-training calibration the charges
-  need ([why](docs/born-charges.md)).
+  Born tensors to DFPT labels ([calibration](docs/born-charges.md#calibrating-the-scale-and-sign-against-dfpt-labels)).
 
 ## Documentation
 
 | | |
 |---|---|
-| [install.md](docs/install.md) | building the environment, the `mpich` trap, the smoke test |
+| [install.md](docs/install.md) | dependencies, environment setup and import check |
 | [alpha-and-mesh.md](docs/alpha-and-mesh.md) | does the term apply to your data; choosing `alpha` and the mesh; `pme` vs `ewald` |
 | [non-periodic.md](docs/non-periodic.md) | molecules: `nopbc`, `method: "isolated"`, what that term computes |
-| [multi-head.md](docs/multi-head.md) | several levels of theory: `shared_dict`, `gradient_max_norm`, the rules that bite |
+| [multi-head.md](docs/multi-head.md) | several levels of theory: sharing, clipping and branch configuration |
 | [same-as.md](docs/same-as.md) | one theory, bulk + slab: `same_as`; setting the long-range type at load |
 | [dataset-layout.md](docs/dataset-layout.md) | systems, `type_map.raw`, the full-periodic-table convention, HDF5 |
 | [training.md](docs/training.md) | schedules, grafting, EMA, what to watch, validating, troubleshooting |
 | [cost.md](docs/cost.md) | step time and memory, compressed and not |
-| [md.md](docs/md.md) | why export is refused; energy-conservation check; the GPU classes, the traps, relaxing a packed box |
+| [md.md](docs/md.md) | ASE workflow, energy conservation, charge filtering and initial relaxation |
 | [compression.md](docs/compression.md) | compressed backbone: requirements, what changes, building the CUDA operators |
 | [born-charges.md](docs/born-charges.md) | Born effective charges, MD in an external field, calibrating against DFPT |
-| [partitioned-md.md](docs/partitioned-md.md) | `DistributedEvaluator`, the MD classes and one shared evaluator, your own kernel loop, what is conserved, scaling |
+| [partitioned-md.md](docs/partitioned-md.md) | GPU MD, cell updates, skin and halos, custom integrators and scaling |
 | [neighbour-lists.md](docs/neighbour-lists.md) | which neighbour list runs: the serial model's, and the MD engine's GPU-direct one |
-| [tests.md](docs/tests.md) | what the suite pins |
+| [tests.md](docs/tests.md) | running the tests and coverage by module |
 
 ```bash
 pytest tests/ -q          # compressed-kernel tests need a CUDA build

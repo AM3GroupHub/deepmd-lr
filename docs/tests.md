@@ -1,42 +1,63 @@
 # Tests
 
+Run from the repository root in the [prepared environment](install.md):
+
 ```bash
-pytest tests/ -q                                                # most files need a CUDA device
-DP_CUDA_INFER=1 DEEPMD_LR_REQUIRE_COMPRESS=1 pytest tests/ -q   # with the CUDA-operator build
+pytest tests/ -q
+DP_CUDA_INFER=1 DEEPMD_LR_REQUIRE_COMPRESS=1 pytest tests/ -q
 ```
 
-`DEEPMD_LR_REQUIRE_COMPRESS=1` turns the compressed-kernel skips into failures,
-so a build that lost its operator cannot pass
-([building it](compression.md#building-the-cuda-operators)).
+Most test modules need CUDA. The second command requires the
+[compiled compression operator](compression.md#building-the-cuda-operators)
+and turns missing CUDA/operator skips into failures.
 
-Two tests are opt-in because they need a trained water checkpoint; add
+## Checks with a trained checkpoint
+
+These workflows are opt-in. Supply a trained water checkpoint; add
 `DEEPMD_LR_WATER_COMPRESS=1` to compress it first:
 
 ```bash
-DEEPMD_LR_WATER_MODEL=model.ckpt.pt pytest tests/test_nvalchemi.py -k long_water -s   # 25 ps never wrapped, forces checked every 500 steps; ~10 min
-DEEPMD_LR_WATER_MODEL=model.ckpt.pt pytest tests/test_md.py -k water_relaxes          # a 4% stretched box back to zero stress in each mode; ~20 s
+DEEPMD_LR_WATER_MODEL=model.ckpt.pt pytest tests/test_nvalchemi.py -k long_water -s
+DEEPMD_LR_WATER_MODEL=model.ckpt.pt pytest tests/test_md.py -k water_relaxes
 ```
 
-| file | pins |
+The first runs 25 ps without wrapping and checks forces every 500 steps
+(about 10 minutes). The second relaxes a box stretched by 4% in each cell mode
+(about 20 seconds). Timings depend on hardware.
+
+## Physics and model coverage
+
+| tests | checks |
 |---|---|
-| `test_lr_term.py` | the reciprocal term against a hand-written Ewald sum; `pme` against `ewald`; the slab correction; boundary guards, batching, masking, gradients including the double backward; the mesh and sum a cell and pbc pick |
-| `test_isolated_term.py` | the no-cell term: its periodic limit, invariances, differentiability, configuration, use inside the model |
-| `test_pme_physics.py` | nvalchemiops' PME against the NaCl Madelung constant, spline orders, the double backward |
-| `test_joint_model.py` | force and virial against finite differences of the energy, the shared backbone, training gradients, guards, serialization |
-| `test_charge_head.py` | the total-charge projection (exactness, masking, differentiability) and the charge head's symmetries |
-| `test_born.py`, `test_eps_inf.py` | Born charges against a brute-force derivative, their symmetries, the field force, `sqrt(eps_inf)` on every path |
-| `test_multi_task.py`, `test_same_as.py`, `test_charge_same_as.py` | multi-head sharing, the `same_as` expansion, one charge head under two theories |
-| `test_neighbors.py` | the cell-list graph against the dense builder |
-| `test_nlist.py` | the GPU-direct list against the dense oracle: periodic, small (several images of one pair), triclinic and slab cells, unwrapped positions, a halo node set, a set drifting past its box; both CSR views valid; an overflowed matrix or edge buffer reported and grown; a poisoned tail never read; a warm search without a synchronising op, correct on a side stream; differentiable vectors reaching the coordinates and strain; the Born row-sum kernel equal to the array-API response and deterministic |
-| `test_ase_calculator.py` | the calculator against the model, pbc guards, export refusal, NVE drift; each frame's pbc picking its sum and its cell the mesh; too little vacuum refused; a multi-head branch loaded by name |
-| `test_read_structure.py` | the file's pbc kept; a slab's open axis padded, centred, made whole; fixed atoms read and moved with the slab; molecules and wires refused |
-| `test_nvalchemi.py` | the partitioner and halo (unwrapped too), skin rules and memory probe, the device gather, the gathered term and virial; `DistributedEvaluator` matching a fresh evaluation at every call, across cell changes; slabs at 1, 2 and 4 partitions, an atom near an open face refused, an `isolated` term refused; a supercell's mesh; evaluators sharing one model; `charge_spin` and `exclude_types` serial and partitioned alike |
-| `test_sync.py` | one download per evaluation (one bool more on two partitions, one more for an uncompressed model's edge count); no pageable upload, `nonzero` or `bincount` |
-| `test_thermo.py` | `Thermo`'s measurements, warp aliasing, cell sync, the guards that make one evaluator safe to share, fixed atoms at rest and out of the temperature |
-| `test_md.py` | the MD classes and relaxations against hand-written kernel loops; one evaluator across stages; `atoms` in step both ways; observers, checkpoints, the log; conservation as dt² in every cell mode and the Nosé–Hoover invariant; the barostats' transposed cell; the cell relaxation against finite differences of the enthalpy; the dipole current; slabs kept, refused by barostats, restored only onto their boundary; fixed atoms in every integrator |
-| `test_compress.py` | every refusal, the graph-lower guard, argument validation, state intact after a failed compression, the strict mode; with the operator, kernel dispatch, compressed against uncompressed, and the GPU list's CSR views driving the kernel at 1, 2 and 4 partitions |
-| `test_charge_filter.py` | exact zeros below the threshold, the total kept, a C³ weight, forces equal to minus the gradient on one and two partitions, serial = partitioned = ASE, serialization, training gradients, overrides and refusals |
-| `test_neutrality_loss.py` | the `ener_lr` loss: the reported shift, the term and its schedule, its gradient reaching head and backbone, schema, factory, serialization |
-| `test_ema_default.py` | EMA enforced for training |
-| `test_plugin_registration.py`, `test_import_order.py` | entry-point registration, schema acceptance, each module importing cleanly first |
-| `test_xyz_to_deepmd.py`, `test_graft_short_range.py`, `test_calibrate_born.py` | the three scripts |
+| [lr_term](../tests/test_lr_term.py), [pme_physics](../tests/test_pme_physics.py) | Ewald reference, PME, NaCl Madelung constant, slab correction, gradients and double backward |
+| [isolated_term](../tests/test_isolated_term.py) | periodic limit, invariances, differentiability and no-cell inference |
+| [joint_model](../tests/test_joint_model.py) | finite-difference forces and virial, shared backbone, training and serialization |
+| [charge_head](../tests/test_charge_head.py) | total-charge projection, masking and symmetries |
+| [born](../tests/test_born.py), [eps_inf](../tests/test_eps_inf.py) | tensor derivatives, sum rules, field forces and screening on each path |
+| [charge_filter](../tests/test_charge_filter.py) | exact zeros, total charge, C³ weights, force gradients and agreement across interfaces |
+| [neutrality_loss](../tests/test_neutrality_loss.py) | `ener_lr` penalty, schedule, gradients, schema and serialization |
+| [multi_task](../tests/test_multi_task.py), [same_as](../tests/test_same_as.py), [charge_same_as](../tests/test_charge_same_as.py) | branch expansion and parameter sharing |
+
+## Inference and MD coverage
+
+| tests | checks |
+|---|---|
+| [neighbors](../tests/test_neighbors.py) | fallback cell-list graph against the dense builder |
+| [nlist](../tests/test_nlist.py) | GPU graph, periodic images, small/triclinic/slab cells, cell changes, CSR, overflow recovery, gradients and deterministic Born reduction |
+| [nvalchemi](../tests/test_nvalchemi.py) | partition ownership, halos, skin, cell deformation, memory probing, gathered quantities and agreement with fresh evaluation |
+| [sync](../tests/test_sync.py) | host-transfer counts, no pageable uploads, `nonzero` or `bincount` in the warm path |
+| [thermo](../tests/test_thermo.py) | measurements, Warp views, cell updates, evaluator sharing and fixed atoms |
+| [md](../tests/test_md.py) | integrators against kernel loops, conservation, cell conventions, stage sharing, checkpoints, observers and constraints |
+| [compress](../tests/test_compress.py) | requirements, failed-compression rollback, kernel dispatch and agreement with uncompressed evaluation |
+| [ase_calculator](../tests/test_ase_calculator.py) | model agreement, boundaries, export guards, NVE drift, mesh selection and head loading |
+| [read_structure](../tests/test_read_structure.py) | periodicity, slab padding and centring, fixed atoms and unsupported structures |
+
+## Configuration and tools
+
+| tests | checks |
+|---|---|
+| [ema_default](../tests/test_ema_default.py) | EMA training defaults |
+| [plugin_registration](../tests/test_plugin_registration.py), [import_order](../tests/test_import_order.py) | entry point, schema and independent module imports |
+| [xyz_to_deepmd](../tests/test_xyz_to_deepmd.py) | dataset conversion |
+| [graft_short_range](../tests/test_graft_short_range.py) | checkpoint grafting |
+| [calibrate_born](../tests/test_calibrate_born.py) | signed scale fitting and calibration CLI |

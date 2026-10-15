@@ -1,28 +1,14 @@
 # Running MD over partitions
 
-`LongRangeCalculator` is single-process and single-device. `DistributedEvaluator`
-evaluates the model over spatial partitions, one per GPU:
+`DistributedEvaluator` computes energies and forces; the MD classes integrate
+positions and velocities on the GPU. Build it once with `build_evaluator` and
+share it across stages. The default uses the model's single device. Pass
+`devices=["cuda:0", "cuda:1"]` to split the system over two GPUs.
 
-```python
-from deepmd_lr.nvalchemi import DistributedEvaluator
-
-evaluator = DistributedEvaluator(
-    model, atype, cell,
-    devices=["cuda:0", "cuda:1", "cuda:2", "cuda:3"],
-    compute_virial=False,       # True also fills .virial and .stress
-)
-energy, forces = evaluator(positions)      # eV, eV/angstrom
-```
-
-It owns the partitioning, the ghost halo, the per-device replicas and the
-decision of when to rebuild, and nothing else: no timestep, ensemble,
-thermostat or velocities. `positions` may be a torch tensor, including one an
-integrator mutates in place, or anything `np.asarray` accepts. Forces come
-back as a float64 tensor on the model's device, which `wp.from_torch` views
-without a copy, so the trajectory never leaves the GPU. `evaluator.results`
-carries the energy split and charges; `evaluator.masses()` reads the element
-order off the model's `type_map`. There is no ASE calculator on this path on
-purpose: ASE's integrators cannot touch on-device state.
+Each entry in `devices` defines a partition; repeated device names also create
+multiple partitions. A single entry uses the whole system without halo atoms.
+See [partitioning](#how-the-atoms-are-split) and the
+[low-level interface](#what-the-driver-returns) for details.
 
 ### The MD classes
 
@@ -38,7 +24,7 @@ from deepmd_lr.nvalchemi import (
 )
 
 atoms = read_structure("start.xyz")
-ev = build_evaluator("model.ckpt.pt", atoms, devices=["cuda:0", "cuda:1"])
+ev = build_evaluator("model.ckpt.pt", atoms)
 FIRE2(ev, atoms).run(fmax=0.05)
 thermalize_momenta(atoms, temperature_K=300)
 Stationary(atoms)
@@ -64,9 +50,9 @@ npt.run(20_000)
 | `FIRE` | relaxes the positions, and the cell with `relax_cell`; classic FIRE with ASE's defaults | — |
 | `FIRE2` | the same with FIRE 2.0 and nvalchemiops' more cautious defaults | — |
 
-`FIRE` and `FIRE2` are ASE's two relaxations on nvalchemiops kernels, with
-ASE's parameter names and unit masses. FIRE caps each atom's step on its own;
-FIRE2 kicks before measuring the power, backs off half a step after an uphill
+`FIRE` and `FIRE2` use nvalchemiops kernels with ASE-style interfaces and unit
+masses. FIRE caps each atom's step on its own; FIRE2 kicks before measuring
+the power, backs off half a step after an uphill
 step, and scales the whole step so no atom moves more than `maxstep`. On water
 from an MD snapshot they reached 0.05 eV/Å in 199 and 380 steps; from a
 TIP3P-relaxed packed box, in 149 and 160.
@@ -115,9 +101,10 @@ On water stretched by 4%, at 192 and 12,288 atoms alike, to 0.05 eV/Å and
 | `FIRE` | 750 | 610 | 740 |
 | `FIRE2`, cell force ÷ N | 1000 | 1480 | 1570 |
 
-The new cell goes to the evaluator every step, as under NPT, and the
-partitions follow it without a rebuild. An MD object built before the
-relaxation refuses to step afterwards; build it from the relaxed `atoms`.
+The new cell goes to the evaluator every step, as under NPT. Partitions are
+reused while the [displacement and cell-deformation bound](#reusing-a-partitioning-across-steps)
+holds. An MD object built before the relaxation refuses to step afterwards;
+build it from the relaxed `atoms`.
 
 ### Sharing one evaluator
 
@@ -142,16 +129,18 @@ once is not supported), is safe by construction:
   open axis. Along an open axis there are no images and the long-range sum
   takes its slab form (Yeh–Berkowitz) whatever the model was trained with,
   since the term holds no weights. `read_structure` pads the open axis to at
-  least 20 Å of vacuum (`vacuum=`) and centres the slab. An atom within half a
-  skin of an open face is refused. NPT, NPH and cell relaxation are refused for
-  a slab. An `isolated` term, molecules and clusters belong to the ASE
+  least 20 Å of vacuum (`vacuum=`) and centres the slab. Atoms must stay inside
+  the open faces; multiple partitions also require a half-skin margin at each
+  rebuild. NPT, NPH and cell relaxation are refused for a slab.
+  An `isolated` term, molecules and clusters belong to the ASE
   calculator ([non-periodic](non-periodic.md#running-md)).
 - **PME mesh.** Set from the cell when the evaluator is built, at least
   `ceil(2 alpha L)` points per axis, and kept for the run
   ([alpha and mesh](alpha-and-mesh.md)).
-- **The model.** Each evaluator builds its own long-range term
-  (`ev.long_range_energy`) and never changes the model, so evaluators for
-  different systems, and ASE calculators, can share one.
+- **The model.** Each evaluator owns its long-range term
+  (`ev.long_range_energy`), so its boundary and mesh settings do not overwrite
+  those of another evaluator sharing the model. Compression does modify the
+  descriptor; shared users must agree on the folded `charge_spin`.
 - **Checkpoints** record the boundary, so a bulk checkpoint does not restore
   onto a slab evaluator or the reverse.
 - **Virial.** `set_compute_virial` switches it on for the stage that needs it;
@@ -164,9 +153,10 @@ raised. Edits made between runs or inside an observer are uploaded before the
 next step; a cheap every-step observer can skip that with
 `attach(fn, 1, sync_atoms=False)`.
 
-The classes add no host synchronisation beyond the evaluator's own and cost
-what a hand-written kernel loop costs (water, one GB10, medians of three
-interleaved runs; logging every 100 steps changes nothing measurable):
+Between output and observer intervals, integration adds no host
+synchronisation beyond the evaluator's own. Measured against a hand-written
+loop on water, one GB10, medians of three interleaved runs (logging every 100
+steps had no measurable cost):
 
 | ms/step | 192 atoms | 12,288 atoms, compressed |
 |---|---:|---:|
@@ -191,6 +181,7 @@ observers and checkpoints for free
 does the second). NVE on a `Thermo`:
 
 ```python
+from deepmd_lr.nvalchemi import Thermo
 from nvalchemiops.dynamics.integrators import (
     velocity_verlet_position_update, velocity_verlet_velocity_finalize,
 )
@@ -199,7 +190,7 @@ th = Thermo(ev, atoms.get_positions(), velocities=atoms.get_velocities(),
             masses=atoms.get_masses())
 dt = th.scalar(0.5 * units.fs)                   # the loop owns time
 th.evaluate()
-for _ in range(steps):
+for _ in range(10_000):
     velocity_verlet_position_update(
         th.positions, th.velocities, th.forces, th.masses, dt)
     th.evaluate()
@@ -291,20 +282,21 @@ conservation checks.
 
 ### How the atoms are split
 
-**On one device they are not.** The node set is the system itself
-(`partition.whole_system`): every atom owned, no ghosts, and the neighbour
-list below searches the real cell with the real periodicity, recording each
-pair's lattice image as an integer shift. The host-side spatial sort never
-runs. The rest of this section is about two or more devices.
+The evaluator selects its path from `len(devices)`, even if entries name the
+same physical GPU:
 
-Into a grid of blocks, not slabs. A device holds its owned block plus a shell
-of ghosts `rcut + skin` deep on every side, and that shell does not shrink
-when the block does: slabs keep two faces at full cell size however thin they
-get, while cutting more axes keeps every face smaller. `decomposition_grid`
-picks, per partition count, the factorisation that minimises one block's halo
-box (slabs for two, 2 × 2 × 1 for four, 2 × 2 × 2 for eight on a cubic box,
-slabs again along a long axis when the box is elongated enough), each cut at
-equal atom count. Nodes on the busiest device, water at the auto skin:
+| device entries | nodes | role of `skin` |
+|---|---|---|
+| one (default) | real atoms only; periodic images are edge shifts | inactive; no halo or memory probe |
+| two or more | owned atoms plus explicit ghosts within `rcut + skin` | allows the partitioning to be reused |
+
+Both paths search for neighbours at **`rcut` every evaluation**. Skin caches
+the partition membership, not the pair list.
+
+For multiple partitions, `decomposition_grid` minimises each block's halo
+volume and cuts at equal atom count: 2 × 2 × 1 for four partitions of a cubic
+box, 2 × 2 × 2 for eight, or slabs along a sufficiently long axis. Nodes on
+the busiest device, water at the auto skin:
 
 | atoms | partitions | slabs | grid | change |
 |---|---|---:|---:|---:|
@@ -325,8 +317,8 @@ expresses each node back relative to the positions it was given, so a node
 sits in the cell however far its atom has wandered. Between rebuilds nothing
 needs folding: a node moves with its atom, and the Verlet check reads raw
 displacement, so a caller that wraps an atom (a jump by a lattice vector)
-simply triggers a rebuild. On one device the cell-list kernel folds the images
-into the pair shifts itself, every step.
+simply triggers a rebuild. With one partition the cell-list kernel folds
+the images into the pair shifts itself, every step.
 
 ### What is split and what is not
 
@@ -337,35 +329,35 @@ into the pair shifts itself, every step.
 | reciprocal sum + charge projection | 73 ms | gathered onto one device |
 | charge-response force | — | partitioned |
 
-The reciprocal sum is gathered because it does not survive spatial
-decomposition (2.0% error on 2 ranks, 36.5% on 8), and that is affordable
-because it is under 10% of the step and the round trip is ~230 KB. Most of the
-73 ms is the gather and the projection; the PME itself is 1.5 ms and stays
-there as the system grows ([Cost](cost.md)). The charge-response force,
-`-Σⱼ (dE/dqⱼ) ∂qⱼ/∂rᵢ`, stays partitioned: the energy is long-ranged, but
-`∂qⱼ/∂rᵢ` is nonzero only within `rcut`.
+Independent reciprocal sums per partition miss interactions between
+partitions. Charges are therefore gathered for one global sum. In the
+measurement above, most of the 73 ms was gathering and projection; PME itself
+took 1.5 ms ([Cost](cost.md)). The charge-response backward through the raw
+charge head stays partitioned because each raw charge depends only on edges
+within `rcut`. The global total-charge projection is included in the gather
+stage.
 
 ### Reusing a partitioning across steps
 
-Ghosts are gathered within `rcut + skin`, and the partitioning is rebuilt only
-once atoms have moved far enough to threaten it (`2·max displacement > skin`).
+With multiple partitions, ghosts are gathered within `rcut + skin`. At fixed
+cell the rebuild criterion is `2·max displacement > skin`.
 `repartition_every=1` forces a rebuild each step; it changes timing, never
 results, and a test asserts exactly that.
 
-**A changing cell keeps the partitioning.** Every node is an atom's folded
+**Cell deformation also counts toward the bound.** Every node is an atom's folded
 position `f_i = r_i − n_i H` plus a lattice shift `S H`, with `n_i` and `S`
 kept as integers. `set_cell` re-expresses the shifts in the new cell, and the
 Verlet bound counts each atom's motion in its folded frame, `Δr_i − n_i ΔH`,
 plus `(max|S| + √3) ‖ΔH‖` for the ghosts and the images just outside the halo.
-NPT therefore rebuilds about as often as NVT does; repartitioning at every
-step cost 66 against 38 ms/step at 12,288 water atoms and 154 against 97 at
-41,472.
+Small cell changes can reuse the partitioning; larger changes rebuild it.
+In measured water runs, rebuilding every step cost 66 against 38 ms/step at
+12,288 atoms and 154 against 97 at 41,472.
 
-The bound is evaluated on the device and read back as one bool per step. On
-one device nothing is reused and nothing is rebuilt; `rebuild_count` only
-counts the rebuilds `repartition_every` forces.
+The bound is evaluated on the device and read back as one bool per step.
+The whole-system path skips this check and reuses its node set and buffers.
+Its `rebuild_count` counts initialisation and any forced rebuilds.
 
-**A barostat never touches the host.** The cell it integrates is a device
+**Cell and pressure updates stay on the device.** The barostat's cell is a device
 tensor, handed on by `Thermo.set_cell_device`: the evaluator copies it
 device-to-device, inverts it there (a 3 × 3 inverse written out, since
 `torch.linalg.inv` reads the device to check its result), re-expresses the
@@ -392,26 +384,22 @@ LAMMPS-Kokkos builds it. The pair vector `x[j] − x[i] + S·H` is both
 libraries' convention, so the shifts pass straight through, and the kernel
 folds unwrapped coordinates into `S`.
 
-Nothing is cached between steps and nothing reads the host. The buffers are
-allocated once, sized by the first search (the one that synchronises) at 1.2×
+The search runs every step, reusing buffers sized by the first search at 1.2×
 the widest row and 1.15× the edge count; the edge count stays a device scalar,
 `edge_mask` marks where the real edges end, and a device status word reports
 an overflowed row or edge buffer, on which the evaluator widens it by a
 quarter, repeats the step, warns and counts it in `evaluator.list_growths`.
-Growth is rare: along a water trajectory the edge count moves by well under a
-percent, and the widest row drifts up slowly (101 to 113 neighbours over 440
-steps at 319k atoms), which the margin absorbs. A compressed model takes the
-kernel's float32 vectors over the full buffers, since its kernels walk the CSR
+Initial sizing and overflow recovery synchronise with the host. A warm
+compressed search fits within the evaluator's existing status readback.
+A compressed model takes the kernel's float32 vectors over the full buffers,
+since its kernels walk the CSR
 rows and never see the tail, unless the charge response needs `edge_vec`
 differentiable; an uncompressed model gets vectors in its own precision on a
-compact edge axis, at the cost of one more download (the edge count), because
+compact edge axis, at the cost of one edge-count download per partition, because
 its descriptor processes every edge it is handed.
 
 Measured 2026-10-02 on water with the compressed SR model (`DP_CUDA_INFER=2`),
-ms per MD step, against the cached pair list it replaced (DeePMD-kit's builder
-over every node, ghosts included, a dense-matrix decode, two argsorts and a
-per-step `nonzero`/`bincount` filter, about ten host synchronisations per
-step):
+ms per MD step. The pair-list rows refer to the former implementation:
 
 | GPU | atoms | path | step | graph (+ search) | forward | nodes | peak GiB |
 |---|---:|---|---:|---:|---:|---:|---:|
@@ -424,18 +412,9 @@ step):
 | H200 | 1,956,864 | pair list | 213 | 61 (+704 per rebuild, 3.8 s repartition) | 95 | 2,757,158 | 115 |
 | H200 | 1,956,864 | GPU list | 97 | 26 | 68 | 1,956,864 | 22 |
 
-The list's own stages on the H200 at 1.96M: query 12.8 ms, fill 7.1, source
-CSR 6.2, 26 ms in all for 175M edges (89 per atom), the same standalone,
-inside the evaluator and after 50 MD steps on the moved, unwrapped positions.
-The step is 97 ms against LAMMPS-Kokkos's 90 on the same problem, with the
-model's kernels at 68 ms. nvalchemiops' search scales linearly (0.96, 6.6 and
-56 ms at 10k, 169k and 1.96M atoms on a GB10), so a stateless search every
-step costs less than the bookkeeping a Verlet list needs: a search at
-`rcut + 1 Å` costs 44 ms for 280M pairs per rebuild, against a 12 ms per-step
-query, so a Verlet variant would save a few ms per step for reference
-positions, fold images, a rebuild bound and cell-change bookkeeping, and is
-not built. If a step looks slow, compare nodes before anything else: one H200
-node ran the same binary and inputs at 139 ms with the query kernel at 54 ms.
+At 1.96M atoms on the H200, the list's 26 ms comprises 12.8 ms for the query,
+7.1 for the fill and 6.2 for source CSR, over 175M edges. These measurements
+motivated rebuilding the pair list on the device each step.
 
 A graph that is differentiated (the charge response, the virial strain) or a
 model that runs in float64 asks the list for `float64_vectors`: the fill
@@ -450,10 +429,9 @@ and 36 ms in float32; without the strain, 13 ms.
 
 ### The knob that decides multi-GPU scaling
 
-**`skin` (default `"auto"`)**, two or more devices only: on one device there is
-no halo to size and the memory probe below does not run. The decomposition is
-reused until an atom has moved half the skin, then rebuilt on the host by a
-spatial sort whose cost grows with the atom count. Two A40s at 98,304 atoms:
+**`skin` (default `"auto"`)** controls halo reuse with two or more partitions.
+It is inactive on the whole-system path. Increasing it trades fewer host
+rebuilds for more ghost nodes. Two A40s at 98,304 atoms:
 
 | skin (Å) | ms/step | rebuild | serial fraction | 2-GPU Amdahl ceiling |
 |---|---|---|---|---|
@@ -462,32 +440,26 @@ spatial sort whose cost grows with the atom count. Two A40s at 98,304 atoms:
 | 4.0 | 101 | none in 40 steps | 5 % | 1.90x |
 | 8.0 | 189 | none | 4 % | 1.92x |
 
-A constant is wrong at both ends (a few thousand atoms rebuild cheaply and pay
-for a thick halo), so `"auto"` takes the largest skin whose halo costs at most
+`"auto"` takes the largest skin whose halo costs at most
 25% more nodes than a zero-skin halo, from the cell, the cutoff and the
 partition count (`partition.default_skin`): 1.4 Å at 1,536 atoms, 4.3 Å at
 98,304, where the measurement put the optimum, and 5.3 Å at 192,000. Pass a
 number to override; `evaluator.skin` reports what was used.
 
-**Memory is a measured cap, not a term in the formula.** How many bytes a node
-costs is a property of the model and the step, not of the geometry, and spans
-a factor of thirty between models:
+**Memory caps the geometry-based skin.** Measured bytes per node differ
+substantially between models:
 
 | model | bytes per node | linear fit error |
 |---|---|---|
 | uncompressed long-range | 755 kB | 0.3 % |
 | compressed long-range | 24.3 kB | 1.2 % |
 
-The first evaluation is a probe at the floor skin, the smallest halo there is;
-its peak allocation per node is the coefficient, the footprint is linear in
-the node count, and the skin becomes the largest value whose predicted
-footprint fits `memory_headroom` (0.8 by default) of what this process could
-hold on the device, free memory plus its own cached blocks, so a co-tenant is
-accounted for. It is only a ceiling: the geometry rule decides whenever memory
-is not binding. Predicted against actual peak at 41,472 atoms uncompressed:
-47.4 against 47.23 GiB. The node count the probe counted, not `N/V`, turns the
-skin into nodes, which is right for a slab, an interface or a void where a
-uniform density is not.
+The first evaluation probes peak allocation at the minimum auto skin. The
+measured cost per node caps the halo at `memory_headroom` (default 0.8) of
+available memory, including this process's cached blocks. The measured node
+count accounts for slabs and voids without assuming uniform density. At
+41,472 atoms uncompressed, the predicted peak was 47.4 GiB against 47.23 GiB
+measured. The geometry rule still applies when memory is not limiting.
 
 On an out-of-memory the evaluator halves the skin, rebuilds and retries the
 step, and that value becomes a ceiling too, `set_cell` under a barostat
@@ -497,10 +469,9 @@ below which the halo is not what is filling the device.
 
 ### The launch phase is single-threaded
 
-A thread per device raced on the lazily initialised libraries underneath
-(deepmd-kit's fake-op registration, torch's CUDA linear-algebra loader, warp's
-code generation), so the loop runs one partition at a time, in order. Two
-things from that work stay, because they are about correctness:
+One host thread queues the partitions in order, avoiding races in lazy
+library initialisation; device work can overlap across GPUs. Two details
+are required for correctness and performance:
 
 - **`_current_device` around each partition.** The compressed operator binds
   the *current* device rather than its arguments' device: without this, a
@@ -512,6 +483,20 @@ things from that work stay, because they are about correctness:
 
 ## What the driver returns
 
+`DistributedEvaluator` accepts a torch tensor (including one mutated in place
+by an integrator) or an array-like of positions. It returns energy in eV as a
+Python float and forces in eV/Å as a float64 tensor on the model's device.
+`wp.from_torch` aliases the force buffer without copying. `results` includes
+the energy split and charges and converts entries to NumPy only when read.
+`masses()` derives masses from the model's `type_map`.
+
+```python
+from deepmd_lr.nvalchemi import DistributedEvaluator
+
+ev = DistributedEvaluator(model, atype, cell, devices=["cuda:0"])
+energy, forces = ev(positions)
+```
+
 `evaluate_partitioned` assembles on the gather device and returns device
 tensors (scalars as 0-d tensors): the per-partition forces, energies, charges,
 charge-response forces and Born tensors are scatter-added with `index_add_`
@@ -521,19 +506,22 @@ as a device primitive. Convert explicitly when you want numpy:
 ```python
 from deepmd_lr.nvalchemi import evaluate_partitioned, to_numpy
 
-out = evaluate_partitioned(model, coord, atype, cell, n_partitions=2, devices=[...])
+out = evaluate_partitioned(model, coord, atype, cell, n_partitions=2,
+                           devices=["cuda:0", "cuda:1"])
 out["force"]                      # torch tensor on the gather device
 to_numpy(out)["force"]            # numpy (N, 3), one explicit download
 ```
 
-`DistributedEvaluator` keeps the tensor path: the forces go straight into the
-buffer the warp integrator aliases, and `results` converts an entry to numpy
-only when it is read. One download per step remains, because the call returns
-the energy as a Python float: the energy, the neighbour list's status flags
-and, with `compute_virial`, the virial come back in one small copy. On one
-device that is the step's only host synchronisation; two or more devices add
-the one bool of the halo's Verlet check; an uncompressed model adds its
-compact edge count. `tests/test_sync.py` pins these counts.
+Without supplied `partitions`, this low-level helper calls `partition_system`,
+including explicit periodic ghosts even for `n_partitions=1`. Use
+`DistributedEvaluator` for whole-system MD and persistent buffers.
+
+In a warm evaluation without rebuilding or buffer growth, the evaluator reads
+energy and list status in one small copy (also the virial if requested).
+Multiple partitions add one bool for the halo check; an uncompressed model
+also reads one compact edge count per partition. Logging, observers and
+checkpoints can download more. [`test_sync.py`](../tests/test_sync.py) checks
+the evaluation counts.
 
 ## Limits
 
@@ -546,10 +534,9 @@ compact edge count. `tests/test_sync.py` pins these counts.
   All three contributions decompose. The short-range virial is the sum of the
   per-partition `energy_derv_c_redu`, since each edge survives in exactly one
   partition. The reciprocal virial is a strain derivative taken on the gather
-  device. The charge-response virial comes from straining each partition's
-  node coordinates and backpropagating `dE/dq` into the strain leaf, which is
-  exact because a ghost's offset is a lattice-vector combination `n A` that
-  deforms as `n A (I+ε)ᵀ`, the same transform as a coordinate. Verified
+  device. The charge-response virial strains each partition's edge vectors
+  and backpropagates `dE/dq` into the strain leaf. This includes periodic
+  offsets because every term of `r_j + S H − r_i` deforms alike. Verified
   against the serial virial, itself finite-difference checked, to ~6e-15,
   symmetric, and identical at 1, 2, 4 and 8 partitions.
 
@@ -565,9 +552,9 @@ compact edge count. `tests/test_sync.py` pins these counts.
   | compressed long-range, 41,472 atoms | 48.7 ms | 47.6 ms | host (device busy 10.7 ms) |
   | uncompressed short-range, 12,288 atoms | 222 ms | 141 ms | devices (121 ms each) |
 
-  So compressed runs below roughly 100,000 atoms belong on one GPU, and an
-  uncompressed run overlaps at 80–86% across two. The fixed per-partition host
-  cost, eager-PyTorch dispatch, is what more partitions multiply.
+  These compressed cases gain little from a second GPU; the uncompressed
+  run overlaps at 80–86% across two. More partitions multiply eager-PyTorch
+  dispatch costs. Measure the intended system and hardware before adding GPUs.
 
 - **Neighbour lists.** Which builder runs for the descriptor and for the
   charge head, why a rebuilt model must re-resolve `neighbor_graph_method`,

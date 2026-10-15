@@ -1,8 +1,13 @@
 # Which neighbour list runs
 
-Three neighbour graphs exist, chosen independently: the descriptor's and the
-charge head's for the serial model (training, the ASE calculator), and the MD
-engine's, which lives on the device.
+The energy and charge heads normally share one descriptor pass and graph.
+The builder depends on the execution path:
+
+| path | builder |
+|---|---|
+| training and ASE inference | DeePMD-kit's descriptor graph |
+| charge fallback, when captured features cannot carry gradients | `build_neighbor_graph_fast` |
+| GPU MD through `DistributedEvaluator` | `GpuNeighborList` |
 
 **The descriptor's**, which DeePMD-kit owns, is selected by
 `neighbor_graph_method`. It resolves once at training startup (default `auto`,
@@ -16,8 +21,9 @@ hand does not. On the 6520-atom LiFSI frame that gap is **48.2 GB and 724 ms**
 for `dense` against **4.0 GB and 201 ms** for `nv`, at a bit-identical energy,
 and 48 GB does not fit a 48 GB card.
 
-**The charge head's**, which this package owns, comes from
-`build_neighbor_graph_fast`. With `method="auto"` it uses the cell list when
+**The charge fallback** uses this package's `build_neighbor_graph_fast`.
+It is not used by compressed models, which require the shared descriptor.
+With `method="auto"` it uses the cell list when
 the frame is on CUDA, nvalchemiops is available, and the atom count clears the
 threshold for its boundary condition:
 
@@ -41,10 +47,8 @@ the dense path has no ghost images to materialise and stays cheaper until
 about a thousand atoms. `method="cell_list"` or `"dense"` forces either; the
 graph is identical, and `tests/test_neighbors.py` asserts it.
 
-Only the search is taken from nvalchemiops: its edge vectors come out of a Warp
-kernel with no gradient, so they are discarded and DeePMD-kit's
-`neighbor_graph_from_ijs` recomputes `edge_vec` from `coord` and `box`. Using
-the kernel's vectors directly would give a model with no forces.
+This fallback takes only the search from nvalchemiops, then uses
+`neighbor_graph_from_ijs` to reconstruct differentiable edge vectors.
 
 **The virial never needs the dense builder.** The strain is applied to the
 finished edge vectors, not to the coordinates and cell, so the derivative
@@ -56,19 +60,17 @@ the edge vectors is exact (every term of `coord[j] + S·box − coord[i]`
 transforms by the same `(I+ε)ᵀ`) and costs 8.3 GB and 0.92 s per step against
 63 GB and 3.0 s through the box.
 
-**The MD engine's**, `GpuNeighborList` in `deepmd_lr/nvalchemi/nlist.py`,
-which `DistributedEvaluator` uses for every node set: nvalchemiops' cell list
-every step at `rcut` into preallocated buffers, compacted into DeePMD-kit's
-graph by two Warp kernels, with no sort and no host synchronisation after the
-first, sizing search. On one device it searches the real cell with the real
-periodicity (no halo, nodes = atoms); on a partition, the owned atoms plus
-their explicit ghost images, non-periodically, with only the owned atoms as
-centres. Here the kernel's float32 vectors are used when nothing
-differentiates through them (a compressed short-range model); the charge
-response and the virial get vectors recomputed from the node coordinates and
-the strain. The same CSR rows let the Born tensor's edge half be summed per
-node by one kernel ([Born charges](born-charges.md#implementation-notes)).
-Mechanics and measured costs:
-[the device list](partitioned-md.md#the-neighbour-list-lives-on-the-device).
-Small boxes, slabs, triclinic cells and lattice jumps are checked against the
-dense oracle in `tests/test_nlist.py`.
+**GPU MD** searches at `rcut` every evaluation, reusing allocated buffers.
+With one device entry it searches the real cell and records periodic edge
+shifts; with multiple entries it searches owned atoms and explicit halo
+nodes. Skin controls halo reuse, not pair-list reuse
+([partitioning](partitioned-md.md#how-the-atoms-are-split)).
+
+The fill kernels produce vectors and CSR rows directly. Differentiable
+vectors use a custom backward for coordinate and strain gradients; they are
+not rebuilt in torch. See [the device list](partitioned-md.md#the-neighbour-list-lives-on-the-device)
+for precision, buffer growth and measurements, and
+[host transfers](partitioned-md.md#what-the-driver-returns) for synchronisation.
+The same CSR rows serve the [Born kernel](born-charges.md#implementation-notes).
+[`test_nlist.py`](../tests/test_nlist.py) checks these graphs against the dense
+oracle, including small boxes, slabs, triclinic cells and lattice jumps.
