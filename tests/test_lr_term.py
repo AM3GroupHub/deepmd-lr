@@ -679,3 +679,58 @@ class TestSerialization:
         term = LongRangeEnergy(alpha=0.35, mesh_dimensions=(20, 20, 20), spline_order=5)
         restored = LongRangeEnergy.deserialize(term.serialize())
         assert restored.serialize() == term.serialize()
+
+
+class TestSystemSettings:
+    """How the sum is taken follows the system, not the checkpoint."""
+
+    WATER = {
+        "alpha": 0.4,
+        "method": "pme",
+        "slab_correction": False,
+        "pbc": [True, True, True],
+        "mesh_spacing": None,
+        "mesh_dimensions": (10, 10, 10),
+        "spline_order": 6,
+    }
+
+    def test_the_mesh_grows_with_the_cell_and_never_shrinks(self):
+        from deepmd_lr.lr import system_mesh
+
+        # The water model's mesh is right for its training box and kept there.
+        assert system_mesh(self.WATER, np.eye(3) * 12.429) == (10, 10, 10)
+        # A 4x4x4 supercell needs 1.25 A spacing: 40, not the stored 10.
+        assert system_mesh(self.WATER, np.eye(3) * 49.716) == (40, 40, 40)
+        # A mesh finer than the rule is never coarsened.
+        fine = dict(self.WATER, mesh_dimensions=(30, 30, 30))
+        assert system_mesh(fine, np.eye(3) * 12.429) == (30, 30, 30)
+
+    def test_a_spacing_is_honoured_and_example_03s_mesh_is_reproduced(self):
+        from deepmd_lr.lr import system_mesh
+
+        settings = {"alpha": 0.4, "mesh_spacing": 1.25}
+        assert system_mesh(settings, np.diag([14.04, 14.04, 52.0])) == (12, 12, 42)
+        finer = {"alpha": 0.4, "mesh_spacing": 0.5}
+        assert system_mesh(finer, np.eye(3) * 10.0) == (20, 20, 20)
+
+    def test_pbc_picks_the_3d_or_the_slab_sum(self):
+        from deepmd_lr.lr import system_reciprocal
+
+        cell = np.diag([12.429, 12.429, 40.0])
+        slab = system_reciprocal(self.WATER, cell, [True, True, False])
+        assert slab["slab_correction"] is True
+        assert slab["pbc"] == [True, True, False]
+        assert slab["mesh_dimensions"] == [10, 10, 32]
+        bulk = system_reciprocal(slab, np.eye(3) * 12.429, [True, True, True])
+        assert bulk["slab_correction"] is False
+        assert bulk["pbc"] == [True, True, True]
+        # The rest is the model's.
+        assert bulk["alpha"] == 0.4 and bulk["spline_order"] == 6
+
+    def test_two_open_axes_are_refused_and_the_isolated_term_is_left_alone(self):
+        from deepmd_lr.lr import system_reciprocal
+
+        with pytest.raises(ValueError, match="2 axes open"):
+            system_reciprocal(self.WATER, np.eye(3) * 10.0, [True, False, False])
+        isolated = {"method": "isolated", "alpha": 0.4}
+        assert system_reciprocal(isolated, np.eye(3) * 10.0, [True] * 3) == isolated

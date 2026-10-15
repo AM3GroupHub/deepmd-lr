@@ -36,6 +36,7 @@ from deepmd_lr.born import (
 from deepmd_lr.compress import (
     compress_model,
 )
+from deepmd_lr.fitting.charge import check_charge_filter
 
 __all__ = ["LongRangeCalculator", "load_model", "select_neighbor_graph_method"]
 
@@ -148,7 +149,9 @@ class LongRangeCalculator(Calculator):
     ----------
     model
         A path to a training checkpoint (``model.ckpt.pt``), or an already
-        constructed model.
+        constructed model. A model passed in is used, not copied, and before
+        each frame its long-range term is adapted to that frame's cell and
+        pbc. GPU evaluators build terms of their own, so they may share it.
     device
         Torch device; defaults to DeePMD-kit's own choice.
     charge_spin
@@ -159,10 +162,10 @@ class LongRangeCalculator(Calculator):
         Omit when passing an already constructed model.
     long_range
         Optional replacement for the reciprocal-space settings, e.g.
-        ``{"method": "pme", "slab_correction": True, "pbc": [True, True,
-        False]}``. The long-range term carries no weights, so the boundary
-        treatment is a property of the simulation rather than of the
-        checkpoint.
+        ``{"method": "isolated"}`` for a molecule. The frame's pbc already
+        picks the 3D or the slab sum. The long-range term carries no weights,
+        so the boundary treatment is a property of the simulation rather than
+        of the checkpoint.
     compress
         ``True`` to compress the DPA4C backbone for inference at DeePMD-kit's
         default table stride, or a float stride in angstrom. Needs a
@@ -176,6 +179,14 @@ class LongRangeCalculator(Calculator):
         Coulomb charges into the screened ones for which the energy reads
         ``q~_i q~_j / (4 pi eps_0 eps_inf r)``. A field force built from those
         tensors scales with it; the energy and field-free forces do not.
+    charge_filter
+        ``(c_t, delta)`` in e; ``False`` for none; None (the default) for the
+        model's own ``long_range.charge_filter``. As an override, simulation
+        only: charges below ``c_t - delta`` in magnitude are set exactly to
+        zero, those above
+        ``c_t + delta`` kept, with a C^3 polynomial between, and the total
+        restored on the atoms that keep charge; see
+        :func:`~deepmd_lr.fitting.charge.filter_charges`. Refused with a field.
 
     Examples
     --------
@@ -202,6 +213,7 @@ class LongRangeCalculator(Calculator):
         long_range: dict | None = None,
         compress: bool | float = False,
         eps_inf: float = 1.0,
+        charge_filter: Any = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -249,6 +261,21 @@ class LongRangeCalculator(Calculator):
         self.eps_inf = float(eps_inf)
         if self._has_long_range:
             self.model.eps_inf = self.eps_inf
+        # None: the model's own `long_range.charge_filter`; False: none.
+        self.charge_filter = charge_filter
+        effective = (
+            getattr(self.model, "trained_charge_filter", None)
+            if charge_filter is None
+            else check_charge_filter(charge_filter)
+        )
+        if effective is not None:
+            if not self._has_long_range:
+                raise ValueError("charge_filter needs a model with a long_range block")
+            if self.efield is not None:
+                raise ValueError(
+                    "charge_filter cannot be combined with an efield yet: the "
+                    "field force is built from unfiltered Born charges"
+                )
         self.type_map = list(self.model.get_type_map())
         self.charge_spin = None
         if charge_spin is not None:
@@ -275,6 +302,30 @@ class LongRangeCalculator(Calculator):
             ) from exc
         return torch.tensor(indices, dtype=torch.int64, device=self.device)
 
+    def _check_slab_gap(self, atoms) -> None:
+        """Refuse a slab whose vacuum a cutoff sphere could cross.
+
+        This calculator hands the model the full cell, so the descriptor sees
+        a slab as 3D-periodic. With a gap narrower than the cutoff, atoms at
+        one face would see the next image's opposite face, an interaction the
+        slab does not have.
+        """
+        axis = [bool(p) for p in atoms.pbc].index(False)
+        cell = np.asarray(atoms.get_cell(), dtype=np.float64)
+        a, b = (cell[j] for j in range(3) if j != axis)
+        normal = np.cross(a, b)
+        normal /= np.linalg.norm(normal)
+        depth = abs(float(cell[axis] @ normal))
+        gap = depth - float(np.ptp(atoms.get_positions() @ normal))
+        rcut = float(self.model.get_rcut())
+        if gap < rcut:
+            raise ValueError(
+                f"the slab leaves {gap:.2f} A of vacuum along its open axis, "
+                f"less than the cutoff {rcut} A: atoms would see their images "
+                "across it. Pad the cell and centre the slab, e.g. "
+                "deepmd_lr.nvalchemi.read_structure(path) does both."
+            )
+
     def _check_pbc(self, atoms) -> bool:
         """Refuse a boundary condition this model cannot evaluate.
 
@@ -296,12 +347,14 @@ class LongRangeCalculator(Calculator):
                     "and so no cell to repeat. For an isolated molecule build the "
                     "model with `long_range.reciprocal.method: 'isolated'`."
                 )
-            expected_pbc = term.pbc if term.needs_cell else (False, False, False)
-            if not np.array_equal(atoms.pbc, expected_pbc):
+            if not term.needs_cell and periodic:
                 raise ValueError(
                     f"Atoms pbc={atoms.pbc.tolist()} does not match the "
-                    f"selected long-range branch pbc={list(expected_pbc)}"
+                    "selected long-range branch pbc=[False, False, False]: the "
+                    "isolated term sums no periodic images"
                 )
+            if term.needs_cell and sum(bool(p) for p in atoms.pbc) == 2:
+                self._check_slab_gap(atoms)
         elif periodic and not atoms.pbc.all():
             raise ValueError(
                 "Partial pbc is unsupported by the short-range graph interface"
@@ -317,6 +370,12 @@ class LongRangeCalculator(Calculator):
         super().calculate(atoms, properties or ["energy"], system_changes)
         atoms = self.atoms
         periodic = self._check_pbc(atoms)
+        if self._has_long_range and periodic:
+            # The frame decides how the sum is taken: its pbc picks the 3D or
+            # the slab sum, its cell the PME mesh. The term holds no weights,
+            # so this changes no parameter, and each frame gets the mesh its
+            # own cell needs.
+            self.model.adapt_long_range(np.asarray(atoms.get_cell()), atoms.pbc)
 
         coord = torch.tensor(
             np.asarray(atoms.get_positions()),
@@ -340,6 +399,7 @@ class LongRangeCalculator(Calculator):
             # calculators built with different media, and the last one to be
             # constructed must not win over the one actually computing.
             self.model.eps_inf = self.eps_inf
+            self.model.charge_filter = self.charge_filter     # re-asserted, as eps_inf
         out = self.model(coord, atype, box=cell, charge_spin=self.charge_spin)
 
         energy = float(out["energy"].reshape(-1)[0].detach())

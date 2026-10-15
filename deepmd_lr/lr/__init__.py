@@ -17,6 +17,8 @@ from deepmd_lr.lr.term import (
     LongRangeEnergy,
     LongRangeTerm,
     build_long_range_energy,
+    system_mesh,
+    system_reciprocal,
 )
 
 __all__ = [
@@ -28,4 +30,6 @@ __all__ = [
     "LongRangeEnergy",
     "LongRangeTerm",
     "build_long_range_energy",
+    "system_mesh",
+    "system_reciprocal",
 ]

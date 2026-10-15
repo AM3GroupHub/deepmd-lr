@@ -32,9 +32,6 @@ from typing import (
 
 import numpy as np
 import torch
-from deepmd.dpmodel.utils.neighbor_graph.csr import (
-    attach_edge_csr,
-)
 
 from deepmd_lr.born import (
     edge_born_response,
@@ -42,6 +39,8 @@ from deepmd_lr.born import (
 )
 from deepmd_lr.fitting.charge import (
     charge_mask,
+    check_charge_filter,
+    filter_charges,
     project_to_total_charge,
     resolve_charge_spin,
 )
@@ -50,8 +49,11 @@ from deepmd_lr.model.lr_model import (
     _run_backbone,
     _symmetric_strain,
 )
-from deepmd_lr.neighbors import (
-    build_neighbor_graph_fast,
+from deepmd_lr.nvalchemi.born_csr import (
+    edge_born_response_csr,
+)
+from deepmd_lr.nvalchemi.nlist import (
+    GpuNeighborList,
 )
 from deepmd_lr.nvalchemi.partition import (
     Partition,
@@ -201,38 +203,42 @@ def partition_graph(
     dtype=torch.float64,
     requires_grad: bool = False,
     strain: torch.Tensor | None = None,
+    with_csr: bool = False,
 ):
-    """Build one partition's neighbour graph, keeping only owned destinations.
+    """Build one partition's neighbour graph: every edge into an owned atom.
 
-    Built with ``box=None`` -- non-periodic. The halo already carries explicit
-    periodic images, so applying the boundary again inside the partition would
-    double-count it.
-
-    Edges whose destination is a ghost are masked out. That is what makes the
-    assembled sum exact: each edge survives in exactly one partition, the one
-    owning its destination.
+    The search is :class:`~deepmd_lr.nvalchemi.nlist.GpuNeighborList`, cached
+    on the partition and run at every call: nvalchemiops' cell list over the
+    node set with only the owned atoms as centres, compacted on the device
+    into DeePMD-kit's graph with no host synchronisation. Searching only from
+    owned atoms is what makes the assembled sum exact -- each edge survives in
+    exactly one partition, the one owning its destination -- without an
+    ownership mask. The whole system on one device
+    (:func:`~deepmd_lr.nvalchemi.partition.whole_system`) is searched in the
+    real cell with the real periodicity, the images carried as integer shifts;
+    a partition's node set (owned atoms plus explicit ghost images) is searched
+    non-periodically.
 
     With ``requires_grad``, the node coordinates are tracked and returned so a
-    later backward can reach them. That lets the charge-response term reuse
-    this graph instead of rebuilding it -- the search is the expensive part,
-    and it is identical either way.
-
-    With ``strain`` (a ``(3, 3)`` matrix, typically ``I + sym(eps)``), the
-    node coordinates are deformed by it before the search. That is all the
-    virial needs here: a ghost's Cartesian offset is a lattice-vector
-    combination ``n A``, which deforms as ``n A (I+eps)^T`` -- the same
-    transform as a coordinate -- so straining the assembled node set is
-    exact, and the strain reaches ``edge_vec`` through the coordinates rather
-    than through a box. That is why the partitioned virial does not need a
-    cell-differentiable neighbour builder -- nor does the serial path, which
-    strains its finished edge vectors instead.
+    later backward can reach them: the charge-response term differentiates
+    through this graph's ``edge_vec`` instead of rebuilding it. With ``strain``
+    (a ``(3, 3)`` matrix, typically ``I + sym(eps)``) the finished vectors are
+    deformed by it, which is all the virial needs: an edge vector is
+    ``x_j + S H - x_i``, every term of which deforms alike, so the strain
+    reaches ``edge_vec`` without a cell-differentiable search.
 
     Returns ``(graph, node_type_flat, node_coord)``. ``node_coord`` is the
     unstrained leaf, so a backward reaches both it and the strain.
 
     ``coord`` may be a device tensor or a numpy array; either way the node
     set is gathered on ``device`` with :meth:`Partition.views`, never
-    concatenated on the host.
+    concatenated on the host. ``with_csr`` asks for the destination and source
+    CSR views the compressed kernel needs; a compressed model then takes the
+    kernel's float32 vectors over the list's fixed-capacity buffers (its
+    kernels walk the CSR rows and never see the tail), unless the charge
+    response needs ``edge_vec`` differentiable. An uncompressed model gets
+    vectors in its own precision on a compact edge axis, since its array-API
+    descriptor processes every edge it is handed.
     """
     # One gather, on the device: owned nodes plus ghosts shifted into place,
     # taken from the global coordinate tensor with this partition's cached
@@ -245,20 +251,95 @@ def partition_graph(
     )
     v = part.views(device, dtype)
     c = coord_t.detach().to(device=device, dtype=dtype)
-    nodes = torch.cat([c[v["owned"]], c[v["ghost"]] + v["shift"]])
+    if part.is_whole_system:
+        # The nodes ARE the atoms, in order: no gather, no shift.
+        nodes = c
+    else:
+        nodes = torch.cat(
+            [c[v["owned"]] + v["owned_shift"], c[v["ghost"]] + v["shift"]]
+        )
     node_coord = nodes.unsqueeze(0).clone().requires_grad_(requires_grad)
     node_type = part.types_on(atype, device).unsqueeze(0)
 
-    search_coord = (
-        node_coord
-        if strain is None
-        else torch.bmm(node_coord, strain.transpose(-1, -2).unsqueeze(0))
-    )
-    graph = build_neighbor_graph_fast(search_coord, node_type, None, rcut)
-
-    owned_dst = graph.edge_index[1] < part.n_owned
-    graph.edge_mask = graph.edge_mask & owned_dst
+    nlist = part.neighbor_list_on(device)
+    if nlist is None:
+        # Float64 vectors from the kernel when they will be differentiated
+        # (the charge response) or the model runs uncompressed; the
+        # compressed short-range model takes the float32 ones.
+        keep64 = requires_grad or not with_csr
+        if part.is_whole_system:
+            # The real cell and periodicity; `v["cell"]` is the tensor
+            # `Partition.set_cell` keeps current, read at every search.
+            nlist = GpuNeighborList(
+                part.n_node,
+                rcut,
+                device,
+                cell=v["cell"],
+                pbc=part.periodic,
+                float64_vectors=keep64,
+            )
+        else:
+            nlist = GpuNeighborList(
+                part.n_node,
+                rcut,
+                device,
+                cell=None,
+                targets=torch.arange(
+                    part.n_owned, dtype=torch.int32, device=torch.device(device)
+                ),
+                float64_vectors=keep64,
+            )
+        part.store_neighbor_list(device, nlist)
+    nlist.search(nodes)
+    if with_csr and not requires_grad:
+        graph = nlist.graph()
+    elif with_csr:
+        graph = nlist.graph(node_coord, strain, dtype=torch.float32)
+    else:
+        graph = nlist.graph(node_coord, strain, dtype=dtype, compact=True)
+        # Without the CSR views the uncompressed path assembles forces the way
+        # it always has (the array-API scatter).
+        graph.destination_order = graph.source_order = None
+        graph.destination_row_ptr = graph.source_row_ptr = None
+        graph.destination_sorted = False
     return graph, node_type.reshape(-1), node_coord
+
+
+def check_long_range_boundary(model: Any, pbc, term: Any = None) -> None:
+    """Refuse a long-range term whose boundary is not the system's.
+
+    ``term`` is the one about to be evaluated, by default the model's own.
+    The check :class:`~deepmd_lr.ase.LongRangeCalculator` makes. Without it the
+    term simply runs: an ``isolated`` term on a periodic cell sums no images,
+    and a slab term corrects a cell that is periodic along z. On the 192-atom
+    water box that was 1.1 eV and 0.03 eV off, with nothing raised.
+    """
+    if not getattr(model, "has_long_range", False):
+        return
+    if term is None:
+        term = model.long_range_energy
+    expected = (
+        tuple(bool(p) for p in term.pbc) if term.needs_cell else (False, False, False)
+    )
+    have = tuple(bool(p) for p in np.broadcast_to(np.asarray(pbc, dtype=bool), (3,)))
+    if have != expected:
+        method = getattr(term, "method", getattr(term, "METHOD", "?"))
+        raise ValueError(
+            f"the long-range term ('{method}', pbc {list(expected)}) does not "
+            f"match the system's pbc {list(have)}. DistributedEvaluator builds "
+            "the term a bulk cell or a slab needs; evaluate_partitioned takes "
+            "one as long_range_energy=model.long_range_energy_for(cell, pbc). "
+            "An `isolated` term, and molecules and clusters, belong to the ASE "
+            "calculator, deepmd_lr.ase.LongRangeCalculator"
+        )
+
+
+#: Born tensors differentiate the raw charges (``deepmd_lr.born``); the filter
+#: would need its own chain through them, which does not exist yet.
+_FILTER_WITH_BORN = (
+    "charge_filter cannot be combined with Born charges (compute_born or an "
+    "efield) yet: the Born tensor is built from the unfiltered charges"
+)
 
 
 def evaluate_partitioned(
@@ -276,6 +357,9 @@ def evaluate_partitioned(
     charge_spin: torch.Tensor | tuple[float, float] | None = None,
     compute_born: bool = False,
     eps_inf: float = 1.0,
+    long_range_energy: Any = None,
+    charge_filter: tuple[float, float] | None = None,
+    atype_device: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     """Run ``model`` over spatial partitions and assemble the global result.
 
@@ -303,6 +387,18 @@ def evaluate_partitioned(
         ``q~_i q~_j / (4 pi eps_0 eps_inf r)``. Energies and forces are
         evaluated with the model's own charges and are unchanged. ``1.0`` is
         vacuum. See :func:`deepmd_lr.born.screening_factor`.
+    long_range_energy
+        The long-range term to evaluate, by default ``model.long_range_energy``.
+        :class:`~deepmd_lr.nvalchemi.evaluator.DistributedEvaluator` passes
+        the one it built for its cell and pbc, which leaves the model alone.
+    charge_filter
+        ``(c_t, delta)``: switch charges below about ``c_t`` off, smoothly,
+        after the projection (:func:`~deepmd_lr.fitting.charge.filter_charges`).
+        A simulation-only setting; refused with Born charges.
+    atype_device
+        ``atype`` already on the gather device, for the long-range term. A
+        caller that evaluates every step keeps one copy rather than paying a
+        pageable upload per call; ``cell`` may likewise be a device tensor.
     Returns
     -------
     dict
@@ -313,6 +409,10 @@ def evaluate_partitioned(
         -- the last is what :func:`_charge_response_force` backpropagates
         through each partition's charge head.
     """
+    check_long_range_boundary(model, pbc, long_range_energy)
+    charge_filter = check_charge_filter(charge_filter)
+    if charge_filter is not None and compute_born:
+        raise NotImplementedError(_FILTER_WITH_BORN)
     rcut = float(model.get_rcut())
     coord_np = (
         None if isinstance(coord, torch.Tensor) else np.asarray(coord, dtype=np.float64)
@@ -368,6 +468,7 @@ def evaluate_partitioned(
         if dev not in coord_on:
             with _current_device(dev):
                 coord_on[dev] = coord_t.to(device=dev, dtype=dtype)
+
     def launch_one(part, device) -> _Launched:
         """One partition's forward, on its own device.
 
@@ -384,6 +485,7 @@ def evaluate_partitioned(
             if compute_virial:
                 eps, strain = _symmetric_strain(dtype, device)
             # `requires_grad` only when the charge-response backward will need it.
+            # The compressed kernel needs the destination CSR views.
             graph, node_type, node_coord = partition_graph(
                 part,
                 coord_on[torch.device(device)],
@@ -393,18 +495,9 @@ def evaluate_partitioned(
                 dtype,
                 requires_grad=long_range,
                 strain=strain,
+                with_csr=_is_compressed(local),
             )
             n_node, n_local = part.counts_on(device)
-
-            if _is_compressed(local):
-                # The compressed kernel needs the destination CSR views, attached
-                # AFTER the ownership mask: `build_edge_csr` routes masked edges
-                # into a padding segment using the mask it is shown, so attaching
-                # inside the builder would leave ghost-destination edges in owned
-                # rows. `canonicalize=False` leaves `edge_vec` the very tensor the
-                # search produced, so the charge-response backward below still
-                # reaches `node_coord` through it.
-                graph = attach_edge_csr(graph, part.n_node)
             # The model's own capture context: it records the backbone output the
             # charge head reuses, and it is what permits the graph lower -- any
             # caller outside one would be reporting the short-range energy alone.
@@ -461,8 +554,6 @@ def evaluate_partitioned(
             virial += out["energy_derv_c_redu"].reshape(3, 3).detach().to(home, dtype)
         # Energy: owned atoms only. Each atom is scored by exactly one owner.
         per_atom = out["energy"].reshape(-1).detach().to(home, dtype)
-        atom_energy.index_add_(0, v["owned"], per_atom[: part.n_owned])
-
         # Force: every node, ghosts included. A ghost carries the reaction to
         # an owned atom's edge, and that belongs to the ghost's owner --
         # scatter-add, exactly as ghost-force reverse communication in a
@@ -473,6 +564,14 @@ def evaluate_partitioned(
         node_force = (
             out["energy_derv_r"].reshape(part.n_node, 3).detach().to(home, dtype)
         )
+        if part.is_whole_system:
+            # Nodes are the atoms in order: the sums have one term each.
+            atom_energy.copy_(per_atom)
+            force.copy_(node_force)
+            if long_range:
+                raw_charge.copy_(raw.detach().to(home, dtype))
+            continue
+        atom_energy.index_add_(0, v["owned"], per_atom[: part.n_owned])
         force.index_add_(0, v["ids"], node_force)
 
         if long_range:
@@ -496,8 +595,10 @@ def evaluate_partitioned(
             home,
             dtype,
             compute_virial=compute_virial,
-            atype=atype,
+            atype=atype if atype_device is None else atype_device,
             charge_spin=charge_spin,
+            term=long_range_energy,
+            charge_filter=charge_filter,
         )
     )
     result["energy"] = result["energy_short_range"] + result["energy_long_range"]
@@ -508,7 +609,7 @@ def evaluate_partitioned(
     if compute_born:
         # Before `_charge_response_force`, which backpropagates through the
         # same `raw` tensors without retaining the graph.
-        result["born_charge"] = _born_charges_partitioned(
+        result["born_charge"], born_grads = _born_charges_partitioned(
             launched, n_atoms, result["charge"], home, dtype, eps_inf=eps_inf
         )
     # The energy above used the model's own charges; only the report is
@@ -519,7 +620,13 @@ def evaluate_partitioned(
         result["charge"] = result["charge"] * factor
 
     response_force, response_virial = _charge_response_force(
-        launched, n_atoms, result["dE_dq"], home, dtype, compute_virial=compute_virial
+        launched,
+        n_atoms,
+        result["dE_dq"],
+        home,
+        dtype,
+        compute_virial=compute_virial,
+        born_grads=born_grads if compute_born else None,
     )
     result["force_charge_response"] = response_force
     result["force"] = result["force"] + response_force
@@ -550,9 +657,17 @@ def _to_host(value):
     return float(value) if value.ndim == 0 else value.cpu().numpy()
 
 
+def _csr_views(graph) -> bool:
+    return (
+        graph.destination_row_ptr is not None
+        and graph.source_order is not None
+        and graph.source_row_ptr is not None
+    )
+
+
 def _born_charges_partitioned(
     launched, n_atoms: int, charge, home, dtype, *, eps_inf: float = 1.0
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, list]:
     r"""Born effective charge tensors, assembled across partitions.
 
     The global total-charge projection is not an obstacle here, for the same
@@ -579,9 +694,20 @@ def _born_charges_partitioned(
     live here, but its *source* edges point at neighbours that may be ghosts,
     and those edges live in the neighbour's partition. Neither partition sees
     all of atom i's terms alone; the scatter-add is what completes the sum.
+
+    Returns the assembled tensor and, per partition, the unweighted edge
+    cotangent ``d raw / d edge_vec`` it differentiated (``None`` where no
+    capture was used), for :func:`_charge_response_force` to reuse: the
+    descriptor is one-hop, so the weighted cotangent that force needs is the
+    same gradient scaled by each edge's destination weight, and the second
+    backward through the descriptor is saved. With the GPU list's CSR views
+    and float32 vectors the edge half is summed along the rows by
+    :func:`~deepmd_lr.nvalchemi.born_csr.edge_born_response_csr`; otherwise
+    by the array-API :func:`~deepmd_lr.born.edge_born_response`.
     """
     born = torch.zeros((n_atoms, 3, 3), dtype=dtype, device=home)
     contributions = []
+    unweighted = []
     # Launch every backward before transferring anything, for the same reason
     # the forward pass is staged.
     for part, _out, raw, _node_coord, _eps, graph, cap in launched:
@@ -595,13 +721,28 @@ def _born_charges_partitioned(
             # only the differentiation target changes.
             leaf = cap if cap is not None else graph.edge_vec
             (g,) = torch.autograd.grad(raw.sum(), leaf, retain_graph=True)
-            # The mask is defensive: `partition_graph` masked ghost-destination
-            # edges before the descriptor ran, so those gradients are zero.
-            node = edge_born_response(
-                g, graph.edge_vec.detach(), graph.edge_index, graph.edge_mask,
-                part.n_node,
-            )
+            vec = graph.edge_vec.detach()
+            if (
+                _csr_views(graph)
+                and g.dtype == torch.float32
+                and vec.dtype == torch.float32
+            ):
+                node = edge_born_response_csr(
+                    g,
+                    vec,
+                    graph.destination_row_ptr,
+                    graph.source_order,
+                    graph.source_row_ptr,
+                    part.n_node,
+                )
+            else:
+                # The mask is defensive: only owned-destination edges are in
+                # the graph, and the tail's gradients are zero.
+                node = edge_born_response(
+                    g, vec, graph.edge_index, graph.edge_mask, part.n_node
+                )
             contributions.append((part, node))
+            unweighted.append(g if cap is not None else None)
 
     for part, node in contributions:
         born.index_add_(
@@ -616,11 +757,17 @@ def _born_charges_partitioned(
     born = born + charge.reshape(-1, 1, 1).to(home, dtype) * eye
     # Screened tensor, Z~ = sqrt(eps_inf) Z -- same factor as the serial
     # `born_charges`, applied once to the assembled whole.
-    return born * screening_factor(eps_inf)
+    return born * screening_factor(eps_inf), unweighted
 
 
 def _charge_response_force(
-    launched, n_atoms: int, dE_dq, home, dtype, compute_virial: bool = False
+    launched,
+    n_atoms: int,
+    dE_dq,
+    home,
+    dtype,
+    compute_virial: bool = False,
+    born_grads: list | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     r"""The force from charges shifting as atoms move.
 
@@ -649,6 +796,12 @@ def _charge_response_force(
     search and re-running the descriptor here -- as an earlier version did --
     was a third descriptor evaluation per partition for no additional
     information.
+
+    ``born_grads``, when the Born tensors were just computed, holds each
+    partition's unweighted cotangent ``d raw / d edge_vec``. The descriptor
+    is one-hop -- a raw charge depends only on the edges into its atom -- so
+    ``d (sum_j w_j raw_j) / d edge_vec_e`` is that gradient times
+    ``w_{dst(e)}``, and the backward through the descriptor is not repeated.
     """
     # dE_dq already differentiates through the global, possibly masked projection.
     force = torch.zeros((n_atoms, 3), dtype=dtype, device=home)
@@ -657,7 +810,7 @@ def _charge_response_force(
     # Launch every backward first, then transfer, for the same reason the
     # forward pass is staged: a `.cpu()` between them serialises the devices.
     gradients = []
-    for part, _out, raw, node_coord, eps, graph, cap in launched:
+    for k, (part, _out, raw, node_coord, eps, graph, cap) in enumerate(launched):
         with _current_device(raw.device):
             weights = dE_dq[part.views(home, dtype)["owned"]].to(
                 device=raw.device, dtype=raw.dtype
@@ -673,9 +826,15 @@ def _charge_response_force(
                 # function of both. The leaves are numerically identical, so the
                 # composition is the exact chain rule, and routing through
                 # `graph.edge_vec` keeps the strain derivative the virial needs.
-                (g_e,) = torch.autograd.grad(
-                    (raw * weights).sum(), cap, retain_graph=True
-                )
+                g1 = born_grads[k] if born_grads is not None else None
+                if g1 is not None:
+                    w_node = torch.zeros(part.n_node, dtype=g1.dtype, device=g1.device)
+                    w_node[: part.n_owned] = weights.to(g1.dtype)
+                    g_e = g1 * w_node[graph.edge_index[1]][:, None]
+                else:
+                    (g_e,) = torch.autograd.grad(
+                        (raw * weights).sum(), cap, retain_graph=True
+                    )
                 grads = torch.autograd.grad(
                     (graph.edge_vec * g_e.detach()).sum(), targets
                 )
@@ -703,8 +862,12 @@ def _long_range_global(
     *,
     atype,
     charge_spin=None,
+    term=None,
+    charge_filter=None,
 ) -> dict:
     """The global half: project the charges, then evaluate the reciprocal sum.
+
+    ``term`` is the long-range term to evaluate, by default the model's own.
 
     Returns the direct force ``-dE/dr`` at fixed charge, and ``dE/dq``. The
     remaining *charge-response* force, ``-sum_j (dE/dq_j) dq_j/dr_i``, is
@@ -737,10 +900,16 @@ def _long_range_global(
     condition = _condition_on(model, charge_spin, device, dtype)
     total_charge = 0.0 if condition is None else condition[:, 0]
     types = torch.as_tensor(atype, dtype=torch.int64, device=device).reshape(1, -1)
-    charge = project_to_total_charge(
-        charge_t, total_charge, mask=charge_mask(model, types)
-    )
-    atom_energy = model.long_range_energy(coord_in, charge, cell_in)
+    mask = charge_mask(model, types)
+    charge = project_to_total_charge(charge_t, total_charge, mask=mask)
+    if charge_filter is not None:
+        # After the projection, inside this graph: dE/dq below is taken with
+        # respect to the raw charges, so the filter reaches the charge-response
+        # force with no other change.
+        charge = filter_charges(charge, total_charge, charge_filter, mask=mask)
+    if term is None:
+        term = model.long_range_energy
+    atom_energy = term(coord_in, charge, cell_in)
     total = atom_energy.sum()
     targets = [coord_t, charge_t] if eps is None else [coord_t, charge_t, eps]
     grads = torch.autograd.grad(total, targets)

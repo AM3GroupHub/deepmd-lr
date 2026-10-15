@@ -8,15 +8,19 @@ the frozen model came back at -93.74 eV where the eager model gives -55.12,
 having dropped 38.6 eV of long-range energy without a word.
 """
 
+import copy
+
 import numpy as np
 import pytest
 import torch
 from ase import Atoms
+from deepmd.pt_expt.train.wrapper import ModelWrapper
 from deepmd.pt_expt.utils.env import DEVICE
 
-from deepmd_lr.ase import LongRangeCalculator
+from deepmd_lr.ase import LongRangeCalculator, load_model
 
 from .test_joint_model import build
+from .test_multi_task import TestThreeBranchInterfaceBulkMolecule as ThreeBranch
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="the model runs on GPU"
@@ -134,6 +138,7 @@ class TestCalculatorGuards:
         """pbc=[True, True, False] is exactly the configuration
         `slab_correction` exists for; the guard used to reject it."""
         atoms = water_atoms()
+        atoms.set_cell([10.0, 10.0, 30.0])  # a real slab: 20 A of vacuum over it
         atoms.pbc = [True, True, False]
         from deepmd_lr.lr.term import LongRangeEnergy
 
@@ -143,6 +148,52 @@ class TestCalculatorGuards:
         model.long_range_energy = LongRangeEnergy(**settings)
         atoms.calc = LongRangeCalculator(model)
         assert np.isfinite(atoms.get_potential_energy())
+
+    def test_each_frames_pbc_picks_its_sum(self):
+        """One calculator, three frames: the slab sum where pbc opens z, the
+        3D sum where it does not, matching calculators fixed to each."""
+        from deepmd_lr.lr.term import LongRangeEnergy
+
+        bulk = water_atoms()
+        slab = water_atoms()
+        slab.set_cell([10.0, 10.0, 30.0])
+        slab.pbc = [True, True, False]
+
+        def fixed(atoms, slab_mode):
+            model = build()
+            settings = model.long_range_energy.serialize()
+            if slab_mode:
+                settings.update(slab_correction=True, pbc=[True, True, False])
+            settings.update(mesh_dimensions=[15, 15, 24 if slab_mode else 15])
+            model.long_range_energy = LongRangeEnergy(**settings)
+            a = atoms.copy()
+            a.calc = LongRangeCalculator(model)
+            return a.get_potential_energy()
+
+        calc = LongRangeCalculator(build())
+        for atoms, slab_mode in ((bulk, False), (slab, True), (bulk, False)):
+            a = atoms.copy()
+            a.calc = calc
+            energy = a.get_potential_energy()
+            assert calc.model.long_range_energy.slab_correction is slab_mode
+            assert energy == pytest.approx(fixed(atoms, slab_mode), abs=1e-9)
+
+    def test_each_frame_gets_the_mesh_its_cell_needs(self):
+        calc = LongRangeCalculator(build())
+        for box, mesh in ((10.0, (15, 15, 15)), (40.0, (32, 32, 32))):
+            atoms = water_atoms(box=box)
+            atoms.calc = calc
+            atoms.get_potential_energy()
+            assert calc.model.long_range_energy.mesh_dimensions == mesh
+
+    def test_a_slab_with_less_vacuum_than_the_cutoff_is_refused(self):
+        """The calculator hands the model the whole cell, so across a thin
+        gap the descriptor would see the next image's other face."""
+        atoms = water_atoms()
+        atoms.pbc = [True, True, False]  # a 10 A cell with atoms up to its faces
+        atoms.calc = LongRangeCalculator(build())
+        with pytest.raises(ValueError, match="less than the cutoff"):
+            atoms.get_potential_energy()
 
     def test_rejects_unknown_elements(self):
         atoms = water_atoms()
@@ -194,7 +245,7 @@ class TestEnergyConservation:
         reduction removes; a conservative one drives drift to zero. Run over
         the same physical time so the comparison is like for like."""
         from ase import units
-        from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
+        from ase.md.velocitydistribution import thermalize_momenta
         from ase.md.verlet import VelocityVerlet
 
         drifts = []
@@ -202,7 +253,7 @@ class TestEnergyConservation:
             atoms = water_atoms()
             atoms.calc = LongRangeCalculator(build())
             np.random.seed(0)
-            MaxwellBoltzmannDistribution(atoms, temperature_K=300.0)
+            thermalize_momenta(atoms, temperature_K=300.0)
             start = atoms.get_total_energy()
             VelocityVerlet(atoms, timestep=timestep * units.fs).run(steps)
             drifts.append(abs(atoms.get_total_energy() - start) / len(atoms))
@@ -263,3 +314,81 @@ class TestPlainEnergyModel:
     def test_a_field_is_refused_rather_than_crashing(self):
         with pytest.raises(ValueError, match="no `long_range`"):
             LongRangeCalculator(self._standard_model(), efield=[0.0, 0.0, 0.1])
+
+
+# --- multi-head checkpoints through the calculator ---------------------------
+
+@pytest.mark.parametrize("name", ["interface", "bulk", "molecule"])
+def test_checkpoint_head_to_ase(tmp_path, name):
+    fixture = ThreeBranch()
+    cfg, _ = fixture.config()
+    models = fixture.build()
+    cfg["model"]["model_dict"][name]["model_branch_alias"] = ["selected"]
+    state = ModelWrapper(models, model_params=cfg["model"]).state_dict()
+    path = str(tmp_path / "multi.pt")
+    torch.save({"model": state}, path)
+    atoms = water_atoms(n_mol=2)
+    if name == "interface":
+        atoms.set_cell([10.0, 10.0, 30.0])  # a slab needs vacuum over it
+    atoms.pbc = {"interface": [True, True, False], "bulk": True, "molecule": False}[
+        name
+    ]
+    atoms.calc = LongRangeCalculator(models[name])
+    energy, forces = atoms.get_potential_energy(), atoms.get_forces()
+    atoms.calc = LongRangeCalculator(path, head="selected")
+    assert atoms.get_potential_energy() == pytest.approx(energy, abs=1e-8)
+    np.testing.assert_allclose(atoms.get_forces(), forces, atol=1e-8)
+    with pytest.raises(ValueError, match="Select a checkpoint head"):
+        load_model(path)
+    with pytest.raises(ValueError, match="Unknown or ambiguous"):
+        load_model(path, head="absent")
+    broken = copy.deepcopy(state)
+    key = next(k for k in broken if k.startswith(f"model.{name}.charge_fitting."))
+    del broken[key]
+    torch.save({"model": broken}, path)
+    with pytest.raises(ValueError, match="weights do not match"):
+        load_model(path, head=name)
+
+
+@pytest.mark.parametrize(
+    "name,pbc,message",
+    [
+        ("bulk", [True, False, False], "2 axes open"),
+        ("molecule", [True, True, True], "does not match"),
+    ],
+)
+def test_reject_boundary_mismatch(name, pbc, message):
+    """What no periodic sum can take: a wire, and the isolated term in a cell."""
+    model = ThreeBranch().build()[name]
+    atoms = water_atoms(n_mol=1)
+    atoms.pbc = pbc
+    atoms.calc = LongRangeCalculator(model)
+    with pytest.raises(ValueError, match=message):
+        atoms.get_potential_energy()
+
+
+@pytest.mark.parametrize("pbc", [[True, True, True], [False, True, True]])
+def test_a_slab_branch_follows_the_frames_pbc(pbc):
+    """The term holds no weights, so the frame's pbc picks the sum: the
+    interface branch runs a bulk cell, or a slab open along x."""
+    model = ThreeBranch().build()["interface"]
+    atoms = water_atoms(n_mol=1)
+    if not all(pbc):
+        axis = pbc.index(False)
+        cell = atoms.cell.array.copy()
+        cell[axis, axis] += 20.0  # vacuum along the open axis
+        atoms.set_cell(cell)
+    atoms.pbc = pbc
+    atoms.calc = LongRangeCalculator(model)
+    assert np.isfinite(atoms.get_potential_energy())
+    term = model.long_range_energy
+    assert term.slab_correction is (not all(pbc))
+    assert list(term.pbc) == pbc
+
+
+def test_short_range_partial_pbc_is_refused():
+    atoms = water_atoms(n_mol=1)
+    atoms.pbc = [True, False, False]
+    atoms.calc = LongRangeCalculator(build(long_range=False))
+    with pytest.raises(ValueError, match="Partial pbc"):
+        atoms.get_potential_energy()

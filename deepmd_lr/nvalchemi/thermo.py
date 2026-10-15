@@ -1,99 +1,96 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""The simulation state an MD loop carries, and the thermodynamics it reports.
+"""The state an MD run carries, and what can be measured from it.
 
-:class:`Thermo` **owns** the state -- positions, velocities, masses, forces,
-cell and timestep -- and exposes each as a warp array that nvalchemiops'
-integrator kernels mutate in place. It also reports, the way LAMMPS' ``thermo``
-and ASE's ``MDLogger`` do. The name follows LAMMPS; read it as "the object the
-thermo output is about".
+:class:`Thermo` **owns** the state -- positions, velocities, masses, the forces
+view and the cell -- and exposes each as a warp array that nvalchemiops'
+integrator kernels mutate in place. It also measures: kinetic, potential and
+total energy, temperature, volume and pressure. The name follows LAMMPS; read
+it as "the object the thermo output is about".
 
-nvalchemiops supplies half-step kernels and nothing else: no state container,
-no logger, no potential energy, no kelvin conversion, and every scratch array
-is caller-allocated. This class is that missing half. It deliberately does not
-own the *ensemble* -- thermostat chains and barostat masses stay with whoever
-is integrating, which is what lets one class serve NVE, NVT and NPT alike.
+It deliberately owns neither **time** nor the **ensemble**. The timestep, the
+target temperature, thermostat and barostat parameters, the step count and the
+log all belong to the integrator (:mod:`deepmd_lr.nvalchemi.md`), which builds
+a Thermo in its own ``__init__`` around the evaluator it is given. A custom
+kernel loop makes those scalars itself, e.g. ``dt = th.scalar(0.5 * units.fs)``
+and ``kT = th.scalar(units.kB * 300.0)``.
 
-Units are the model's throughout -- angstrom, eV, amu, ASE time units -- so no
-conversion factor appears in any loop. Two deliberate exceptions, both because
-they are what a human types or reads:
+The evaluator is **shared, never copied**: :attr:`evaluator` is the object the
+caller built, so a relaxation, an NVT stage and an NPT stage can run one after
+another on one set of device replicas, each with a Thermo of its own. Two
+checks make that safe:
 
-* ``temperature`` is in **kelvin**, as a measurement and as the constructor's
-  setpoint. The eV-valued sibling is :attr:`kT`, which is a warp array with a
-  different name, type and role, so the two cannot be confused at a call site.
-* :meth:`log` prints pressure in GPa, and the column is named ``press_GPa``.
-  That is the only unit conversion in the class, and it happens where a human
-  reads the number.
+- :attr:`fresh` is False once another object has evaluated since this one
+  did. All of them view the same forces buffer.
+- :attr:`cell_is_current` is False once the evaluator's cell has moved on,
+  as an NPT stage leaves it.
+
+**Fixed atoms** come from ASE's ``FixAtoms`` on the ``Atoms`` given to
+:meth:`from_atoms`, with no argument of their own. They stay where they
+started, at rest. :meth:`evaluate` puts them back before every force call, so
+a kernel that moves every atom -- Langevin's noise does -- cannot carry them
+off, and :attr:`forces` gives them zero force, so no kick moves them either.
+They carry no kinetic energy and no degrees of freedom: :attr:`ndof` counts
+three per mobile atom, as ASE's ``Atoms.get_temperature`` does.
+
+Units are the model's throughout -- angstrom, eV, amu, ASE time units. The one
+exception is :attr:`temperature`, in kelvin, because that is what a human reads.
 """
 
 from __future__ import annotations
 
-import time
 from typing import Any
 
 import numpy as np
 import torch
 import warp as wp
-from ase.units import GPa, fs, kB
+from ase.units import kB
 from nvalchemiops.dynamics.utils import (
     compute_kinetic_energy,
-    compute_temperature,
-    initialize_velocities,
+    remove_com_motion,
 )
+
+from deepmd_lr.cell import det_3x3
 
 __all__ = ["Thermo"]
 
-#: What :meth:`Thermo.log` knows how to compute, with the unit it prints in.
-BUILTIN_COLUMNS = {
-    "step": "",
-    "time": "fs",
-    "temp": "K",
-    "epot": "eV",
-    "ekin": "eV",
-    "etot": "eV",
-    "press": "GPa",
-    "vol": "A^3",
+#: Keywords the constructor used to take, and where each went.
+_MOVED = {
+    "timestep": "the integrator's `timestep` (deepmd_lr.nvalchemi.md)",
+    "temperature": "the integrator's `temperature_K`, or ASE's thermalize_momenta()",
+    "columns": "the integrator's `logfile`/`extra_columns`",
+    "every": "the integrator's `loginterval`",
+    "file": "the integrator's `logfile`",
 }
-
-DEFAULT_COLUMNS = ("step", "time", "temp", "epot", "ekin", "etot")
-
-
-def _column_header(name: str) -> str:
-    """A log column's header: its name, its unit if it has one, right-aligned."""
-    unit = BUILTIN_COLUMNS.get(name)
-    return f"{name + (f' [{unit}]' if unit else ''):>15s}"
 
 
 class Thermo:
-    """MD state plus its thermodynamic report.
+    """MD state and its measurements.
 
     Parameters
     ----------
     evaluator
-        A :class:`~deepmd_lr.nvalchemi.evaluator.DistributedEvaluator`. It is
-        the source of everything derivable -- device, atom count, masses, cell,
-        and the forces buffer -- so nothing is passed twice.
+        A :class:`~deepmd_lr.nvalchemi.evaluator.DistributedEvaluator`, shared
+        as it is -- never copied or wrapped. It is the source of everything
+        derivable: device, atom count, default masses, cell, and the forces
+        buffer.
     positions
-        ``(n, 3)`` in angstrom. Copied into a tensor this object owns.
+        ``(n, 3)`` in angstrom, wrapped or not. Copied into a tensor this
+        object owns.
     velocities
-        ``(n, 3)``, or ``None`` to start at rest. Prefer
-        :meth:`maxwell_boltzmann`.
+        ``(n, 3)`` in angstrom per ASE time unit (ASE's own convention), or
+        ``None`` to start at rest.
     masses
-        ``(n,)`` in amu, or ``None`` to take the evaluator's own table.
-    timestep
-        In **femtoseconds**; converted once, here.
-    temperature
-        Setpoint in **kelvin**, or ``None``. Builds :attr:`kT` so no caller ever
-        has to construct one -- passing kelvin where a kernel wants ``k_B T``
-        thermostats to ~11,600x the temperature intended, and the surest way to
-        prevent that is to leave no reason to write the conversion.
-    columns, every, file
-        See :meth:`log`.
+        ``(n,)`` in amu, or ``None`` to take the evaluator's own table. The MD
+        classes pass ``atoms.get_masses()``, so isotopes work.
+
+    :meth:`from_atoms` builds one from an ``Atoms`` instead, its ``FixAtoms``
+    included; that is how the MD classes build theirs.
 
     Notes
     -----
     Every warp attribute is bound once here and never reassigned. Rebinding one
     would leave the kernels writing into the old buffer while every read saw
-    the new one.
+    the new one. :meth:`set_state` copies new values into the bound buffers.
     """
 
     def __init__(
@@ -103,38 +100,23 @@ class Thermo:
         *,
         velocities: Any = None,
         masses: Any = None,
-        timestep: float = 0.5,
-        temperature: float | None = None,
-        columns: tuple[str, ...] = DEFAULT_COLUMNS,
-        every: int = 1,
-        file: Any = None,
+        _fixed: Any = None,
+        **moved: Any,
     ) -> None:
+        if moved:
+            where = "; ".join(
+                f"{k} -> {_MOVED.get(k, 'nowhere')}" for k in sorted(moved)
+            )
+            raise TypeError(
+                f"Thermo no longer takes {sorted(moved)}. The timestep, the "
+                "target temperature and the log belong to the integrator, "
+                f"which builds its own Thermo: {where}. In a custom kernel "
+                "loop, make them yourself: dt = th.scalar(timestep), "
+                "kT = th.scalar(kB * T)."
+            )
         self.evaluator = evaluator
         self.device = str(evaluator.home)
         self.n_atoms = int(evaluator.n_atoms)
-
-        unknown = [c for c in columns if c not in BUILTIN_COLUMNS]
-        if unknown:
-            raise ValueError(
-                f"unknown thermo column(s) {unknown}; built-ins are "
-                f"{sorted(BUILTIN_COLUMNS)}. Anything else is a keyword to "
-                "log(), so it is computed by the caller."
-            )
-        if ("press" in columns or "vol" in columns) and not evaluator.compute_virial:
-            # Caught here rather than at step 0, where it would surface as a
-            # None halfway through a run that has already cost GPU time.
-            raise ValueError(
-                "columns ask for pressure or volume, which need the virial. "
-                "Build the evaluator with compute_virial=True."
-            )
-        self.columns = tuple(columns)
-        self.every = int(every)
-        self.rows: list[tuple] = []
-        #: Column order of `rows`, fixed by the first `log` call --
-        #: built-ins followed by whatever extras that call passed.
-        self.row_names: tuple[str, ...] = ()
-        #: (step, wall clock) at each `log`, for the throughput properties.
-        self._clock: list[tuple[int, float]] = []
 
         # --- state this object owns -------------------------------------
         # Allocated here, so contiguous by construction. That matters: warp's
@@ -142,9 +124,7 @@ class Thermo:
         # then mutate a temporary while the real positions never moved.
         x = np.ascontiguousarray(np.asarray(positions, dtype=np.float64))
         if x.shape != (self.n_atoms, 3):
-            raise ValueError(
-                f"positions must be ({self.n_atoms}, 3), got {x.shape}"
-            )
+            raise ValueError(f"positions must be ({self.n_atoms}, 3), got {x.shape}")
         self._x = torch.tensor(x, dtype=torch.float64, device=self.device)
         self._v = torch.zeros_like(self._x)
         if velocities is not None:
@@ -154,31 +134,57 @@ class Thermo:
             np.ascontiguousarray(m), dtype=torch.float64, device=self.device
         )
 
+        #: Indices of the atoms held in place, sorted; empty when none are.
+        self.fixed = np.asarray([] if _fixed is None else _fixed, dtype=np.int64)
+        #: The kinetic degrees of freedom every temperature here divides by.
+        #: With the centre of mass at rest, 3N - 3. Fixed atoms hold the rest
+        #: in place instead, so the mobile atoms' momentum is not conserved
+        #: and each keeps all three.
+        self.ndof = (
+            3 * (self.n_atoms - len(self.fixed))
+            if len(self.fixed)
+            else 3 * self.n_atoms - 3
+        )
+        self._fixed_idx = None
+        if len(self.fixed):
+            self._fixed_idx = torch.as_tensor(self.fixed, device=self.device)
+            #: Where the fixed atoms are held.
+            self._anchor = self._x.index_select(0, self._fixed_idx)
+            self._v.index_fill_(0, self._fixed_idx, 0.0)
+
         self.positions = self._vec(self._x)
         self.velocities = self._vec(self._v)
         self.masses = wp.from_torch(self._m)
         # Bound ONCE to the evaluator's preallocated buffer. Valid for the life
         # of this object because `__call__` copies into it rather than
         # rebinding -- an invariant guarded in `evaluate` and pinned by a test.
-        self.forces = self._vec(evaluator.forces)
+        # With fixed atoms the kernels read a buffer of this object's own
+        # instead, the evaluator's with their rows zeroed; the evaluator's
+        # stays the model's, which is what output records.
+        if self._fixed_idx is None:
+            self.forces = self._vec(evaluator.forces)
+        else:
+            self._f = torch.zeros_like(self._x)
+            self.forces = self._vec(self._f)
         self._forces_ptr = evaluator.forces.data_ptr()
+        #: The evaluator's call count after this object's last evaluation.
+        self._seen_calls: int | None = None
 
         self.cell = wp.array(
             np.asarray(evaluator.cell, dtype=np.float64)[None],
             dtype=wp.mat33d,
             device=self.device,
         )
-        self.dt = self.scalar(timestep * fs)
-        self.timestep = float(timestep)
-        self.kT = None if temperature is None else self.scalar(kB * temperature)
+        #: The evaluator's cell version this object last set or agreed on.
+        self._cell_version_seen = evaluator.cell_version
         self.natoms = self.scalar(self.n_atoms, dtype=wp.int32)
 
         # --- scratch, allocated once ------------------------------------
+        #: Kinetic energy as a kernel input, refreshed by update_kinetic_energy.
         self._ke_w = self.zeros(1)
         #: The getters' own kinetic energy. Kernels consume `_ke_w`, and a
         #: getter writing it would let a log change the next step.
         self._ke_probe = self.zeros(1)
-        self._temp_w = self.zeros(1)
         #: Volume as a device array, for kernels that take one.
         self.volume_w = self.scalar(evaluator.volume)
         self._momentum = self.zeros(1, dtype=wp.vec3d)
@@ -196,10 +202,22 @@ class Thermo:
         self._symbols = [
             evaluator.model.get_type_map()[i] for i in np.asarray(evaluator.atype)
         ]
-        self._file = open(file, "w") if isinstance(file, (str, bytes)) else file
-        self._header_written = False
-        if temperature is not None and velocities is None:
-            self.maxwell_boltzmann(temperature)
+
+    @classmethod
+    def from_atoms(cls, evaluator: Any, atoms: Any) -> Thermo:
+        """A Thermo for ``atoms``: its positions, velocities, masses, and the
+        atoms its ``FixAtoms`` holds. The MD classes build theirs this way.
+
+        ``FixAtoms`` is the one ASE constraint honoured; any other is refused,
+        since the kernels would ignore it silently.
+        """
+        return cls(
+            evaluator,
+            atoms.get_positions(),
+            velocities=atoms.get_velocities(),
+            masses=atoms.get_masses(),
+            _fixed=_fixed_atoms(atoms),
+        )
 
     # --- allocation helpers, bound to this object's device ----------------
 
@@ -210,9 +228,9 @@ class Thermo:
     def zeros(self, shape: Any = 1, dtype: Any = wp.float64) -> wp.array:
         """A zeroed warp array on this simulation's device.
 
-        Thermostat and barostat state belongs to the caller, not here -- this
-        is what a script uses to allocate its own chain variables without
-        having to name the device every time.
+        Thermostat and barostat state belongs to the integrator, not here --
+        this is how it allocates its chain variables without naming the device
+        every time.
         """
         return wp.zeros(shape, dtype=dtype, device=self.device)
 
@@ -230,7 +248,14 @@ class Thermo:
     # --- the force call ----------------------------------------------------
 
     def evaluate(self) -> float:
-        """Energy and forces at the current positions. Returns the energy."""
+        """Energy and forces at the current positions. Returns the energy.
+
+        Fixed atoms are first put back where they are held, at rest, and
+        leave with zero force in :attr:`forces`.
+        """
+        if self._fixed_idx is not None:
+            self._x.index_copy_(0, self._fixed_idx, self._anchor)
+            self._v.index_fill_(0, self._fixed_idx, 0.0)
         self.energy, forces = self.evaluator(self._x)
         if forces.data_ptr() != self._forces_ptr:
             raise RuntimeError(
@@ -239,7 +264,33 @@ class Thermo:
                 "DistributedEvaluator.__call__ must write into the existing "
                 "tensor, not rebind it."
             )
+        if self._fixed_idx is not None:
+            self._f.copy_(forces)
+            self._f.index_fill_(0, self._fixed_idx, 0.0)
+        self._seen_calls = self.evaluator.calls
         return self.energy
+
+    def get_forces(self, apply_constraint: bool = True) -> np.ndarray:
+        """The last evaluation's forces on the host, ``(n, 3)`` in eV/A.
+
+        As ASE's ``Atoms.get_forces``: with ``apply_constraint`` the fixed
+        atoms' rows are zero, as the kernels read them in :attr:`forces`.
+        Without it they hold the force the model puts on those atoms, which
+        is what output records; ASE zeroes them again on reading. Valid until
+        another object evaluates on the shared evaluator.
+        """
+        if apply_constraint or self._fixed_idx is None:
+            return self.forces.numpy().copy()
+        return self.evaluator.forces.detach().cpu().numpy().copy()
+
+    @property
+    def fresh(self) -> bool:
+        """Whether :attr:`forces` still hold this object's own evaluation.
+
+        False before the first :meth:`evaluate`, and after any other object
+        sharing the evaluator has evaluated since -- the buffer is shared.
+        """
+        return self._seen_calls == self.evaluator.calls
 
     def set_cell(self, cell: Any = None) -> None:
         """Push the cell to the evaluator and refresh the volume.
@@ -253,33 +304,76 @@ class Thermo:
             self.cell.assign(np.asarray(cell, dtype=np.float64).reshape(1, 3, 3))
         self.evaluator.set_cell(self.cell.numpy()[0])
         self.volume_w.fill_(self.evaluator.volume)
+        self._cell_version_seen = self.evaluator.cell_version
+
+    def set_cell_device(self, cell: torch.Tensor) -> None:
+        """:meth:`set_cell` from a device tensor, reading nothing back.
+
+        The barostats' seam: ``cell`` is the ``(3, 3)`` cell they integrate,
+        lattice vectors as rows, on this device. It is copied into
+        :attr:`cell`, handed to the evaluator (:meth:`DistributedEvaluator.
+        set_cell_device`) and its volume computed into :attr:`volume_w`, all
+        on the device. The old seam downloaded the cell, uploaded it, and
+        downloaded it again, every step.
+        """
+        h = cell.detach().to(device=self.device, dtype=torch.float64).reshape(3, 3)
+        wp.to_torch(self.cell).reshape(3, 3).copy_(h)
+        self.evaluator.set_cell_device(h)
+        wp.to_torch(self.volume_w).reshape(1).copy_(det_3x3(h).abs().reshape(1))
+        self._cell_version_seen = self.evaluator.cell_version
+
+    @property
+    def cell_is_current(self) -> bool:
+        """Whether the evaluator still has the cell this object last set.
+
+        An NPT stage on the shared evaluator moves its cell; a Thermo built
+        before that describes a box the evaluator no longer partitions. A
+        version counter, not a comparison of host copies: under a barostat
+        the host copy is refreshed only on demand.
+        """
+        return self._cell_version_seen == self.evaluator.cell_version
+
+    def set_state(self, positions: Any = None, velocities: Any = None) -> None:
+        """Copy new positions and/or velocities into the bound buffers.
+
+        Never rebinds, so every warp view stays live. Used when ``atoms`` was
+        edited between runs or by an observer. New positions also move where
+        the fixed atoms are held; their velocities stay zero.
+        """
+        for value, tensor in ((positions, self._x), (velocities, self._v)):
+            if value is None:
+                continue
+            new = np.asarray(value, dtype=np.float64)
+            if new.shape != (self.n_atoms, 3):
+                raise ValueError(f"expected ({self.n_atoms}, 3), got {new.shape}")
+            tensor.copy_(torch.as_tensor(new, device=self.device))
+        if self._fixed_idx is not None:
+            if positions is not None:
+                self._anchor.copy_(self._x.index_select(0, self._fixed_idx))
+            self._v.index_fill_(0, self._fixed_idx, 0.0)
 
     # --- measurements ------------------------------------------------------
+    # Every getter measures into scratch of its own and never writes a kernel
+    # input (`ke_w`, `press_w`): reading one for a log row must not change the
+    # next step. `update_kinetic_energy` and `update_pressure` are the writers.
 
     @property
     def kinetic_energy(self) -> float:
-        """Total kinetic energy in eV.
-
-        Measured into scratch of its own, never into :attr:`ke_w`: the NPT
-        thermostat and barostat consume ``ke_w``, so a getter that refreshed it
-        would let logging change the trajectory. :meth:`update_kinetic_energy`
-        is what refreshes ``ke_w``.
-        """
+        """Total kinetic energy in eV."""
         compute_kinetic_energy(self.velocities, self.masses, self._ke_probe)
         return float(self._ke_probe.numpy()[0])
 
     @property
     def temperature(self) -> float:
-        """Instantaneous temperature in kelvin.
+        """Instantaneous temperature in kelvin, ``2 KE / (ndof kB)``.
 
-        nvalchemiops divides by ``3N - 3``, i.e. it assumes the centre-of-mass
-        motion was removed -- which :meth:`maxwell_boltzmann` does. Set
-        velocities by hand and the report is biased by ``3/(3N-3)``. Like
-        :attr:`kinetic_energy`, it leaves :attr:`ke_w` alone.
+        :attr:`ndof` is ``3N - 3``, which assumes the centre-of-mass motion
+        was removed -- :meth:`remove_com_motion` and the MD classes do that --
+        or, with fixed atoms, three per mobile atom.
         """
-        compute_kinetic_energy(self.velocities, self.masses, self._ke_probe)
-        compute_temperature(self._ke_probe, self._temp_w, self.natoms)
-        return float(self._temp_w.numpy()[0]) / kB
+        if self.ndof < 1:
+            return 0.0
+        return 2.0 * self.kinetic_energy / self.ndof / kB
 
     @property
     def potential_energy(self) -> float:
@@ -333,10 +427,12 @@ class Thermo:
             vec9d,
         )
 
-        if self.evaluator.virial is None:
+        virial = getattr(self.evaluator, "virial_dev", None)
+        if virial is None:
             raise ValueError(
                 "no virial available; build the evaluator with "
-                "compute_virial=True and call evaluate() first."
+                "compute_virial=True (or call set_compute_virial(True)) and "
+                "evaluate first."
             )
         if self.press_w is None:
             self._virial_w = wp.zeros(1, dtype=vec9d, device=self.device)
@@ -345,15 +441,25 @@ class Thermo:
             self._press_probe = wp.zeros(1, dtype=vec9d, device=self.device)
             self._kin_probe = wp.zeros((1, 9), dtype=wp.float64, device=self.device)
         # Shared by both paths: it only ever holds the evaluator's virial, so
-        # either path rewrites it with the same numbers.
-        self._virial_w.assign(
-            np.asarray(self.evaluator.virial, dtype=np.float64).reshape(1, 9)
+        # either path rewrites it with the same numbers. Device to device: the
+        # evaluator keeps the virial on the device, and re-uploading its host
+        # copy was a pageable copy that stalled every barostat step.
+        wp.to_torch(self._virial_w).reshape(9).copy_(
+            virial.detach().reshape(9).to(torch.float64)
         )
-        kinetic, pressure = ((self._kin_probe, self._press_probe) if probe
-                             else (self._kin_w, self.press_w))
+        kinetic, pressure = (
+            (self._kin_probe, self._press_probe)
+            if probe
+            else (self._kin_w, self.press_w)
+        )
         compute_pressure_tensor(
-            self.velocities, self.masses, self._virial_w, self.cell,
-            kinetic, pressure, self.volume_w,
+            self.velocities,
+            self.masses,
+            self._virial_w,
+            self.cell,
+            kinetic,
+            pressure,
+            self.volume_w,
         )
 
     def update_kinetic_energy(self) -> None:
@@ -370,178 +476,73 @@ class Thermo:
         """Kinetic energy as a device array, for kernels that take one."""
         return self._ke_w
 
-    # --- throughput --------------------------------------------------------
-
-    @property
-    def seconds_per_step(self) -> float:
-        """Wall-clock seconds per MD step, over the logged history.
-
-        The first logged interval is **dropped** when there is more than one,
-        because it carries kernel compilation -- on this machine that is
-        ~1 s against a ~30 ms step, and a least-squares fit over all points
-        still comes out 2x high (measured). Excluding it is the only thing
-        that actually recovers the steady-state rate. The remaining points are
-        then fitted by least squares.
-
-        This measures the loop as it actually ran, `log` included. Logging
-        every step means a device synchronisation every step, and that cost is
-        real and counted here; a production run logging every 100th step is
-        faster than this number suggests.
-        """
-        clock = self._clock[1:] if len(self._clock) > 2 else self._clock
-        if len(clock) < 2:
-            return float("nan")
-        steps = np.array([c[0] for c in clock], dtype=float)
-        wall = np.array([c[1] for c in clock], dtype=float)
-        if steps.max() == steps.min():
-            return float("nan")
-        return float(np.polyfit(steps, wall, 1)[0])
-
-    @property
-    def ms_per_step(self) -> float:
-        """Wall-clock milliseconds per MD step."""
-        return self.seconds_per_step * 1000.0
-
-    @property
-    def ns_per_day(self) -> float:
-        """Simulated nanoseconds per day of wall clock.
-
-        Scales with the timestep, so it is a statement about this run's `dt`
-        and not about the model alone.
-        """
-        seconds = self.seconds_per_step
-        if not np.isfinite(seconds) or seconds <= 0:
-            return float("nan")
-        return self.timestep * 1e-6 * 86400.0 / seconds
-
-    def performance(self) -> str:
-        """One line of throughput, for the end of a run."""
-        return (
-            f"{self.n_atoms} atoms, dt {self.timestep} fs: "
-            f"{self.ms_per_step:.1f} ms/step -> {self.ns_per_day:.3f} ns/day"
-        )
-
     # --- setup -------------------------------------------------------------
 
-    def maxwell_boltzmann(self, temperature: float | None = None,
-                          seed: int = 0) -> None:
-        """Draw velocities from Maxwell-Boltzmann, in kelvin, COM removed.
+    def remove_com_motion(self) -> None:
+        """Subtract the centre-of-mass velocity, in place on the device.
 
-        Through nvalchemiops, so the draw happens on the device. Like ASE's
-        equivalent it does not rescale to hit the target exactly -- the
-        instantaneous temperature fluctuates about it.
+        Every temperature and thermostat here counts ``3N - 3`` degrees of
+        freedom, which is only right with the centre of mass at rest. With
+        fixed atoms it is refused: they hold the system in place, and
+        subtracting a velocity from every atom would set them moving.
         """
-        if temperature is None and self.kT is None:
-            raise ValueError("no temperature given, and none set at construction")
-        kt = self.kT if temperature is None else self.scalar(kB * temperature)
-        initialize_velocities(
-            self.velocities, self.masses, kt,
-            self._momentum, self._total_mass, self._com,
-            random_seed=seed, remove_com=True,
+        if self._fixed_idx is not None:
+            raise ValueError(
+                "fixed atoms hold the system in place, so there is no "
+                "centre-of-mass motion to remove; removing it would set them "
+                "moving"
+            )
+        remove_com_motion(
+            self.velocities, self.masses, self._momentum, self._total_mass, self._com
         )
 
     def atoms(self) -> Any:
         """A snapshot as an ASE ``Atoms`` -- the way state leaves this object.
 
-        One escape hatch rather than a parallel host API: an ``Atoms`` carries
-        positions, cell, symbols and velocities together, which is what writing
-        a trajectory frame actually needs. ASE's velocity units are these
-        units, so nothing is converted.
+        Positions (unwrapped, as integrated), cell, the evaluator's ``pbc``,
+        masses, velocities, and the fixed atoms as a ``FixAtoms``. ASE's
+        velocity units are these units, so nothing is converted.
         """
         from ase import Atoms
+        from ase.constraints import FixAtoms
 
-        return Atoms(
+        atoms = Atoms(
             symbols=self._symbols,
             positions=self._x.detach().cpu().numpy(),
             cell=np.asarray(self.evaluator.cell),
+            masses=self._m.detach().cpu().numpy(),
             velocities=self._v.detach().cpu().numpy(),
-            pbc=True,
+            pbc=getattr(self.evaluator, "pbc", True),
         )
+        if len(self.fixed):
+            atoms.set_constraint(FixAtoms(indices=self.fixed))
+        return atoms
 
-    # --- reporting ---------------------------------------------------------
 
-    def _value(self, name: str, step: int) -> float:
-        if name == "step":
-            return step
-        if name == "time":
-            return step * self.timestep
-        if name == "temp":
-            return self.temperature
-        if name == "epot":
-            return self.energy
-        if name == "ekin":
-            return self.kinetic_energy
-        if name == "etot":
-            return self.total_energy
-        if name == "press":
-            return self.pressure / GPa
-        if name == "vol":
-            return self.volume
-        raise KeyError(name)               # unreachable: validated in __init__
+def _fixed_atoms(atoms: Any) -> np.ndarray:
+    """The atoms ``atoms``' ``FixAtoms`` constraints hold, as sorted indices.
 
-    def log(self, step: int, **extra: float) -> dict:
-        """Record one row, print it every ``every`` steps, and return it.
+    ``FixAtoms`` is the one ASE constraint the GPU classes honour, and any
+    other is refused: the kernels would ignore it without a word.
+    """
+    from ase.constraints import FixAtoms
 
-        Built-in column names resolve first; anything else must arrive as a
-        keyword, which is the line between what this object has the state to
-        compute and what it does not. A Nose-Hoover invariant or a field
-        alignment is the caller's to work out and pass in.
-
-        Note this synchronises with the device to read the measurements. On a
-        large system at ``every=1`` that serialises the pipeline -- log as
-        rarely as the analysis allows.
-        """
-        names = (*self.columns, *extra)
-        if not self.row_names:
-            self.row_names = names
-        elif names != self.row_names:
-            raise ValueError(
-                f"log() called with columns {names}, but the first call fixed "
-                f"{self.row_names}. The rows are a table; keep them aligned."
-            )
-        if not self._header_written:
-            self._emit("".join(_column_header(n) for n in names))
-            self._header_written = True
-
-        self._clock.append((step, time.perf_counter()))
-        row = {n: self._value(n, step) for n in self.columns}
-        row.update(extra)
-        self.rows.append(tuple(row.values()))
-        if step % self.every == 0:
-            cells = "".join(
-                f"{v:15d}" if isinstance(v, int) else f"{v:15.5f}"
-                for v in row.values()
-            )
-            self._emit(cells)
-        return row
-
-    def _emit(self, line: str) -> None:
-        print(line, flush=True)
-        if self._file is not None:
-            self._file.write(line + "\n")
-            self._file.flush()
-
-    def drift(self, column: str = "etot", per_atom: bool = True) -> float:
-        """Least-squares drift in a logged column, in meV/atom/ps.
-
-        Works on anything logged, including a keyword extra -- a Nose-Hoover
-        invariant is exactly the quantity worth fitting, and it is the
-        caller's to compute.
-
-        The reason this is here rather than in a caller: the unit chain --
-        eV and fs in, meV per atom per ps out -- is easy to get wrong, and it
-        is the headline number of an NVE conservation check.
-        """
-        names = self.row_names or self.columns
-        if column not in names:
-            raise KeyError(f"{column!r} is not a logged column: {names}")
-        if "time" not in names:
-            raise KeyError("drift needs a 'time' column")
-        i, j = names.index(column), names.index("time")
-        t = np.array([r[j] for r in self.rows]) / 1000.0        # ps
-        y = np.array([r[i] for r in self.rows]) * 1000.0        # meV
-        if per_atom:
-            y = y / self.n_atoms
-        if len(t) < 2:
-            return float("nan")
-        return float(np.polyfit(t, y, 1)[0])
+    other = sorted(
+        {type(c).__name__ for c in atoms.constraints if not isinstance(c, FixAtoms)}
+    )
+    if other:
+        raise ValueError(
+            f"atoms carries {', '.join(other)}: of ASE's constraints the GPU "
+            "classes honour FixAtoms alone, and the kernels would ignore the "
+            "rest silently. Remove them (atoms.set_constraint()), or run "
+            "through the ASE calculator, deepmd_lr.ase.LongRangeCalculator"
+        )
+    held = [np.asarray(c.get_indices(), dtype=np.int64) for c in atoms.constraints]
+    if not held:
+        return np.zeros(0, dtype=np.int64)
+    # Numpy's indexing, as ASE's own FixAtoms applies it: a negative index
+    # counts from the end, and one past the last atom is refused.
+    idx = np.unique(np.arange(len(atoms))[np.concatenate(held)])
+    if len(idx) == len(atoms):
+        raise ValueError("every atom is fixed, so nothing would move")
+    return idx

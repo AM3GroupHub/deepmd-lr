@@ -1,20 +1,25 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""Running MD with nvalchemiops: the evaluator it calls for forces.
+"""Running MD with nvalchemiops: the evaluator, the state, and the integrators.
 
-:class:`DistributedEvaluator` is the driver an MD engine calls -- energy and
-forces across several devices, plus the virial on request, and nothing else.
-The integrator, ensemble and thermostat belong to the caller;
-``nvalchemiops.dynamics.integrators`` supplies the half-step kernels and
-consumes the returned tensor through ``wp.from_torch`` without a copy.
-
-:class:`Thermo` is the other half an MD loop needs: it owns the state those
-kernels mutate -- positions, velocities, masses, forces, cell, timestep -- and
-reports the thermodynamics, which nvalchemiops does not do at all. Ensembles
-stay with the caller; see ``examples/06-md_nvalchemi`` for a loop per ensemble.
+- :class:`DistributedEvaluator` computes energy and forces across several
+  devices, plus the virial and Born charges on request. Build it once, with
+  :func:`build_evaluator`, and share it.
+- The MD classes -- :class:`VelocityVerlet` (NVE); :class:`Langevin`,
+  :class:`NoseHooverChainNVT` and :class:`VelocityRescaling` (NVT);
+  :class:`MTKNPT` (NPT) and :class:`MTKNPH` (NPH), each with an isotropic,
+  orthorhombic or full cell -- and the relaxations :class:`FIRE` and
+  :class:`FIRE2` take that evaluator and an ``ase.Atoms``, ASE-style:
+  parameters in ``__init__``, then ``run(steps)``. Several may run one after
+  another on one evaluator.
+- Each builds a :class:`Thermo`: the device state the nvalchemiops kernels
+  mutate (positions, velocities, masses, forces view, cell) and its
+  measurements. A custom kernel loop can use a Thermo directly; see
+  ``examples/06-md_nvalchemi``. ``Thermo.from_atoms`` builds one from an
+  ``Atoms``, whose ``FixAtoms`` holds atoms in place; there is no other way to
+  fix them.
 """
 
 from deepmd_lr.nvalchemi.driver import (
-    device_replicas,
     evaluate_partitioned,
     partition_graph,
     to_numpy,
@@ -22,6 +27,21 @@ from deepmd_lr.nvalchemi.driver import (
 from deepmd_lr.nvalchemi.evaluator import (
     DistributedEvaluator,
     atomic_masses,
+)
+from deepmd_lr.nvalchemi.md import (
+    MTKNPH,
+    MTKNPT,
+    Langevin,
+    MDInstabilityError,
+    MolecularDynamics,
+    NoseHooverChainNVT,
+    VelocityRescaling,
+    VelocityVerlet,
+)
+from deepmd_lr.nvalchemi.optimize import (
+    FIRE,
+    FIRE2,
+    RelaxationError,
 )
 from deepmd_lr.nvalchemi.partition import (
     Partition,
@@ -37,14 +57,24 @@ from deepmd_lr.nvalchemi.thermo import (
 
 __all__ = [
     "DistributedEvaluator",
-    "Thermo",
+    "FIRE",
+    "FIRE2",
+    "Langevin",
+    "MDInstabilityError",
+    "MTKNPH",
+    "MTKNPT",
+    "MolecularDynamics",
+    "NoseHooverChainNVT",
     "Partition",
+    "RelaxationError",
+    "Thermo",
+    "VelocityRescaling",
+    "VelocityVerlet",
     "atomic_masses",
     "build_evaluator",
-    "device_replicas",
     "evaluate_partitioned",
     "partition_graph",
     "partition_system",
-    "to_numpy",
     "read_structure",
+    "to_numpy",
 ]

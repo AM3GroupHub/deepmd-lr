@@ -3,24 +3,23 @@
 Two prerequisites, then one measurement worth doing before spending GPU time.
 
 **Periodic data uses Ewald; non-periodic data uses the direct sum.** Both are
-supported — see [Non-periodic systems](non-periodic.md#non-periodic-systems) — but they are
-different code paths and the choice is not automatic.
+supported ([Non-periodic systems](non-periodic.md#non-periodic-systems)), as
+different code paths, and the choice is not automatic.
 
-**You need energies and forces. You do not need charges.** The charge head is
-trained through the electrostatic energy, never against charge labels.
+**You need energies and forces, not charges.** The charge head is trained
+through the electrostatic energy, never against charge labels.
 
-**Measure the headroom.** The long-range term can only recover the part of the
-signal that lives beyond the descriptor cutoff. If that is negligible, nothing
-downstream will help. Compare exact Ewald forces against Coulomb truncated at
-your cutoff: on the benchmark system **17.7% of the force signal lies beyond
-6 Å**, which corresponds to a 0.37 eV/Å floor no local model can beat — and
-the baseline duly plateaued at 0.41. If your equivalent number is ~1%, expect
-a correspondingly small return.
+**Measure the headroom.** The term can only recover the part of the signal
+beyond the descriptor cutoff. Compare exact Ewald forces against Coulomb
+truncated at your cutoff: on the benchmark system 17.7% of the force signal
+lies beyond 6 Å, a 0.37 eV/Å floor no local model can beat, and the baseline
+plateaued at 0.41. If your number is ~1%, expect a correspondingly small
+return.
 
 ## Choosing `alpha` and the mesh
 
-`alpha` is **not** a free parameter. This term supplies only the reciprocal
-half of the Ewald split, so `alpha` decides the division of labour:
+`alpha` is not a free parameter. This term supplies only the reciprocal half
+of the Ewald split, so `alpha` decides the division of labour:
 
 ```
 full Coulomb  =  erfc(alpha·r)/r     +     the reciprocal sum
@@ -28,9 +27,9 @@ full Coulomb  =  erfc(alpha·r)/r     +     the reciprocal sum
                  the network's job         this term's job
 ```
 
-### Constraint 1 — `alpha` large enough that the network's share fits inside its cutoff
+### Constraint 1: `alpha` large enough that the network's share fits inside its cutoff
 
-`erfc(alpha·r_cut)` — what is still unresolved at the descriptor cutoff:
+`erfc(alpha·r_cut)`, what is still unresolved at the descriptor cutoff:
 
 | alpha | rc = 4 Å | rc = 5 Å | rc = 6 Å | rc = 8 Å |
 |------:|---------:|---------:|---------:|---------:|
@@ -40,12 +39,12 @@ full Coulomb  =  erfc(alpha·r)/r     +     the reciprocal sum
 | 0.5   |  4.7e-03 | **4.1e-04** | 2.2e-05 | 1.5e-08 |
 | 0.7   | **7.5e-05** | 7.4e-07 | 2.9e-09 | 2.4e-15 |
 
-Aim for ≲ 1e-3. Too small an `alpha` hands the network a tail it structurally
-cannot represent — the exact failure the long-range term exists to fix.
+Aim for ≲ 1e-3. Too small an `alpha` hands the network a tail it cannot
+represent, the exact failure the term exists to fix.
 
-### Constraint 2 — mesh fine enough to resolve the screening Gaussian
+### Constraint 2: mesh fine enough to resolve the screening Gaussian
 
-Relative error in the reciprocal energy vs mesh spacing `h`:
+Relative error in the reciprocal energy against mesh spacing `h`:
 
 | alpha | 1/(2·alpha) | h = 1.5 | h = 1.25 | h = 1.0 | h = 0.75 |
 |------:|------------:|--------:|---------:|--------:|---------:|
@@ -54,7 +53,7 @@ Relative error in the reciprocal energy vs mesh spacing `h`:
 | 0.5   |        1.00 | 1.1e-04 |  1.6e-04 | 1.8e-05 |  8.3e-07 |
 | 0.7   |        0.71 | 5.9e-03 |  5.5e-04 | 2.9e-04 |  2.2e-05 |
 
-**`h ≈ 1/(2·alpha)`** lands around 1e-4; go one step finer for ~1e-6.
+`h ≈ 1/(2·alpha)` lands around 1e-4; one step finer gives ~1e-6.
 
 ### Recommended pairings
 
@@ -64,29 +63,38 @@ Relative error in the reciprocal energy vs mesh spacing `h`:
 | 5 Å               |     0.5 |     ≤ 1.00 Å | `[20, 20, 20]`  |
 | 4 Å               |     0.7 |     ≤ 0.75 Å | `[28, 28, 28]`  |
 
-Larger `alpha` costs mesh but leaves the network less to do. **Whatever you
-pick must match between training and any later MD** — `alpha` defines the
-model, not just the numerics.
+Larger `alpha` costs mesh but leaves the network less to do. Whatever you pick
+must match between training and any later MD: `alpha` defines the model, not
+just the numerics.
 
 **Prefer `mesh_dimensions` over `mesh_spacing`.** A spacing-derived mesh is
-`ceil(L / spacing)`, a step function of the cell: a cell length crossing a
-multiple of the spacing gains a whole grid point and the energy jumps. It is
-harmless at fixed cell (NVE/NVT) and a real problem under NPT or any strain
-derivative — it showed up here as a 2% virial error that looked like a bug in
-the strain derivative.
+`ceil(L / spacing)`, a step function of the cell, so a cell length crossing a
+multiple of the spacing gains a grid point and the energy jumps. Harmless at a
+fixed cell, a real problem under NPT or any strain derivative: it showed up as
+a 2% virial error.
+
+**At inference the mesh follows the cell.** The water model's `[10, 10, 10]`
+is exact on its 12.43 Å training box but left 0.49 meV/atom and 0.0077 eV/Å
+rms on the 49.7 Å 4×4×4 supercell. Both inference paths therefore give each
+axis at least `ceil(2 alpha L)` points, the `1/(2 alpha)` spacing above, and
+never fewer than the model asks for; that supercell gets `[40, 40, 40]` and is
+exact. The GPU evaluator sets the mesh once, when built, in a long-range term
+of its own, so NPT keeps the smooth energy of a fixed mesh and evaluators for
+different cells can share one model; the ASE calculator sets the model's mesh
+per frame. Training is unchanged.
 
 ## `pme` or `ewald`
 
-Both compute the *same* reciprocal sum, by different routes.
+Both compute the same reciprocal sum by different routes.
 
 | | `pme` (default) | `ewald` |
 |---|---|---|
 | how | charges onto a mesh, then an FFT | explicit sum over k-vectors |
 | scaling | `O(N log N)` | `O(N · K)`, and `K` grows with cell volume |
-| error | mesh interpolation, ~1e-6 at a sane mesh | none — exact for its `k_cutoff` |
+| error | mesh interpolation, ~1e-6 at a sane mesh | none, exact for its `k_cutoff` |
 | knobs | `mesh_dimensions` / `mesh_spacing`, `spline_order` | `k_cutoff` (or `accuracy`) |
 
-Measured (energy + backward, alpha 0.4, 1.25 Å mesh):
+Energy + backward, alpha 0.4, 1.25 Å mesh:
 
 | atoms | cell | `pme` | `ewald` | k-vectors |
 |------:|-----:|------:|--------:|----------:|
@@ -95,13 +103,11 @@ Measured (energy + backward, alpha 0.4, 1.25 Å mesh):
 |   512 | 35 Å | 2.7 ms | 25.5 ms |    21,437 |
 |  2048 | 56 Å | 2.9 ms | 113.6 ms |   83,187 |
 
-**Use `pme` for training.** It is faster at every size tested — including the
-smallest, so there is no small-system crossover to exploit — and the gap grows
-to 40× by 2048 atoms.
+**Use `pme` for training.** It is faster at every size, including the
+smallest, and the gap reaches 40× by 2048 atoms.
 
-**Use `ewald` to check a `pme` setting.** Because it has no interpolation
-error, disagreement between the two is a statement about your mesh, not about
-the physics:
+**Use `ewald` to check a `pme` setting.** It has no interpolation error, so a
+disagreement between the two is a statement about your mesh:
 
 ```python
 from deepmd_lr.lr import LongRangeEnergy
@@ -111,7 +117,6 @@ a, b = pme(coord, q, box).sum(), ewald(coord, q, box).sum()
 print(abs(a - b) / abs(b))       # want <= 1e-4; if not, refine the mesh
 ```
 
-Parameters belonging to the other method are **rejected**, not ignored — a
-mesh setting silently dropped under `ewald` would be indistinguishable from
-one that was applied.
-
+Parameters belonging to the other method are rejected, not ignored: a mesh
+setting silently dropped under `ewald` would be indistinguishable from one
+that was applied.

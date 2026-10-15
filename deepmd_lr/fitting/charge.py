@@ -21,6 +21,7 @@ is applied one level up, at the model, where both the frame structure and
 also makes it testable on its own, independently of any network.
 """
 
+import math
 from typing import (
     Any,
 )
@@ -79,6 +80,113 @@ def resolve_charge_spin(
             "charge_spin set to this run's state, or run uncompressed."
         )
     return condition
+
+
+def projection_shift(
+    charge: torch.Tensor, raw_charge: torch.Tensor, mask: torch.Tensor | None
+) -> torch.Tensor:
+    """The uniform shift the total-charge projection applied, per frame.
+
+    :func:`project_to_total_charge` adds the same amount to every real atom
+    of a frame, ``(Q - sum_j raw_j) / N``; this returns it, shape ``(nf,)``,
+    measured from the two charge sets so it holds for any mask. It is the
+    per-atom gap between the raw and the projected charges, and the quantity
+    the ``ener_lr`` loss penalises.
+
+    Why it needs penalising: a constant added to every raw charge of a frame
+    is removed exactly by the projection, so single-material training frames
+    leave each material's raw offset free. Two materials then carry offsets
+    that differ slightly, and at an interface the projection spreads that
+    difference over both bulks as a charge that grows with the thickness.
+    """
+    diff = charge - raw_charge
+    if mask is None:
+        return diff.mean(dim=-1)
+    weight = mask.to(diff.dtype)
+    n_real = weight.sum(dim=-1)
+    return (diff * weight).sum(dim=-1) / torch.clamp(n_real, min=1.0)
+
+
+def check_charge_filter(charge_filter: Any) -> tuple[float, float] | None:
+    """Validate ``charge_filter = (c_t, delta)``: finite, ``0 < delta <= c_t``.
+
+    ``None`` and ``False`` both return None (no filter)."""
+    if charge_filter is None or charge_filter is False:
+        return None
+    try:
+        c_t, delta = (float(x) for x in charge_filter)
+    except (TypeError, ValueError):
+        raise ValueError("charge_filter must be a pair (c_t, delta)") from None
+    if not (math.isfinite(c_t) and math.isfinite(delta) and 0.0 < delta <= c_t):
+        raise ValueError(
+            f"charge_filter needs finite 0 < delta <= c_t, got c_t={c_t}, delta={delta}"
+        )
+    return c_t, delta
+
+
+def charge_filter_weight(
+    charge: torch.Tensor, c_t: float, delta: float
+) -> torch.Tensor:
+    """The filter's weight: 0 for ``|q| <= c_t - delta``, 1 for ``|q| >= c_t + delta``,
+    and ``35 u^4 - 84 u^5 + 70 u^6 - 20 u^7`` between, with
+    ``u = (|q| - c_t + delta) / (2 delta)`` -- C^3 at both ends."""
+    u = torch.clamp((charge.abs() - (c_t - delta)) / (2.0 * delta), 0.0, 1.0)
+    u2 = u * u
+    return u2 * u2 * (35.0 - 84.0 * u + 70.0 * u2 - 20.0 * u2 * u)
+
+
+def filter_charges(
+    charge: torch.Tensor,
+    total_charge: Any,
+    charge_filter: tuple[float, float],
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    r"""Switch small charges off, smoothly, and restore the total on the rest.
+
+    Used in training and inference when configured on the model, or as a
+    simulation override. Below a threshold an atom's charge is exactly zero,
+    so a bulk whose atoms each carry a little charge carries none.
+
+    With ``x = |q_i|`` and ``u = (x - c_t + delta) / (2 delta)`` clipped to
+    [0, 1], the weight is
+
+    .. math:: y_i = 35 u^4 - 84 u^5 + 70 u^6 - 20 u^7,
+
+    exactly 0 for ``|q| <= c_t - delta``, exactly 1 for ``|q| >= c_t + delta``,
+    and C^3 in between, so forces and the Hessian stay continuous. The frame's
+    total charge is then restored on the atoms that keep charge, in proportion
+    to their weight,
+
+    .. math:: q'_i = y_i q_i + y_i (Q - \sum_j y_j q_j) / \sum_j y_j ,
+
+    so an atom switched off stays exactly at zero. A frame with no atom left
+    above the threshold spreads ``Q`` uniformly, as the plain projection does.
+
+    ``charge`` is ``(nf, nloc)`` and already satisfies the total; ``mask``
+    marks the real atoms. Differentiable, so autograd carries the filter into
+    the charge-response force.
+    """
+    dtype = charge.dtype
+    weight = torch.ones_like(charge) if mask is None else mask.to(dtype)
+    y = charge_filter_weight(charge, *charge_filter) * weight
+    kept = y * charge
+    if not hasattr(total_charge, "shape"):
+        total = torch.full(
+            charge.shape[:-1], float(total_charge), dtype=dtype, device=charge.device
+        )
+    else:
+        total = torch.as_tensor(total_charge, dtype=dtype, device=charge.device)
+        total = total.reshape(-1).expand(charge.shape[0])
+    deficit = total - kept.sum(dim=-1)
+    y_sum = y.sum(dim=-1)
+    n_real = torch.clamp(weight.sum(dim=-1), min=1.0)
+    any_kept = y_sum > 0
+    share = torch.where(
+        any_kept[:, None],
+        y / torch.where(any_kept, y_sum, torch.ones_like(y_sum))[:, None],
+        weight / n_real[:, None],
+    )
+    return kept + share * deficit[:, None]
 
 
 def charge_mask(model: Any, atype: torch.Tensor) -> torch.Tensor:

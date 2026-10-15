@@ -7,8 +7,8 @@ each entry point and never calls it -- so registration has to be a side
 effect of importing this module, not the body of a function. The entry point
 in ``pyproject.toml`` therefore names this module, not a callable inside it.
 
-Both imports below register by decorator at their own import time, so this
-module stays import-only. That also keeps it cheap, which matters: it runs
+The model, fitting head and schema register at import time. The training and
+compression hooks are installed below, after those imports. This module runs
 during every ``deepmd.pt_expt`` import, including ones that never touch this
 plugin.
 
@@ -18,10 +18,11 @@ input-normalization time -- both strictly after the backend import that
 brings us here.
 """
 
-from deepmd_lr import (  # schema args; `same_as`, EMA, compression hooks
+from deepmd_lr import (  # schema args; `same_as`, EMA, compression, loss hooks
     argcheck,
     compress,
     ema_default,
+    loss,
     same_as,
 )
 from deepmd_lr.fitting import (  # registers the `charge` fitting head
@@ -31,8 +32,8 @@ from deepmd_lr.model import (  # registers the `dp_lr` model type
     lr_model,
 )
 
-# Unlike the three imports above, this one is not registration-by-decorator:
-# it wraps four DeePMD-kit symbols. It is called last because it imports
+# `same_as` is not registration-by-decorator: it wraps DeePMD-kit symbols.
+# Install it after the imports because it imports
 # `deepmd.pt_expt.train.training`, and we are running *inside*
 # `deepmd.pt_expt.__init__`. Kept here rather than at `same_as` import time so
 # that merely importing the module -- which `argcheck` does, for one constant
@@ -45,4 +46,15 @@ ema_default.install()
 # `get_geo_compress` never does for DPA4C. One boolean, see `compress.py`.
 compress.install()
 
-__all__ = ["argcheck", "charge", "compress", "ema_default", "lr_model", "same_as"]
+# `ener_lr`: upstream's loss factory is a fixed if/elif over its own types.
+loss.install()
+
+__all__ = [
+    "argcheck",
+    "charge",
+    "compress",
+    "ema_default",
+    "loss",
+    "lr_model",
+    "same_as",
+]

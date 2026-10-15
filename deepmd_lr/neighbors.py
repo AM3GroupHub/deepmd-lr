@@ -17,9 +17,9 @@ This module only chooses between them by size. Measured on one GB10, median of
               nv    0.62  0.69  0.83  1.15  0.69   3.95
 
 With a cell, ``nv`` wins at every size, so there is nothing to decide. Without
-one -- which is what a partition uses, since its halo already carries the
-images -- the dense path skips ghost materialisation and stays cheaper until
-about a thousand atoms.
+one the dense path skips ghost materialisation and stays cheaper until about
+a thousand atoms. (The MD engine no longer comes through here: its node sets
+are searched by ``deepmd_lr.nvalchemi.nlist.GpuNeighborList`` on the device.)
 
 An earlier version of this module drove nvalchemiops directly instead of going
 through DeePMD-kit's backend. That was redundant and slower: the in-tree

@@ -48,18 +48,28 @@ from deepmd_lr.born import (
     field_force,
     screening_factor,
 )
+from deepmd_lr.cell import inverse_3x3
 from deepmd_lr.compress import (
     compress_model,
 )
+from deepmd_lr.fitting.charge import check_charge_filter
 from deepmd_lr.nvalchemi.driver import (
     _to_host,
+    check_long_range_boundary,
     device_replicas,
     evaluate_partitioned,
 )
+from deepmd_lr.nvalchemi.nlist import (
+    STATUS_EDGE_OVERFLOW,
+    STATUS_LEN,
+    STATUS_MATRIX_OVERFLOW,
+)
 from deepmd_lr.nvalchemi.partition import (
+    _perpendicular_widths,
     default_skin,
     partition_system,
     skin_for_node_ratio,
+    whole_system,
 )
 
 __all__ = [
@@ -71,6 +81,14 @@ __all__ = [
 #: Below this the halo is no longer what is using the memory, so backing off
 #: further would trade real speed for nothing.
 MIN_AUTO_SKIN = 0.1
+
+#: Slot of the status word that the evaluator owns: a slab atom outside the
+#: cell along an open axis (the list's own slots are the ``STATUS_*`` ones).
+STATUS_OPEN_FACE = 2
+
+#: How many times one call may widen the neighbour list and redo the step
+#: before giving up: each widening is 1.25x, so this is a factor of about 3.
+MAX_LIST_GROWTHS = 5
 
 
 def _is_out_of_memory(exc: BaseException) -> bool:
@@ -133,16 +151,58 @@ class _LazyNumpy(dict):
         return [self[k] for k in self]
 
 
+_VIRIAL_UNDER_FIELD = (
+    "compute_virial and efield cannot be combined: the field's contribution "
+    "to the stress is a separate derivation, and reporting the field-free "
+    "virial under a field would be quietly wrong."
+)
+
+
+def _checked_pbc(pbc: Any) -> tuple[bool, bool, bool]:
+    """A bulk cell or a slab: the two boundaries partitioned MD handles."""
+    flags = tuple(bool(p) for p in np.broadcast_to(np.asarray(pbc, dtype=bool), (3,)))
+    if sum(flags) < 2:
+        raise ValueError(
+            f"pbc={list(flags)}: partitioned MD handles a bulk cell and a slab "
+            "(one open axis). Molecules, clusters and wires run through the "
+            "ASE calculator, deepmd_lr.ase.LongRangeCalculator."
+        )
+    return flags
+
+
+def _indexed_device(device) -> str:
+    """``"cuda"`` -> ``"cuda:<current>"``; anything else unchanged."""
+    d = torch.device(device)
+    if d.type == "cuda" and d.index is None:
+        d = torch.device("cuda", torch.cuda.current_device())
+    return str(d)
+
+
 class DistributedEvaluator:
     """Evaluate a ``dp_lr`` model over spatial partitions, one per device.
 
     Parameters
     ----------
     model
-        A ``dp_lr`` model, already on its home device.
+        A ``dp_lr`` model, already on its home device. It is never changed,
+        so several evaluators, and ASE calculators, may share it.
     atype, cell
-        Atom types ``(natoms,)`` and the cell ``(3, 3)``. Both fixed for the
-        life of the driver; a changing cell means rebuilding it.
+        Atom types ``(natoms,)`` and the cell ``(3, 3)``. The types are fixed
+        for the life of the driver; a barostat changes the cell through
+        :meth:`set_cell`.
+    pbc
+        Which cell axes are periodic; all three by default. One open axis is
+        a slab: no periodic images along it, and the long-range term takes its
+        slab form (the Yeh-Berkowitz correction). The term's PME mesh is set
+        from ``cell`` as well, once, for the life of the driver. The term is
+        this evaluator's own, :attr:`long_range_energy`
+        (:meth:`~deepmd_lr.model.lr_model.LongRangeEnergyModel.long_range_energy_for`).
+        A slab's atoms must stay inside the cell along the open axis; see
+        :meth:`_check_open_axes`.
+    long_range
+        Reciprocal-space settings to adapt instead of the model's, as
+        ``set_long_range`` takes them (alpha is the model's and cannot
+        change). For this evaluator only.
     devices
         One device per partition. Repeats are accepted and exercise the
         partitioning arithmetic, but only distinct devices test placement.
@@ -195,10 +255,6 @@ class DistributedEvaluator:
         what a run that wants the geometry rule and nothing else should pass.
         The out-of-memory backoff stays either way, since a prediction can
         still be wrong when another process is sharing the device.
-    results_on_device
-        Keep :attr:`results` as device tensors. By default they are wrapped so
-        that each entry is converted to numpy on first access -- the forces
-        the integrator consumes never leave the GPU either way.
     compress
         ``True`` to compress the DPA4C backbone at DeePMD-kit's default table
         stride, or a float stride in angstrom. Done before the device replicas
@@ -213,6 +269,18 @@ class DistributedEvaluator:
         is the screened ``q~_i q~_j / (4 pi eps_0 eps_inf r)`` with
         ``q~ = sqrt(eps_inf) q``. The field force, built from ``Z``, scales with
         it; energies and field-free forces do not change.
+
+    charge_filter
+        ``(c_t, delta)`` in e; ``False`` for none; None (the default) for the
+        model's own ``long_range.charge_filter``, if it was trained with one.
+        Charges with ``|q| <= c_t - delta`` are set exactly to zero, those
+        above ``c_t + delta`` kept, with a C^3 polynomial between, and the
+        total is restored on the atoms that keep charge
+        (:func:`~deepmd_lr.fitting.charge.filter_charges`). It removes the
+        small charge a model can leave on every bulk atom, which adds up over
+        a thick slab. Applying it to a model trained without it changes the
+        interface electrostatics that model learned. Refused with Born charges
+        and fields.
 
     Notes
     -----
@@ -229,6 +297,8 @@ class DistributedEvaluator:
         cell: np.ndarray,
         *,
         devices: list[Any],
+        pbc: Any = (True, True, True),
+        long_range: dict | None = None,
         skin: float | str = "auto",
         repartition_every: int | None = None,
         compute_virial: bool = False,
@@ -237,8 +307,8 @@ class DistributedEvaluator:
         charge_spin: torch.Tensor | tuple[float, float] | None = None,
         compress: bool | float = False,
         eps_inf: float = 1.0,
-        results_on_device: bool = False,
         memory_headroom: float | None = 0.8,
+        charge_filter: Any = None,
     ) -> None:
         if not devices:
             raise ValueError("DistributedEvaluator needs at least one device")
@@ -252,8 +322,53 @@ class DistributedEvaluator:
                 f"memory_headroom must be in (0, 1], got {memory_headroom}"
             )
 
+        self._cell_host = np.asarray(cell, dtype=np.float64).reshape(3, 3)
+        self._cell_host_stale = False
+        #: Bumped by every cell change, host or device path, so that a
+        #: :class:`~deepmd_lr.nvalchemi.thermo.Thermo` can tell whether the
+        #: cell is still the one it set without comparing host copies.
+        self.cell_version = 0
+        self._skin_stale = False
+        self.pbc = _checked_pbc(pbc)
+        # The term holds no weights, so this evaluator builds its own: its pbc
+        # picks the 3D or the slab sum, its cell the PME mesh. The mesh is
+        # fixed here for the life of the driver, so the small cell changes of
+        # a barostat keep the energy smooth. The model is left alone: another
+        # evaluator built from it, for another cell or boundary, would
+        # otherwise change the term under this one.
+        #: The long-range term this evaluator evaluates, or None for a model
+        #: without one.
+        self.long_range_energy = None
+        if getattr(model, "has_long_range", False):
+            self.long_range_energy = model.long_range_energy_for(
+                self.cell, self.pbc, long_range
+            )
+        elif long_range is not None:
+            raise ValueError("long_range= needs a model with a long-range block")
+        if self.long_range_energy is not None:
+            # The cell is validated here and in `set_cell`, on the host; the
+            # term's own per-call check would read the device every step.
+            self.long_range_energy.check_cell = False
+        det = np.linalg.det(self.cell)
+        if not np.isfinite(det) or abs(det) <= 0:
+            raise ValueError("the cell is degenerate (zero volume)")
+        # Checked here as well as per call, to fail before the memory probe.
+        check_long_range_boundary(model, self.pbc, self.long_range_energy)
         self.model = model
-        self.devices = list(devices)
+        # A bare "cuda" means the current device; spelled out here so the
+        # list, the partition views and the model agree on one device object.
+        self.devices = [_indexed_device(d) for d in devices]
+        #: One device and the GPU-direct list: the node set is the system
+        #: itself, periodic through the list's image shifts, and nothing is
+        #: partitioned, probed or rebuilt
+        #: (:func:`~deepmd_lr.nvalchemi.partition.whole_system`).
+        self._whole_system = len(self.devices) == 1
+        self._open_axes = [k for k in range(3) if not self.pbc[k]]
+        if self._whole_system and np.linalg.det(self.cell) <= 0.0:
+            raise ValueError(
+                "the cell is left-handed or degenerate (det <= 0); nvalchemiops' "
+                "cell list refuses it. Swap two lattice vectors."
+            )
         self.repartition_every = repartition_every
         self.compute_virial = bool(compute_virial)
         #: Also assemble Born effective charge tensors, exposed as
@@ -274,15 +389,25 @@ class DistributedEvaluator:
                     "block, so it predicts no charges."
                 )
             if self.compute_virial:
-                raise ValueError(
-                    "compute_virial and efield cannot be combined: the "
-                    "field's contribution to the stress is a separate "
-                    "derivation, and reporting the field-free virial under a "
-                    "field would be quietly wrong."
-                )
+                raise ValueError(_VIRIAL_UNDER_FIELD)
             # The field force is built from Z, so Z has to be assembled.
             self.compute_born = True
         self.charge_spin = charge_spin
+        #: ``(c_t, delta)`` or None; see the class docstring. Absent, the
+        #: model's own (``long_range.charge_filter``); ``False``, none.
+        self.charge_filter = (
+            getattr(model, "trained_charge_filter", None)
+            if charge_filter is None
+            else check_charge_filter(charge_filter)
+        )
+        if self.charge_filter is not None:
+            if not getattr(model, "has_long_range", False):
+                raise ValueError("charge_filter needs a model with a long_range block")
+            if self.compute_born:
+                raise ValueError(
+                    "charge_filter cannot be combined with Born charges or an "
+                    "efield yet: the Born tensor is built from unfiltered charges"
+                )
         #: High-frequency dielectric constant. ``results['charge']`` and
         #: ``results['born_charge']`` -- and therefore the field force -- are
         #: scaled by sqrt(eps_inf); energies and field-free forces are not.
@@ -290,10 +415,30 @@ class DistributedEvaluator:
         screening_factor(eps_inf)
         self.eps_inf = float(eps_inf)
         #: Leave ``results`` as device tensors instead of the lazy numpy view.
-        self.results_on_device = bool(results_on_device)
         self.home = next(model.parameters()).device
         self.atype = np.asarray(atype, dtype=np.int64).reshape(-1)
-        self.cell = np.asarray(cell, dtype=np.float64).reshape(3, 3)
+        #: The types on the home device, uploaded once for the long-range term.
+        self._atype_dev = torch.as_tensor(self.atype, device=self.home)
+        #: The cell and its inverse on the home device. A barostat replaces
+        #: the cell every step; the copies go through pinned memory with
+        #: `non_blocking`, a ring of four slots so a copy still in flight is
+        #: never overwritten, instead of a pageable upload that stalls the host.
+        self._cell_dev = torch.as_tensor(
+            self.cell, dtype=torch.float64, device=self.home
+        )
+        self._cell_inv_dev = torch.as_tensor(
+            np.linalg.inv(self.cell), dtype=torch.float64, device=self.home
+        )
+        self._reference_cell_dev: torch.Tensor | None = None
+        self._pinned = (
+            torch.empty((4, 2, 3, 3), dtype=torch.float64).pin_memory()
+            if self.home.type == "cuda"
+            else None
+        )
+        self._pin_slot = 0
+        if self.long_range_energy is not None:
+            # The k-vectors follow the cell, which only `set_cell` changes.
+            self.long_range_energy.set_k_vectors(self._cell_dev)
         #: Whether the caller asked for the geometry rule. Kept because the
         #: rule reads the cell, and `set_cell` can replace it mid-run: under a
         #: barostat a contraction would otherwise keep a skin that no longer
@@ -307,6 +452,7 @@ class DistributedEvaluator:
         self._skin_cap = float("inf")
         #: How often the halo has been given back to free memory.
         self.skin_backoffs = 0
+        self.list_growths = 0
         #: Fraction of usable device memory the halo may be sized for, or
         #: ``None`` to skip the measurement entirely.
         self.memory_headroom = (
@@ -318,8 +464,11 @@ class DistributedEvaluator:
         #: Whether the first evaluation is still the probe. It runs at the
         #: floor skin, which is the smallest halo there is, so that the step
         #: that measures the footprint is also the one least likely to fail.
+        # No probe on one device with the GPU list: the node count is the
+        # atom count whatever the skin, so there is no halo to size.
         self._probe_pending = (
             self._skin_is_auto
+            and not self._whole_system
             and self.memory_headroom is not None
             and any(torch.device(d).type == "cuda" for d in self.devices)
         )
@@ -335,10 +484,21 @@ class DistributedEvaluator:
         self._partitions = None
         self._reference_positions = None
         self._calls_since_rebuild = 0
+        #: The halo the current partitions were built with, and the cell and
+        #: per-atom fold images they were built in (see :meth:`_needs_rebuild`).
+        self._halo_skin = 0.0
+        self._images = None
+        self._reach = 0.0
 
         self.rebuild_count = 0
+        #: Completed evaluations. Several MD objects may share this evaluator,
+        #: one after another, and all of them view the same forces buffer; a
+        #: Thermo compares this count with the one it saw at its own last
+        #: evaluation to know whether the forces are still its own.
+        self.calls = 0
         self.results: dict[str, Any] = {}
         self.virial: np.ndarray | None = None
+        self._virial_dev: torch.Tensor | None = None
         self.forces = torch.zeros(
             (len(self.atype), 3), dtype=torch.float64, device=self.home
         )
@@ -346,6 +506,32 @@ class DistributedEvaluator:
     @property
     def n_atoms(self) -> int:
         return len(self.atype)
+
+    @property
+    def cell(self) -> np.ndarray:
+        """The cell ``(3, 3)``, lattice vectors as rows: the host copy.
+
+        Under a barostat the device leads (:meth:`set_cell_device`) and this
+        copy is refreshed on demand, which costs the one read of the device
+        a log row, a checkpoint or a repartition then makes; a step reads
+        nothing.
+        """
+        if self._cell_host_stale:
+            self._cell_host = self._cell_dev.detach().cpu().numpy().reshape(3, 3)
+            self._cell_host_stale = False
+        return self._cell_host
+
+    @cell.setter
+    def cell(self, value) -> None:
+        self._cell_host = np.asarray(value, dtype=np.float64).reshape(3, 3)
+        self._cell_host_stale = False
+
+    @property
+    def virial_dev(self) -> torch.Tensor | None:
+        """The last virial as a ``(3, 3)`` device tensor (``None`` without
+        ``compute_virial``): what a barostat's pressure kernel should read,
+        instead of re-uploading :attr:`virial`."""
+        return self._virial_dev
 
     @property
     def volume(self) -> float:
@@ -365,6 +551,24 @@ class DistributedEvaluator:
         """Standard masses for this system, in amu."""
         return atomic_masses(self.model, self.atype)
 
+    def set_compute_virial(self, flag: bool) -> None:
+        """Switch the virial on or off for the evaluations that follow.
+
+        One evaluator can then carry a relaxation and an NVT stage without
+        paying for the virial, and an NPT stage with it, instead of a second
+        evaluator copying the model onto every device again. Refused under a
+        field, for the reason the constructor refuses the combination. The
+        first-step memory probe did not price the virial; should switching it
+        on outgrow a device, the out-of-memory backoff shrinks the skin.
+        """
+        flag = bool(flag)
+        if flag and self.efield is not None:
+            raise ValueError(_VIRIAL_UNDER_FIELD)
+        self.compute_virial = flag
+        if not flag:
+            self.virial = None
+            self._virial_dev = None
+
     def _auto_skin(self) -> float:
         """The geometry rule, never above a ceiling memory has forced on us.
 
@@ -382,25 +586,79 @@ class DistributedEvaluator:
         )
 
     def set_cell(self, cell: Any) -> None:
-        """Replace the cell and invalidate the partitioning.
+        """Replace the cell, keeping the partitioning while it still holds.
 
-        A barostat moves the cell every step, and the partitioning was built
-        against the old one. An ``"auto"`` skin is recomputed here too, since
-        the rule is a function of the cell. Invalidation here is
-        **correctness, not caching**:
-        :meth:`_needs_rebuild` watches atom displacement only and cannot see a
-        cell change, so nothing else would ever notice. A stale halo puts ghost
-        images at the wrong offsets and the forces are quietly wrong -- there
-        is no natural backstop for that, which is why this is unconditional
-        rather than left to the caller's judgement.
+        A barostat deforms the cell a little every step. The partitions keep
+        their nodes -- the same atoms and lattice images -- and re-express the
+        images' offsets in the new cell (:meth:`Partition.set_cell`); the
+        Verlet bound in :meth:`_needs_rebuild` counts the cell's change as well
+        as the atoms', so a small deformation costs no repartition and a large
+        one rebuilds at the next call. Before this, every step of NPT
+        repartitioned: 66 against 38 ms/step at 12,288 water atoms.
+
+        An ``"auto"`` skin is recomputed for the next rebuild, since the rule
+        is a function of the cell; the current halo keeps the skin it was
+        built with. An explicitly chosen skin is the caller's and is left
+        alone.
         """
         self.cell = np.asarray(cell, dtype=np.float64).reshape(3, 3)
-        self._partitions = None
-        self._reference_positions = None
-        # The rule is a function of the cell, so a new cell means a new answer.
-        # An explicitly chosen skin is the caller's and is left alone.
+        if abs(np.linalg.det(self.cell)) <= 0:
+            raise ValueError("the cell is degenerate (zero volume)")
+        self._upload_cell()
+        self.cell_version += 1
+        if self.long_range_energy is not None:
+            self.long_range_energy.set_k_vectors(self._cell_dev)
+        if self._partitions is not None:
+            for part, device in zip(self._partitions, self.devices, strict=True):
+                part.set_cell(self.cell, device_cell=self._cell_dev)
+                nlist = part.neighbor_list_on(device)
+                if nlist is not None:
+                    nlist.cell_changed(self.cell)
         if self._skin_is_auto:
             self.skin = self._auto_skin()
+            self._skin_stale = False
+
+    def set_cell_device(self, cell: torch.Tensor) -> None:
+        """Replace the cell from a device tensor, reading nothing back.
+
+        The barostats' path: the cell they integrate lives on the device and
+        changes every step, and the old seam copied it to the host and back
+        twice per step. This copies it device-to-device into the evaluator's
+        cell, inverts it there, re-expresses the partitions' images and the
+        long-range term's k-vectors on the device, and leaves the host copy
+        stale: :attr:`cell` refreshes it when something on the host asks. An
+        ``"auto"`` skin is recomputed at the next rebuild rather than here.
+        The neighbour list refreshes its search radius on the device at the
+        next search, using the new cell and bin counts.
+        """
+        h = cell.detach().to(device=self.home, dtype=torch.float64).reshape(3, 3)
+        self._cell_dev.copy_(h)
+        self._cell_inv_dev.copy_(inverse_3x3(self._cell_dev))
+        self._cell_host_stale = True
+        self.cell_version += 1
+        self._skin_stale = self._skin_is_auto
+        if self.long_range_energy is not None:
+            self.long_range_energy.set_k_vectors(self._cell_dev)
+        if self._partitions is not None:
+            for part, device in zip(self._partitions, self.devices, strict=True):
+                part.set_cell_device(self._cell_dev)
+                nlist = part.neighbor_list_on(device)
+                if nlist is not None:
+                    nlist.cell_changed_device()
+
+    def _upload_cell(self) -> None:
+        """The host cell and its inverse onto the home device, without a stall."""
+        inverse = np.linalg.inv(self.cell)
+        if self._pinned is None:
+            self._cell_dev.copy_(torch.as_tensor(self.cell))
+            self._cell_inv_dev.copy_(torch.as_tensor(inverse))
+            return
+        slot = self._pinned[self._pin_slot]
+        self._pin_slot = (self._pin_slot + 1) % self._pinned.shape[0]
+        slot[0].copy_(torch.from_numpy(self.cell))
+        slot[1].copy_(torch.from_numpy(inverse))
+        self._cell_dev.copy_(slot[0], non_blocking=True)
+        self._cell_inv_dev.copy_(slot[1], non_blocking=True)
 
     def _needs_rebuild(self, positions: torch.Tensor) -> bool:
         """Standard Verlet criterion on the cached halo.
@@ -417,22 +675,102 @@ class DistributedEvaluator:
             and self._calls_since_rebuild >= self.repartition_every
         ):
             return True
-        moved = float((positions - self._reference_positions).norm(dim=1).max())
-        return 2.0 * moved > self.skin
+        if self._whole_system:
+            # Searched afresh every step: nothing can go stale.
+            return False
+        # Raw displacement, not minimum image, on purpose. The halo was built
+        # around each atom's folded position at the last rebuild; a caller that
+        # wraps an atom moves it by a lattice vector, and a minimum-image check
+        # would call that no motion and keep a halo built around the old image.
+        # A node moves by df_i + S dH: folded atom motion plus its image's
+        # share of the cell deformation. Include one extra lattice step for
+        # images just outside the halo. The Frobenius norm bounds ||dH||_2
+        # without a decomposition.
+        moved = positions - self._reference_positions
+        if self._reference_cell_dev is not None and self._images is not None:
+            dh = self._cell_dev - self._reference_cell_dev
+            moved = moved - self._images @ dh.to(moved.dtype)
+            drift = moved.norm(dim=1).max() + self._reach * dh.norm()
+        else:
+            drift = moved.norm(dim=1).max()
+        # The one host read the halo needs: a bool, not the positions.
+        return bool(2.0 * drift > self._halo_skin)
+
+    def _check_open_axes(self, coord: np.ndarray) -> None:
+        """Keep every atom inside the cell along an open axis.
+
+        Nothing folds an open axis, but the reciprocal sum is still taken over
+        the whole cell, so an atom that crossed a face would be summed as its
+        image at the opposite face, across the vacuum. An atom moves less than
+        half the skin before the next rebuild, so being that far inside the
+        faces now keeps it inside until then.
+        """
+        open_axes = [k for k in range(3) if not self.pbc[k]]
+        if not open_axes:
+            return
+        frac = coord @ np.linalg.inv(self.cell)
+        widths = _perpendicular_widths(self.cell)
+        margin = 0.5 * self.skin
+        for k in open_axes:
+            depth = np.minimum(frac[:, k], 1.0 - frac[:, k]) * widths[k]
+            i = int(np.argmin(depth))
+            if depth[i] < margin:
+                raise ValueError(
+                    f"atom {i} is {depth[i]:.2f} A inside a face of the cell "
+                    f"along the open axis {k}, and must stay {margin:.2f} A "
+                    "inside (half the skin): past the face the long-range sum "
+                    "would put it across the vacuum. Give the slab more vacuum, "
+                    "e.g. read_structure(..., vacuum=30.0)."
+                )
 
     def _rebuild(self, tracked: torch.Tensor) -> None:
         """Re-partition at the current skin and restart the displacement clock."""
+        if self._skin_stale:
+            # Deferred from `set_cell_device`: the rule reads the host cell,
+            # and a rebuild reads the host anyway.
+            self.skin = self._auto_skin()
+            self._skin_stale = False
+        if self._whole_system:
+            # Nothing to partition and nothing to copy to the host: the one
+            # node set is the system, built once; a forced "rebuild"
+            # (`repartition_every`) only restarts the counters.
+            if self._partitions is None:
+                self._partitions = [whole_system(self.n_atoms, self.pbc, self.cell)]
+            self._reference_positions = tracked
+            self._halo_skin = float("inf")
+            self._images, self._reach = None, 0.0
+            self._calls_since_rebuild = 0
+            self.rebuild_count += 1
+            return
         # The only host copy of the coordinates: the spatial decomposition is
         # a numpy/scipy routine, and it runs only when the skin says so.
+        host = tracked.cpu().numpy()
+        self._check_open_axes(host)
         self._partitions = partition_system(
-            tracked.cpu().numpy(),
+            host,
             self.cell,
             self._rcut,
             len(self.devices),
-            pbc=(True, True, True),
+            pbc=self.pbc,
             skin=self.skin,
         )
         self._reference_positions = tracked.clone()
+        self._reference_cell_dev = self._cell_dev.clone()
+        self._halo_skin = self.skin
+        # Every atom is owned once, and its owned node is its fold image undone.
+        images = np.zeros((self.n_atoms, 3))
+        for part in self._partitions:
+            images[part.owned] = -part.owned_image
+        self._images = torch.as_tensor(images, dtype=torch.float64, device=self.home)
+        shifts = [
+            part.ghost_image + images[part.ghost]
+            for part in self._partitions
+            if len(part.ghost)
+        ]
+        widest = max(
+            (float(np.linalg.norm(s, axis=1).max()) for s in shifts), default=0.0
+        )
+        self._reach = widest + np.sqrt(3.0)
         self._calls_since_rebuild = 0
         self.rebuild_count += 1
 
@@ -541,7 +879,7 @@ class DistributedEvaluator:
                     self.model,
                     tracked,
                     self.atype,
-                    self.cell,
+                    self._cell_dev,
                     n_partitions=len(self.devices),
                     devices=self.devices,
                     partitions=self._partitions,
@@ -550,9 +888,18 @@ class DistributedEvaluator:
                     compute_born=self.compute_born,
                     charge_spin=self.charge_spin,
                     eps_inf=self.eps_inf,
+                    pbc=self.pbc,
+                    long_range_energy=self.long_range_energy,
+                    charge_filter=self.charge_filter,
+                    atype_device=self._atype_dev,
                 )
             except Exception as exc:
-                if not _is_out_of_memory(exc) or not self._skin_is_auto:
+                if (
+                    not _is_out_of_memory(exc)
+                    or not self._skin_is_auto
+                    or self._whole_system
+                ):
+                    # On one device there is no halo to give back.
                     raise
                 if self.skin <= MIN_AUTO_SKIN:
                     warnings.warn(
@@ -622,6 +969,30 @@ class DistributedEvaluator:
         self._calls_since_rebuild += 1
 
         out = self._evaluate(tracked)
+        # The one download of the step: energy, the device status word and,
+        # when asked for, the virial, in a single small copy. A list that
+        # overflowed a buffer truncated the graph, so that step is redone
+        # after the buffer has grown; this happens on the first steps of a
+        # run, if at all, and the growth is kept.
+        for _ in range(MAX_LIST_GROWTHS):
+            energy, flags, virial = self._readback(out, tracked)
+            if not (flags[STATUS_MATRIX_OVERFLOW] or flags[STATUS_EDGE_OVERFLOW]):
+                break
+            self._grow_lists()
+            warnings.warn(
+                "a neighbour-list buffer was too small for this step; it was "
+                "widened and the step repeated",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            out = self._evaluate(tracked)
+        else:
+            raise RuntimeError(
+                f"the neighbour list overflowed {MAX_LIST_GROWTHS} times in one "
+                "step; the system's density is not what the list was sized for"
+            )
+        if flags[STATUS_OPEN_FACE]:
+            self._raise_open_face(tracked)
 
         if self._probe_pending:
             self._probe_pending = False
@@ -633,18 +1004,16 @@ class DistributedEvaluator:
             self._reference_positions = None
         # Results stay on the device; `_LazyNumpy` hands out numpy on access,
         # so a caller that reads `results["charge"]` pays for that copy and a
-        # caller that reads nothing pays for none. `results_on_device` skips
-        # the wrapper for callers that want the tensors themselves.
-        self.results = out if self.results_on_device else _LazyNumpy(out)
-        self.virial = (
-            None if out.get("virial") is None else out["virial"].detach().cpu().numpy()
-        )
+        # caller that reads nothing pays for none.
+        self.results = _LazyNumpy(out)
+        self.virial = virial
+        self._virial_dev = out.get("virial")
         # INVARIANT: this writes INTO the preallocated buffer and never
         # rebinds `self.forces`, so a warp view taken once stays live for the
         # life of the object -- which is what lets `Thermo` bind it a single
         # time instead of rewrapping every step. Turning either this or the
         # `+=` below into an assignment would silently freeze the forces every
-        # MD driver sees. `tests/test_nvalchemi.py` pins the pointer.
+        # MD driver sees. `tests/test_thermo.py` pins the pointer.
         self.forces.copy_(out["force"].to(device=self.home, dtype=torch.float64))
         if self.efield is not None:
             # Through `field_force` rather than an einsum written out again:
@@ -655,7 +1024,87 @@ class DistributedEvaluator:
             self.forces += response
             # Kept separately so a caller can watch the field term without
             # re-deriving it, and so `out["force"]` stays the field-free force.
-            self.results["field_force"] = (
-                response if self.results_on_device else response.cpu().numpy()
-            )
-        return float(out["energy"]), self.forces
+            # A tensor, like the rest: downloaded only if read.
+            self.results["field_force"] = response
+        self.calls += 1
+        return energy, self.forces
+
+    # ------------------------------------------------------------ the readback
+
+    def _lists(self):
+        """The GPU neighbour lists the partitions hold, with their devices."""
+        if self._partitions is None:
+            return
+        for part, device in zip(self._partitions, self.devices, strict=True):
+            nlist = part.neighbor_list_on(device)
+            if nlist is not None:
+                yield nlist, device
+
+    @property
+    def list_resizes(self) -> int:
+        """How often a neighbour list's buffers were resized (host syncs)."""
+        return sum(nlist.resizes for nlist, _ in self._lists())
+
+    def _device_status(self, tracked: torch.Tensor) -> torch.Tensor:
+        """The step's status word on the home device: the lists' flags OR-ed
+        together, plus the evaluator's own open-face check."""
+        flags = torch.zeros(STATUS_LEN, dtype=torch.int64, device=self.home)
+        for nlist, _device in self._lists():
+            flags |= nlist.status.to(self.home)
+        if self._whole_system and self._open_axes:
+            # Nothing folds an open axis, and the reciprocal sum is taken over
+            # the whole cell: an atom past a face would be summed as its image
+            # at the opposite face, across the vacuum. The halo path checks
+            # this on the host at every rebuild; here it is checked on the
+            # device at every step and read back with the energy.
+            frac = tracked @ self._cell_inv_dev
+            open_frac = frac[:, self._open_axes]
+            outside = ((open_frac < 0.0) | (open_frac > 1.0)).any()
+            flags[STATUS_OPEN_FACE : STATUS_OPEN_FACE + 1] |= outside.to(
+                torch.int64
+            ).reshape(1)
+        return flags
+
+    def _readback(self, out: dict, tracked: torch.Tensor):
+        """Energy (float), status flags (list of int) and the virial (numpy or
+        None), downloaded together in one copy."""
+        pieces = [
+            out["energy"].reshape(1).to(torch.float64),
+            self._device_status(tracked).to(torch.float64),
+        ]
+        virial = out.get("virial")
+        if virial is not None:
+            pieces.append(virial.detach().reshape(9).to(torch.float64))
+        host = torch.cat(pieces).cpu()
+        flags = [int(x) for x in host[1 : 1 + STATUS_LEN]]
+        vir = (
+            None
+            if virial is None
+            else host[1 + STATUS_LEN :].reshape(3, 3).numpy().copy()
+        )
+        return float(host[0]), flags, vir
+
+    def _grow_lists(self) -> None:
+        for nlist, _device in self._lists():
+            if bool(nlist.status[:2].any()):
+                nlist.grow()
+        self.list_growths += 1
+
+    def _raise_open_face(self, tracked: torch.Tensor) -> None:
+        """Name the atom that left the cell along an open axis (the step has
+        already been found wrong, so a host copy costs nothing that matters)."""
+        frac = tracked.detach().cpu().numpy() @ np.linalg.inv(self.cell)
+        widths = _perpendicular_widths(self.cell)
+        worst = None
+        for k in self._open_axes:
+            depth = np.minimum(frac[:, k], 1.0 - frac[:, k]) * widths[k]
+            i = int(np.argmin(depth))
+            if worst is None or depth[i] < worst[0]:
+                worst = (float(depth[i]), i, k)
+        depth, i, k = worst
+        raise ValueError(
+            f"atom {i} is {-depth:.2f} A outside the cell along the open axis "
+            f"{k}: past the face the long-range sum would put it across the "
+            "vacuum. Give the slab more vacuum, e.g. read_structure(..., "
+            "vacuum=30.0)."
+        )

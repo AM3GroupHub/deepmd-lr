@@ -113,15 +113,20 @@ Measured: **0.139 s/batch** at 468 atoms, batch size 1.
 
 ## Using it in MD afterwards
 
-The `Atoms` object must carry `pbc=[True, True, False]` to match the
-`long_range` block, or `LongRangeCalculator` refuses the frame:
+Give the `Atoms` `pbc=[True, True, False]`. That is what selects the slab sum,
+in the ASE calculator and in the GPU MD classes alike: a model trained on bulk
+runs a slab the same way, and this one runs bulk when handed a 3D-periodic
+cell. `deepmd_lr.nvalchemi.read_structure` keeps the file's `pbc`, pads the
+open axis to at least 20 Å of vacuum (`vacuum=`) and centres the slab.
 
-```
-Atoms pbc=[True, True, True] does not match the selected long-range
-branch pbc=[True, True, False]
-```
+The two paths need the vacuum for different reasons. The ASE calculator hands
+the model the whole cell, so its descriptor sees a 3D-periodic cell as in
+training, and it refuses a slab with less vacuum than the cutoff. The GPU
+classes make no images along z; they only need the atoms kept off the faces.
 
-Pad the cell the same way you padded it for training.
+To hold the bottom layers in place, as the bulk beneath would, attach ASE's
+`FixAtoms`. The GPU classes honour it and count only the mobile atoms in the
+temperature ([example 06](../06-md_nvalchemi/README.md#fixed-atoms)).
 
 ## Caveats
 

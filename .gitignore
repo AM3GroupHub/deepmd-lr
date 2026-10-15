@@ -50,6 +50,7 @@ experiments/
 !examples/02-molecules/*.xyz
 !examples/03-slab/*.xyz
 !examples/06-md_nvalchemi/*.xyz
+!examples/09-fire-swap/*.xyz
 
 # Generated example datasets. `type.raw` and `type_map.raw` are not *.npy, so
 # without this an example would ship those two files and nothing else -- the

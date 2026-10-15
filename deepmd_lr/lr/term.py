@@ -94,6 +94,7 @@ from typing import (
     Any,
 )
 
+import numpy as np
 import torch
 from deepmd.dpmodel.modifier.dipole_charge import (
     ELECTROSTATIC_CONVERSION,
@@ -110,6 +111,8 @@ from nvalchemiops.torch.interactions.electrostatics.pme import (
 from nvalchemiops.torch.interactions.electrostatics.slab import (
     compute_slab_correction,
 )
+
+from deepmd_lr.cell import inverse_3x3
 
 #: Ewald's default truncation: ``exp(-k^2 / 4 alpha^2)`` falls to this at
 #: ``k_cutoff``.
@@ -304,6 +307,13 @@ class LongRangeEnergy(torch.nn.Module):
         self.method = method
         self.slab_correction = slab_correction
         self.pbc = pbc
+        #: Refuse a degenerate cell at every call. That check reads the device,
+        #: so a driver that validates the cell on the host when it changes
+        #: (``DistributedEvaluator``) switches it off for its own term.
+        self.check_cell = True
+        #: PME k-vectors fixed by :meth:`set_k_vectors`, or None to generate
+        #: them at every call.
+        self._k_cache: tuple[torch.Tensor, torch.Tensor] | None = None
         self.mesh_spacing = mesh_spacing
         self.mesh_dimensions = mesh_dimensions
         self.spline_order = int(spline_order)
@@ -344,6 +354,69 @@ class LongRangeEnergy(torch.nn.Module):
     @classmethod
     def deserialize(cls, data: dict[str, Any]) -> "LongRangeEnergy":
         return cls(**data)
+
+    def _pbc_on(self, device) -> torch.Tensor:
+        """The periodicity flags as a device tensor, uploaded once per device.
+
+        Building them from the Python tuple at every call is a pageable
+        host-to-device copy, which blocks the host until the device has
+        drained -- one of the per-step synchronisations the MD engine removes.
+        """
+        cache = self.__dict__.setdefault("_pbc_cache", {})
+        key = str(torch.device(device))
+        pbc = cache.get(key)
+        if pbc is None:
+            pbc = torch.tensor(self.pbc, dtype=torch.bool, device=device)
+            cache[key] = pbc
+        return pbc
+
+    def set_k_vectors(self, cell: torch.Tensor | None) -> None:
+        """Fix the PME k-vectors for ``cell`` until the next call.
+
+        nvalchemiops regenerates them at every evaluation, which includes a
+        small upload from host memory that stalls the host until the device
+        has drained. A driver that evaluates the same cell step after step --
+        the MD engine -- computes them once here, when it sets the cell, and
+        the term reuses them. The caller owns the cell: it must call again
+        whenever the cell changes (``DistributedEvaluator.set_cell`` does),
+        and pass ``None`` to go back to per-call generation. ``cell`` is
+        ``(3, 3)`` or ``(1, 3, 3)`` on the device the term runs on. Only the
+        PME method has them; the Ewald sum builds its own vectors per call.
+        """
+        if cell is None or self.method != "pme":
+            self._k_cache = None
+            return
+        self._k_cache = self._k_vectors_for(cell.detach().reshape(1, 3, 3))
+
+    def _k_vectors_for(
+        self, cell: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """nvalchemiops' ``generate_k_vectors_pme``, without its host upload.
+
+        The Miller-index grid depends only on the mesh and is cached per mesh,
+        device and dtype; the reciprocal cell is a 3 x 3 inverse written out
+        (:func:`deepmd_lr.cell.inverse_3x3`); and the floor under ``k^2`` is a
+        clamp rather than a scalar tensor built from a Python float at every
+        call, which is the pageable upload a barostat step would otherwise
+        pay. Same convention as nvalchemiops: ``k = h @ (2 pi inv(H))^T``
+        with ``H`` rows as lattice vectors and ``h`` the Miller indices.
+        """
+        mesh = tuple(int(m) for m in self._mesh(cell))
+        key = (mesh, str(cell.device), cell.dtype)
+        cache = self.__dict__.setdefault("_miller_cache", {})
+        grid = cache.get(key)
+        if grid is None:
+            nx, ny, nz = mesh
+            kx = torch.fft.fftfreq(nx, d=1.0, device=cell.device, dtype=cell.dtype) * nx
+            ky = torch.fft.fftfreq(ny, d=1.0, device=cell.device, dtype=cell.dtype) * ny
+            kz = torch.fft.rfftfreq(nz, d=1.0, device=cell.device, dtype=cell.dtype)
+            kz = kz * nz
+            grid = torch.stack(torch.meshgrid(kx, ky, kz, indexing="ij"), dim=-1)
+            cache[key] = grid
+        reciprocal = 2.0 * math.pi * inverse_3x3(cell.reshape(3, 3))
+        k_vectors = grid @ reciprocal.transpose(0, 1)
+        k_squared = (k_vectors * k_vectors).sum(-1)
+        return k_vectors, k_squared.clamp(min=1e-12)
 
     def _mesh(self, cell: torch.Tensor) -> tuple[int, int, int]:
         """PME mesh dimensions for this cell."""
@@ -395,29 +468,38 @@ class LongRangeEnergy(torch.nn.Module):
         nf, nloc = coord.shape[0], coord.shape[1]
         cell = box.reshape(nf, 3, 3)
 
-        volume = torch.abs(torch.linalg.det(cell.detach()))
-        if bool((volume <= 0).any()):
-            raise ValueError(
-                "The long-range term requires a non-degenerate cell, but at "
-                "least one frame has zero volume. A collapsed or unset box "
-                "cannot define periodic images."
-            )
+        if self.check_cell:
+            volume = torch.abs(torch.linalg.det(cell.detach()))
+            if bool((volume <= 0).any()):
+                raise ValueError(
+                    "The long-range term requires a non-degenerate cell, but at "
+                    "least one frame has zero volume. A collapsed or unset box "
+                    "cannot define periodic images."
+                )
 
         positions = coord.reshape(nf * nloc, 3)
         charges = charge.reshape(nf * nloc)
         if mask is not None:
             charges = charges * mask.reshape(nf * nloc).to(charges.dtype)
+        # The energy is quadratic in the charges, so the unit conversion goes
+        # onto them rather than onto the energy afterwards. Not cosmetic: the
+        # MD driver differentiates the summed energy, and nvalchemiops'
+        # backward takes its fast, read-free path only when the cotangent it
+        # receives is a plain expanded constant. A multiply after the sum
+        # turns that into a tensor it inspects on the host at every step.
+        charges = charges * math.sqrt(ELECTROSTATIC_CONVERSION)
 
         batch_idx = torch.repeat_interleave(
             torch.arange(nf, dtype=torch.int32, device=coord.device), nloc
         )
-        pbc = torch.tensor(self.pbc, dtype=torch.bool, device=coord.device)
+        pbc = self._pbc_on(coord.device)
 
         # Both backends return the k-space sum MINUS the Ewald self term,
         # which is what we want: the bare k-space sum counts each Gaussian
         # interacting with itself, an artifact of the smearing rather than a
         # physical interaction. See the module docstring.
         if self.method == "pme":
+            cached = self._k_cache
             energy = pme_reciprocal_space(
                 positions,
                 charges,
@@ -427,6 +509,8 @@ class LongRangeEnergy(torch.nn.Module):
                 spline_order=self.spline_order,
                 batch_idx=batch_idx,
                 energy_reduction="atom",
+                k_vectors=None if cached is None else cached[0],
+                k_squared=None if cached is None else cached[1],
             )
         else:
             # The explicit sum wants alpha per system as a tensor, not a
@@ -462,7 +546,6 @@ class LongRangeEnergy(torch.nn.Module):
                 energy_reduction="atom",
             )
 
-        energy = energy * ELECTROSTATIC_CONVERSION
         return energy.reshape(nf, nloc, 1)
 
 
@@ -682,3 +765,62 @@ def build_long_range_energy(settings: dict[str, Any]) -> torch.nn.Module:
             f"method must be one of {tuple(TERM_CLASSES)}, got {method!r}"
         )
     return TERM_CLASSES[method](**settings)
+
+
+def system_mesh(settings: dict[str, Any], cell: Any) -> tuple[int, int, int]:
+    """The PME mesh a cell needs: at least ``ceil(2 alpha L)`` points along
+    each cell vector, and never fewer than ``settings`` asks for.
+
+    ``1 / (2 alpha)`` is the spacing the screening Gaussian needs -- 1.25 A at
+    alpha 0.4. A fixed mesh is right for the cell it was chosen for and for no
+    other: the water model's (10, 10, 10), exact on its 12.43 A training box,
+    was 0.49 meV/atom and 0.0077 eV/A rms off on the 49.7 A 4x4x4 supercell of
+    that same box, where this rule's (40, 40, 40) is exact.
+    """
+    lengths = np.linalg.norm(np.asarray(cell, dtype=np.float64).reshape(3, 3), axis=1)
+    alpha = float(settings.get("alpha", DEFAULT_ALPHA))
+    if settings.get("mesh_dimensions") is not None:
+        asked = [int(n) for n in settings["mesh_dimensions"]]
+    else:
+        spacing = settings.get("mesh_spacing") or 1.0  # the term's own default
+        asked = [math.ceil(length / spacing - 1e-9) for length in lengths]
+    return tuple(
+        max(n, math.ceil(2.0 * alpha * length - 1e-9), 2)
+        for n, length in zip(asked, lengths, strict=True)
+    )
+
+
+def system_reciprocal(settings: dict[str, Any], cell: Any, pbc: Any) -> dict[str, Any]:
+    """The reciprocal-space settings a system needs, from a model's own.
+
+    The term holds no weights, so how the sum is taken is a property of the
+    system, not of the checkpoint. The system's ``pbc`` picks the sum -- all
+    three axes periodic is the 3D sum, one open axis a slab with the
+    Yeh-Berkowitz correction -- and its cell the PME mesh
+    (:func:`system_mesh`). ``alpha``, the method and the spline order stay
+    the model's.
+
+    The ``isolated`` method comes back unchanged: moving between it and a
+    periodic method changes the physics, so it is asked for explicitly, with
+    ``long_range=``, never inferred from a structure.
+    """
+    method = settings.get("method", "pme")
+    if method not in METHODS:
+        return dict(settings)
+    periodic = [bool(p) for p in np.broadcast_to(np.asarray(pbc, dtype=bool), (3,))]
+    out = dict(settings)
+    if all(periodic):
+        out.update(slab_correction=False, pbc=[True, True, True])
+    elif sum(periodic) == 2:
+        out.update(slab_correction=True, pbc=periodic)
+    else:
+        raise ValueError(
+            f"pbc={periodic} leaves {3 - sum(periodic)} axes open. The periodic "
+            "sum covers a bulk cell and a slab (one open axis); a molecule or a "
+            "wire runs through the ASE calculator with "
+            "long_range={'method': 'isolated'}."
+        )
+    if method == "pme":
+        out["mesh_dimensions"] = list(system_mesh(settings, cell))
+        out["mesh_spacing"] = None
+    return out

@@ -47,6 +47,7 @@ __all__ = [
     "halo_node_ratio",
     "partition_system",
     "skin_for_node_ratio",
+    "whole_system",
 ]
 
 
@@ -64,13 +65,41 @@ class Partition:
         of the same atom are in range.
     ghost_shift
         Cartesian offset applied to each ghost, shape ``(n_ghost, 3)``.
+    owned_shift
+        Cartesian offset applied to each owned atom, shape ``(n_owned, 3)``;
+        zeros unless the coordinates handed to :func:`partition_system` were
+        unwrapped. Both shifts are relative to those coordinates: a node sits
+        at ``coord[atom] + shift``, folded into the cell, however far the atom
+        itself has wandered.
+    ghost_image, owned_image
+        The integer lattice vectors behind the shifts, ``shift = image @ cell``.
+        With them :meth:`set_cell` moves the nodes to a deformed cell without
+        repartitioning; a barostat deforms it a little every step.
     """
 
     owned: np.ndarray
     ghost: np.ndarray
     ghost_shift: np.ndarray
+    owned_shift: np.ndarray | None = None
+    ghost_image: np.ndarray | None = None
+    owned_image: np.ndarray | None = None
+    #: Set for the whole system on one device (:func:`whole_system`): its
+    #: per-axis periodicity, which the GPU list applies through image shifts.
+    #: ``None`` for a halo partition, whose node set carries its images
+    #: explicitly and is searched non-periodically.
+    periodic: tuple[bool, bool, bool] | None = None
+    #: The cell a whole-system partition lives in, host copy; :meth:`set_cell`
+    #: keeps it and the device copy in :meth:`views` current.
+    cell: np.ndarray | None = None
     #: Device-resident index tensors, built once per device (see :meth:`views`).
     _views: dict = field(default_factory=dict, repr=False, compare=False)
+    #: The cell last set from a device tensor (:meth:`set_cell_device`), which
+    #: then leads the host copies.
+    _device_cell: torch.Tensor | None = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self):
+        if self.owned_shift is None:
+            self.owned_shift = np.zeros((len(self.owned), 3))
 
     @property
     def n_owned(self) -> int:
@@ -80,22 +109,86 @@ class Partition:
     def n_node(self) -> int:
         return len(self.owned) + len(self.ghost)
 
+    @property
+    def is_whole_system(self) -> bool:
+        """Whether this is the undivided periodic system (see :func:`whole_system`)."""
+        return self.periodic is not None
+
     def global_ids(self) -> np.ndarray:
         """Global atom index of every node, owned then ghost."""
         return np.concatenate([self.owned, self.ghost])
 
     def coordinates(self, coord: np.ndarray) -> np.ndarray:
-        """Node coordinates: owned as-is, ghosts shifted into place."""
-        return np.concatenate([coord[self.owned], coord[self.ghost] + self.ghost_shift])
+        """Node coordinates, owned then ghost, each shifted into place."""
+        return np.concatenate(
+            [coord[self.owned] + self.owned_shift, coord[self.ghost] + self.ghost_shift]
+        )
 
     def types(self, atype: np.ndarray) -> np.ndarray:
         return np.concatenate([atype[self.owned], atype[self.ghost]])
+
+    def set_cell(
+        self, cell: np.ndarray, device_cell: torch.Tensor | None = None
+    ) -> None:
+        """Re-express the node shifts in a new cell, keeping the nodes.
+
+        Updates host shifts and cached device views. The evaluator's Verlet
+        bound decides whether the halo still covers every neighbour.
+        ``device_cell`` can supply the same cell on a device to avoid a
+        pageable host upload to that device.
+        """
+        if self.ghost_image is None or self.owned_image is None:
+            raise ValueError(
+                "this partition carries no lattice images; rebuild it for the "
+                "new cell instead"
+            )
+        cell = np.asarray(cell, dtype=np.float64).reshape(3, 3)
+        self.ghost_shift = self.ghost_image @ cell
+        self.owned_shift = self.owned_image @ cell
+        if self.periodic is not None:
+            self.cell = cell.copy()
+        self._device_cell = None
+        for v in self._views.values():
+            if isinstance(v, dict) and "ghost_image" in v:
+                source = cell
+                if device_cell is not None and device_cell.device == v["shift"].device:
+                    source = device_cell
+                self._set_view_cell(v, source)
+
+    def set_cell_device(self, cell: torch.Tensor) -> None:
+        """Re-express the node shifts from a cell that lives on a device.
+
+        Updates cached device views without a host transfer. Later views use
+        this cell too; host shifts and ``cell`` lag until :meth:`set_cell`.
+        """
+        if self.ghost_image is None or self.owned_image is None:
+            raise ValueError(
+                "this partition carries no lattice images; rebuild it for the "
+                "new cell instead"
+            )
+        self._device_cell = cell.detach()
+        for v in self._views.values():
+            if isinstance(v, dict) and "ghost_image" in v:
+                self._set_view_cell(v, self._device_cell)
+
+    @staticmethod
+    def _set_view_cell(v: dict, cell) -> None:
+        """Update bound tensors in place; the neighbour list needs a float64 cell."""
+        shift = v["shift"]
+        dtype = torch.float64 if "cell" in v else shift.dtype
+        h = torch.as_tensor(cell, dtype=dtype, device=shift.device)
+        h_shift = h.to(shift.dtype)
+        shift.copy_(v["ghost_image"] @ h_shift)
+        v["owned_shift"].copy_(v["owned_image"] @ h_shift)
+        if "cell" in v:
+            v["cell"].copy_(h.reshape(1, 3, 3))
 
     def views(self, device, dtype=torch.float64) -> dict:
         """This partition's index tensors on ``device``, built once and cached.
 
         ``owned`` and ``ghost`` are global atom indices, ``ids`` their
-        concatenation in node order, ``shift`` the ghosts' Cartesian offsets.
+        concatenation in node order, ``shift`` and ``owned_shift`` the ghosts'
+        and the owned atoms' Cartesian offsets.
         The partitioning is reused across many steps, so uploading these
         every step would be the kind of per-step host traffic the device
         gather exists to remove.
@@ -109,14 +202,53 @@ class Partition:
                 "ids": ids,
                 "owned": ids[: self.n_owned],
                 "ghost": ids[self.n_owned :],
-                "shift": torch.as_tensor(
-                    np.asarray(self.ghost_shift, dtype=np.float64).reshape(-1, 3),
-                    dtype=dtype,
-                    device=dev,
-                ),
             }
+            for name, shift in (
+                ("shift", self.ghost_shift), ("owned_shift", self.owned_shift)
+            ):
+                v[name] = (
+                    torch.empty((len(shift), 3), dtype=dtype, device=dev)
+                    if self._device_cell is not None
+                    else torch.as_tensor(
+                        np.asarray(shift, dtype=np.float64).reshape(-1, 3),
+                        dtype=dtype,
+                        device=dev,
+                    )
+                )
+            if self.ghost_image is not None and self.owned_image is not None:
+                for name, image in (
+                    ("ghost_image", self.ghost_image),
+                    ("owned_image", self.owned_image),
+                ):
+                    v[name] = torch.as_tensor(
+                        np.asarray(image).reshape(-1, 3), dtype=dtype, device=dev
+                    )
+            if self.periodic is not None:
+                v["cell"] = (
+                    torch.empty((1, 3, 3), dtype=torch.float64, device=dev)
+                    if self._device_cell is not None
+                    else torch.as_tensor(
+                        np.asarray(self.cell, dtype=np.float64).reshape(1, 3, 3),
+                        device=dev,
+                    )
+                )
+            if self._device_cell is not None:
+                self._set_view_cell(v, self._device_cell)
             self._views[key] = v
         return v
+
+    def neighbor_list_on(self, device):
+        """This partition's GPU neighbour list on ``device``, if one exists.
+
+        Built on first use by :func:`~deepmd_lr.nvalchemi.driver.partition_graph`
+        (a :class:`~deepmd_lr.nvalchemi.nlist.GpuNeighborList` over this node
+        set with the owned atoms as centres) and kept for the partition's
+        life: its buffers are sized once and overwritten by every search.
+        """
+        return self._views.get(("nlist", str(torch.device(device))))
+
+    def store_neighbor_list(self, device, nlist) -> None:
+        self._views[("nlist", str(torch.device(device)))] = nlist
 
     def types_on(self, atype: np.ndarray, device) -> torch.Tensor:
         """Node types on ``device``, cached (the type of an atom never changes)."""
@@ -147,6 +279,37 @@ class Partition:
             )
             self._views[key] = c
         return c
+
+
+def whole_system(n_atoms: int, pbc, cell: np.ndarray) -> Partition:
+    """The undivided system as one partition: every atom owned, no ghosts.
+
+    What one device runs with the GPU-direct list. There is no halo because
+    there is nothing to exchange with: the list searches the real cell with
+    the real periodicity and records each pair's lattice image as an integer
+    shift, so the nodes are the atoms -- 1.96M of them instead of the 2.76M
+    the periodic-image halo used to add on one H200 -- and
+    :func:`partition_system`'s host-side spatial sort never runs. The
+    coordinates may be unwrapped; nvalchemiops folds the images into the
+    shifts itself.
+
+    ``owned_image`` and ``ghost_image`` are present (all zero, and empty) so
+    :meth:`Partition.set_cell` works unchanged under a barostat.
+    """
+    n = int(n_atoms)
+    if n < 1:
+        raise ValueError(f"the system needs at least one atom, got {n}")
+    flags = tuple(bool(p) for p in np.broadcast_to(np.asarray(pbc, dtype=bool), (3,)))
+    return Partition(
+        owned=np.arange(n),
+        ghost=np.zeros(0, dtype=int),
+        ghost_shift=np.zeros((0, 3)),
+        owned_shift=np.zeros((n, 3)),
+        ghost_image=np.zeros((0, 3), dtype=int),
+        owned_image=np.zeros((n, 3), dtype=int),
+        periodic=flags,
+        cell=np.asarray(cell, dtype=np.float64).reshape(3, 3).copy(),
+    )
 
 
 def _image_shifts(cell: np.ndarray, pbc, rcut: float) -> np.ndarray:
@@ -348,7 +511,8 @@ def partition_system(
     Parameters
     ----------
     coord
-        ``(N, 3)`` Cartesian coordinates.
+        ``(N, 3)`` Cartesian coordinates, wrapped or not: they are folded into
+        the cell on periodic axes before anything is built.
     cell
         ``(3, 3)`` cell vectors as rows.
     rcut
@@ -375,8 +539,21 @@ def partition_system(
             f"{n_partitions} partitions requested for only {n_atoms} atoms"
         )
 
-    # Assign owners on a grid of blocks, `decomposition_grid` pieces per axis.
     inverse = np.linalg.inv(cell)
+    # Fold every atom into the cell on periodic axes. Integrators never wrap,
+    # so atoms that leave through opposite faces end up many cells apart, and
+    # the +-ceil(halo/width) images below only bridge a spread of about one
+    # halo: built from the raw coordinates, the halo silently lost neighbours
+    # (1.1 eV/A on water at a spread of L + 12 A). Everything is built from the
+    # folded positions, and the nodes are expressed back relative to the
+    # coordinates handed in -- `owned_shift` and `ghost_shift` -- so callers
+    # keep integrating unwrapped positions and nothing else changes.
+    image = np.where(
+        np.asarray(pbc, dtype=bool), np.floor(coord @ inverse), 0.0
+    ).astype(np.int64)
+    fold = image @ cell
+    coord = coord - fold
+    # Assign owners on a grid of blocks, `decomposition_grid` pieces per axis.
     frac = coord @ inverse
     keys = np.empty_like(frac)
     for axis in range(3):
@@ -391,7 +568,15 @@ def partition_system(
     # and for a slab system with vacuum equal-width would leave empty
     # partitions. Cut one axis at a time, each group by its own sort, so the
     # counts stay equal however the density varies.
-    grid = decomposition_grid(cell, n_partitions, rcut)
+    # An open axis counts with the atoms' extent, not the cell's: a slab's
+    # vacuum would otherwise make its normal the longest axis, and the grid
+    # would slice the slab through its thickness, each slice mostly halo.
+    grid_cell = np.array(cell, dtype=np.float64)
+    for axis in range(3):
+        if not pbc[axis]:
+            extent = frac[:, axis].max() - frac[:, axis].min()
+            grid_cell[axis] *= max(extent, 1e-6)
+    grid = decomposition_grid(grid_cell, n_partitions, rcut)
     groups = [np.arange(n_atoms)]
     for axis in range(3):
         if grid[axis] == 1:
@@ -415,8 +600,8 @@ def partition_system(
     shifts = _image_shifts(cell, pbc, halo)
     offsets = shifts @ cell
     images = (coord[None, :, :] + offsets[:, None, :]).reshape(-1, 3)
+    # Image `i` is atom `i % n_atoms` under lattice shift `shifts[i // n_atoms]`.
     image_atom = np.tile(np.arange(n_atoms), len(shifts))
-    image_shift = np.repeat(offsets, n_atoms, axis=0)
     # Fractional coordinates of every image, and how far a Euclidean step of
     # `halo` can move each fractional coordinate: the distance between the
     # planes f_j = c and f_j = c + d is d times the cell's perpendicular width
@@ -442,9 +627,7 @@ def partition_system(
         #      `halo`, which is exactly the set a ball query would return.
         lo = frac[owned].min(axis=0) - reach
         hi = frac[owned].max(axis=0) + reach
-        boxed = np.flatnonzero(
-            np.all((image_frac >= lo) & (image_frac <= hi), axis=1)
-        )
+        boxed = np.flatnonzero(np.all((image_frac >= lo) & (image_frac <= hi), axis=1))
         if len(owned) and len(boxed):
             nearest, _ = cKDTree(coord[owned]).query(
                 images[boxed], k=1, distance_upper_bound=bound, workers=-1
@@ -454,15 +637,22 @@ def partition_system(
             candidates = np.empty(0, dtype=int)
         # Drop the owned atoms' own unshifted copies; a shifted copy of an
         # owned atom is a legitimate ghost when the cell is small.
-        is_self = np.isin(image_atom[candidates], owned) & (
-            np.abs(image_shift[candidates]).sum(axis=1) == 0
+        is_self = np.isin(image_atom[candidates], owned) & np.all(
+            shifts[candidates // n_atoms] == 0, axis=1
         )
         ghosts = candidates[~is_self]
+        # Relative to the coordinates handed in, not the folded ones, and as
+        # integer lattice vectors, so a deformed cell can re-express them.
+        ghost_image = shifts[ghosts // n_atoms] - image[image_atom[ghosts]]
+        owned_image = -image[owned]
         partitions.append(
             Partition(
                 owned=owned,
                 ghost=image_atom[ghosts],
-                ghost_shift=image_shift[ghosts],
+                ghost_shift=ghost_image @ cell,
+                owned_shift=owned_image @ cell,
+                ghost_image=ghost_image,
+                owned_image=owned_image,
             )
         )
     return partitions

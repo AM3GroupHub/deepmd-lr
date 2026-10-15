@@ -6,21 +6,27 @@ dynamics, so never use it for production. It is genuinely useful for one
 thing: dragging a badly prepared structure to temperature before handing it to
 a real thermostat.
 
-`velocity_rescale` takes the scale factor, not a temperature, so the policy is
-yours -- here, rescale only when the drift exceeds a tolerance.
+`VelocityRescaling` is velocity Verlet plus nvalchemiops' `velocity_rescale`
+kernel, applied only when the temperature strays from the target by more than
+`tolerance` (as LAMMPS' fix temp/rescale does), and only every `interval`
+steps. A policy of your own fits an observer: `md.attach(fn, interval)` sees
+`atoms` synced from the GPU, and what it writes back into `atoms` -- new
+momenta, say -- is uploaded before the next step.
 
     python 04_nvt_rescale.py --model ../../path/to/model.ckpt.pt
 """
 
 import argparse
 
-from nvalchemiops.dynamics.integrators import (
-    velocity_rescale,
-    velocity_verlet_position_update,
-    velocity_verlet_velocity_finalize,
-)
+import numpy as np
+from ase import units
+from ase.md.velocitydistribution import Stationary, thermalize_momenta
 
-from deepmd_lr.nvalchemi import Thermo, build_evaluator, read_structure
+from deepmd_lr.nvalchemi import (
+    VelocityRescaling,
+    build_evaluator,
+    read_structure,
+)
 
 
 def main():
@@ -37,36 +43,20 @@ def main():
 
     atoms = read_structure(a.structure, a.index)
     ev = build_evaluator(a.model, atoms)
-    th = Thermo(
-        ev, atoms.get_positions(), timestep=a.dt, temperature=a.temperature,
-        columns=("step", "time", "temp", "epot"),
-        every=max(a.steps // 10, 1),
-    )
-    scale = th.scalar(1.0)
-    rescales = 0
-
-    print(f"velocity rescaling  {th.n_atoms} atoms  dt {a.dt} fs  "
+    thermalize_momenta(atoms, temperature_K=a.temperature, rng=np.random.default_rng(1))
+    Stationary(atoms)
+    md = VelocityRescaling(ev, atoms, a.dt * units.fs, a.temperature,
+                           tolerance=a.tolerance, logfile="-",
+                           loginterval=max(a.steps // 20, 1),
+                           extra_columns={"rescaled": lambda m: m.rescales})
+    print(f"velocity rescaling  {len(atoms)} atoms  dt {a.dt} fs  "
           f"T {a.temperature} K  tolerance {a.tolerance} K")
-    th.evaluate()
-    for step in range(a.steps + 1):
-        temperature = th.temperature
-        th.log(step, rescaled=rescales)
-        if step == a.steps:
-            break
-        if abs(temperature - a.temperature) > a.tolerance and temperature > 0:
-            scale.fill_((a.temperature / temperature) ** 0.5)
-            velocity_rescale(th.velocities, scale)
-            rescales += 1
-        velocity_verlet_position_update(th.positions, th.velocities,
-                                        th.forces, th.masses, th.dt)
-        th.evaluate()
-        velocity_verlet_velocity_finalize(th.velocities, th.forces,
-                                          th.masses, th.dt)
-    half = len(th.rows) // 2
-    rows = th.rows[half:]
-    print(f"\n  {th.performance()}")
+    md.run(a.steps)
+
+    half = md.rows[len(md.rows) // 2:]
+    print(f"\n  {md.performance()}")
     print(f"  mean T over the second half: "
-          f"{sum(r[2] for r in rows)/len(rows):.1f} K   ({rescales} rescalings)")
+          f"{np.mean([r['T[K]'] for r in half]):.1f} K   ({md.rescales} rescalings)")
     print("  Use this to equilibrate, then switch to Langevin or Nose-Hoover")
     print("  before collecting anything you intend to report.")
 

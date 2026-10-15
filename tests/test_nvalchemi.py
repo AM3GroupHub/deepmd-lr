@@ -10,9 +10,14 @@ Phase A covers the short-range model; Phase B adds the long-range term,
 gathered onto one device.
 """
 
+import copy
+import math
+import os
+
 import numpy as np
 import pytest
 import torch
+from ase import Atoms
 from ase import units as ase_units
 from deepmd.pt_expt.utils.env import DEVICE
 
@@ -23,9 +28,9 @@ from deepmd_lr.nvalchemi import (
     partition_system,
     to_numpy,
 )
-from deepmd_lr.nvalchemi.partition import default_skin
+from deepmd_lr.nvalchemi.partition import default_skin, whole_system
 
-from .test_joint_model import build, frame
+from .test_joint_model import DESCRIPTOR, FITTING, LONG_RANGE, build, frame, get_model
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="the model runs on GPU"
@@ -50,6 +55,47 @@ def system():
 
 
 class TestPartitioner:
+    @pytest.mark.parametrize("whole", [False, True])
+    def test_late_views_follow_the_latest_cell(self, system, whole):
+        coord, _, cell, *_ = system
+        part = (
+            whole_system(len(coord), True, cell)
+            if whole
+            else partition_system(coord + cell[0], cell, RCUT, 2)[0]
+        )
+        early = part.views(DEVICE, torch.float32)
+        h = torch.as_tensor(cell * 1.0017, device=DEVICE)
+        part.set_cell_device(h)
+        for view in (early, part.views(DEVICE)):
+            for shift, image in (
+                ("shift", "ghost_image"),
+                ("owned_shift", "owned_image"),
+            ):
+                torch.testing.assert_close(
+                    view[shift], view[image] @ h.to(view[shift].dtype)
+                )
+            if whole:
+                torch.testing.assert_close(view["cell"], h[None], rtol=0, atol=0)
+        # A host update supersedes the previous device cell, including for
+        # views first requested afterwards on another device.
+        new_cell = cell * 1.0023
+        part.set_cell(new_cell)
+        late = part.views("cpu")
+        np.testing.assert_allclose(late["shift"], part.ghost_image @ new_cell)
+        if whole:
+            np.testing.assert_array_equal(late["cell"][0], new_cell)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+    def test_a_bare_cuda_device_is_the_current_one(self, system):
+        # `devices=["cuda"]` used to fail the list's device check against
+        # the views' `cuda:0`.
+        coord, atype, cell, *_ = system
+        ev = DistributedEvaluator(
+            build(), atype, cell, devices=["cuda"], memory_headroom=None
+        )
+        assert ev.devices == [f"cuda:{torch.cuda.current_device()}"]
+        ev(coord)
+
     def test_owned_sets_tile_the_system(self, system):
         """Every atom owned exactly once -- no gaps, no duplicates."""
         coord, _, cell, *_ = system
@@ -73,12 +119,9 @@ class TestPartitioner:
                 delta = (frac - np.round(frac)) @ cell
                 within = np.flatnonzero(np.linalg.norm(delta, axis=1) < RCUT)
                 for neighbour in within:
-                    separation = np.linalg.norm(
-                        nodes - coord[atom], axis=1
-                    )
+                    separation = np.linalg.norm(nodes - coord[atom], axis=1)
                     present = np.any(
-                        (separation < RCUT + 1e-6)
-                        & (part.global_ids() == neighbour)
+                        (separation < RCUT + 1e-6) & (part.global_ids() == neighbour)
                     )
                     assert present, (
                         f"atom {neighbour} is within rcut of owned atom "
@@ -146,6 +189,12 @@ class TestHaloMatchesABallQuery:
         from scipy.spatial import cKDTree
 
         mine = partition_system(coord, cell, rcut, parts, pbc, skin=skin)
+        # The definition applies to the atoms folded into the cell: an image of
+        # an atom is the same atom however far it has wandered, and the nodes
+        # are then expressed back relative to the coordinates handed in.
+        n = np.where(np.asarray(pbc), np.floor(coord @ np.linalg.inv(cell)), 0.0)
+        fold = n @ cell
+        coord = coord - fold
         halo = rcut + skin
         volume = abs(np.linalg.det(cell))
         ranges = []
@@ -169,14 +218,25 @@ class TestHaloMatchesABallQuery:
             )
             ghosts = cand[~self_copy]
             np.testing.assert_array_equal(part.ghost, atom[ghosts])
-            np.testing.assert_array_equal(part.ghost_shift, shift[ghosts])
+            np.testing.assert_array_equal(
+                part.ghost_shift, shift[ghosts] - fold[atom[ghosts]]
+            )
+            np.testing.assert_array_equal(part.owned_shift, -fold[part.owned])
 
     @pytest.mark.parametrize("parts", [1, 2, 3])
     @pytest.mark.parametrize("skin", [0.0, 2.0])
     def test_periodic_box(self, system, parts, skin):
         coord, _atype, cell, *_ = system
-        self.reference(np.asarray(coord), np.asarray(cell), RCUT, parts,
-                       (True, True, True), skin)
+        self.reference(
+            np.asarray(coord), np.asarray(cell), RCUT, parts, (True, True, True), skin
+        )
+
+    @pytest.mark.parametrize("parts", [1, 2, 3])
+    def test_unwrapped_box(self, system, parts):
+        """Atoms several cell lengths out, as an integrator leaves them."""
+        coord, _atype, cell, *_ = system
+        moved = TestUnwrappedCoordinates.shifted(np.asarray(coord), np.asarray(cell))
+        self.reference(moved, np.asarray(cell), RCUT, parts, (True, True, True), 2.0)
 
     def test_unwrapped_drifted_coordinates(self, system):
         """MD positions leave the cell; the bounding box must follow them."""
@@ -196,8 +256,9 @@ class TestHaloMatchesABallQuery:
 
     def test_non_periodic_axis(self, system):
         coord, _atype, cell, *_ = system
-        self.reference(np.asarray(coord), np.asarray(cell), RCUT, 2,
-                       (True, True, False), 1.0)
+        self.reference(
+            np.asarray(coord), np.asarray(cell), RCUT, 2, (True, True, False), 1.0
+        )
 
 
 class TestPartitionCountInvariance:
@@ -228,17 +289,18 @@ class TestPartitionCountInvariance:
         d_energy, d_force = self._noise_floor(model, coord_t, atype_t, cell_t)
 
         for n in PARTITION_COUNTS:
-            out = to_numpy(evaluate_partitioned(
-                model, coord, atype, cell, n_partitions=n, devices=[DEVICE] * n
-            ))
-            assert abs(out["energy"] - energy_ref) <= max(d_energy * 10, 1e-9), (
-                f"{n} partitions: energy off by "
-                f"{abs(out['energy'] - energy_ref):.3e}"
+            out = to_numpy(
+                evaluate_partitioned(
+                    model, coord, atype, cell, n_partitions=n, devices=[DEVICE] * n
+                )
             )
-            assert np.abs(out["force"] - force_ref).max() <= max(
-                d_force * 10, 1e-9
-            ), f"{n} partitions: force off by " \
-               f"{np.abs(out['force'] - force_ref).max():.3e}"
+            assert abs(out["energy"] - energy_ref) <= max(d_energy * 10, 1e-9), (
+                f"{n} partitions: energy off by {abs(out['energy'] - energy_ref):.3e}"
+            )
+            assert np.abs(out["force"] - force_ref).max() <= max(d_force * 10, 1e-9), (
+                f"{n} partitions: force off by "
+                f"{np.abs(out['force'] - force_ref).max():.3e}"
+            )
 
     def test_atom_energies_match_serial(self, system):
         """Per-atom, not just the total -- a total can hide compensating errors."""
@@ -252,18 +314,22 @@ class TestPartitionCountInvariance:
             .cpu()
             .numpy()
         )
-        out = to_numpy(evaluate_partitioned(
-            model, coord, atype, cell, n_partitions=4, devices=[DEVICE] * 4
-        ))
+        out = to_numpy(
+            evaluate_partitioned(
+                model, coord, atype, cell, n_partitions=4, devices=[DEVICE] * 4
+            )
+        )
         assert np.abs(out["atom_energy"] - reference).max() < 1e-8
 
     def test_rejects_device_count_mismatch(self, system):
         coord, atype, cell, *_ = system
         model = build(long_range=False)
         with pytest.raises(ValueError, match="one device per partition"):
-            to_numpy(evaluate_partitioned(
-                model, coord, atype, cell, n_partitions=4, devices=[DEVICE]
-            ))
+            to_numpy(
+                evaluate_partitioned(
+                    model, coord, atype, cell, n_partitions=4, devices=[DEVICE]
+                )
+            )
 
 
 class TestSkinDefault:
@@ -350,6 +416,10 @@ class TestSkinIsFittedToMemory:
     on this machine. So the first evaluation is a probe at the floor skin, and
     the skin the rest of the run uses is the largest one whose extrapolated
     footprint fits the budget -- never more than the geometry rule asks for.
+
+    Halo semantics, so two partitions of one device: on one device the GPU
+    list has no halo, the node count is the atom count whatever the skin, and
+    the probe does not run.
     """
 
     @pytest.fixture(scope="class")
@@ -369,11 +439,11 @@ class TestSkinIsFittedToMemory:
         from deepmd_lr.nvalchemi.evaluator import MIN_AUTO_SKIN
 
         coord, atype, cell, *_ = system
-        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE])
+        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE] * 2)
         assert ev.skin == pytest.approx(MIN_AUTO_SKIN)
         ev(coord)
         # This device has room to spare, so the geometry rule still decides.
-        assert ev.skin == pytest.approx(default_skin(cell, ev._rcut, 1))
+        assert ev.skin == pytest.approx(default_skin(cell, ev._rcut, 2))
         assert ev.bytes_per_node is not None and ev.bytes_per_node > 0
         rebuilds = ev.rebuild_count
         ev(coord)
@@ -384,12 +454,12 @@ class TestSkinIsFittedToMemory:
 
         coord, atype, cell, *_ = system
         ev = DistributedEvaluator(
-            model, atype, cell, devices=[DEVICE], memory_headroom=1e-6
+            model, atype, cell, devices=[DEVICE] * 2, memory_headroom=1e-6
         )
         with pytest.warns(RuntimeWarning, match="does not fit"):
             ev(coord)
         assert ev.skin == pytest.approx(MIN_AUTO_SKIN)
-        assert ev.skin < default_skin(cell, ev._rcut, 1)
+        assert ev.skin < default_skin(cell, ev._rcut, 2)
 
     def test_the_fitted_skin_is_the_arithmetic_it_claims(
         self, system, model, monkeypatch
@@ -405,44 +475,44 @@ class TestSkinIsFittedToMemory:
         peak, free = 8 * 2**30, 20 * 2**30
         headroom = 0.8
         ev = DistributedEvaluator(
-            model, atype, cell, devices=[DEVICE], memory_headroom=headroom
+            model, atype, cell, devices=[DEVICE] * 2, memory_headroom=headroom
         )
         self._pin_memory(monkeypatch, peak=peak, free=free)
         ev(coord)
         ratio = headroom * free / peak
         expected = min(
-            skin_for_node_ratio(cell, ev._rcut, 1, ratio, skin_from=MIN_AUTO_SKIN),
-            default_skin(cell, ev._rcut, 1),
+            skin_for_node_ratio(cell, ev._rcut, 2, ratio, skin_from=MIN_AUTO_SKIN),
+            default_skin(cell, ev._rcut, 2),
         )
         assert ev.skin == pytest.approx(expected, rel=1e-6)
         # and the prediction that skin encodes: at most `ratio` times the
         # nodes the probe actually counted.
-        got = halo_node_ratio(cell, ev._rcut, 1, ev.skin, MIN_AUTO_SKIN)
+        got = halo_node_ratio(cell, ev._rcut, 2, ev.skin, MIN_AUTO_SKIN)
         assert got <= ratio + 1e-9
 
     def test_a_tight_budget_binds_before_the_geometry_rule(
         self, system, model, monkeypatch
     ):
         coord, atype, cell, *_ = system
-        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE])
+        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE] * 2)
         self._pin_memory(monkeypatch, peak=8 * 2**30, free=int(8.5 * 2**30))
         with pytest.warns(RuntimeWarning, match="does not fit"):
             ev(coord)
-        assert ev.skin < default_skin(cell, ev._rcut, 1)
+        assert ev.skin < default_skin(cell, ev._rcut, 2)
 
     def test_none_skips_the_probe_entirely(self, system, model):
         coord, atype, cell, *_ = system
         ev = DistributedEvaluator(
-            model, atype, cell, devices=[DEVICE], memory_headroom=None
+            model, atype, cell, devices=[DEVICE] * 2, memory_headroom=None
         )
-        assert ev.skin == pytest.approx(default_skin(cell, ev._rcut, 1))
+        assert ev.skin == pytest.approx(default_skin(cell, ev._rcut, 2))
         ev(coord)
         assert ev.bytes_per_node is None
-        assert ev.skin == pytest.approx(default_skin(cell, ev._rcut, 1))
+        assert ev.skin == pytest.approx(default_skin(cell, ev._rcut, 2))
 
     def test_an_explicit_skin_is_never_probed(self, system, model):
         coord, atype, cell, *_ = system
-        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE], skin=2.5)
+        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE] * 2, skin=2.5)
         assert ev.skin == 2.5
         ev(coord)
         assert ev.skin == 2.5
@@ -452,11 +522,11 @@ class TestSkinIsFittedToMemory:
         """A halo only has to cover the cutoff; its thickness is a cost knob."""
         coord, atype, cell, *_ = system
         plain = DistributedEvaluator(
-            model, atype, cell, devices=[DEVICE], memory_headroom=None
+            model, atype, cell, devices=[DEVICE] * 2, memory_headroom=None
         )
         want_e, want_f = plain(coord)
         want_f = want_f.clone()
-        probed = DistributedEvaluator(model, atype, cell, devices=[DEVICE])
+        probed = DistributedEvaluator(model, atype, cell, devices=[DEVICE] * 2)
         probed(coord)
         energy, forces = probed(coord)
         assert energy == pytest.approx(want_e, abs=1e-9)
@@ -469,7 +539,7 @@ class TestSkinIsFittedToMemory:
         for bad in (0.0, -0.5, 1.5):
             with pytest.raises(ValueError, match="memory_headroom"):
                 DistributedEvaluator(
-                    model, atype, cell, devices=[DEVICE], memory_headroom=bad
+                    model, atype, cell, devices=[DEVICE] * 2, memory_headroom=bad
                 )
 
 
@@ -482,6 +552,9 @@ class TestSkinBacksOffWhenMemoryRunsOut:
     difference between running and an out-of-memory, where the old fixed 1 A
     skin fitted. Predicting the footprint means guessing bytes per node for a
     model this class never inspects; reacting to it does not.
+
+    Two partitions of one device: on one device there is no halo to give
+    back, and an out-of-memory is raised as it is.
     """
 
     @pytest.fixture(scope="class")
@@ -512,13 +585,13 @@ class TestSkinBacksOffWhenMemoryRunsOut:
     ):
         coord, atype, cell, *_ = system
         reference = DistributedEvaluator(
-            model, atype, cell, devices=[DEVICE], memory_headroom=None
+            model, atype, cell, devices=[DEVICE] * 2, memory_headroom=None
         )
         want_energy, want_forces = reference(coord)
         want_forces = want_forces.clone()
 
         ev = DistributedEvaluator(
-            model, atype, cell, devices=[DEVICE], memory_headroom=None
+            model, atype, cell, devices=[DEVICE] * 2, memory_headroom=None
         )
         before = ev.skin
         self._fail_n_times(monkeypatch, 1)
@@ -534,7 +607,7 @@ class TestSkinBacksOffWhenMemoryRunsOut:
     def test_it_keeps_halving_until_it_fits(self, system, model, monkeypatch):
         coord, atype, cell, *_ = system
         ev = DistributedEvaluator(
-            model, atype, cell, devices=[DEVICE], memory_headroom=None
+            model, atype, cell, devices=[DEVICE] * 2, memory_headroom=None
         )
         before = ev.skin
         self._fail_n_times(monkeypatch, 3)
@@ -547,7 +620,7 @@ class TestSkinBacksOffWhenMemoryRunsOut:
         """`set_cell` re-runs the geometry rule, which must not climb back."""
         coord, atype, cell, *_ = system
         ev = DistributedEvaluator(
-            model, atype, cell, devices=[DEVICE], memory_headroom=None
+            model, atype, cell, devices=[DEVICE] * 2, memory_headroom=None
         )
         self._fail_n_times(monkeypatch, 1)
         with pytest.warns(RuntimeWarning):
@@ -555,13 +628,13 @@ class TestSkinBacksOffWhenMemoryRunsOut:
         capped = ev.skin
         ev.set_cell(cell * 2.0)
         assert ev.skin == pytest.approx(capped)
-        assert default_skin(cell * 2.0, ev._rcut, 1) > capped
+        assert default_skin(cell * 2.0, ev._rcut, 2) > capped
 
     def test_an_explicit_skin_is_the_callers_and_is_not_touched(
         self, system, model, monkeypatch
     ):
         coord, atype, cell, *_ = system
-        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE], skin=2.5)
+        ev = DistributedEvaluator(model, atype, cell, devices=[DEVICE] * 2, skin=2.5)
         self._fail_n_times(monkeypatch, 1)
         with pytest.raises(torch.cuda.OutOfMemoryError):
             ev(coord)
@@ -576,7 +649,7 @@ class TestSkinBacksOffWhenMemoryRunsOut:
 
         coord, atype, cell, *_ = system
         ev = DistributedEvaluator(
-            model, atype, cell, devices=[DEVICE], memory_headroom=None
+            model, atype, cell, devices=[DEVICE] * 2, memory_headroom=None
         )
         self._fail_n_times(monkeypatch, 10**6)
         with (
@@ -589,7 +662,7 @@ class TestSkinBacksOffWhenMemoryRunsOut:
     def test_any_other_failure_is_not_swallowed(self, system, model, monkeypatch):
         coord, atype, cell, *_ = system
         ev = DistributedEvaluator(
-            model, atype, cell, devices=[DEVICE], memory_headroom=None
+            model, atype, cell, devices=[DEVICE] * 2, memory_headroom=None
         )
         before = ev.skin
         self._fail_n_times(monkeypatch, 1, error=ValueError("not a memory problem"))
@@ -604,7 +677,7 @@ class TestSkinBacksOffWhenMemoryRunsOut:
         """warp and the allocator behind the search raise a bare RuntimeError."""
         coord, atype, cell, *_ = system
         ev = DistributedEvaluator(
-            model, atype, cell, devices=[DEVICE], memory_headroom=None
+            model, atype, cell, devices=[DEVICE] * 2, memory_headroom=None
         )
         self._fail_n_times(
             monkeypatch, 1, error=RuntimeError("Failed to allocate 4 GiB on cuda:0")
@@ -634,12 +707,25 @@ class TestGatherIsOnTheDevice:
     def test_results_are_tensors_on_the_gather_device(self, system, model):
         coord, atype, cell, *_ = system
         out = evaluate_partitioned(
-            model, coord, atype, cell, n_partitions=2,
-            devices=[DEVICE] * 2, compute_born=True, compute_virial=False,
+            model,
+            coord,
+            atype,
+            cell,
+            n_partitions=2,
+            devices=[DEVICE] * 2,
+            compute_born=True,
+            compute_virial=False,
         )
         expected = torch.device(DEVICE)
-        for key in ("force", "atom_energy", "charge", "born_charge",
-                    "force_long_range", "force_charge_response", "dE_dq"):
+        for key in (
+            "force",
+            "atom_energy",
+            "charge",
+            "born_charge",
+            "force_long_range",
+            "force_charge_response",
+            "dE_dq",
+        ):
             value = out[key]
             assert isinstance(value, torch.Tensor), f"{key} is {type(value).__name__}"
             assert value.device.type == expected.type, f"{key} on {value.device}"
@@ -667,8 +753,13 @@ class TestGatherIsOnTheDevice:
         monkeypatch.setattr(real_np.add, "at", refuse)
         coord, atype, cell, *_ = system
         out = evaluate_partitioned(
-            model, coord, atype, cell, n_partitions=2,
-            devices=[DEVICE] * 2, compute_born=True,
+            model,
+            coord,
+            atype,
+            cell,
+            n_partitions=2,
+            devices=[DEVICE] * 2,
+            compute_born=True,
         )
         assert torch.isfinite(out["force"]).all()
 
@@ -697,9 +788,11 @@ class TestGatheredLongRange:
         coord, atype, cell, *_ = system
         model, serial = joint
         reference = serial["charge"].reshape(-1).detach().cpu().numpy()
-        out = to_numpy(evaluate_partitioned(
-            model, coord, atype, cell, n_partitions=n, devices=[DEVICE] * n
-        ))
+        out = to_numpy(
+            evaluate_partitioned(
+                model, coord, atype, cell, n_partitions=n, devices=[DEVICE] * n
+            )
+        )
         assert np.abs(out["charge"] - reference).max() < 1e-12
 
     @pytest.mark.parametrize("n", PARTITION_COUNTS)
@@ -707,9 +800,11 @@ class TestGatheredLongRange:
         """The constraint is global; a per-partition projection would break it."""
         coord, atype, cell, *_ = system
         model, _ = joint
-        out = to_numpy(evaluate_partitioned(
-            model, coord, atype, cell, n_partitions=n, devices=[DEVICE] * n
-        ))
+        out = to_numpy(
+            evaluate_partitioned(
+                model, coord, atype, cell, n_partitions=n, devices=[DEVICE] * n
+            )
+        )
         assert abs(out["charge"].sum()) < 1e-10
 
     @pytest.mark.parametrize("n", PARTITION_COUNTS)
@@ -717,9 +812,11 @@ class TestGatheredLongRange:
         coord, atype, cell, *_ = system
         model, serial = joint
         reference = float(serial["energy_long_range"].reshape(-1)[0])
-        out = to_numpy(evaluate_partitioned(
-            model, coord, atype, cell, n_partitions=n, devices=[DEVICE] * n
-        ))
+        out = to_numpy(
+            evaluate_partitioned(
+                model, coord, atype, cell, n_partitions=n, devices=[DEVICE] * n
+            )
+        )
         assert abs(out["energy_long_range"] - reference) < 1e-10
 
     def test_direct_long_range_force_matches_serial(self, system, joint):
@@ -729,12 +826,12 @@ class TestGatheredLongRange:
         frozen = serial["charge"].detach()
         positions = coord_t.clone().requires_grad_(True)
         energy = model.long_range_energy(positions, frozen, cell_t).sum()
-        reference = (
-            -torch.autograd.grad(energy, positions)[0][0].cpu().numpy()
+        reference = -torch.autograd.grad(energy, positions)[0][0].cpu().numpy()
+        out = to_numpy(
+            evaluate_partitioned(
+                model, coord, atype, cell, n_partitions=4, devices=[DEVICE] * 4
+            )
         )
-        out = to_numpy(evaluate_partitioned(
-            model, coord, atype, cell, n_partitions=4, devices=[DEVICE] * 4
-        ))
         assert np.abs(out["force_long_range"] - reference).max() < 1e-12
 
     def test_charge_gradient_is_available_and_nonzero(self, system, joint):
@@ -742,9 +839,11 @@ class TestGatheredLongRange:
         what keeps the autograd graph on a single device."""
         coord, atype, cell, *_ = system
         model, _ = joint
-        out = to_numpy(evaluate_partitioned(
-            model, coord, atype, cell, n_partitions=4, devices=[DEVICE] * 4
-        ))
+        out = to_numpy(
+            evaluate_partitioned(
+                model, coord, atype, cell, n_partitions=4, devices=[DEVICE] * 4
+            )
+        )
         assert out["dE_dq"].shape == (len(coord),)
         assert np.isfinite(out["dE_dq"]).all()
         assert np.abs(out["dE_dq"]).max() > 1e-6
@@ -760,9 +859,11 @@ class TestGatheredLongRange:
         coord, atype, cell, *_ = system
         model, serial = joint
         reference = serial["force"][0].detach().cpu().numpy()
-        out = to_numpy(evaluate_partitioned(
-            model, coord, atype, cell, n_partitions=n, devices=[DEVICE] * n
-        ))
+        out = to_numpy(
+            evaluate_partitioned(
+                model, coord, atype, cell, n_partitions=n, devices=[DEVICE] * n
+            )
+        )
         assert np.abs(out["force"] - reference).max() < 1e-12
 
     def test_charge_response_dominates_the_direct_term(self, system, joint):
@@ -774,9 +875,11 @@ class TestGatheredLongRange:
         """
         coord, atype, cell, *_ = system
         model, _ = joint
-        out = to_numpy(evaluate_partitioned(
-            model, coord, atype, cell, n_partitions=4, devices=[DEVICE] * 4
-        ))
+        out = to_numpy(
+            evaluate_partitioned(
+                model, coord, atype, cell, n_partitions=4, devices=[DEVICE] * 4
+            )
+        )
         response = np.sqrt((out["force_charge_response"] ** 2).mean())
         direct = np.sqrt((out["force_long_range"] ** 2).mean())
         assert response > direct
@@ -796,14 +899,22 @@ class TestGatheredLongRange:
         model, _ = joint
 
         def energy(positions):
-            return to_numpy(evaluate_partitioned(
-                model, positions, atype, cell,
-                n_partitions=n, devices=[DEVICE] * n,
-            ))["energy"]
+            return to_numpy(
+                evaluate_partitioned(
+                    model,
+                    positions,
+                    atype,
+                    cell,
+                    n_partitions=n,
+                    devices=[DEVICE] * n,
+                )
+            )["energy"]
 
-        force = to_numpy(evaluate_partitioned(
-            model, coord, atype, cell, n_partitions=n, devices=[DEVICE] * n
-        ))["force"]
+        force = to_numpy(
+            evaluate_partitioned(
+                model, coord, atype, cell, n_partitions=n, devices=[DEVICE] * n
+            )
+        )["force"]
 
         step = 1e-5
         for atom in range(0, len(coord), 11):
@@ -813,7 +924,6 @@ class TestGatheredLongRange:
                 minus[atom, axis] -= step
                 numeric = -(energy(plus) - energy(minus)) / (2 * step)
                 assert abs(numeric - force[atom, axis]) < 1e-6
-
 
     @pytest.mark.parametrize("n", [1, 2, 4])
     def test_assembled_virial_is_the_strain_derivative(self, system, joint, n):
@@ -834,15 +944,28 @@ class TestGatheredLongRange:
         model, _ = joint
 
         def energy(positions, box):
-            return to_numpy(evaluate_partitioned(
-                model, positions, atype, box,
-                n_partitions=n, devices=[DEVICE] * n,
-            ))["energy"]
+            return to_numpy(
+                evaluate_partitioned(
+                    model,
+                    positions,
+                    atype,
+                    box,
+                    n_partitions=n,
+                    devices=[DEVICE] * n,
+                )
+            )["energy"]
 
-        analytic = to_numpy(evaluate_partitioned(
-            model, coord, atype, cell,
-            n_partitions=n, devices=[DEVICE] * n, compute_virial=True,
-        ))["virial"]
+        analytic = to_numpy(
+            evaluate_partitioned(
+                model,
+                coord,
+                atype,
+                cell,
+                n_partitions=n,
+                devices=[DEVICE] * n,
+                compute_virial=True,
+            )
+        )["virial"]
 
         step = 1e-5
         numeric = np.zeros((3, 3))
@@ -850,13 +973,11 @@ class TestGatheredLongRange:
             for j in range(3):
                 delta = np.zeros((3, 3))
                 delta[i, j] = step
-                delta = 0.5 * (delta + delta.T)      # symmetric strain
+                delta = 0.5 * (delta + delta.T)  # symmetric strain
                 energies = []
                 for sign in (1.0, -1.0):
                     strain = np.eye(3) + sign * delta
-                    energies.append(
-                        energy(coord @ strain.T, cell @ strain.T)
-                    )
+                    energies.append(energy(coord @ strain.T, cell @ strain.T))
                 numeric[i, j] = -(energies[0] - energies[1]) / (2 * step)
 
         worst = float(np.abs(analytic - numeric).max())
@@ -935,9 +1056,7 @@ class TestDistributedEvaluator:
         _, reused = driver(moved)
         fresh = self._driver(model, system, skin=1.0)
         _, rebuilt = fresh(moved)
-        assert np.abs(
-            reused.cpu().numpy() - rebuilt.cpu().numpy()
-        ).max() < 1e-8
+        assert np.abs(reused.cpu().numpy() - rebuilt.cpu().numpy()).max() < 1e-8
 
     def test_forcing_a_rebuild_every_call_changes_nothing(self, model, system):
         """Caching must be an optimisation, not a physics knob."""
@@ -1048,13 +1167,9 @@ class TestDistributedEvaluator:
             system[0], dtype=torch.float64, device=DEVICE
         ).contiguous()
         velocities = torch.zeros_like(positions)
-        masses = torch.tensor(
-            driver.masses(), dtype=torch.float64, device=DEVICE
-        )
+        masses = torch.tensor(driver.masses(), dtype=torch.float64, device=DEVICE)
         # ASE's unit system: angstrom, eV, amu, time in A sqrt(amu/eV).
-        dt = torch.tensor(
-            [0.25 * ase_units.fs], dtype=torch.float64, device=DEVICE
-        )
+        dt = torch.tensor([0.25 * ase_units.fs], dtype=torch.float64, device=DEVICE)
 
         energy, forces = driver(positions)
         vec = lambda t: wp.from_torch(t, dtype=wp.vec3d)  # noqa: E731
@@ -1064,17 +1179,267 @@ class TestDistributedEvaluator:
         start = energy + kinetic()
         for _ in range(20):
             velocity_verlet_position_update(
-                vec(positions), vec(velocities), vec(forces),
-                wp.from_torch(masses), wp.from_torch(dt),
+                vec(positions),
+                vec(velocities),
+                vec(forces),
+                wp.from_torch(masses),
+                wp.from_torch(dt),
             )
             energy, forces = driver(positions)
             velocity_verlet_velocity_finalize(
-                vec(velocities), vec(forces),
-                wp.from_torch(masses), wp.from_torch(dt),
+                vec(velocities),
+                vec(forces),
+                wp.from_torch(masses),
+                wp.from_torch(dt),
             )
             wp.synchronize()
         drift = abs(energy + kinetic() - start) / driver.n_atoms * 1000
         assert drift < 1.0, f"drift {drift:.4f} meV/atom over 20 steps"
+
+
+class TestLongRangeBoundary:
+    """The system's pbc decides how the long-range sum is taken, and only a
+    term that cannot be adapted is refused. Before either, the partitioned
+    path ran an ``isolated`` term on the periodic water box 1.1 eV off, and a
+    slab term 0.03 eV off, and raised nothing."""
+
+    def test_an_isolated_term_is_refused(self, system):
+        coord, atype, cell, *_ = system
+        model = build()
+        model.set_long_range({"method": "isolated"})
+        with pytest.raises(ValueError, match="ASE calculator"):
+            DistributedEvaluator(model, atype, cell, devices=[DEVICE])
+        with pytest.raises(ValueError, match="does not match the system's pbc"):
+            evaluate_partitioned(model, coord, atype, cell, n_partitions=1)
+
+    def test_a_slab_term_on_a_bulk_cell_takes_the_3d_sum(self, system):
+        coord, atype, cell, *_ = system
+
+        def slab_model():
+            model = build()
+            settings = model.long_range_energy.serialize()
+            settings.update(slab_correction=True, pbc=[True, True, False])
+            model.set_long_range(settings)
+            return model
+
+        ev = DistributedEvaluator(
+            slab_model(), atype, cell, devices=[DEVICE], memory_headroom=None
+        )
+        assert ev.long_range_energy.slab_correction is False
+        assert ev.model.long_range_energy.slab_correction is True  # left alone
+        bulk = DistributedEvaluator(
+            build(), atype, cell, devices=[DEVICE], memory_headroom=None
+        )
+        (e, f), (e_ref, f_ref) = ev(coord), bulk(coord)
+        assert e == pytest.approx(e_ref, abs=1e-9)
+        np.testing.assert_allclose(f.cpu().numpy(), f_ref.cpu().numpy(), atol=1e-9)
+        # The functional API adapts nothing, so there the mismatch is refused.
+        with pytest.raises(ValueError, match="does not match the system's pbc"):
+            evaluate_partitioned(slab_model(), coord, atype, cell, n_partitions=1)
+
+
+def slab(n_mol=16, box=14.0, vacuum=20.0):
+    """The fixture's molecules as a slab: a periodic xy plane, an open z with
+    `vacuum` of it above the layer, the layer centred."""
+    coord, atype, _ = frame(n_mol=n_mol, box=box)
+    c = coord[0].cpu().numpy().copy()
+    c[:, 2] += vacuum / 2 - c[:, 2].min()
+    height = np.ptp(c[:, 2]) + vacuum
+    return c, atype[0].cpu().numpy(), np.diag([box, box, height])
+
+
+SLAB_PBC = (True, True, False)
+
+
+class TestSlab:
+    """One open axis: no periodic images along it, and the slab form of the
+    long-range sum (Yeh-Berkowitz), whatever the model was trained with."""
+
+    def serial(self, coord, atype, cell):
+        """The unpartitioned model on the same slab. Its descriptor sees the
+        cell as 3D-periodic, which the 20 A gap, far above rcut, makes the
+        same as an open z."""
+        model = build()
+        model.adapt_long_range(cell, SLAB_PBC)
+        out = model(
+            torch.tensor(coord, dtype=torch.float64, device=DEVICE)[None],
+            torch.tensor(atype, device=DEVICE)[None],
+            box=torch.tensor(cell, dtype=torch.float64, device=DEVICE)[None],
+        )
+        energy = float(out["energy"].reshape(-1)[0])
+        return energy, out["force"][0].detach().cpu().numpy()
+
+    @pytest.mark.parametrize("n_part", [1, 2, 4])
+    def test_a_slab_matches_the_serial_model(self, n_part):
+        coord, atype, cell = slab()
+        e_ref, f_ref = self.serial(coord, atype, cell)
+        ev = DistributedEvaluator(
+            build(),
+            atype,
+            cell,
+            devices=[DEVICE] * n_part,
+            pbc=SLAB_PBC,
+            memory_headroom=None,
+        )
+        e, f = ev(coord)
+        assert float(e) == pytest.approx(e_ref, abs=1e-9)
+        np.testing.assert_allclose(f.cpu().numpy(), f_ref, atol=1e-9)
+
+    def test_pbc_switches_the_slab_sum_on(self):
+        coord, atype, cell = slab()
+        ev = DistributedEvaluator(
+            build(), atype, cell, devices=[DEVICE], pbc=SLAB_PBC, memory_headroom=None
+        )
+        term = ev.long_range_energy
+        assert term.slab_correction is True
+        assert term.pbc == SLAB_PBC
+        # The mesh covers the vacuum too: at least ceil(2 alpha L) along z.
+        assert term.mesh_dimensions[2] >= math.ceil(0.8 * cell[2, 2])
+
+    def test_two_partitions_cut_the_plane_not_the_slab(self):
+        coord, atype, cell = slab(n_mol=32)
+        parts = partition_system(coord, cell, 6.0, 2, pbc=SLAB_PBC, skin=1.0)
+        for part in parts:
+            # Each half spans the whole thickness: the cut is in-plane.
+            assert np.ptp(coord[part.owned, 2]) > 0.8 * np.ptp(coord[:, 2])
+
+    def test_an_atom_at_an_open_face_is_refused(self):
+        """Two partitions check on the host at every rebuild, so an atom must
+        stay half a skin inside the face; one device checks on the device at
+        every step, so only an atom actually past the face is refused."""
+        coord, atype, cell = slab()
+        near = coord.copy()
+        near[0, 2] = cell[2, 2] - 0.1  # 0.1 A under the top face
+        ev = DistributedEvaluator(
+            build(),
+            atype,
+            cell,
+            devices=[DEVICE] * 2,
+            pbc=SLAB_PBC,
+            memory_headroom=None,
+        )
+        with pytest.raises(ValueError, match="inside a face"):
+            ev(near)
+        ev = DistributedEvaluator(
+            build(), atype, cell, devices=[DEVICE], pbc=SLAB_PBC, memory_headroom=None
+        )
+        ev(near)  # fine: still inside the cell
+        past = coord.copy()
+        past[0, 2] = cell[2, 2] + 0.1  # 0.1 A above the top face
+        with pytest.raises(ValueError, match="outside the cell along the open axis"):
+            ev(past)
+
+    def test_two_open_axes_are_refused(self):
+        coord, atype, cell = slab()
+        with pytest.raises(ValueError, match="bulk cell and a slab"):
+            DistributedEvaluator(
+                build(), atype, cell, devices=[DEVICE], pbc=(True, False, False)
+            )
+
+
+class TestMeshFollowsTheCell:
+    def test_a_supercell_gets_the_mesh_its_cell_needs(self):
+        """A 2x2x2 supercell is the same periodic system, so it must give the
+        unit cell's energy per atom and its forces. It does only because the
+        mesh doubles with the cell: a stored mesh kept on the bigger cell
+        under-resolves the sum."""
+
+        def model(mesh):
+            m = build()
+            settings = m.long_range_energy.serialize()
+            settings.update(mesh_dimensions=list(mesh), mesh_spacing=None)
+            m.set_long_range(settings)
+            return m
+
+        coord, atype, cell = frame(n_mol=8, box=10.0)
+        c, t, h = coord[0].cpu().numpy(), atype[0].cpu().numpy(), cell[0].cpu().numpy()
+        unit = DistributedEvaluator(
+            model((8, 8, 8)), t, h, devices=[DEVICE], memory_headroom=None
+        )
+        e1, f1 = unit(c)
+        shifts = np.array(
+            [[i, j, k] for i in range(2) for j in range(2) for k in range(2)]
+        )
+        c2 = np.concatenate([c + s @ h for s in shifts])
+        t2, h2 = np.tile(t, len(shifts)), 2.0 * h
+        big = DistributedEvaluator(
+            model((8, 8, 8)), t2, h2, devices=[DEVICE], memory_headroom=None
+        )
+        assert big.long_range_energy.mesh_dimensions == (16, 16, 16)
+        e2, f2 = big(c2)
+        assert float(e2) / len(t2) == pytest.approx(float(e1) / len(t), abs=1e-10)
+        np.testing.assert_allclose(
+            f2.cpu().numpy(), np.tile(f1.cpu().numpy(), (len(shifts), 1)), atol=1e-9
+        )
+
+
+class TestSharedModel:
+    """One model, several evaluators: each builds the term its own cell and
+    boundary need, and leaves the model alone. They used to adapt the model
+    itself. A slab evaluator then broke the bulk one built before it, and a
+    small cell's evaluator silently took a supercell's mesh away."""
+
+    def test_each_evaluator_keeps_its_own_term(self):
+        from deepmd_lr.ase import LongRangeCalculator
+
+        model = build()
+        before = model.long_range_energy.serialize()
+        coord, atype, cell = frame(n_mol=8, box=10.0)
+        c, t, h = coord[0].cpu().numpy(), atype[0].cpu().numpy(), cell[0].cpu().numpy()
+        shifts = np.array(
+            [[i, j, k] for i in range(2) for j in range(2) for k in range(2)]
+        )
+        systems = {
+            "supercell": (
+                np.concatenate([c + s @ h for s in shifts]),
+                np.tile(t, len(shifts)),
+                2.0 * h,
+                (True, True, True),
+            ),
+            "unit": (c, t, h, (True, True, True)),
+            "slab": (*slab(n_mol=8, box=10.0), SLAB_PBC),
+        }
+        evs, first = {}, {}
+        for name, (x, types, box, pbc) in systems.items():
+            evs[name] = DistributedEvaluator(
+                model, types, box, devices=[DEVICE], pbc=pbc, memory_headroom=None
+            )
+            first[name] = float(evs[name](x)[0])
+        assert model.long_range_energy.serialize() == before
+        mesh = {n: ev.long_range_energy.mesh_dimensions for n, ev in evs.items()}
+        assert mesh["supercell"] > mesh["unit"]  # the larger cell needs more
+        assert evs["slab"].long_range_energy.slab_correction is True
+        # An ASE calculator on the same model adapts the model itself, here
+        # to the unit cell's bulk sum; no evaluator notices.
+        atoms = Atoms(numbers=[8, 1, 1] * 8, positions=c, cell=h, pbc=True)
+        atoms.calc = LongRangeCalculator(model)
+        atoms.get_potential_energy()
+        for name, (x, *_rest) in systems.items():
+            assert float(evs[name](x)[0]) == pytest.approx(first[name], abs=1e-9)
+
+    def test_long_range_settings_are_the_evaluators_alone(self):
+        model = build()
+        before = model.long_range_energy.serialize()
+        coord, atype, cell = frame(n_mol=8, box=10.0)
+        t, h = atype[0].cpu().numpy(), cell[0].cpu().numpy()
+        ev = DistributedEvaluator(
+            model,
+            t,
+            h,
+            devices=[DEVICE],
+            memory_headroom=None,
+            long_range={"method": "pme", "mesh_dimensions": [20, 20, 20]},
+        )
+        assert ev.long_range_energy.mesh_dimensions == (20, 20, 20)
+        assert model.long_range_energy.serialize() == before
+        with pytest.raises(ValueError, match="alpha is fixed"):
+            DistributedEvaluator(
+                model,
+                t,
+                h,
+                devices=[DEVICE],
+                long_range={"method": "pme", "alpha": 0.1},
+            )
 
 
 class TestBackboneCapture:
@@ -1091,8 +1456,12 @@ class TestBackboneCapture:
     def _system(n_mol=8):
         model = build()
         coord, atype, cell = frame(n_mol=n_mol)
-        return (model, coord[0].cpu().numpy(), atype[0].cpu().numpy(),
-                cell[0].cpu().numpy())
+        return (
+            model,
+            coord[0].cpu().numpy(),
+            atype[0].cpu().numpy(),
+            cell[0].cpu().numpy(),
+        )
 
     @staticmethod
     def _run(model, c, a, cl, devices, *, force_fallback=False, **kw):
@@ -1104,8 +1473,13 @@ class TestBackboneCapture:
         try:
             ev = DistributedEvaluator(model, a, cl, devices=devices, **kw)
             energy, forces = ev(c)
-            return (float(energy), forces.detach().cpu().numpy().copy(),
-                    ev.results["charge"].copy(), ev.results, ev)
+            return (
+                float(energy),
+                forces.detach().cpu().numpy().copy(),
+                ev.results["charge"].copy(),
+                ev.results,
+                ev,
+            )
         finally:
             DRV._usable_capture = original
 
@@ -1162,3 +1536,470 @@ class TestBackboneCapture:
             model, c, a, cl, [DEVICE] * 2, compute_virial=True, force_fallback=True
         )
         assert np.abs(ev_cap.virial - ev_ref.virial).max() < 1e-10
+
+
+class TestUnwrappedCoordinates:
+    """Integrators never wrap, so no result may depend on which periodic image
+    an atom sits in. The halo used to be built from the raw coordinates with
+    only the +-1 images, so atoms that had diffused out through opposite faces
+    silently lost their neighbours: 1.1 eV/A on water at a spread of L + 12 A,
+    and blow-ups after 5-20 ps. Every check compares with the same atoms
+    wrapped into the cell.
+    """
+
+    KEYS = ("energy", "force", "charge", "born_charge", "virial")
+
+    @pytest.fixture(scope="class")
+    def model(self):
+        m = build(long_range=True)
+        m.eval()
+        return m
+
+    @staticmethod
+    def shifted(coord, cell, n_moved=12, seed=0, reach=3):
+        """Random atoms moved by random lattice vectors, up to `reach` cells."""
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(len(coord), n_moved, replace=False)
+        out = np.array(coord, dtype=np.float64, copy=True)
+        out[idx] += rng.integers(-reach, reach + 1, size=(n_moved, 3)) @ cell
+        return out
+
+    def evaluate(self, model, coord, atype, cell, n):
+        return to_numpy(
+            evaluate_partitioned(
+                model,
+                coord,
+                atype,
+                cell,
+                n_partitions=n,
+                devices=[DEVICE] * n,
+                compute_born=True,
+                compute_virial=True,
+            )
+        )
+
+    def assert_same(self, got, want):
+        for key in self.KEYS:
+            np.testing.assert_allclose(got[key], want[key], atol=1e-9, err_msg=key)
+
+    @pytest.mark.parametrize("n", PARTITION_COUNTS)
+    def test_lattice_shifts_change_nothing(self, system, model, n):
+        coord, atype, cell, *_ = system
+        want = self.evaluate(model, coord, atype, cell, n)
+        got = self.evaluate(model, self.shifted(coord, cell), atype, cell, n)
+        self.assert_same(got, want)
+
+    def test_the_evaluator_is_indifferent_to_images(self, system, model):
+        coord, atype, cell, *_ = system
+        results = []
+        for positions in (coord, self.shifted(coord, cell)):
+            ev = DistributedEvaluator(
+                model,
+                atype,
+                cell,
+                devices=[DEVICE] * 2,
+                compute_born=True,
+                compute_virial=True,
+                memory_headroom=None,
+            )
+            energy, forces = ev(torch.as_tensor(positions, device=DEVICE))
+            results.append(
+                (
+                    energy,
+                    forces.cpu().numpy().copy(),
+                    ev.virial.copy(),
+                    np.asarray(ev.results["born_charge"]).copy(),
+                )
+            )
+        (e0, f0, v0, z0), (e1, f1, v1, z1) = results
+        assert e1 == pytest.approx(e0, abs=1e-9)
+        np.testing.assert_allclose(f1, f0, atol=1e-9)
+        np.testing.assert_allclose(v1, v0, atol=1e-9)
+        np.testing.assert_allclose(z1, z0, atol=1e-9)
+
+    @pytest.mark.parametrize("spread", [6.0, 8.0, 10.0, 12.0])
+    def test_a_two_sided_spread(self, system, model, spread):
+        """Atoms near x = 0 leave through +x and atoms near x = L through -x,
+        so the unwrapped cloud spans L + spread along x."""
+        coord, atype, cell, *_ = system
+        length = cell[0, 0]
+        moved = np.array(coord, copy=True)
+        moved[coord[:, 0] < spread / 2, 0] += length
+        moved[coord[:, 0] > length - spread / 2, 0] -= length
+        assert np.ptp(moved[:, 0]) > length + spread - 2.0
+        for n in (1, 2):
+            self.assert_same(
+                self.evaluate(model, moved, atype, cell, n),
+                self.evaluate(model, coord, atype, cell, n),
+            )
+
+    def test_the_serial_model_is_indifferent_to_images(self, system, model):
+        """The serial path (the ASE calculator, training) never had the bug:
+        DeePMD-kit's own neighbour builder wraps. Pinned so an upgrade that
+        stops doing so is caught here rather than in a trajectory."""
+        coord, _atype, cell, coord_t, atype_t, cell_t = system
+        moved = torch.as_tensor(
+            self.shifted(coord, cell), dtype=coord_t.dtype, device=coord_t.device
+        ).unsqueeze(0)
+        want = model(coord_t, atype_t, box=cell_t)
+        got = model(moved, atype_t, box=cell_t)
+        for key in ("energy", "force", "charge", "virial"):
+            torch.testing.assert_close(got[key], want[key], atol=1e-9, rtol=0, msg=key)
+
+    def test_crossing_a_face_between_rebuilds(self, system, model):
+        """An atom walks out through a face while the partitioning is reused:
+        every step must match a fresh evaluation of the wrapped positions."""
+        coord, atype, cell, *_ = system
+        ev = DistributedEvaluator(
+            model, atype, cell, devices=[DEVICE] * 2, skin=3.0, memory_headroom=None
+        )
+        walk = np.array(coord, copy=True)
+        i = int(np.argmax(walk[:, 0]))
+        ev(torch.as_tensor(walk, device=DEVICE))
+        rebuilds = ev.rebuild_count
+        for _ in range(7):
+            walk[i, 0] += 0.2
+            energy, forces = ev(torch.as_tensor(walk, device=DEVICE))
+            wrapped = walk.copy()
+            wrapped[i] -= np.floor(wrapped[i] @ np.linalg.inv(cell)) @ cell
+            want = self.evaluate(model, wrapped, atype, cell, 1)
+            assert energy == pytest.approx(want["energy"], abs=1e-9)
+            np.testing.assert_allclose(forces.cpu().numpy(), want["force"], atol=1e-9)
+        assert walk[i, 0] > cell[0, 0], "the walk never crossed the face"
+        assert ev.rebuild_count == rebuilds, "the walk was meant to reuse the halo"
+
+    def test_a_lattice_jump_forces_a_rebuild(self, system, model):
+        """The Verlet check uses raw displacement on purpose: a caller that
+        wraps an atom moves it by a lattice vector, and the halo built around
+        its old image must not be reused."""
+        coord, atype, cell, *_ = system
+        ev = DistributedEvaluator(
+            model, atype, cell, devices=[DEVICE] * 2, skin=2.0, memory_headroom=None
+        )
+        e0, _ = ev(torch.as_tensor(coord, device=DEVICE))
+        rebuilds = ev.rebuild_count
+        jumped = np.array(coord, copy=True)
+        jumped[0] += cell[0]
+        e1, _ = ev(torch.as_tensor(jumped, device=DEVICE))
+        assert ev.rebuild_count == rebuilds + 1
+        assert e1 == pytest.approx(e0, abs=1e-9)
+
+    def test_one_device_is_image_blind(self, system, model):
+        """On one device the list is searched every step in the real cell:
+        lattice jumps change nothing and need no rebuild."""
+        coord, atype, cell, *_ = system
+        ev = DistributedEvaluator(
+            model, atype, cell, devices=[DEVICE], memory_headroom=None
+        )
+        e0, f0 = ev(torch.as_tensor(coord, device=DEVICE))
+        f0 = f0.clone()
+        rebuilds = ev.rebuild_count
+        jumped = self.shifted(coord, cell)
+        e1, f1 = ev(torch.as_tensor(jumped, device=DEVICE))
+        assert ev.rebuild_count == rebuilds
+        assert e1 == pytest.approx(e0, abs=1e-9)
+        np.testing.assert_allclose(f1.cpu().numpy(), f0.cpu().numpy(), atol=1e-9)
+
+    @pytest.mark.skipif(
+        not os.environ.get("DEEPMD_LR_WATER_MODEL"),
+        reason="slow: set DEEPMD_LR_WATER_MODEL to a trained water checkpoint",
+    )
+    def test_a_long_water_run_keeps_exact_forces(self):
+        """25 ps of Langevin water on two partitions, never wrapped. Every
+        500 steps the forces must match a fresh evaluation of the wrapped
+        positions. Water diffuses past L + 12 A within this time, the spread
+        at which the old halo was off by 1.1 eV/A.
+
+        Opt-in: DEEPMD_LR_WATER_MODEL (checkpoint), DEEPMD_LR_WATER_COMPRESS=1
+        (needs the CUDA-operator build), DEEPMD_LR_WATER_STEPS (default 50000).
+        """
+        import pathlib
+
+        from ase import units
+        from ase.md.velocitydistribution import Stationary, thermalize_momenta
+
+        from deepmd_lr.nvalchemi import (
+            Langevin,
+            build_evaluator,
+            read_structure,
+        )
+
+        root = pathlib.Path(__file__).resolve().parents[1]
+        atoms = read_structure(root / "examples" / "06-md_nvalchemi" / "water_192.xyz")
+        compress = os.environ.get("DEEPMD_LR_WATER_COMPRESS") == "1"
+        ev = build_evaluator(
+            os.environ["DEEPMD_LR_WATER_MODEL"],
+            atoms,
+            devices=[DEVICE] * 2,
+            compress=compress,
+        )
+        thermalize_momenta(atoms, temperature_K=300.0, rng=np.random.default_rng(1))
+        Stationary(atoms)
+        md = Langevin(ev, atoms, 0.5 * units.fs, 300.0, friction=0.05, seed=0)
+        cell = np.asarray(ev.cell)
+        inverse = np.linalg.inv(cell)
+        steps = int(os.environ.get("DEEPMD_LR_WATER_STEPS", 50_000))
+        seen = {"worst": 0.0, "spread": 0.0}
+
+        def check():
+            x = md.thermo.positions.numpy()
+            assert np.isfinite(x).all(), f"blew up by step {md.nsteps}"
+            seen["spread"] = max(
+                seen["spread"], float((np.ptp(x, axis=0) - np.diag(cell)).max())
+            )
+            wrapped = x - np.floor(x @ inverse) @ cell
+            fresh = to_numpy(
+                evaluate_partitioned(
+                    ev.model, wrapped, ev.atype, cell, devices=[DEVICE]
+                )
+            )
+            seen["worst"] = max(
+                seen["worst"],
+                float(np.abs(md.thermo.forces.numpy() - fresh["force"]).max()),
+            )
+
+        md.attach(check, 500, sync_atoms=False)
+        md.run(steps)
+        worst, spread = seen["worst"], seen["spread"]
+        print(
+            f"\n  {steps} steps: widest spread L + {spread:.1f} A, "
+            f"worst force difference {worst:.2e} eV/A"
+        )
+        assert spread > 12.0, "the run never reached the regime it guards"
+        assert worst <= 1e-5
+
+
+class TestReusedNeighbourhoods:
+    """Between calls the evaluator reuses the partitions -- across cell
+    changes too. That may not change an answer: every check compares with a
+    fresh evaluation of the same positions and cell, with new partitions and
+    a fresh neighbour search."""
+
+    KEYS = ("energy", "force", "charge", "born_charge", "virial")
+
+    @pytest.fixture(scope="class")
+    def model(self):
+        m = build(long_range=True)
+        m.eval()
+        return m
+
+    @staticmethod
+    def fresh(model, coord, atype, cell, n):
+        return to_numpy(
+            evaluate_partitioned(
+                model,
+                coord,
+                atype,
+                cell,
+                n_partitions=n,
+                devices=[DEVICE] * n,
+                compute_born=True,
+                compute_virial=True,
+            )
+        )
+
+    @staticmethod
+    def reused(ev, coord):
+        energy, forces = ev(torch.as_tensor(coord, device=DEVICE))
+        return {
+            "energy": energy,
+            "force": forces.cpu().numpy().copy(),
+            "charge": np.asarray(ev.results["charge"]).copy(),
+            "born_charge": np.asarray(ev.results["born_charge"]).copy(),
+            "virial": ev.virial.copy(),
+        }
+
+    def assert_same(self, got, want):
+        for key in self.KEYS:
+            np.testing.assert_allclose(got[key], want[key], atol=1e-9, err_msg=key)
+
+    @staticmethod
+    def evaluator(model, atype, cell, n, **kwargs):
+        return DistributedEvaluator(
+            model,
+            atype,
+            cell,
+            devices=[DEVICE] * n,
+            compute_born=True,
+            compute_virial=True,
+            memory_headroom=None,
+            **kwargs,
+        )
+
+    @pytest.mark.parametrize("n", [1, 2, 4])
+    def test_each_kind_of_change_rebuilds_only_what_it_must(self, system, model, n):
+        """A halo of 2 A: a small shear reuses it, a 0.3 A step reuses it
+        (the GPU list is searched every step, so nothing else can go stale),
+        and a 10 % strain repartitions -- on two or more devices."""
+        coord, atype, cell, *_ = system
+        ev = self.evaluator(model, atype, cell, n, skin=2.0)
+        x, h = coord.copy(), cell.copy()
+        self.assert_same(self.reused(ev, x), self.fresh(model, x, atype, h, n))
+        count = ev.rebuild_count
+        shear = np.eye(3)
+        shear[1, 0] = shear[0, 1] = 1e-3
+        h, x = h @ shear, x @ shear
+        ev.set_cell(h)
+        self.assert_same(self.reused(ev, x), self.fresh(model, x, atype, h, n))
+        assert ev.rebuild_count == count
+        x[3] += [0.3, 0.0, 0.0]
+        self.assert_same(self.reused(ev, x), self.fresh(model, x, atype, h, n))
+        # The GPU list searches every step, so a 0.3 A step within the halo
+        # rebuilds nothing; and on one device there is no halo, so nothing
+        # is ever rebuilt.
+        assert ev.rebuild_count == count
+        h, x = h * 1.1, x * 1.1
+        ev.set_cell(h)
+        self.assert_same(self.reused(ev, x), self.fresh(model, x, atype, h, n))
+        assert ev.rebuild_count == count + (0 if n == 1 else 1)
+        # A shrink as well: on one device a 14 A box is small enough that the
+        # cell list's search radius is re-estimated for the new cell.
+        h, x = h * 0.85, x * 0.85
+        ev.set_cell(h)
+        self.assert_same(self.reused(ev, x), self.fresh(model, x, atype, h, n))
+
+    @pytest.mark.parametrize("n", PARTITION_COUNTS)
+    def test_a_walk_under_a_barostat_matches_fresh_evaluations(self, system, model, n):
+        """Atoms walk and the cell strains a little every call, as under NPT,
+        with the default skins. Every call matches a fresh evaluation, and the
+        partitions survive the cell's changes."""
+        coord, atype, cell, *_ = system
+        ev = self.evaluator(model, atype, cell, n)
+        rng = np.random.default_rng(1)
+        x, h = coord.copy(), cell.copy()
+        for step in range(10):
+            if step:
+                strain = np.eye(3) + 1e-3 * rng.normal(size=(3, 3))
+                strain = 0.5 * (strain + strain.T)
+                h, x = h @ strain, x @ strain + rng.normal(scale=0.01, size=x.shape)
+                ev.set_cell(h)
+            self.assert_same(self.reused(ev, x), self.fresh(model, x, atype, h, n))
+        assert ev.rebuild_count < 5
+
+    def test_the_graph_is_the_dense_search_with_valid_csr(self, system, model):
+        """The GPU list searches each partition's node set with only the
+        owned atoms as centres: the edges a dense search keeps for owned
+        destinations, with CSR views that address them correctly."""
+        from deepmd.dpmodel.utils.neighbor_graph import build_neighbor_graph
+        from deepmd.pt_expt.utils.graph_csr import validate_graph_csr_for_export
+
+        coord, atype, cell, *_ = system
+        for part in partition_system(coord, cell, RCUT, 2, skin=1.0):
+            graph, _, _ = partition_graph(
+                part, coord, atype, RCUT, DEVICE, with_csr=True
+            )
+            assert part.neighbor_list_on(DEVICE) is not None
+            nodes = torch.as_tensor(part.coordinates(coord), device=DEVICE)
+            nodes = nodes.unsqueeze(0)
+            types = part.types_on(atype, DEVICE).unsqueeze(0)
+            dense = build_neighbor_graph(nodes, types, None, RCUT)
+            keep = dense.edge_mask & (dense.edge_index[1] < part.n_owned)
+
+            def edges(index, mask):
+                src, dst = (index[k][mask].tolist() for k in (0, 1))
+                return set(zip(src, dst, strict=True))
+
+            got = edges(graph.edge_index, graph.edge_mask)
+            want = edges(dense.edge_index, keep)
+            assert got == want
+            validate_graph_csr_for_export(
+                graph.edge_index,
+                graph.edge_mask,
+                graph.destination_order,
+                graph.destination_row_ptr,
+                graph.source_order,
+                graph.source_row_ptr,
+                part.n_node,
+                destination_sorted=graph.destination_sorted,
+            )
+            rp, sp = graph.destination_row_ptr.tolist(), graph.source_row_ptr.tolist()
+            index, order = graph.edge_index, graph.source_order
+            for i in range(part.n_node):
+                assert bool((index[1, rp[i] : rp[i + 1]] == i).all()), f"dst row {i}"
+                srcs = index[0, order[sp[i] : sp[i + 1]]]
+                assert bool((srcs == i).all()), f"src row {i}"
+
+
+# --- charge_spin and exclude_types, serial against partitioned --------------
+
+
+def conditioned_model(excluded=False):
+    descriptor = copy.deepcopy(DESCRIPTOR)
+    descriptor.update(add_chg_spin_ebd=True, default_chg_spin=[1.0, 2.0])
+    long_range = copy.deepcopy(LONG_RANGE)
+    long_range["charge_net"]["exclude_types"] = [1] if excluded else []
+    return get_model(
+        dict(
+            type="dp_lr",
+            type_map=["O", "H"],
+            descriptor=descriptor,
+            fitting_net=copy.deepcopy(FITTING),
+            long_range=long_range,
+        )
+    ).eval()
+
+
+@pytest.mark.parametrize("batched", [False, True])
+def test_default_charge_matches_explicit_condition(batched):
+    model = conditioned_model()
+    coord, atype, cell = frame()
+    if batched:
+        coord, atype, cell = (
+            x.repeat(2, *([1] * (x.ndim - 1))) for x in (coord, atype, cell)
+        )
+    implicit = model(coord, atype, box=cell)
+    explicit = model(coord, atype, box=cell, charge_spin=coord.new_tensor([1.0, 2.0]))
+    torch.testing.assert_close(
+        implicit["charge"].sum(dim=1), torch.ones_like(implicit["charge"].sum(dim=1))
+    )
+    for key in ("charge", "energy", "force", "virial"):
+        torch.testing.assert_close(implicit[key], explicit[key])
+
+
+@pytest.mark.parametrize("excluded", [False, True])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_partitioned_charge_contracts(excluded, explicit):
+    model = conditioned_model(excluded)
+    coord, atype, cell = frame()
+    condition = (-1.0, 3.0) if explicit else None
+    serial = model(coord, atype, box=cell, charge_spin=condition)
+    positions = coord[0].cpu().numpy()
+    types = atype[0].cpu().numpy()
+    box = cell[0].cpu().numpy()
+    result = to_numpy(
+        evaluate_partitioned(
+            model,
+            positions,
+            types,
+            box,
+            n_partitions=2,
+            devices=[coord.device] * 2,
+            compute_virial=True,
+            charge_spin=condition,
+        )
+    )
+    assert result["charge"].sum() == pytest.approx(-1.0 if explicit else 1.0, abs=1e-12)
+    if excluded:
+        np.testing.assert_array_equal(result["charge"][types == 1], 0.0)
+        torch.testing.assert_close(
+            serial["charge"].reshape(-1)[atype.reshape(-1) == 1], coord.new_zeros(8)
+        )
+    for key in ("charge", "energy", "force", "virial", "atom_energy"):
+        reference = serial[key].detach().cpu().numpy().reshape(np.shape(result[key]))
+        np.testing.assert_allclose(result[key], reference, atol=1e-8, rtol=1e-7)
+    assert result["atom_energy"].sum() == pytest.approx(result["energy"], abs=1e-10)
+    np.testing.assert_allclose(
+        result["atom_energy_short_range"] + result["atom_energy_long_range"],
+        result["atom_energy"],
+        atol=1e-12,
+    )
+    evaluator = DistributedEvaluator(
+        model,
+        types,
+        box,
+        devices=[coord.device],
+        charge_spin=condition,
+    )
+    energy, force = evaluator(coord[0])
+    assert energy == pytest.approx(result["energy"], abs=1e-8)
+    np.testing.assert_allclose(force.cpu().numpy(), result["force"], atol=1e-8)

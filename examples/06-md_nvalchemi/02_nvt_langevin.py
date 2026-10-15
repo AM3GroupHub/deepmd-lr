@@ -15,17 +15,25 @@ Start from a poorly equilibrated structure and the first few hundred fs are
 equilibration, not sampling -- the excess potential energy turns into heat
 faster than a weak thermostat removes it.
 
+The noise is seeded by `seed + step`, so a restarted run replays exactly the
+noise an uninterrupted one would have drawn. `fixcm=True`, ASE's default,
+removes the centre-of-mass motion the noise adds, so the temperature's
+3N - 3 degrees of freedom are exact.
+
     python 02_nvt_langevin.py --model ../../path/to/model.ckpt.pt
 """
 
 import argparse
 
-from nvalchemiops.dynamics.integrators import (
-    langevin_baoab_finalize,
-    langevin_baoab_half_step,
-)
+import numpy as np
+from ase import units
+from ase.md.velocitydistribution import Stationary, thermalize_momenta
 
-from deepmd_lr.nvalchemi import Thermo, build_evaluator, read_structure
+from deepmd_lr.nvalchemi import (
+    Langevin,
+    build_evaluator,
+    read_structure,
+)
 
 
 def main():
@@ -43,33 +51,20 @@ def main():
 
     atoms = read_structure(a.structure, a.index)
     ev = build_evaluator(a.model, atoms)
-    th = Thermo(
-        ev, atoms.get_positions(), timestep=a.dt, temperature=a.temperature,
-        columns=("step", "time", "temp", "epot", "ekin"),
-        every=max(a.steps // 10, 1),
-    )
-    friction = th.scalar(a.friction)
-
-    print(f"Langevin (BAOAB)  {th.n_atoms} atoms  dt {a.dt} fs  "
+    thermalize_momenta(atoms, temperature_K=a.temperature,
+                       rng=np.random.default_rng(a.seed))
+    Stationary(atoms)
+    md = Langevin(ev, atoms, a.dt * units.fs, temperature_K=a.temperature,
+                  friction=a.friction, seed=a.seed, logfile="-",
+                  loginterval=max(a.steps // 20, 1))
+    print(f"Langevin (BAOAB)  {len(atoms)} atoms  dt {a.dt} fs  "
           f"T {a.temperature} K  friction {a.friction}")
-    th.evaluate()
-    for step in range(a.steps + 1):
-        th.log(step)
-        if step == a.steps:
-            break
-        # B-A-O-A: half-kick, half-drift, thermostat, half-drift -- one kernel.
-        # The seed advances per step so the noise is not repeated.
-        langevin_baoab_half_step(th.positions, th.velocities, th.forces,
-                                 th.masses, th.dt, th.kT, friction,
-                                 a.seed + step)
-        th.evaluate()
-        # The final B: half-kick with the new forces.
-        langevin_baoab_finalize(th.velocities, th.forces, th.masses, th.dt)
-    half = len(th.rows) // 2
-    rows = th.rows[half:]
-    print(f"\n  {th.performance()}")
+    md.run(a.steps)
+
+    half = md.rows[len(md.rows) // 2:]
+    print(f"\n  {md.performance()}")
     print(f"  mean T over the second half: "
-          f"{sum(r[2] for r in rows)/len(rows):.1f} K (target {a.temperature})")
+          f"{np.mean([r['T[K]'] for r in half]):.1f} K (target {a.temperature})")
     print("  There is no conserved quantity here -- the thermostat exchanges")
     print("  energy with a bath on purpose. Judge it by the temperature.")
 

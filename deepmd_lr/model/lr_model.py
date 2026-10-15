@@ -76,14 +76,22 @@ from deepmd_lr.born import (
     born_charges,
     screening_factor,
 )
+from deepmd_lr.compress import (
+    FOLDED_ATTR,
+    folded_charge_spin,
+)
 from deepmd_lr.fitting.charge import (
     charge_mask,
+    check_charge_filter,
+    filter_charges,
     project_to_total_charge,
+    projection_shift,
     resolve_charge_spin,
 )
 from deepmd_lr.lr.term import (
     LongRangeTerm,
     build_long_range_energy,
+    system_reciprocal,
 )
 from deepmd_lr.neighbors import (
     build_neighbor_graph_fast,
@@ -219,6 +227,13 @@ class LongRangeEnergyModel(EnergyModel):
         #: turns the model's Coulomb charges into screened ones; the energy
         #: and forces are untouched. 1.0 is vacuum. See `deepmd_lr.born`.
         self.eps_inf = 1.0
+        #: ``(c_t, delta)`` from ``long_range.charge_filter``, or None: part of
+        #: the model, applied in training and simulation, and saved.
+        self.trained_charge_filter: tuple[float, float] | None = None
+        #: A simulation-time override of it: ``(c_t, delta)``, ``False`` for
+        #: off, or None to use the model's own. Never saved; refused in
+        #: training, where only the model's own filter applies.
+        self.charge_filter: Any = None
         #: True on the non-base members of a `same_as` group, whose
         #: `atomic_model` is the base's very object. A plain bool, not a
         #: module: see `deepmd_lr.same_as`.
@@ -227,10 +242,30 @@ class LongRangeEnergyModel(EnergyModel):
         #: is allowed only inside one -- that is where the long-range term
         #: gets added -- and captures nest, so this is a count, not a flag.
         self._capture_depth = 0
-        #: The (charge, multiplicity) folded into the compressed tables, or
-        #: None. The compressed kernel ignores the runtime condition, so a
-        #: forward with a different one is refused (`resolve_charge_spin`).
-        self._compressed_charge_spin: tuple[float, float] | None = None
+
+    @property
+    def effective_charge_filter(self) -> tuple[float, float] | None:
+        """The filter applied now: the simulation-time override if one is set
+        (``False`` switching the model's own off), else the model's own."""
+        if self.charge_filter is None:
+            return self.trained_charge_filter
+        return check_charge_filter(self.charge_filter)
+
+    @property
+    def _compressed_charge_spin(self) -> tuple[float, float] | None:
+        """The (charge, multiplicity) folded into the compressed tables, or None.
+
+        The compressed kernel ignores the runtime condition, so a forward with
+        a different one is refused (`resolve_charge_spin`). Read from the
+        descriptor, which records it whichever method folded the tables --
+        this class's `enable_compression`, upstream's, or a later
+        `apply_charge_state` (see `deepmd_lr.compress`).
+        """
+        return folded_charge_spin(self.atomic_model.descriptor)
+
+    @_compressed_charge_spin.setter
+    def _compressed_charge_spin(self, value: tuple[float, float] | None) -> None:
+        setattr(self.atomic_model.descriptor, FOLDED_ATTR, value)
 
     def change_out_bias(
         self, merged: Any, bias_adjust_mode: str = "change-by-statistic"
@@ -265,6 +300,54 @@ class LongRangeEnergyModel(EnergyModel):
             self.charge_fitting is not None and self.long_range_energy is not None
         )
 
+    def long_range_energy_for(
+        self, cell: Any, pbc: Any, settings: dict[str, Any] | None = None
+    ) -> torch.nn.Module | None:
+        """A long-range term built for one system; this model's own is left
+        as it is.
+
+        The system's ``pbc`` picks the 3D sum or the slab one, and its cell
+        the PME mesh (:func:`~deepmd_lr.lr.term.system_reciprocal`). The term
+        holds no weights, so every system can have one of its own: that is
+        how evaluators and calculators share a model without disturbing each
+        other. The ``isolated`` term comes back unchanged, and a model without
+        a long-range block gives None.
+
+        The settings adapted are ``settings``, checked as
+        :meth:`set_long_range` checks them, or by default the model's as they
+        were before any :meth:`adapt_long_range`. Adapting its current ones
+        instead would leave one large cell's mesh behind for every smaller
+        one after it: the rule never lowers a mesh.
+        """
+        if not self.has_long_range:
+            if settings is not None:
+                self._checked_long_range(settings)  # raises: no block
+            return None
+        if settings is not None:
+            base = self._checked_long_range(settings)
+        elif getattr(self, "_reciprocal_base", None) is not None:
+            base = self._reciprocal_base
+        else:
+            base = self.long_range_energy.serialize()
+        return build_long_range_energy(system_reciprocal(base, cell, pbc))
+
+    def adapt_long_range(self, cell: Any, pbc: Any) -> bool:
+        """Install the term :meth:`long_range_energy_for` builds for this
+        system; returns whether it changed.
+
+        The ASE calculator does this before each frame, because it runs the
+        model's own forward. The GPU evaluator builds a term of its own and
+        never changes the model. An explicit :meth:`set_long_range` is a new
+        starting point for both.
+        """
+        term = self.long_range_energy_for(cell, pbc)
+        if term is None or term.serialize() == self.long_range_energy.serialize():
+            return False
+        if getattr(self, "_reciprocal_base", None) is None:
+            self._reciprocal_base = self.long_range_energy.serialize()
+        self._install_long_range(term.serialize())
+        return True
+
     def set_long_range(self, settings: dict[str, Any]) -> None:
         """Swap the long-range term for one built from ``settings``.
 
@@ -289,7 +372,15 @@ class LongRangeEnergyModel(EnergyModel):
         supply exactly the ``erfc(alpha r)/r`` remainder left at *that* split
         -- so it defines the model as surely as the weights do. Passing a
         different one is refused rather than silently honoured.
+
+        The new settings are also what :meth:`long_range_energy_for` and
+        :meth:`adapt_long_range` adapt from.
         """
+        self._install_long_range(settings)
+        self._reciprocal_base = None
+
+    def _checked_long_range(self, settings: dict[str, Any]) -> dict[str, Any]:
+        """``settings`` with this model's alpha, which they may not change."""
         if not self.has_long_range:
             raise ValueError(
                 "this model has no `long_range` block, so there is no "
@@ -306,6 +397,11 @@ class LongRangeEnergyModel(EnergyModel):
                 "remainder of *that* split; moving it silently invalidates "
                 "every weight in the model."
             )
+        return settings
+
+    def _install_long_range(self, settings: dict[str, Any]) -> None:
+        """The swap itself, leaving :meth:`adapt_long_range`'s base alone."""
+        settings = self._checked_long_range(settings)
         self.long_range_energy = build_long_range_energy(settings)
         # Keep the recorded config in step, so a model that is re-serialised
         # after a swap describes the term it actually has rather than the one
@@ -349,6 +445,8 @@ class LongRangeEnergyModel(EnergyModel):
             )
 
         charge_fitting, long_range_energy = cls._build_long_range(data, descriptor)
+        block = _strip_comments(data.get(LONG_RANGE_KEY) or {})
+        trained_filter = check_charge_filter(block.get("charge_filter"))
 
         model = cls(
             descriptor=descriptor,
@@ -359,6 +457,7 @@ class LongRangeEnergyModel(EnergyModel):
             charge_fitting=charge_fitting,
             long_range_energy=long_range_energy,
         )
+        model.trained_charge_filter = trained_filter
         model.model_def_script = json.dumps(model_params)
         return model
 
@@ -403,7 +502,9 @@ class LongRangeEnergyModel(EnergyModel):
         charge_spin: torch.Tensor | None,
         mask: torch.Tensor | None,
         strain: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        *,
+        return_raw: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Per-atom charges satisfying the frame's total-charge constraint.
 
         Runs the shared descriptor and the charge head on the graph route,
@@ -457,7 +558,9 @@ class LongRangeEnergyModel(EnergyModel):
         # The same head and projection a captured backbone goes through. Column
         # 0 of charge_spin is the frame's total charge; absent it, the frame is
         # assumed neutral, the common case in training data.
-        return self._charges_from_features(gg, rot_mat, atype, charge_spin, mask)
+        return self._charges_from_features(
+            gg, rot_mat, atype, charge_spin, mask, return_raw=return_raw
+        )
 
     @contextlib.contextmanager
     def _capturing_backbone(self) -> Any:
@@ -617,6 +720,29 @@ class LongRangeEnergyModel(EnergyModel):
         mask = charge_mask(self, atype)
         create_graph = self.training
         born = None
+        if self.training and self.charge_filter is not None:
+            raise RuntimeError(
+                "a simulation-time charge_filter override is set; clear it "
+                "(model.charge_filter = None) before training. A filter meant "
+                "for training belongs in the config, long_range.charge_filter"
+            )
+        charge_filter = self.effective_charge_filter
+        if charge_filter is not None:
+            if self.compute_born:
+                raise NotImplementedError(
+                    "charge_filter cannot be combined with Born charges yet: "
+                    "the Born tensor is built from the unfiltered charges"
+                )
+            total = (
+                charge_spin[:, 0].to(coord.dtype)
+                if charge_spin is not None
+                else torch.zeros(nf, dtype=coord.dtype, device=device)
+            )
+
+        def filtered(projected: torch.Tensor) -> torch.Tensor:
+            if charge_filter is None:
+                return projected
+            return filter_charges(projected, total, charge_filter, mask=mask)
 
         if shared is not None:
             # SHARED BACKBONE. The energy head already ran the descriptor; its
@@ -631,7 +757,7 @@ class LongRangeEnergyModel(EnergyModel):
             # converts the short-range energy's edge gradient. Its backward
             # sets `retain_graph=True`, which is what leaves the captured
             # graph traversable here.
-            charge, raw_charge = self._charges_from_features(
+            projected, raw_charge = self._charges_from_features(
                 shared["features"],
                 shared["rot_mat"],
                 atype,
@@ -639,6 +765,7 @@ class LongRangeEnergyModel(EnergyModel):
                 mask,
                 return_raw=True,
             )
+            charge = filtered(projected)
             atom_energy = self.long_range_energy(
                 strained_coord, charge, strained_box, mask=mask
             )
@@ -704,9 +831,16 @@ class LongRangeEnergyModel(EnergyModel):
                     "selecting a fused energy/force kernel; unset it (or set "
                     "it below 2) for field simulations."
                 )
-            charge = self._predict_charges(
-                leaf_coord, atype, base_box, charge_spin, mask, strain=strain
+            projected, raw_charge = self._predict_charges(
+                leaf_coord,
+                atype,
+                base_box,
+                charge_spin,
+                mask,
+                strain=strain,
+                return_raw=True,
             )
+            charge = filtered(projected)
             atom_energy = self.long_range_energy(
                 strained_coord, charge, strained_box, mask=mask
             )
@@ -730,6 +864,7 @@ class LongRangeEnergyModel(EnergyModel):
             # above was evaluated with the model's own `charge`, which is what
             # it was trained with; only the diagnostic output is rescaled.
             "charge": charge * screening_factor(self.eps_inf),
+            "charge_projection_shift": projection_shift(projected, raw_charge, mask),
         }
         if born is not None:
             out["born_charge"] = born
@@ -761,6 +896,11 @@ class LongRangeEnergyModel(EnergyModel):
         # was 18% of the forward at 6520 atoms.
         if self.has_long_range:
             charge_spin = resolve_charge_spin(self, charge_spin, atype.shape[0], coord)
+        elif self._compressed_charge_spin is not None:
+            # Check only, so the short-range model passes its input on exactly
+            # as the standard one does: the kernel reads the folded state, and
+            # a different request would be silently dropped.
+            resolve_charge_spin(self, charge_spin, atype.shape[0], coord)
         with self._capturing_backbone() as captured:
             short_range = super().forward(
                 coord,
@@ -802,6 +942,9 @@ class LongRangeEnergyModel(EnergyModel):
         # Diagnostics: the pieces a user needs to see whether the long-range
         # term is doing anything, without re-running the model.
         out["charge"] = long_range["charge"]
+        # What the neutrality projection added to every atom of each frame,
+        # (nf,); the `ener_lr` loss can penalise it (`deepmd_lr.loss`).
+        out["charge_projection_shift"] = long_range["charge_projection_shift"]
         if "born_charge" in long_range:
             out["born_charge"] = long_range["born_charge"]
         out["energy_long_range"] = long_range["energy"]
@@ -895,12 +1038,20 @@ class LongRangeEnergyModel(EnergyModel):
                 raise RuntimeError(_NO_KERNEL)
             # Level before CSR: at level 0 upstream builds no CSR at all, so
             # the missing views are the symptom and the level is the cause.
+            # A long-range model needs level 1: at 2 a fused kernel bypasses the
+            # backbone the charge head shares. A short-range model has no charge
+            # head, so level 2 -- DeePMD-kit's fused energy/force pipeline, force
+            # as a value with no autograd tape -- is allowed and is the faster one.
             level = cuda_infer_level()
-            if level != 1:
+            allowed = (1,) if self.has_long_range else (1, 2)
+            if level not in allowed:
                 raise RuntimeError(
                     f"DP_CUDA_INFER={level} on a compressed model: at 0 the "
-                    "tables are built and never used, at 2 a fused kernel "
-                    "bypasses the shared backbone. Set DP_CUDA_INFER=1."
+                    "tables are built and never used"
+                    + (", at 2 a fused kernel bypasses the shared backbone the "
+                       "charge head needs. Set DP_CUDA_INFER=1."
+                       if self.has_long_range else
+                       ". Set DP_CUDA_INFER=1 or 2 (2: the fused energy/force path).")
                 )
             if destination_order is None or destination_row_ptr is None:
                 raise RuntimeError(
@@ -909,7 +1060,7 @@ class LongRangeEnergyModel(EnergyModel):
                     "would silently fall back to the uncompressed math. Graphs "
                     "built by DeePMD-kit's own forward get them from "
                     "`get_geo_compress()`; a hand-built graph needs "
-                    "`attach_edge_csr`."
+                    "`build_neighbor_graph_fast(..., with_csr=True)`."
                 )
         return super().forward_common_lower_graph(
             atype,
@@ -972,12 +1123,13 @@ class LongRangeEnergyModel(EnergyModel):
                 "compressed DPA4C cannot re-enter training mode."
             )
         level = cuda_infer_level()
-        if level >= 2:
+        if level >= 2 and self.has_long_range:
             raise RuntimeError(
                 "DP_CUDA_INFER=2 selects the fused energy/force kernel, which "
                 "bypasses `descriptor.call_graph`: the charge head could no "
                 "longer share the backbone and Born charges would be refused. "
-                "Set DP_CUDA_INFER=1, the level compression needs."
+                "Set DP_CUDA_INFER=1, the level compression needs. (A model "
+                "without `long_range` may use 2.)"
             )
         descriptor = self.atomic_model.descriptor
         state = None
@@ -1001,6 +1153,8 @@ class LongRangeEnergyModel(EnergyModel):
         was_compressed = descriptor.compress
         had_scalars = hasattr(descriptor, "_compression_scalars")
         scalars = getattr(descriptor, "_compression_scalars", None)
+        had_folded = FOLDED_ATTR in descriptor.__dict__
+        folded = descriptor.__dict__.get(FOLDED_ATTR)
         try:
             super().enable_compression(
                 table_extrapolate, table_stride_1, table_stride_2, check_frequency
@@ -1017,9 +1171,11 @@ class LongRangeEnergyModel(EnergyModel):
                 descriptor._compression_scalars = scalars
             elif hasattr(descriptor, "_compression_scalars"):
                 del descriptor._compression_scalars
+            if had_folded:
+                setattr(descriptor, FOLDED_ATTR, folded)
+            else:
+                descriptor.__dict__.pop(FOLDED_ATTR, None)
             raise
-        if state is not None:
-            self._compressed_charge_spin = (state[0], state[1])
         # Only successful compression changes the process-wide inference level.
         if level == 0:
             os.environ["DP_CUDA_INFER"] = "1"
@@ -1105,6 +1261,8 @@ class LongRangeEnergyModel(EnergyModel):
                 "charge_net": self.charge_fitting.serialize(),
                 RECIPROCAL_KEY: self.long_range_energy.serialize(),
             }
+            if self.trained_charge_filter is not None:
+                data[LONG_RANGE_KEY]["charge_filter"] = list(self.trained_charge_filter)
         return data
 
     @classmethod
@@ -1120,4 +1278,7 @@ class LongRangeEnergyModel(EnergyModel):
             # still load.
             settings = block.get(RECIPROCAL_KEY, block.get(_LEGACY_RECIPROCAL_KEY))
             model.long_range_energy = build_long_range_energy(settings)
+            model.trained_charge_filter = check_charge_filter(
+                block.get("charge_filter")
+            )
         return model
