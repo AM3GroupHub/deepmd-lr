@@ -17,9 +17,9 @@ Three algorithms, as in ASE, each on its nvalchemiops kernel:
 - :class:`LBFGS`, limited-memory BFGS with a ``maxstep`` trust region and no
   line search (nvalchemiops 0.5), under ASE's ``memory`` and ``maxstep``.
 
-On a 192-water MD snapshot (``examples/06-md_nvalchemi/water_192.xyz``) FIRE
-reached 0.05 eV/A in 370 steps, FIRE2 in 450 and LBFGS in 212; from a packed
-box pre-relaxed with TIP3P, in 170, 160 and 229, LBFGS ending 1.2 eV lower.
+On a 192-atom water snapshot (``examples/06-md_nvalchemi/water_192.xyz``) FIRE
+reached 0.05 eV/A in 370 steps, FIRE2 in 444 and LBFGS in 215; from a packed
+box pre-relaxed with TIP3P, in 149, 145 and 211, LBFGS ending 1.3 eV lower.
 
 A freshly packed box can hold tens of eV of clashes, and MD would release that
 as heat in the first few hundred fs, pushing the model into regions it never
@@ -31,7 +31,7 @@ saw -- so relax first.
 - ``"isotropic"``: the cell scales uniformly and keeps its shape. The choice for
   a liquid, which has no shear stiffness: ``"full"`` lets its cell shear.
 - ``"orthorhombic"``: the three lengths of a diagonal cell move independently.
-- ``"full"``: all nine entries move.
+- ``"full"``: all six cell degrees of freedom, with the orientation kept.
 
 The target is ``pressure_au`` (eV/A^3, e.g. ``1e-4 * units.GPa``), and
 ``run(smax=...)`` says how close the stress must come to it. The evaluator must
@@ -200,10 +200,6 @@ class _Relaxation:
         refused either way.
     """
 
-    #: How often the loop reads the largest force back: every step for a
-    #: quasi-Newton method, whose restart kicks a converged structure by
-    #: ``maxstep`` if it is stepped once more; every ten for FIRE.
-    _check_every = 10
     #: The triangle of ASE's cell matrix the kernel's six cell parameters fill.
     _cell_form = "lower"
 
@@ -376,9 +372,10 @@ class _Relaxation:
         lower, q1 = _standard_form(cell @ q, "lower")
         return lower @ q0, q @ q1.T @ q0
 
-    def _restore(self) -> None:
-        """Leave the kernel's frame at the end of a run, re-evaluating once
-        when that is a rotation, so forces and virial are reported in it."""
+    def _restore(self, evaluate: bool) -> None:
+        """Leave the kernel's frame at the end of a run. When that is a
+        rotation, re-evaluate once so forces and virial are reported in it,
+        unless the last evaluation failed: then the geometry alone comes back."""
         if self._frame is None:
             return
         cell, r = self._user_frame(np.array(self.evaluator.cell, dtype=np.float64))
@@ -387,7 +384,14 @@ class _Relaxation:
             return
         self._rotate(r)
         self.thermo.set_cell(cell)
-        self.thermo.evaluate()
+        if evaluate:
+            self.thermo.evaluate()
+
+    def _discard_results(self) -> None:
+        """``atoms`` keeps no result of a run whose last evaluation failed."""
+        self.converged = False
+        self.atoms.calc = None
+        self.atoms.arrays.pop("born_charges", None)
 
     def _move(self) -> None:
         """One step of the atoms, and with ``relax_cell`` of the cell too."""
@@ -424,56 +428,71 @@ class _Relaxation:
         ):
             th.set_cell(self.atoms.cell.array)  # atoms edited between runs
         th.set_state(positions=self.atoms.get_positions())
-        self._reset()
-        th.evaluate()
-        n = th.n_atoms
-        e0, f0, v0 = self._enthalpy(), self.fmax(), self.evaluator.volume
-        bonds0 = _covalent_bonds(self.atoms) if self.check else None
-        self._record(f0)
+        self.converged = False
         diverged = None
-        self.converged = self._converged(f0, fmax, smax)
+        # True while the Thermo holds a finite evaluation of its current
+        # geometry: only then may the frame restore re-evaluate, and `atoms`
+        # receive energy and forces, whatever interrupted the run.
+        valid = False
         try:
+            self._reset()
+            th.evaluate()
+            n = th.n_atoms
+            e0, f0, v0 = self._enthalpy(), self.fmax(), self.evaluator.volume
+            valid = math.isfinite(e0) and math.isfinite(f0)
+            if not valid:
+                raise RelaxationError(
+                    "the first evaluation gave a non-finite energy or force"
+                )
+            bonds0 = _covalent_bonds(self.atoms) if self.check else None
+            self._record(f0)
+            self.converged = self._converged(f0, fmax, smax)
             for _ in range(int(steps)):
                 if self.converged:
                     break
+                valid = False
                 self._move()
                 th.evaluate()
                 self.nsteps += 1
-                if not math.isfinite(th.energy):
-                    diverged = "non-finite energy"
+                # One scalar readback per step: the energy already is a host
+                # float, and a quasi-Newton restart would kick a converged
+                # structure by ``maxstep`` if it were stepped once more.
+                f = self.fmax()
+                valid = math.isfinite(th.energy) and math.isfinite(f)
+                released = (e0 - self._enthalpy()) / n
+                if not valid or f > max(10.0 * f0, 50.0) or released > 2.0:
+                    diverged = (
+                        "a non-finite energy or force"
+                        if not valid
+                        else f"max|F| reached {f:.3g} eV/A and the energy "
+                        f"fell {released:.3g} eV/atom"
+                    )
                     break
-                if (
-                    self.nsteps % self._check_every == 0
-                    or self.nsteps % self.loginterval == 0
-                ):
-                    f = self.fmax()
-                    released = (e0 - self._enthalpy()) / n
-                    if (
-                        not math.isfinite(f)
-                        or f > max(10.0 * f0, 50.0)
-                        or released > 2.0
-                    ):
-                        diverged = (
-                            f"max|F| reached {f:.3g} eV/A and the energy "
-                            f"fell {released:.3g} eV/atom"
-                        )
-                        break
-                    grown = self.evaluator.volume / v0
-                    if not 0.5 < grown < 2.0:
-                        diverged = f"the cell volume changed {grown:.3g}-fold"
-                        break
-                    self.converged = self._converged(f, fmax, smax)
-                    if self.nsteps % self.loginterval == 0:
-                        self._record(f)
+                grown = self.evaluator.volume / v0
+                if not 0.5 < grown < 2.0:
+                    diverged = f"the cell volume changed {grown:.3g}-fold"
+                    break
+                self.converged = self._converged(f, fmax, smax)
+                if self.nsteps % self.loginterval == 0:
+                    self._record(f)
                 for fn, interval, args, kwargs in self._observers:
                     if self.nsteps % interval == 0:
                         fn(*args, **kwargs)
                 yield self.nsteps
         finally:
-            if math.isfinite(th.energy):
-                self._restore()
-                _sync_atoms(self.atoms, th)
+            try:
+                self._restore(evaluate=valid)
+            except BaseException:
+                valid = False
+                raise
+            finally:
+                if not valid:
+                    self._discard_results()
+                _sync_atoms(self.atoms, th, results=valid)
         f1 = self.fmax()
+        if diverged is None and not (math.isfinite(th.energy) and math.isfinite(f1)):
+            diverged = "a non-finite energy or force"  # from the restore's evaluation
+            self._discard_results()
         if self._last_recorded != self.nsteps:
             self._record(f1)
         if diverged:
@@ -857,7 +876,8 @@ class LBFGS(_Relaxation):
     while the force converges; a direction that stops descending, or a pair
     with too little curvature, restarts the history from steepest descent, and
     the first step after a (re)start moves the most-forced atom by exactly
-    ``maxstep``. On water it needed about half of FIRE's force evaluations
+    ``maxstep`` (which is why every relaxation reads its largest force back
+    every step). On water it needed about half of FIRE's force evaluations
     from an MD snapshot and somewhat more from a packed box (module
     docstring). The history starts afresh at every ``run``.
 
@@ -869,7 +889,9 @@ class LBFGS(_Relaxation):
     With ``relax_cell`` the kernel relaxes the atoms and the cell together in
     ASE's ``UnitCellFilter`` chart, the deformation from the cell at the start
     of ``run``, driven by the stress; ``maxstep`` caps the Cartesian motion of
-    the atoms, their ride with the cell included.
+    the atoms in the kernel's frame, their ride with the cell included; the
+    rigid rotation that brings a shearing cell back into the start's
+    orientation can make displacements between reported frames larger.
 
     Parameters
     ----------
@@ -882,7 +904,6 @@ class LBFGS(_Relaxation):
     ``loginterval``, ``trajectory`` and ``check`` are as for :class:`FIRE2`.
     """
 
-    _check_every = 1
     _cell_form = "upper"  # lattice vectors as columns, lower-triangular
 
     def __init__(
