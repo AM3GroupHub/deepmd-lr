@@ -1437,7 +1437,82 @@ def _metric_spring(model, rotation=None):
     return atoms, ev, h_ref
 
 
+class _Failing:
+    """A real evaluator whose call number ``at`` raises, or returns a
+    non-finite energy or force."""
+
+    def __init__(self, ev, at, kind):
+        self._ev, self.at, self.kind, self.calls = ev, at, kind, 0
+
+    def __getattr__(self, name):
+        return getattr(self._ev, name)
+
+    def __call__(self, positions):
+        self.calls += 1
+        energy, forces = self._ev(positions)
+        if self.calls == self.at:
+            if self.kind == "raise":
+                raise RuntimeError("injected evaluation failure")
+            if self.kind == "energy":
+                energy = float("nan")
+            else:
+                forces[0, 0] = float("nan")
+        return energy, forces
+
+
 class TestCellRelaxation:
+    @OPTIMIZERS
+    @pytest.mark.parametrize("kind", ["raise", "energy", "force"])
+    @pytest.mark.parametrize("at", [1, 2, 3], ids=["first", "step", "restore"])
+    def test_a_failed_evaluation_leaves_the_users_frame(self, model, relax, kind, at):
+        """Whether an evaluation raises or comes back non-finite, at the first
+        call, after a step or while the frame is restored: nothing is
+        re-evaluated, the atoms and the shared evaluator are left in the
+        start's orientation and consistent with each other, no stale result
+        is attached, and the same objects run again once the cause is gone."""
+        from ase.cell import Cell
+        from scipy.spatial.transform import Rotation
+
+        rot = Rotation.from_rotvec([0.3, -0.5, 0.8]).as_matrix()
+        atoms, ev, _ = _metric_spring(model, rotation=rot)
+        q0 = Cell(atoms.cell.array).standard_form()[1]
+        ev = _Failing(ev, at, kind)
+        opt = relax(ev, atoms, relax_cell="full", logfile=None, check=False)
+        if kind == "raise":
+            error, text = RuntimeError, "injected"
+        else:
+            error, text = RelaxationError, "non-finite"
+        with pytest.raises(error, match=text):
+            opt.run(fmax=1e-12, smax=1e-12, steps=1)
+        assert ev.calls == at
+        assert opt._frame is None and not opt.converged and atoms.calc is None
+        np.testing.assert_allclose(atoms.cell.array, ev.cell, atol=1e-12)
+        q1 = Cell(atoms.cell.array).standard_form()[1]
+        np.testing.assert_allclose(q1, q0, atol=1e-10)
+        np.testing.assert_allclose(opt.thermo.positions.numpy(), atoms.positions)
+        ev.at = 0
+        opt.run(fmax=1e-12, smax=1e-12, steps=1)
+        np.testing.assert_allclose(atoms.cell.array, ev.cell, atol=1e-12)
+        assert atoms.calc is not None
+
+    def test_a_failed_setup_leaves_the_users_frame(self, model, monkeypatch):
+        """LBFGS rotates a standard-form cell into its kernel's frame before
+        allocating its state; a failure there still rotates back."""
+        import nvalchemiops.torch.lbfgs as kernels
+
+        atoms, ev, _ = _metric_spring(model)
+        cell, positions = atoms.cell.array.copy(), atoms.positions.copy()
+        opt = LBFGS(ev, atoms, relax_cell="full", logfile=None, check=False)
+        monkeypatch.setattr(
+            kernels, "lbfgs_prepare_state", lambda *a, **k: 1 / 0
+        )
+        with pytest.raises(ZeroDivisionError):
+            opt.run(steps=1)
+        assert opt._frame is None and atoms.calc is None
+        np.testing.assert_allclose(ev.cell, cell, atol=1e-12)
+        np.testing.assert_allclose(atoms.cell.array, cell, atol=1e-12)
+        np.testing.assert_allclose(atoms.positions, positions, atol=1e-12)
+
     def test_the_cell_force_is_the_enthalpy_gradient(self, model):
         """Finite differences of E + P V over the nine cell entries, at fixed
         fractional coordinates, on a sheared cell. nvalchemiops 0.4's

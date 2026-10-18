@@ -58,14 +58,15 @@ the whole step so no atom moves more than `maxstep`; LBFGS takes a quasi-Newton
 step from the last `memory` position and force differences, scaled the same
 way, reads no energy (which may rise on a step while the force converges) and
 restarts from steepest descent when a direction stops descending. Steps to
-0.05 eV/Å on 192 waters with the trained model, nvalchemiops 0.5.0:
+0.05 eV/Å on 192 water atoms (64 molecules) with the trained model,
+nvalchemiops 0.5.0:
 
 | from | `FIRE` | `FIRE2` | `LBFGS` |
 |---|---:|---:|---:|
-| an MD snapshot (`water_192.xyz`) | 370 | 450 | 212 |
-| a packed box pre-relaxed with TIP3P | 170 | 160 | 229 |
+| an MD snapshot (`water_192.xyz`) | 370 | 444 | 215 |
+| a packed box pre-relaxed with TIP3P | 149 | 145 | 211 |
 
-From the packed box LBFGS ended 1.2 eV below FIRE2. Its `memory` barely
+From the packed box LBFGS ended 1.3 eV below FIRE2. Its `memory` barely
 matters here (3 to 100 pairs all landed within 195 to 224 steps on the
 snapshot) and `maxstep` 0.1 against 0.2 changed seven steps.
 
@@ -83,7 +84,7 @@ The units are ASE's: `timestep` in ASE time (`0.5 * units.fs`), `friction` in
 | `None` (default) | fixed | — |
 | `"isotropic"` | scales uniformly, keeping its shape | liquids, which have no shear stiffness: `"full"` lets their cell shear |
 | `"orthorhombic"` | the three lengths of a diagonal cell move independently | orthorhombic crystals |
-| `"full"` | all nine entries move | crystals of any symmetry |
+| `"full"` | six cell degrees of freedom, keeping the orientation | crystals of any symmetry |
 
 ```python
 ev.set_compute_virial(True)                     # the stress drives the cell
@@ -111,6 +112,9 @@ Around the kernels:
   the trajectory frames come back in the orientation of the start: the first
   lattice vector keeps its direction and the second its plane. A diagonal
   cell is never rotated; triclinic cells in any orientation are accepted.
+  L-BFGS applies `maxstep` in its kernel frame. Restoring the orientation of
+  a shearing cell adds a rigid rotation, so reported displacements can exceed
+  that cap. Failed runs also restore the frame and discard stale results.
 - **The cell's weight.** The cell force is not divided by the atom count
   (`cell_force_scale = 1/N` for FIRE2's kernel), which makes the cell about
   as heavy as one atom, and the L-BFGS chart's scale is the cube root of the
@@ -118,14 +122,14 @@ Around the kernels:
   and 12,288 atoms alike) FIRE2 took 390 steps from a 4% stretch and 1000 to
   1570 with the force divided by N.
 
-On 192 waters stretched by 4%, to 0.05 eV/Å and 0.01 GPa, with the trained
+On 192 water atoms stretched by 4%, to 0.05 eV/Å and 0.01 GPa, with the trained
 model on nvalchemiops 0.5.0:
 
 | steps | isotropic | orthorhombic | full |
 |---|---:|---:|---:|
-| `LBFGS` | 172 | 189 | 473 |
-| `FIRE2` | 380 | 350 | 400 |
-| `FIRE` | 690 | 370 | 800 |
+| `LBFGS` | 167 | 208 | 239 |
+| `FIRE2` | 377 | 344 | 395 |
+| `FIRE` | 687 | 362 | 798 |
 
 The new cell goes to the evaluator every step, as under NPT. Partitions are
 reused while the [displacement and cell-deformation bound](#reusing-a-partitioning-across-steps)
