@@ -113,9 +113,9 @@ Measured on that C/Si model (`ener_lr`, `pref_qn` 100) with (3.5e-3, 1.5e-3):
 
 - **A freshly packed box collapses.** The model has no repulsive wall below
   the shortest contacts it was trained on, so a minimiser or the first MD
-  steps can pull clashing atoms together. `FIRE` and `FIRE2` stop with a
-  `RelaxationError` once forces grow tenfold or more than 2 eV/atom is
-  released. Pre-relax with a classical force field
+  steps can pull clashing atoms together. `FIRE`, `FIRE2` and `LBFGS` stop
+  with a `RelaxationError` once forces grow tenfold or more than 2 eV/atom
+  is released. Pre-relax with a classical force field
   ([below](#relaxing-a-packed-box-first)).
 - **Check conservation with NVE first**
   ([above](#check-energy-conservation-before-trusting-a-trajectory)).

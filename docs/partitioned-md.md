@@ -49,13 +49,25 @@ npt.run(20_000)
 | `MTKNPH` | NPH, the MTK barostat alone; `cell` as for `MTKNPT` | the enthalpy H′ |
 | `FIRE` | relaxes the positions, and the cell with `relax_cell`; classic FIRE with ASE's defaults | — |
 | `FIRE2` | the same with FIRE 2.0 and nvalchemiops' more cautious defaults | — |
+| `LBFGS` | the same with limited-memory BFGS (nvalchemiops 0.5): a quasi-Newton step under a `maxstep` trust region, no line search; ASE's `memory` (default 6) and `maxstep` (0.2 Å) | — |
 
-`FIRE` and `FIRE2` use nvalchemiops kernels with ASE-style interfaces and unit
-masses. FIRE caps each atom's step on its own; FIRE2 kicks before measuring
-the power, backs off half a step after an uphill
-step, and scales the whole step so no atom moves more than `maxstep`. On water
-from an MD snapshot they reached 0.05 eV/Å in 199 and 380 steps; from a
-TIP3P-relaxed packed box, in 149 and 160.
+`FIRE`, `FIRE2` and `LBFGS` use nvalchemiops kernels with ASE-style interfaces
+and unit masses. FIRE caps each atom's step on its own; FIRE2 kicks before
+measuring the power, backs off half a step after an uphill step, and scales
+the whole step so no atom moves more than `maxstep`; LBFGS takes a quasi-Newton
+step from the last `memory` position and force differences, scaled the same
+way, reads no energy (which may rise on a step while the force converges) and
+restarts from steepest descent when a direction stops descending. Steps to
+0.05 eV/Å on 192 waters with the trained model, nvalchemiops 0.5.0:
+
+| from | `FIRE` | `FIRE2` | `LBFGS` |
+|---|---:|---:|---:|
+| an MD snapshot (`water_192.xyz`) | 370 | 450 | 212 |
+| a packed box pre-relaxed with TIP3P | 170 | 160 | 229 |
+
+From the packed box LBFGS ended 1.2 eV below FIRE2. Its `memory` barely
+matters here (3 to 100 pairs all landed within 195 to 224 steps on the
+snapshot) and `maxstep` 0.1 against 0.2 changed seven steps.
 
 The units are ASE's: `timestep` in ASE time (`0.5 * units.fs`), `friction` in
 1/ASE time, `tdamp` and `pdamp` in ASE time, `pressure_au` in eV/Å³,
@@ -83,23 +95,35 @@ steps like any other degrees of freedom (nvalchemiops' `07_fire_variable_cell`),
 with three differences, each measured:
 
 - **The cell force** is −∂(E + PV)/∂H = −V H⁻ᵀ (σ + P) for the rows of ASE's
-  cell. nvalchemiops' `stress_to_cell_force` gives −V σ H⁻ᵀ, the gradient for
-  a cell whose columns are the lattice vectors; the two agree for a diagonal
-  cell only. On a sheared water cell this one matched the finite-difference
-  gradient to 2e-3 eV/Å and nvalchemiops' was 0.70 eV/Å off. The structure is
-  never rotated.
+  cell. nvalchemiops 0.4's `stress_to_cell_force` gave −V σ H⁻ᵀ, the gradient
+  for a cell whose columns are the lattice vectors, and was 0.70 eV/Å off the
+  finite-difference gradient on a sheared water cell where this one matched
+  it to 2e-3 eV/Å; 0.5.0 moved to the row convention and the two now agree
+  (a test pins it). The structure is never rotated.
 - **The atoms ride the cell affinely** before their own step.
 - **The cell force is not divided by the atom count**, which makes the cell
   about as heavy as one atom.
 
-On water stretched by 4%, at 192 and 12,288 atoms alike, to 0.05 eV/Å and
-0.01 GPa:
+`LBFGS` packs the cell through ASE's `UnitCellFilter` chart instead, because
+its curvature pairs compare coordinates across steps and the affine ride would
+mix spaces: with H = H₀ Φ (H₀ the cell at the start of `run`) its degrees of
+freedom are the positions in the reference cell, u = r Φ⁻¹, and the rows of
+κ Φ, with the conjugate forces F Φᵀ and H₀ᵀ F_cell / κ. κ is the cube root of
+the starting volume, which gives a cell row about an atom's weight, the scale
+the FIRE measurement picked. A test pins the packed cell force to finite
+differences of the enthalpy over Φ.
+
+On 192 waters stretched by 4%, to 0.05 eV/Å and 0.01 GPa, with the trained
+model on nvalchemiops 0.5.0:
 
 | steps | isotropic | orthorhombic | full |
 |---|---:|---:|---:|
-| `FIRE2` | 390 | 440 | 390 |
-| `FIRE` | 750 | 610 | 740 |
-| `FIRE2`, cell force ÷ N | 1000 | 1480 | 1570 |
+| `LBFGS` | 184 | 179 | 310 |
+| `FIRE2` | 380 | 350 | 420 |
+| `FIRE` | 670 | 370 | 450 |
+
+An earlier measurement put FIRE2 at 390, 440 and 390 steps at 192 and 12,288
+atoms alike, and at 1000 to 1570 with the cell force divided by N.
 
 The new cell goes to the evaluator every step, as under NPT. Partitions are
 reused while the [displacement and cell-deformation bound](#reusing-a-partitioning-across-steps)
