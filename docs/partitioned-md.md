@@ -49,13 +49,25 @@ npt.run(20_000)
 | `MTKNPH` | NPH, the MTK barostat alone; `cell` as for `MTKNPT` | the enthalpy H′ |
 | `FIRE` | relaxes the positions, and the cell with `relax_cell`; classic FIRE with ASE's defaults | — |
 | `FIRE2` | the same with FIRE 2.0 and nvalchemiops' more cautious defaults | — |
+| `LBFGS` | the same with limited-memory BFGS (nvalchemiops 0.5): a quasi-Newton step under a `maxstep` trust region, no line search; ASE's `memory` (default 6) and `maxstep` (0.2 Å) | — |
 
-`FIRE` and `FIRE2` use nvalchemiops kernels with ASE-style interfaces and unit
-masses. FIRE caps each atom's step on its own; FIRE2 kicks before measuring
-the power, backs off half a step after an uphill
-step, and scales the whole step so no atom moves more than `maxstep`. On water
-from an MD snapshot they reached 0.05 eV/Å in 199 and 380 steps; from a
-TIP3P-relaxed packed box, in 149 and 160.
+`FIRE`, `FIRE2` and `LBFGS` use nvalchemiops kernels with ASE-style interfaces
+and unit masses. FIRE caps each atom's step on its own; FIRE2 kicks before
+measuring the power, backs off half a step after an uphill step, and scales
+the whole step so no atom moves more than `maxstep`; LBFGS takes a quasi-Newton
+step from the last `memory` position and force differences, scaled the same
+way, reads no energy (which may rise on a step while the force converges) and
+restarts from steepest descent when a direction stops descending. Steps to
+0.05 eV/Å on 192 waters with the trained model, nvalchemiops 0.5.0:
+
+| from | `FIRE` | `FIRE2` | `LBFGS` |
+|---|---:|---:|---:|
+| an MD snapshot (`water_192.xyz`) | 370 | 450 | 212 |
+| a packed box pre-relaxed with TIP3P | 170 | 160 | 229 |
+
+From the packed box LBFGS ended 1.2 eV below FIRE2. Its `memory` barely
+matters here (3 to 100 pairs all landed within 195 to 224 steps on the
+snapshot) and `maxstep` 0.1 against 0.2 changed seven steps.
 
 The units are ASE's: `timestep` in ASE time (`0.5 * units.fs`), `friction` in
 1/ASE time, `tdamp` and `pdamp` in ASE time, `pressure_au` in eV/Å³,
@@ -78,28 +90,42 @@ ev.set_compute_virial(True)                     # the stress drives the cell
 FIRE2(ev, atoms, relax_cell="isotropic", pressure_au=1e-4 * units.GPa).run(fmax=0.05)
 ```
 
-The cell's rows join the atoms in one extended array that the FIRE kernel
-steps like any other degrees of freedom (nvalchemiops' `07_fire_variable_cell`),
-with three differences, each measured:
+The cell moves on nvalchemiops' own variable-cell kernels: FIRE2's coupled
+coordinate-cell step and L-BFGS's coordinate-cell step relax atoms and cell
+together, and FIRE, which has no coupled kernel upstream, steps the extended
+array of nvalchemiops' cell filter and then lets the atoms ride the cell
+affinely, as the coupled kernels do. Each carries six cell parameters, one
+triangle of the cell matrix, so the cell cannot rotate while it relaxes.
+Around the kernels:
 
-- **The cell force** is −∂(E + PV)/∂H = −V H⁻ᵀ (σ + P) for the rows of ASE's
-  cell. nvalchemiops' `stress_to_cell_force` gives −V σ H⁻ᵀ, the gradient for
-  a cell whose columns are the lattice vectors; the two agree for a diagonal
-  cell only. On a sheared water cell this one matched the finite-difference
-  gradient to 2e-3 eV/Å and nvalchemiops' was 0.70 eV/Å off. The structure is
-  never rotated.
-- **The atoms ride the cell affinely** before their own step.
-- **The cell force is not divided by the atom count**, which makes the cell
-  about as heavy as one atom.
+- **The cell force** given to FIRE and FIRE2 is −∂(E + PV)/∂H = −V H⁻ᵀ (σ + P)
+  for the rows of ASE's cell, projected onto the mode's directions.
+  nvalchemiops 0.4's `stress_to_cell_force` gave the column-cell gradient
+  instead and was 0.70 eV/Å off the finite-difference gradient on a sheared
+  water cell; 0.5.0 moved to the row convention and agrees (a test pins it).
+  L-BFGS takes the stress, projected the same way.
+- **The frame.** FIRE and FIRE2 want the lower triangle of ASE's cell, its
+  standard form; L-BFGS's kernel holds the lattice vectors as columns and
+  wants the upper. A cell not already in the form its kernel needs is rotated
+  into it for the run, positions with it, and the result, the log rows and
+  the trajectory frames come back in the orientation of the start: the first
+  lattice vector keeps its direction and the second its plane. A diagonal
+  cell is never rotated; triclinic cells in any orientation are accepted.
+- **The cell's weight.** The cell force is not divided by the atom count
+  (`cell_force_scale = 1/N` for FIRE2's kernel), which makes the cell about
+  as heavy as one atom, and the L-BFGS chart's scale is the cube root of the
+  starting volume for the same reason. In the measurement that chose it (192
+  and 12,288 atoms alike) FIRE2 took 390 steps from a 4% stretch and 1000 to
+  1570 with the force divided by N.
 
-On water stretched by 4%, at 192 and 12,288 atoms alike, to 0.05 eV/Å and
-0.01 GPa:
+On 192 waters stretched by 4%, to 0.05 eV/Å and 0.01 GPa, with the trained
+model on nvalchemiops 0.5.0:
 
 | steps | isotropic | orthorhombic | full |
 |---|---:|---:|---:|
-| `FIRE2` | 390 | 440 | 390 |
-| `FIRE` | 750 | 610 | 740 |
-| `FIRE2`, cell force ÷ N | 1000 | 1480 | 1570 |
+| `LBFGS` | 172 | 189 | 473 |
+| `FIRE2` | 380 | 350 | 400 |
+| `FIRE` | 690 | 370 | 800 |
 
 The new cell goes to the evaluator every step, as under NPT. Partitions are
 reused while the [displacement and cell-deformation bound](#reusing-a-partitioning-across-steps)

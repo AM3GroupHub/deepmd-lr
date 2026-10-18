@@ -47,7 +47,7 @@ The first runs 25 ps without wrapping and checks forces every 500 steps
 | [nvalchemi](../tests/test_nvalchemi.py) | partition ownership, halos, skin, cell deformation, memory probing, gathered quantities and agreement with fresh evaluation |
 | [sync](../tests/test_sync.py) | host-transfer counts, no pageable uploads, `nonzero` or `bincount` in the warm path |
 | [thermo](../tests/test_thermo.py) | measurements, Warp views, cell updates, evaluator sharing and fixed atoms |
-| [md](../tests/test_md.py) | integrators against kernel loops, conservation, cell conventions, stage sharing, checkpoints, observers and constraints |
+| [md](../tests/test_md.py) | integrators and the three relaxations against kernel loops, conservation, cell conventions, the cell gradient, triclinic and rotated cells coming back in their own frame, stage sharing, checkpoints, observers and constraints |
 | [compress](../tests/test_compress.py) | requirements, failed-compression rollback, kernel dispatch and agreement with uncompressed evaluation |
 | [ase_calculator](../tests/test_ase_calculator.py) | model agreement, boundaries, export guards, NVE drift, mesh selection and head loading |
 | [read_structure](../tests/test_read_structure.py) | periodicity, slab padding and centring, fixed atoms and unsupported structures |

@@ -14,9 +14,10 @@ The float64 fixture model runs on the GPU. What is pinned:
 - **Barostats.** NPT and NPH in every cell mode: the kernels get the cell
   transposed, the enthalpy is conserved as dt^2, and each mode moves only
   what it may.
-- **FIRE and FIRE2.** Each drives its own kernel, under ASE's names, and
-  both refuse a bad relaxation. With `relax_cell` the cell force is the
-  enthalpy gradient, and the cell reaches the target pressure.
+- **FIRE, FIRE2 and LBFGS.** Each drives its own kernel, under ASE's names,
+  and all refuse a bad relaxation. With `relax_cell` the cell force is the
+  enthalpy gradient (in LBFGS's chart too), and the cell reaches the target
+  pressure.
 - **Fixed atoms.** ASE's FixAtoms holds its atoms exactly, in every class;
   temperatures and the thermostats count three degrees of freedom per mobile
   atom, as ASE does; and NVE matches ASE's own VelocityVerlet with the same
@@ -63,6 +64,7 @@ from deepmd_lr.ase import LongRangeCalculator
 from deepmd_lr.nvalchemi import (
     FIRE,
     FIRE2,
+    LBFGS,
     MTKNPH,
     MTKNPT,
     DistributedEvaluator,
@@ -1059,7 +1061,7 @@ class TestBarostats:
             )
 
 
-# --- FIRE ---------------------------------------------------------------------------
+# --- Relaxations --------------------------------------------------------------------
 
 
 class _Perturbed:
@@ -1079,10 +1081,12 @@ class _Perturbed:
         return energy + self._energy(self.n), forces
 
 
-OPTIMIZERS = pytest.mark.parametrize("relax", [FIRE, FIRE2], ids=["FIRE", "FIRE2"])
+OPTIMIZERS = pytest.mark.parametrize(
+    "relax", [FIRE, FIRE2, LBFGS], ids=["FIRE", "FIRE2", "LBFGS"]
+)
 
 
-class TestFIRE:
+class TestRelaxations:
     @OPTIMIZERS
     def test_it_relaxes_and_writes_back(self, model, relax):
         atoms = make_atoms(model)
@@ -1166,7 +1170,7 @@ class TestFIRE:
         with pytest.raises(RelaxationError, match="topology"):
             relax(make_ev(model, atoms), atoms, logfile=None).run(fmax=1.0, steps=300)
 
-    @OPTIMIZERS
+    @pytest.mark.parametrize("relax", [FIRE, FIRE2], ids=["FIRE", "FIRE2"])
     def test_bad_parameters_are_refused(self, model, relax):
         atoms = make_atoms(model)
         ev = make_ev(model, atoms)
@@ -1176,6 +1180,33 @@ class TestFIRE:
             relax(ev, atoms, finc=0.9, logfile=None)
         with pytest.raises(ValueError, match="maxstep"):
             relax(ev, atoms, maxstep=0.0, logfile=None)
+
+    def test_lbfgs_refusals(self, model):
+        atoms = make_atoms(model)
+        ev = make_ev(model, atoms)
+        with pytest.raises(ValueError, match="memory"):
+            LBFGS(ev, atoms, memory=0, logfile=None)
+        with pytest.raises(ValueError, match="maxstep"):
+            LBFGS(ev, atoms, maxstep=-0.1, logfile=None)
+
+    def test_lbfgs_starts_afresh_at_every_run(self, model):
+        """A second run after the atoms were edited must not reuse a history
+        recorded on the old positions: it is the run a fresh object makes."""
+        atoms = make_atoms(model)
+        opt = LBFGS(make_ev(model, atoms), atoms, logfile=None, check=False)
+        assert opt.run(fmax=0.5, steps=500)
+        first = opt.nsteps
+        rng = np.random.default_rng(3)
+        atoms.positions += rng.normal(0.0, 0.15, atoms.positions.shape)
+        fresh_atoms = atoms.copy()
+        assert opt.run(fmax=0.5, steps=500)
+        assert opt.nsteps > first
+        fresh = LBFGS(
+            make_ev(model, fresh_atoms), fresh_atoms, logfile=None, check=False
+        )
+        assert fresh.run(fmax=0.5, steps=500)
+        assert fresh.nsteps == opt.nsteps - first
+        np.testing.assert_allclose(atoms.positions, fresh_atoms.positions, atol=1e-10)
 
 
 #: Distinct non-default values, so that a parameter reaching the wrong kernel
@@ -1266,7 +1297,37 @@ def loop_fire2(ev, atoms, steps, p):
     return th.positions.numpy(), dts
 
 
-class TestFIREKernels:
+def loop_lbfgs(ev, atoms, steps, p):
+    """L-BFGS by hand, in the kernel's own argument names."""
+    from nvalchemiops.dynamics.optimizers import lbfgs_prepare_state, lbfgs_step
+
+    th = Thermo(ev, atoms.get_positions())
+    n = th.n_atoms
+    state = lbfgs_prepare_state(
+        n, 1, dtype=wp.vec3d, history_size=p["memory"], device=th.device
+    )
+    batch = th.zeros(n, dtype=wp.int32)
+    th.evaluate()
+    for _ in range(steps):
+        lbfgs_step(th.positions, th.forces, state, batch, maxstep=p["maxstep"])
+        th.evaluate()
+    return th.positions.numpy(), state
+
+
+class TestKernelLoops:
+    def test_lbfgs_names_reach_the_kernel(self, model):
+        """The class under ASE's names matches the kernel driven by hand, with
+        the history full and a step cap small enough to engage."""
+        atoms = make_atoms(model)
+        p = {"memory": 3, "maxstep": 0.05}
+        want, state = loop_lbfgs(make_ev(model, atoms), atoms, 40, p)
+        assert int(state.history_count.numpy()[0]) == 3
+        opt = LBFGS(make_ev(model, atoms), atoms, logfile=None, check=False, **p)
+        opt.run(fmax=1e-12, steps=40)
+        assert opt.nsteps == 40
+        np.testing.assert_allclose(opt.thermo.positions.numpy(), want, atol=1e-10)
+        assert int(opt._state.history_count.cpu().numpy()[0]) == 3
+
     @pytest.mark.parametrize(
         "relax, loop", [(FIRE, loop_fire), (FIRE2, loop_fire2)], ids=["FIRE", "FIRE2"]
     )
@@ -1329,12 +1390,60 @@ def _cell_only(model, strain):
 STRAINS = {"isotropic": np.eye(3) * 1.03, "orthorhombic": np.diag([1.03, 0.98, 1.0])}
 
 
+class _MetricSpring:
+    """A real evaluator with the atomic forces held at zero and a spring on
+    the cell's metric, E = k V_ref |H H^T - G_ref|^2 / 2, whose virial is
+    exact for any cell shape and the same in any orientation. The relaxed
+    cell has the reference metric; its orientation is what the optimizer
+    keeps, and the atoms, with no forces of their own, ride the cell exactly."""
+
+    def __init__(self, ev, h_ref, k=10.0 * units.GPa):
+        self._ev = ev
+        self._g_ref = h_ref @ h_ref.T
+        self._v_ref = abs(np.linalg.det(h_ref))
+        self._k = k / float(np.sum(self._g_ref**2))
+
+    def __getattr__(self, name):
+        return getattr(self._ev, name)
+
+    def __call__(self, positions):
+        energy, forces = self._ev(positions)
+        forces.zero_()
+        h = np.asarray(self._ev.cell)
+        d = h @ h.T - self._g_ref
+        return 0.5 * self._k * self._v_ref * float(np.sum(d * d)), forces
+
+    @property
+    def virial(self):
+        h = np.asarray(self._ev.cell)
+        return -2.0 * self._k * self._v_ref * h.T @ (h @ h.T - self._g_ref) @ h
+
+
+SHEAR = np.array([[1.03, 0.0, 0.0], [0.01, 0.98, 0.0], [-0.015, 0.01, 1.02]])
+
+
+def _metric_spring(model, rotation=None):
+    """A sheared reference cell in ASE's standard (lower-triangular) form,
+    deformed by SHEAR, the whole structure rotated if asked, and the spring
+    that pulls the cell back to the reference metric."""
+    atoms = make_atoms(model)
+    h_ref = atoms.cell.array.copy()
+    h_ref[1, 0], h_ref[2, 0], h_ref[2, 1] = 1.1, -0.7, 0.9
+    start = h_ref @ SHEAR
+    if rotation is not None:
+        start = start @ rotation
+    atoms.set_cell(start, scale_atoms=True)
+    ev = _MetricSpring(make_ev(model, atoms, compute_virial=True), h_ref)
+    return atoms, ev, h_ref
+
+
 class TestCellRelaxation:
     def test_the_cell_force_is_the_enthalpy_gradient(self, model):
         """Finite differences of E + P V over the nine cell entries, at fixed
-        fractional coordinates, on a sheared cell. nvalchemiops'
-        stress_to_cell_force is written for column cells and misses the
-        shear entries of ASE's row cell by far more."""
+        fractional coordinates, on a sheared cell. nvalchemiops 0.4's
+        stress_to_cell_force was written for column cells and missed the shear
+        entries of ASE's row cell; 0.5.0 moved to the row convention and
+        agrees."""
         from nvalchemiops.dynamics.utils import stress_to_cell_force
 
         atoms = make_atoms(model)
@@ -1371,7 +1480,7 @@ class TestCellRelaxation:
                 fd[i, j] = -(enthalpy(h + step) - enthalpy(h - step)) / (2 * d)
         error = np.abs(got - fd).max()
         assert error < 1e-6 * np.abs(fd).max()
-        assert np.abs(column_cells - fd).max() > 1e3 * error
+        np.testing.assert_allclose(column_cells, got, atol=10 * error)
 
     @OPTIMIZERS
     @pytest.mark.parametrize("mode", list(STRAINS))
@@ -1398,15 +1507,63 @@ class TestCellRelaxation:
         )
         assert np.all(np.abs(ratios - 1.0) > 1e-3)  # it did move
 
-    def test_both_algorithms_find_the_same_cell(self, model):
+    @OPTIMIZERS
+    def test_a_triclinic_cell_relaxes_to_its_target_shape(self, model, relax):
+        """A sheared cell in ASE's standard form, deformed, comes back to the
+        reference metric with its orientation kept: the relaxed cell is the
+        reference cell itself, still lower-triangular, and the atoms rode it."""
+        atoms, ev, h_ref = _metric_spring(model)
+        frac = atoms.get_scaled_positions(wrap=False)
+        opt = relax(ev, atoms, relax_cell="full", logfile=None, check=False)
+        assert opt.run(fmax=0.05, steps=3000, smax=1e-5 * units.GPa)
+        h = atoms.cell.array
+        np.testing.assert_allclose(h, h_ref, atol=2e-3)
+        assert np.abs(np.triu(h, 1)).max() < 1e-10
+        np.testing.assert_allclose(atoms.positions, frac @ h, atol=1e-8)
+        np.testing.assert_array_equal(h, ev.cell)
+
+    @OPTIMIZERS
+    def test_a_rotated_cell_comes_back_in_its_own_frame(self, model, relax, tmp_path):
+        """The same start rotated whole: the kernels work in their own frame,
+        and the result and every trajectory frame come back in the start's,
+        the first lattice vector keeping its direction and the second its
+        plane."""
+        from scipy.spatial.transform import Rotation
+
+        rot = Rotation.from_rotvec([0.3, -0.5, 0.8]).as_matrix()
+        atoms, ev, h_ref = _metric_spring(model, rotation=rot)
+        start = atoms.cell.array.copy()
+        frac = atoms.get_scaled_positions(wrap=False)
+        path = tmp_path / "rotated.extxyz"
+        opt = relax(
+            ev,
+            atoms,
+            relax_cell="full",
+            logfile=None,
+            loginterval=10,
+            trajectory=path,
+            check=False,
+        )
+        assert opt.run(fmax=0.05, steps=3000, smax=1e-5 * units.GPa)
+        opt.close()
+        h = atoms.cell.array
+        np.testing.assert_allclose(h, h_ref @ rot, atol=2e-3)
+        np.testing.assert_allclose(atoms.positions, frac @ h, atol=1e-8)
+        frames = list(ase.io.iread(path))
+        np.testing.assert_allclose(frames[0].cell.array, start, atol=1e-10)
+        np.testing.assert_allclose(frames[0].positions, frac @ start, atol=1e-8)
+        np.testing.assert_allclose(frames[-1].cell.array, h, atol=1e-10)
+
+    def test_every_algorithm_finds_the_same_cell(self, model):
         cells = []
-        for relax in (FIRE, FIRE2):
+        for relax in (FIRE, FIRE2, LBFGS):
             atoms, ev = _cell_only(model, STRAINS["orthorhombic"])
             relax(ev, atoms, relax_cell="orthorhombic", logfile=None, check=False).run(
                 fmax=0.05, steps=3000, smax=1e-5 * units.GPa
             )
             cells.append(atoms.cell.array)
-        np.testing.assert_allclose(cells[0], cells[1], rtol=1e-5)
+        for cell in cells[1:]:
+            np.testing.assert_allclose(cell, cells[0], rtol=1e-5)
 
     def test_refusals(self, model):
         atoms = make_atoms(model)
@@ -1470,8 +1627,9 @@ class TestCellRelaxation:
     "DEEPMD_LR_WATER_MODEL" not in os.environ,
     reason="needs a trained water checkpoint in DEEPMD_LR_WATER_MODEL",
 )
+@pytest.mark.parametrize("relax", [FIRE2, LBFGS], ids=["FIRE2", "LBFGS"])
 @pytest.mark.parametrize("mode", ["isotropic", "orthorhombic", "full"])
-def test_water_relaxes_its_cell(mode):
+def test_water_relaxes_its_cell(mode, relax):
     """A water box stretched by 4% comes back to zero stress in every mode."""
     import pathlib
 
@@ -1487,7 +1645,7 @@ def test_water_relaxes_its_cell(mode):
         compute_virial=True,
         compress=os.environ.get("DEEPMD_LR_WATER_COMPRESS") == "1",
     )
-    opt = FIRE2(ev, atoms, relax_cell=mode, logfile=None)
+    opt = relax(ev, atoms, relax_cell=mode, logfile=None)
     assert opt.run(fmax=0.05, steps=3000)
     assert opt.stress_residual() < 0.01 * units.GPa
 
@@ -1706,7 +1864,7 @@ class TestFixedAtoms:
             last.get_forces(apply_constraint=False), raw, atol=1e-6
         )
 
-    @pytest.mark.parametrize("relax", [FIRE, FIRE2])
+    @OPTIMIZERS
     def test_a_relaxation_moves_only_the_rest(self, model, relax):
         atoms = make_fixed(model)
         x0 = atoms.get_positions()

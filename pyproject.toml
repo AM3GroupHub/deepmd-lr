@@ -11,7 +11,7 @@ requires-python = ">=3.11,<3.14"
 license = "LGPL-3.0-or-later"
 dependencies = [
     "deepmd-kit==3.2.0",
-    "nvalchemi-toolkit-ops>=0.4.1",
+    "nvalchemi-toolkit-ops>=0.5.0",
     "torch>=2.11.0",
     # `deepmd_lr.ase` is built on ASE's Calculator, and the partitioned
     # evaluator reads its mass table. Undeclared until a fresh HOPPER env

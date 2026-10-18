@@ -28,7 +28,7 @@ pip install "deepmd-kit==3.2.0"
 pip install "e3nn>=0.5.9" "vesin[torch]" mpich
 
 # 4. the PME engine
-pip install "nvalchemi-toolkit-ops>=0.4.1" "warp-lang>=1.13.0"
+pip install "nvalchemi-toolkit-ops>=0.5.0" "warp-lang>=1.16.0"
 
 # 5. data / MD / dev tooling
 pip install "dpdata>=0.2.7" "ase>=3.29" pytest pytest-cov ruff

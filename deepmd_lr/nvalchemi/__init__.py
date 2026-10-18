@@ -7,8 +7,8 @@
 - The MD classes -- :class:`VelocityVerlet` (NVE); :class:`Langevin`,
   :class:`NoseHooverChainNVT` and :class:`VelocityRescaling` (NVT);
   :class:`MTKNPT` (NPT) and :class:`MTKNPH` (NPH), each with an isotropic,
-  orthorhombic or full cell -- and the relaxations :class:`FIRE` and
-  :class:`FIRE2` take that evaluator and an ``ase.Atoms``, ASE-style:
+  orthorhombic or full cell -- and the relaxations :class:`FIRE`,
+  :class:`FIRE2` and :class:`LBFGS` take that evaluator and an ``ase.Atoms``, ASE-style:
   parameters in ``__init__``, then ``run(steps)``. Several may run one after
   another on one evaluator.
 - Each builds a :class:`Thermo`: the device state the nvalchemiops kernels
@@ -41,6 +41,7 @@ from deepmd_lr.nvalchemi.md import (
 from deepmd_lr.nvalchemi.optimize import (
     FIRE,
     FIRE2,
+    LBFGS,
     RelaxationError,
 )
 from deepmd_lr.nvalchemi.partition import (
@@ -59,6 +60,7 @@ __all__ = [
     "DistributedEvaluator",
     "FIRE",
     "FIRE2",
+    "LBFGS",
     "Langevin",
     "MDInstabilityError",
     "MTKNPH",
