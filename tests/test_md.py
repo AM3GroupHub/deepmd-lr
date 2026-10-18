@@ -1326,7 +1326,7 @@ class TestKernelLoops:
         opt.run(fmax=1e-12, steps=40)
         assert opt.nsteps == 40
         np.testing.assert_allclose(opt.thermo.positions.numpy(), want, atol=1e-10)
-        assert int(opt._state.history_count.numpy()[0]) == 3
+        assert int(opt._state.history_count.cpu().numpy()[0]) == 3
 
     @pytest.mark.parametrize(
         "relax, loop", [(FIRE, loop_fire), (FIRE2, loop_fire2)], ids=["FIRE", "FIRE2"]
@@ -1390,6 +1390,53 @@ def _cell_only(model, strain):
 STRAINS = {"isotropic": np.eye(3) * 1.03, "orthorhombic": np.diag([1.03, 0.98, 1.0])}
 
 
+class _MetricSpring:
+    """A real evaluator with the atomic forces held at zero and a spring on
+    the cell's metric, E = k V_ref |H H^T - G_ref|^2 / 2, whose virial is
+    exact for any cell shape and the same in any orientation. The relaxed
+    cell has the reference metric; its orientation is what the optimizer
+    keeps, and the atoms, with no forces of their own, ride the cell exactly."""
+
+    def __init__(self, ev, h_ref, k=10.0 * units.GPa):
+        self._ev = ev
+        self._g_ref = h_ref @ h_ref.T
+        self._v_ref = abs(np.linalg.det(h_ref))
+        self._k = k / float(np.sum(self._g_ref**2))
+
+    def __getattr__(self, name):
+        return getattr(self._ev, name)
+
+    def __call__(self, positions):
+        energy, forces = self._ev(positions)
+        forces.zero_()
+        h = np.asarray(self._ev.cell)
+        d = h @ h.T - self._g_ref
+        return 0.5 * self._k * self._v_ref * float(np.sum(d * d)), forces
+
+    @property
+    def virial(self):
+        h = np.asarray(self._ev.cell)
+        return -2.0 * self._k * self._v_ref * h.T @ (h @ h.T - self._g_ref) @ h
+
+
+SHEAR = np.array([[1.03, 0.0, 0.0], [0.01, 0.98, 0.0], [-0.015, 0.01, 1.02]])
+
+
+def _metric_spring(model, rotation=None):
+    """A sheared reference cell in ASE's standard (lower-triangular) form,
+    deformed by SHEAR, the whole structure rotated if asked, and the spring
+    that pulls the cell back to the reference metric."""
+    atoms = make_atoms(model)
+    h_ref = atoms.cell.array.copy()
+    h_ref[1, 0], h_ref[2, 0], h_ref[2, 1] = 1.1, -0.7, 0.9
+    start = h_ref @ SHEAR
+    if rotation is not None:
+        start = start @ rotation
+    atoms.set_cell(start, scale_atoms=True)
+    ev = _MetricSpring(make_ev(model, atoms, compute_virial=True), h_ref)
+    return atoms, ev, h_ref
+
+
 class TestCellRelaxation:
     def test_the_cell_force_is_the_enthalpy_gradient(self, model):
         """Finite differences of E + P V over the nine cell entries, at fixed
@@ -1435,36 +1482,6 @@ class TestCellRelaxation:
         assert error < 1e-6 * np.abs(fd).max()
         np.testing.assert_allclose(column_cells, got, atol=10 * error)
 
-    def test_the_lbfgs_chart_force_is_the_enthalpy_gradient(self, model):
-        """Finite differences of E + P V over the nine entries of Phi, the
-        atoms riding the reference cell (u = r Phi^-1 fixed), on a sheared
-        cell: the packed cell force is the cell force pulled back through
-        H = H0 Phi."""
-        atoms = make_atoms(model)
-        h = atoms.cell.array.copy()
-        h[1, 0], h[2, 0], h[2, 1] = 1.1, -0.7, 0.9
-        atoms.set_cell(h, scale_atoms=True)
-        u = atoms.get_positions()
-        ev = make_ev(model, atoms, compute_virial=True)
-        p = 0.3 * units.GPa
-        opt = LBFGS(ev, atoms, relax_cell="full", pressure_au=p, logfile=None)
-        opt.thermo.evaluate()
-        opt._reset()
-        got = opt._chart_force(h) * opt._kappa
-
-        def enthalpy(phi):
-            ev.set_cell(h @ phi)
-            return ev(u @ phi)[0] + p * abs(np.linalg.det(h @ phi))
-
-        d, fd = 1e-4, np.zeros((3, 3))
-        for i in range(3):
-            for j in range(3):
-                step = np.zeros((3, 3))
-                step[i, j] = d
-                fd[i, j] = -(enthalpy(np.eye(3) + step) - enthalpy(np.eye(3) - step))
-                fd[i, j] /= 2 * d
-        assert np.abs(got - fd).max() < 1e-6 * np.abs(fd).max()
-
     @OPTIMIZERS
     @pytest.mark.parametrize("mode", list(STRAINS))
     def test_the_cell_relaxes_to_the_target_pressure(self, model, relax, mode):
@@ -1489,6 +1506,53 @@ class TestCellRelaxation:
             np.ptp(ratios) > 1e-3 if mode == "orthorhombic" else np.ptp(ratios) < 1e-12
         )
         assert np.all(np.abs(ratios - 1.0) > 1e-3)  # it did move
+
+    @OPTIMIZERS
+    def test_a_triclinic_cell_relaxes_to_its_target_shape(self, model, relax):
+        """A sheared cell in ASE's standard form, deformed, comes back to the
+        reference metric with its orientation kept: the relaxed cell is the
+        reference cell itself, still lower-triangular, and the atoms rode it."""
+        atoms, ev, h_ref = _metric_spring(model)
+        frac = atoms.get_scaled_positions(wrap=False)
+        opt = relax(ev, atoms, relax_cell="full", logfile=None, check=False)
+        assert opt.run(fmax=0.05, steps=3000, smax=1e-5 * units.GPa)
+        h = atoms.cell.array
+        np.testing.assert_allclose(h, h_ref, atol=2e-3)
+        assert np.abs(np.triu(h, 1)).max() < 1e-10
+        np.testing.assert_allclose(atoms.positions, frac @ h, atol=1e-8)
+        np.testing.assert_array_equal(h, ev.cell)
+
+    @OPTIMIZERS
+    def test_a_rotated_cell_comes_back_in_its_own_frame(self, model, relax, tmp_path):
+        """The same start rotated whole: the kernels work in their own frame,
+        and the result and every trajectory frame come back in the start's,
+        the first lattice vector keeping its direction and the second its
+        plane."""
+        from scipy.spatial.transform import Rotation
+
+        rot = Rotation.from_rotvec([0.3, -0.5, 0.8]).as_matrix()
+        atoms, ev, h_ref = _metric_spring(model, rotation=rot)
+        start = atoms.cell.array.copy()
+        frac = atoms.get_scaled_positions(wrap=False)
+        path = tmp_path / "rotated.extxyz"
+        opt = relax(
+            ev,
+            atoms,
+            relax_cell="full",
+            logfile=None,
+            loginterval=10,
+            trajectory=path,
+            check=False,
+        )
+        assert opt.run(fmax=0.05, steps=3000, smax=1e-5 * units.GPa)
+        opt.close()
+        h = atoms.cell.array
+        np.testing.assert_allclose(h, h_ref @ rot, atol=2e-3)
+        np.testing.assert_allclose(atoms.positions, frac @ h, atol=1e-8)
+        frames = list(ase.io.iread(path))
+        np.testing.assert_allclose(frames[0].cell.array, start, atol=1e-10)
+        np.testing.assert_allclose(frames[0].positions, frac @ start, atol=1e-8)
+        np.testing.assert_allclose(frames[-1].cell.array, h, atol=1e-10)
 
     def test_every_algorithm_finds_the_same_cell(self, model):
         cells = []

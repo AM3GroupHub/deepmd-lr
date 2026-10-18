@@ -90,40 +90,42 @@ ev.set_compute_virial(True)                     # the stress drives the cell
 FIRE2(ev, atoms, relax_cell="isotropic", pressure_au=1e-4 * units.GPa).run(fmax=0.05)
 ```
 
-The cell's rows join the atoms in one extended array that the FIRE kernel
-steps like any other degrees of freedom (nvalchemiops' `07_fire_variable_cell`),
-with three differences, each measured:
+The cell moves on nvalchemiops' own variable-cell kernels: FIRE2's coupled
+coordinate-cell step and L-BFGS's coordinate-cell step relax atoms and cell
+together, and FIRE, which has no coupled kernel upstream, steps the extended
+array of nvalchemiops' cell filter and then lets the atoms ride the cell
+affinely, as the coupled kernels do. Each carries six cell parameters, one
+triangle of the cell matrix, so the cell cannot rotate while it relaxes.
+Around the kernels:
 
-- **The cell force** is −∂(E + PV)/∂H = −V H⁻ᵀ (σ + P) for the rows of ASE's
-  cell. nvalchemiops 0.4's `stress_to_cell_force` gave −V σ H⁻ᵀ, the gradient
-  for a cell whose columns are the lattice vectors, and was 0.70 eV/Å off the
-  finite-difference gradient on a sheared water cell where this one matched
-  it to 2e-3 eV/Å; 0.5.0 moved to the row convention and the two now agree
-  (a test pins it). The structure is never rotated.
-- **The atoms ride the cell affinely** before their own step.
-- **The cell force is not divided by the atom count**, which makes the cell
-  about as heavy as one atom.
-
-`LBFGS` packs the cell through ASE's `UnitCellFilter` chart instead, because
-its curvature pairs compare coordinates across steps and the affine ride would
-mix spaces: with H = H₀ Φ (H₀ the cell at the start of `run`) its degrees of
-freedom are the positions in the reference cell, u = r Φ⁻¹, and the rows of
-κ Φ, with the conjugate forces F Φᵀ and H₀ᵀ F_cell / κ. κ is the cube root of
-the starting volume, which gives a cell row about an atom's weight, the scale
-the FIRE measurement picked. A test pins the packed cell force to finite
-differences of the enthalpy over Φ.
+- **The cell force** given to FIRE and FIRE2 is −∂(E + PV)/∂H = −V H⁻ᵀ (σ + P)
+  for the rows of ASE's cell, projected onto the mode's directions.
+  nvalchemiops 0.4's `stress_to_cell_force` gave the column-cell gradient
+  instead and was 0.70 eV/Å off the finite-difference gradient on a sheared
+  water cell; 0.5.0 moved to the row convention and agrees (a test pins it).
+  L-BFGS takes the stress, projected the same way.
+- **The frame.** FIRE and FIRE2 want the lower triangle of ASE's cell, its
+  standard form; L-BFGS's kernel holds the lattice vectors as columns and
+  wants the upper. A cell not already in the form its kernel needs is rotated
+  into it for the run, positions with it, and the result, the log rows and
+  the trajectory frames come back in the orientation of the start: the first
+  lattice vector keeps its direction and the second its plane. A diagonal
+  cell is never rotated; triclinic cells in any orientation are accepted.
+- **The cell's weight.** The cell force is not divided by the atom count
+  (`cell_force_scale = 1/N` for FIRE2's kernel), which makes the cell about
+  as heavy as one atom, and the L-BFGS chart's scale is the cube root of the
+  starting volume for the same reason. In the measurement that chose it (192
+  and 12,288 atoms alike) FIRE2 took 390 steps from a 4% stretch and 1000 to
+  1570 with the force divided by N.
 
 On 192 waters stretched by 4%, to 0.05 eV/Å and 0.01 GPa, with the trained
 model on nvalchemiops 0.5.0:
 
 | steps | isotropic | orthorhombic | full |
 |---|---:|---:|---:|
-| `LBFGS` | 184 | 179 | 310 |
-| `FIRE2` | 380 | 350 | 420 |
-| `FIRE` | 670 | 370 | 450 |
-
-An earlier measurement put FIRE2 at 390, 440 and 390 steps at 192 and 12,288
-atoms alike, and at 1000 to 1570 with the cell force divided by N.
+| `LBFGS` | 172 | 189 | 473 |
+| `FIRE2` | 380 | 350 | 400 |
+| `FIRE` | 690 | 370 | 800 |
 
 The new cell goes to the evaluator every step, as under NPT. Partitions are
 reused while the [displacement and cell-deformation bound](#reusing-a-partitioning-across-steps)

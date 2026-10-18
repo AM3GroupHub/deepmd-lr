@@ -39,30 +39,36 @@ compute the virial (``evaluator.set_compute_virial(True)``), and the new cell is
 pushed to it every step; the partitions follow it, rebuilding only once the
 cell or the atoms have moved enough.
 
-This follows nvalchemiops' variable-cell FIRE example
-(``examples/dynamics/07_fire_variable_cell``): the cell joins the atoms in one
-extended array that the FIRE kernel steps. Three things differ:
+The cell moves on nvalchemiops' own variable-cell kernels. FIRE2's coupled
+coordinate-cell step and L-BFGS's coordinate-cell step relax the atoms and the
+cell together; FIRE, which has no coupled kernel upstream, steps the extended
+array its cell filter packs (``pack_positions_with_cell``) and the atoms then
+ride the cell affinely, as the two coupled kernels make them. All three carry
+six cell parameters, one triangle of the cell matrix, so the cell cannot
+rotate while it relaxes. What this module adds around the kernels:
 
-- **The cell force** is -d(E + PV)/dH = -V H^-T (sigma + P) for the rows of ASE's
-  cell. nvalchemiops 0.4's ``stress_to_cell_force`` was written for column
-  cells and was off the finite-difference gradient by 0.70 eV/A on a sheared
-  water cell, where this one matched it to 2e-3; 0.5.0 moved it to the row
-  convention and the two now agree (pinned in the tests).
-- **The atoms ride the cell affinely** before their own step, as nvalchemiops'
-  FIRE2 variable-cell step does, instead of standing still while it moves.
-- **The cell force is not divided by the atom count**, which makes the cell
-  about as heavy as one atom, as the example's cell mass does. That converged
-  fastest for both algorithms, 192 and 12,288 atoms alike: FIRE2 took 390
-  steps from a 4% stretch, and 1000-1570 with the force divided by N.
-
-:class:`LBFGS` packs the cell through ASE's ``UnitCellFilter`` chart instead,
-because its curvature pairs compare coordinates across steps and the affine
-ride would mix spaces: with ``H = H0 Phi`` (``H0`` the cell at the start of
-``run``) the degrees of freedom are the positions in the reference cell,
-``u = r Phi^-1``, and the rows of ``kappa Phi``, with the conjugate forces
-``F Phi^T`` and ``H0^T F_cell / kappa``. ``kappa`` is the cube root of the
-starting volume, which gives a cell row the weight of about one atom, the
-scale the FIRE measurement above picked.
+- **The cell force** FIRE and FIRE2 are given is -d(E + PV)/dH =
+  -V H^-T (sigma + P) for the rows of ASE's cell, projected onto the mode's
+  directions (:meth:`_Relaxation._cell_force`); since 0.5.0 nvalchemiops'
+  ``stress_to_cell_force`` computes the same gradient (0.4 was written for
+  column cells and was 0.70 eV/A off on a sheared water cell; a test pins the
+  agreement). L-BFGS takes the stress itself, projected the same way.
+- **The frame.** The kernels want the cell triangular: FIRE and FIRE2 the
+  lower triangle of ASE's rows (ASE's standard form); L-BFGS, whose kernel
+  holds the lattice vectors as columns, the upper. A cell that is not already
+  in the form its kernel needs is rotated into it at the start of ``run``,
+  positions with it, and at the end everything is rotated back into the
+  orientation of the start: the first lattice vector keeps its direction and
+  the second its plane, as ASE's standard form has it. Log rows and
+  trajectory frames are written in that frame too. A diagonal cell is never
+  rotated, and nothing is rotated for FIRE and FIRE2 when the cell already
+  is ASE's standard form.
+- **The cell's weight.** The cell force is not divided by the atom count
+  (nvalchemiops' ``cell_force_scale`` is ``1/N`` for FIRE2), which makes the
+  cell about as heavy as one atom; in the measurement that chose it (192 and
+  12,288 atoms alike) FIRE2 took 390 steps from a 4% stretch and 1000-1570
+  with the force divided by N. For L-BFGS the chart scale ``kappa`` is the
+  cube root of the starting volume for the same reason.
 
 **Divergence is always fatal.** A model without a short-range repulsive wall can
 let a minimiser collapse atoms onto each other from a badly distorted start.
@@ -93,6 +99,7 @@ import numpy as np
 import torch
 from ase import Atoms, units
 from ase.calculators.singlepoint import SinglePointCalculator
+from ase.cell import Cell
 from ase.constraints import FixAtoms
 
 from deepmd_lr.nvalchemi.md import (
@@ -148,12 +155,24 @@ def _check_fire(dt, dtmax, dtmin, Nmin, finc, fdec, astart, fa) -> None:
 _CELL_MODES = ("isotropic", "orthorhombic", "full")
 
 
-class _FIREBase:
+def _standard_form(cell: np.ndarray, form: str) -> tuple[np.ndarray, np.ndarray]:
+    """ASE's standard form of a cell: ``(rcell, Q)`` with ``rcell @ Q == cell``,
+    ``rcell`` lower- or upper-triangular and ``Q`` orthogonal."""
+    rcell, q = Cell(np.asarray(cell, dtype=np.float64)).standard_form(form)
+    # Copies: ASE's upper form comes out of reversed views, which torch refuses.
+    return np.array(rcell, dtype=np.float64), np.array(q, dtype=np.float64)
+
+
+def _is_identity(r: np.ndarray) -> bool:
+    return bool(np.abs(r - np.eye(3)).max() < 1e-12)
+
+
+class _Relaxation:
     """What the relaxations share: a Thermo of their own on the shared
     evaluator, the loop with its divergence guard, the checks, the log, the
-    trajectory, observers, and the cell. A subclass sets up its kernel's state
-    and steps ``self._positions`` with it in :meth:`_step`: the atoms, or with
-    ``relax_cell`` the atoms and the cell's three rows after them.
+    trajectory, observers, and the cell's frame. A subclass owns its kernel's
+    buffers and moves the atoms, and with ``relax_cell`` the cell, once per
+    :meth:`_move`.
 
     Parameters
     ----------
@@ -185,6 +204,8 @@ class _FIREBase:
     #: quasi-Newton method, whose restart kicks a converged structure by
     #: ``maxstep`` if it is stepped once more; every ten for FIRE.
     _check_every = 10
+    #: The triangle of ASE's cell matrix the kernel's six cell parameters fill.
+    _cell_form = "lower"
 
     def __init__(
         self,
@@ -249,22 +270,14 @@ class _FIREBase:
         self.loginterval = max(1, int(loginterval))
         self.nsteps = 0
         self.converged = False
-        th, n = self.thermo, self.thermo.n_atoms
-        m = n + (3 if relax_cell else 0)  # the cell's rows follow the atoms
-        self._vel = wp.zeros(m, dtype=wp.vec3d, device=th.device)
-        self._batch = wp.zeros(m, dtype=wp.int32, device=th.device)
-        self._unit_masses = wp.array(np.ones(m), dtype=wp.float64, device=th.device)
-        self._positions, self._forces = th.positions, th.forces
+        th = self.thermo
         self._x = wp.to_torch(th.positions)  # views of the Thermo's buffers
         self._f = wp.to_torch(th.forces)
-        if relax_cell is not None:
-            self._x_old = torch.empty_like(self._x)
-            self._ext_x = torch.zeros(
-                (m, 3), dtype=torch.float64, device=self._x.device
-            )
-            self._ext_f = torch.zeros_like(self._ext_x)
-            self._positions = wp.from_torch(self._ext_x, dtype=wp.vec3d)
-            self._forces = wp.from_torch(self._ext_f, dtype=wp.vec3d)
+        #: ``(Q, Q0)`` while a run is in the kernel's frame: the cell was
+        #: rotated by ``Q`` (``cell @ Q.T``) into the triangle the kernel
+        #: fills, and ``Q0`` is the start's lower standard form, the
+        #: orientation everything comes back in.
+        self._frame: tuple[np.ndarray, np.ndarray] | None = None
         self._observers: list = []
         self._last_recorded: int | None = None
         self._traj = None if trajectory is None else _Trajectory(trajectory, False)
@@ -333,31 +346,52 @@ class _FIREBase:
     def _enthalpy(self) -> float:
         return self.thermo.energy + self.pressure_au * self.evaluator.volume
 
-    def _step(self) -> None:
-        """Step ``self._positions`` once from ``self._forces``."""
-        raise NotImplementedError
-
     def _reset(self) -> None:
-        """Start a run: the state the kernel carries between steps, if any."""
+        """Start a run. Here: into the kernel's frame, if the cell is not in
+        the triangular form it needs; a subclass then resets what its kernel
+        carries between steps."""
+        self._frame = None
+        if self.relax_cell is None:
+            return
+        cell = np.array(self.evaluator.cell, dtype=np.float64)
+        rcell, q = _standard_form(cell, self._cell_form)
+        self._frame = (q, _standard_form(cell, "lower")[1])
+        if not _is_identity(q):
+            self._rotate(q.T)
+            self.thermo.set_cell(rcell)
+
+    def _rotate(self, r: np.ndarray) -> None:
+        """Positions ``-> positions @ r`` on the device."""
+        r = torch.as_tensor(np.ascontiguousarray(r), device=self._x.device)
+        self._x.copy_(self._x @ r)
+
+    def _user_frame(self, cell: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """The cell as it is reported: out of the kernel's frame, in the
+        orientation of the start (its lower standard form). Returns the cell
+        and the rotation ``r`` that takes device positions and forces there
+        (``x @ r``), the identity when no frame is in use."""
+        if self._frame is None:
+            return cell, np.eye(3)
+        q, q0 = self._frame
+        lower, q1 = _standard_form(cell @ q, "lower")
+        return lower @ q0, q @ q1.T @ q0
+
+    def _restore(self) -> None:
+        """Leave the kernel's frame at the end of a run, re-evaluating once
+        when that is a rotation, so forces and virial are reported in it."""
+        if self._frame is None:
+            return
+        cell, r = self._user_frame(np.array(self.evaluator.cell, dtype=np.float64))
+        self._frame = None
+        if _is_identity(r):
+            return
+        self._rotate(r)
+        self.thermo.set_cell(cell)
+        self.thermo.evaluate()
 
     def _move(self) -> None:
         """One step of the atoms, and with ``relax_cell`` of the cell too."""
-        if self.relax_cell is None:
-            self._step()
-            return
-        n, dev = self.thermo.n_atoms, self._x.device
-        h = np.array(self.evaluator.cell, dtype=np.float64)
-        self._x_old.copy_(self._x)
-        self._ext_x[:n].copy_(self._x)
-        self._ext_x[n:].copy_(torch.as_tensor(h, device=dev))
-        self._ext_f[:n].copy_(self._f)
-        self._ext_f[n:].copy_(torch.as_tensor(self._cell_force(h), device=dev))
-        self._step()
-        h_new = self._ext_x[n:].cpu().numpy()
-        # The atoms ride the cell affinely, on top of their own step.
-        affine = torch.as_tensor(np.linalg.solve(h, h_new - h), device=dev)
-        self._x.copy_(self._ext_x[:n] + self._x_old @ affine)
-        self.thermo.set_cell(h_new)
+        raise NotImplementedError
 
     def _converged(self, f: float, fmax: float, smax: float) -> bool:
         return f < fmax and (self.relax_cell is None or self.stress_residual() < smax)
@@ -390,8 +424,8 @@ class _FIREBase:
         ):
             th.set_cell(self.atoms.cell.array)  # atoms edited between runs
         th.set_state(positions=self.atoms.get_positions())
-        th.evaluate()
         self._reset()
+        th.evaluate()
         n = th.n_atoms
         e0, f0, v0 = self._enthalpy(), self.fmax(), self.evaluator.volume
         bonds0 = _covalent_bonds(self.atoms) if self.check else None
@@ -437,6 +471,7 @@ class _FIREBase:
                 yield self.nsteps
         finally:
             if math.isfinite(th.energy):
+                self._restore()
                 _sync_atoms(self.atoms, th)
         f1 = self.fmax()
         if self._last_recorded != self.nsteps:
@@ -487,6 +522,7 @@ class _FIREBase:
         """A log row and a trajectory frame for the current step."""
         self._last_recorded = self.nsteps
         th = self.thermo
+        cell, r = self._user_frame(np.array(self.evaluator.cell, dtype=np.float64))
         if self._logger is not None:
             row = {"step": self.nsteps, "Epot[eV]": th.energy, "fmax[eV/A]": fmax}
             if self.relax_cell is not None:
@@ -498,14 +534,16 @@ class _FIREBase:
         if self._traj is not None:
             frame = Atoms(
                 self.atoms.get_chemical_symbols(),
-                positions=th.positions.numpy(),
-                cell=np.asarray(self.evaluator.cell),
+                positions=th.positions.numpy() @ r,
+                cell=cell,
                 pbc=self.atoms.pbc,
             )
             if len(th.fixed):
                 frame.set_constraint(FixAtoms(indices=th.fixed))
             frame.calc = SinglePointCalculator(
-                frame, energy=th.energy, forces=th.get_forces(apply_constraint=False)
+                frame,
+                energy=th.energy,
+                forces=th.get_forces(apply_constraint=False) @ r,
             )
             frame.info["step"] = self.nsteps
             self._traj.write(frame)
@@ -518,7 +556,7 @@ class _FIREBase:
             self._traj.close()
 
 
-class FIRE(_FIREBase):
+class FIRE(_Relaxation):
     """FIRE, the original algorithm (Bitzek et al., Phys. Rev. Lett. 97, 170201
     (2006)), through nvalchemiops' ``fire_step``.
 
@@ -528,6 +566,12 @@ class FIRE(_FIREBase):
     unit masses: the timestep is a relaxation parameter, not a physical one.
     (With real masses, oxygen moved 16x slower and water took 2-6x as many
     steps.) Each atom's step is capped at ``maxstep`` on its own.
+
+    With ``relax_cell`` the cell's six parameters join the atoms in the
+    extended array nvalchemiops' cell filter packs, stepped by the same
+    kernel, and the atoms then ride the cell affinely (the module docstring).
+    The kernel caps the two cell entries separately, so an isotropic or
+    orthorhombic step is projected back onto its family afterwards.
 
     Parameters
     ----------
@@ -566,8 +610,19 @@ class FIRE(_FIREBase):
 
         _check_fire(dt, dtmax, dtmin, Nmin, finc, fdec, astart, fa)
         super().__init__(evaluator, atoms, **kwargs)
-        th = self.thermo
+        th, n = self.thermo, self.thermo.n_atoms
+        m = n + (2 if self.relax_cell else 0)  # the cell filter's two entries
         self._kernel = fire_step
+        self._vel = th.zeros(m, dtype=wp.vec3d)
+        self._batch = th.zeros(m, dtype=wp.int32)
+        self._unit_masses = wp.array(np.ones(m), dtype=wp.float64, device=th.device)
+        self._positions, self._forces = th.positions, th.forces
+        if self.relax_cell is not None:
+            self._positions = th.zeros(m, dtype=wp.vec3d)  # the extended arrays
+            self._forces = th.zeros(m, dtype=wp.vec3d)
+            self._cell_w = th.zeros(1, dtype=wp.mat33d)
+            self._cell_force_w = th.zeros(1, dtype=wp.mat33d)
+            self._x_old = torch.empty_like(self._x)
         self._alpha, self._dt = th.scalar(astart), th.scalar(dt)
         self._limits = [th.scalar(v) for v in (astart, fa, dtmin, dtmax, self.maxstep)]
         self._n_positive = th.zeros(1, dtype=wp.int32)
@@ -593,10 +648,44 @@ class FIRE(_FIREBase):
             batch_idx=self._batch,
         )
 
+    def _move(self) -> None:
+        if self.relax_cell is None:
+            self._step()
+            return
+        from nvalchemiops.dynamics.utils import (
+            pack_forces_with_cell,
+            pack_positions_with_cell,
+            unpack_positions_with_cell,
+        )
 
-class FIRE2(_FIREBase):
+        th, n = self.thermo, self.thermo.n_atoms
+        h = np.array(self.evaluator.cell, dtype=np.float64)
+        self._cell_w.assign(h.reshape(1, 3, 3))
+        self._cell_force_w.assign(np.tril(self._cell_force(h)).reshape(1, 3, 3))
+        pack_positions_with_cell(th.positions, self._cell_w, extended=self._positions)
+        pack_forces_with_cell(th.forces, self._cell_force_w, extended=self._forces)
+        self._x_old.copy_(self._x)
+        self._step()
+        unpack_positions_with_cell(
+            self._positions, positions=th.positions, cell=self._cell_w, num_atoms=n
+        )
+        h_new = self._cell_w.numpy()[0]
+        # The kernel caps each of the two cell entries on its own, which would
+        # take a uniform scaling off its ray: project the step back onto it.
+        if self.relax_cell == "isotropic":
+            h_new = float(np.sum(h_new * h) / np.sum(h * h)) * h
+        elif self.relax_cell == "orthorhombic":
+            h_new = np.diag(np.diag(h_new))
+        # The atoms ride the cell affinely, on top of their own step.
+        affine = torch.as_tensor(np.linalg.solve(h, h_new - h), device=self._x.device)
+        self._x.add_(self._x_old @ affine)
+        th.set_cell(h_new)
+
+
+class FIRE2(_Relaxation):
     """FIRE 2.0 (Guenole et al., Comput. Mater. Sci. 175, 109584 (2020)),
-    through nvalchemiops' ``fire2_step``.
+    through nvalchemiops' ``fire2_step`` and, with ``relax_cell``, its coupled
+    ``fire2_step_coord_cell``.
 
     FIRE with the changes of FIRE 2.0, as nvalchemiops implements them: the
     kick comes before the power is measured (semi-implicit Euler); a step on
@@ -607,6 +696,10 @@ class FIRE2(_FIREBase):
     names (``Nmin`` is the kernel's ``delaystep``, ``finc`` its ``dtgrow``,
     ``fdec`` its ``dtshrink``, ``astart`` its ``alpha0``, ``fa`` its
     ``alphashrink``, and ``dtmax``/``dtmin`` its ``tmax``/``tmin``).
+
+    With ``relax_cell`` the coupled kernel mixes the six cell parameters with
+    the atoms, deforms the cell and moves the atoms with it and by their own
+    step, capping that whole Cartesian displacement at ``maxstep``.
 
     Parameters
     ----------
@@ -637,8 +730,7 @@ class FIRE2(_FIREBase):
         forces) at every log row and at the end -- the end of a divergence
         included, which is where a failed relaxation went.
     maxstep
-        Largest displacement of any atom, and of any cell row, per step, in
-        angstrom (the ride with the cell comes on top).
+        Largest displacement of any atom per step, in angstrom.
     check
         Refuse a bad relaxation (see the module docstring). Divergence is
         refused either way.
@@ -664,8 +756,10 @@ class FIRE2(_FIREBase):
 
         _check_fire(dt, dtmax, dtmin, Nmin, finc, fdec, astart, fa)
         super().__init__(evaluator, atoms, **kwargs)
-        th = self.thermo
+        th, n = self.thermo, self.thermo.n_atoms
         self._kernel = fire2_step
+        self._vel = th.zeros(n, dtype=wp.vec3d)
+        self._batch = th.zeros(n, dtype=wp.int32)
         self._alpha, self._dt = th.scalar(astart), th.scalar(dt)
         self._n_inc = th.zeros(1, dtype=wp.int32)
         self._scratch = [th.zeros(1) for _ in range(4)]
@@ -678,12 +772,42 @@ class FIRE2(_FIREBase):
             "tmax": float(dtmax),
             "tmin": float(dtmin),
         }
+        if self.relax_cell is not None:
+            dev = self._x.device
+            zeros = lambda *shape, dtype=torch.float64: torch.zeros(  # noqa: E731
+                shape, dtype=dtype, device=dev
+            )
+            self._cell_t = zeros(1, 3, 3)
+            self._cell_vel_t = zeros(1, 3, 3)
+            self._cell_force_t = zeros(1, 3, 3)
+            # The coupled kernel's torch views of the warp state above, and
+            # the packed layout it would otherwise allocate at every call.
+            self._cell_args = (
+                wp.to_torch(self._vel),
+                wp.to_torch(self._batch),
+                wp.to_torch(self._alpha),
+                wp.to_torch(self._dt),
+                wp.to_torch(self._n_inc),
+            )
+            self._cell_kwargs = {
+                "atom_ptr": torch.tensor([0, n], dtype=torch.int32, device=dev),
+                "ext_atom_ptr": torch.tensor([0, n + 2], dtype=torch.int32, device=dev),
+                "ext_batch_idx": zeros(n + 2, dtype=torch.int32),
+                "ext_velocities": zeros(n + 2, 3),
+                "ext_forces": zeros(n + 2, 3),
+                "vf": wp.to_torch(self._scratch[0]),
+                "v_sumsq": wp.to_torch(self._scratch[1]),
+                "f_sumsq": wp.to_torch(self._scratch[2]),
+                "max_norm": wp.to_torch(self._scratch[3]),
+                # Not divided by the atom count: see the module docstring.
+                "cell_force_scale": 1.0 / n,
+            }
 
     def _step(self) -> None:
         self._kernel(
-            self._positions,
+            self.thermo.positions,
             self._vel,
-            self._forces,
+            self.thermo.forces,
             self._batch,
             self._alpha,
             self._dt,
@@ -693,9 +817,39 @@ class FIRE2(_FIREBase):
             **self._parameters,
         )
 
+    def _move(self) -> None:
+        if self.relax_cell is None:
+            self._step()
+            return
+        from nvalchemiops.torch import fire2_step_coord_cell
 
-class LBFGS(_FIREBase):
-    """Limited-memory BFGS (Nocedal 1980), through nvalchemiops' ``lbfgs_step``.
+        h = np.array(self.evaluator.cell, dtype=np.float64)
+        vel, batch, alpha, dt, n_inc = self._cell_args
+        self._cell_t[0].copy_(torch.as_tensor(h, device=self._x.device))
+        self._cell_force_t[0].copy_(
+            torch.as_tensor(np.tril(self._cell_force(h)), device=self._x.device)
+        )
+        fire2_step_coord_cell(
+            self._x,
+            vel,
+            self._f,
+            self._cell_t,
+            self._cell_vel_t,
+            self._cell_force_t,
+            batch,
+            alpha,
+            dt,
+            n_inc,
+            maxstep=self.maxstep,
+            **self._parameters,
+            **self._cell_kwargs,
+        )
+        self.thermo.set_cell(self._cell_t[0].cpu().numpy())
+
+
+class LBFGS(_Relaxation):
+    """Limited-memory BFGS (Nocedal 1980), through nvalchemiops'
+    ``lbfgs_step_coord`` and, with ``relax_cell``, its ``lbfgs_step_coord_cell``.
 
     A quasi-Newton step built from the last ``memory`` position and force
     differences, shortened so that no atom moves more than ``maxstep``. There
@@ -712,10 +866,10 @@ class LBFGS(_FIREBase):
     ``48 * memory`` bytes per atom) and ``maxstep`` (0.2 A, as in ASE). ASE's
     ``damping`` and ``alpha`` have no counterpart in the kernel.
 
-    With ``relax_cell`` the cell enters through ASE's ``UnitCellFilter``
-    chart rather than the extended array FIRE steps (see the module
-    docstring); ``maxstep`` then caps the motion of the positions in the
-    reference cell and of the scaled cell rows.
+    With ``relax_cell`` the kernel relaxes the atoms and the cell together in
+    ASE's ``UnitCellFilter`` chart, the deformation from the cell at the start
+    of ``run``, driven by the stress; ``maxstep`` caps the Cartesian motion of
+    the atoms, their ride with the cell included.
 
     Parameters
     ----------
@@ -729,6 +883,7 @@ class LBFGS(_FIREBase):
     """
 
     _check_every = 1
+    _cell_form = "upper"  # lattice vectors as columns, lower-triangular
 
     def __init__(
         self,
@@ -739,64 +894,75 @@ class LBFGS(_FIREBase):
         maxstep: float = 0.2,
         **kwargs: Any,
     ) -> None:
-        from nvalchemiops.dynamics.optimizers import lbfgs_step
-
         if int(memory) < 1:
             raise ValueError(f"memory must be at least 1 (got {memory})")
         super().__init__(evaluator, atoms, maxstep=maxstep, **kwargs)
         self.memory = int(memory)
-        self._kernel = lbfgs_step
+        dev, n = self._x.device, self.thermo.n_atoms
+        self._batch_t = torch.zeros(n, dtype=torch.int32, device=dev)
         self._state = None
+        self._cell_state = None
+        if self.relax_cell is not None:
+            self._atom_ptr_t = torch.tensor([0, n], dtype=torch.int32, device=dev)
+            self._cell_t = torch.zeros((1, 3, 3), dtype=torch.float64, device=dev)
+            self._stress_t = torch.zeros_like(self._cell_t)
 
     def _reset(self) -> None:
-        import warp as wp
-        from nvalchemiops.dynamics.optimizers import lbfgs_prepare_state
+        from nvalchemiops.torch.lbfgs import (
+            lbfgs_prepare_cell_state,
+            lbfgs_prepare_state,
+        )
 
-        th = self.thermo
+        super()._reset()  # the frame first: the chart's reference is the cell now
+        dev, n = self._x.device, self.thermo.n_atoms
+        cell = self.relax_cell is not None
         self._state = lbfgs_prepare_state(
-            th.n_atoms + (3 if self.relax_cell else 0),
+            n + (2 if cell else 0),
             1,
-            dtype=wp.vec3d,
+            dtype=torch.float64,
             history_size=self.memory,
-            device=th.device,
+            device=dev,
         )
-        if self.relax_cell is not None:
-            self._h0 = np.array(self.evaluator.cell, dtype=np.float64)
-            self._h0_inv = np.linalg.inv(self._h0)
-            self._kappa = abs(np.linalg.det(self._h0)) ** (1.0 / 3.0)
+        if cell:
+            h = np.array(self.evaluator.cell, dtype=np.float64)
+            self._cell_t[0].copy_(torch.as_tensor(h.T.copy(), device=dev))
+            kappa = abs(np.linalg.det(h)) ** (1.0 / 3.0)
+            self._cell_state = lbfgs_prepare_cell_state(
+                self._atom_ptr_t,
+                self._cell_t,
+                cell_force_scale=kappa / n,
+                dtype=torch.float64,
+                device=dev,
+            )
 
-    def _step(self) -> None:
-        self._kernel(
-            self._positions,
-            self._forces,
-            self._state,
-            self._batch,
-            maxstep=self.maxstep,
-        )
-
-    def _chart_force(self, h: np.ndarray) -> np.ndarray:
-        """-d(E + P V)/d(kappa Phi) for the rows of Phi, along the mode's free
-        directions: the cell force on H pulled back through ``H = H0 Phi``."""
-        g = self._h0.T @ (np.linalg.inv(h).T @ self._enthalpy_virial(h))
+    def _stress(self, h: np.ndarray) -> np.ndarray:
+        """The stress that drives the kernel's cell: tensile-positive, the
+        target pressure folded in, along the mode's free directions."""
+        s = -self._enthalpy_virial(h) / abs(np.linalg.det(h))
         if self.relax_cell == "isotropic":
-            g = np.trace(g) / 3.0 * np.eye(3)
-        elif self.relax_cell == "orthorhombic":
-            g = np.diag(np.diag(g))
-        return g / self._kappa
+            return np.trace(s) / 3.0 * np.eye(3)
+        if self.relax_cell == "orthorhombic":
+            return np.diag(np.diag(s))
+        return s
 
     def _move(self) -> None:
-        """One step of the atoms, and with ``relax_cell`` of the chart."""
+        from nvalchemiops.torch.lbfgs import lbfgs_step_coord, lbfgs_step_coord_cell
+
         if self.relax_cell is None:
-            self._step()
+            lbfgs_step_coord(
+                self._x, self._f, self._state, self._batch_t, maxstep=self.maxstep
+            )
             return
-        n, dev = self.thermo.n_atoms, self._x.device
         h = np.array(self.evaluator.cell, dtype=np.float64)
-        phi = self._h0_inv @ h
-        self._ext_x[:n].copy_(self._x @ torch.as_tensor(np.linalg.inv(phi), device=dev))
-        self._ext_x[n:].copy_(torch.as_tensor(self._kappa * phi, device=dev))
-        self._ext_f[:n].copy_(self._f @ torch.as_tensor(phi.T, device=dev))
-        self._ext_f[n:].copy_(torch.as_tensor(self._chart_force(h), device=dev))
-        self._step()
-        phi = self._ext_x[n:].cpu().numpy() / self._kappa
-        self._x.copy_(self._ext_x[:n] @ torch.as_tensor(phi, device=dev))
-        self.thermo.set_cell(self._h0 @ phi)
+        self._stress_t[0].copy_(torch.as_tensor(self._stress(h), device=self._x.device))
+        lbfgs_step_coord_cell(
+            self._x,
+            self._cell_t,
+            self._f,
+            self._stress_t,
+            self._state,
+            self._cell_state,
+            self._batch_t,
+            maxstep=self.maxstep,
+        )
+        self.thermo.set_cell(self._cell_t[0].T.cpu().numpy())
