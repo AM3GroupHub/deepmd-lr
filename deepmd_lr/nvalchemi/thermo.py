@@ -287,10 +287,12 @@ class Thermo:
     def fresh(self) -> bool:
         """Whether :attr:`forces` still hold this object's own evaluation.
 
-        False before the first :meth:`evaluate`, and after any other object
-        sharing the evaluator has evaluated since -- the buffer is shared.
+        False before the first :meth:`evaluate`, after the evaluator discarded
+        its results (``clear_results``, as a failed relaxation does), and after
+        any other object sharing the evaluator has evaluated since -- the
+        buffer is shared.
         """
-        return self._seen_calls == self.evaluator.calls
+        return self._seen_calls == self.evaluator.calls and bool(self.evaluator.results)
 
     def set_cell(self, cell: Any = None) -> None:
         """Push the cell to the evaluator and refresh the volume.
