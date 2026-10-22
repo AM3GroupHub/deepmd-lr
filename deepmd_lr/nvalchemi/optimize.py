@@ -342,6 +342,23 @@ class _Relaxation:
     def _enthalpy(self) -> float:
         return self.thermo.energy + self.pressure_au * self.evaluator.volume
 
+    def _evaluate(self) -> float:
+        """Evaluate, and reject a non-finite result before any kernel sees it:
+        the energy, the largest force and, with ``relax_cell``, every entry of
+        the virial, which the cell kernels would otherwise write into the
+        cell. Returns the largest force."""
+        self.thermo.evaluate()
+        f = self.fmax()
+        valid = math.isfinite(self._enthalpy()) and math.isfinite(f)
+        if self.relax_cell is not None:
+            valid = valid and bool(np.isfinite(self.evaluator.virial).all())
+        if not valid:
+            raise RelaxationError(
+                f"relaxation stopped after {self.nsteps} steps: the evaluation gave "
+                "a non-finite energy, force or virial"
+            )
+        return f
+
     def _reset(self) -> None:
         """Start a run. Here: into the kernel's frame, if the cell is not in
         the triangular form it needs; a subclass then resets what its kernel
@@ -385,13 +402,21 @@ class _Relaxation:
         self._rotate(r)
         self.thermo.set_cell(cell)
         if evaluate:
-            self.thermo.evaluate()
+            self._evaluate()
 
     def _discard_results(self) -> None:
-        """``atoms`` keeps no result of a run whose last evaluation failed."""
+        """Neither ``atoms`` nor the shared evaluator keeps a result of a run
+        whose last evaluation failed: the Thermo's energy and force view and
+        the evaluator's results, virial and force buffer are invalidated, so
+        another object sharing the evaluator re-evaluates instead of reading
+        a stale evaluation as fresh."""
         self.converged = False
         self.atoms.calc = None
         self.atoms.arrays.pop("born_charges", None)
+        self.thermo.energy = float("nan")
+        self.thermo._seen_calls = None
+        self.evaluator.clear_results()
+        self._f.fill_(float("nan"))  # a separate buffer when atoms are fixed
 
     def _move(self) -> None:
         """One step of the atoms, and with ``relax_cell`` of the cell too."""
@@ -436,14 +461,10 @@ class _Relaxation:
         valid = False
         try:
             self._reset()
-            th.evaluate()
+            f0 = self._evaluate()
+            valid = True
             n = th.n_atoms
-            e0, f0, v0 = self._enthalpy(), self.fmax(), self.evaluator.volume
-            valid = math.isfinite(e0) and math.isfinite(f0)
-            if not valid:
-                raise RelaxationError(
-                    "the first evaluation gave a non-finite energy or force"
-                )
+            e0, v0 = self._enthalpy(), self.evaluator.volume
             bonds0 = _covalent_bonds(self.atoms) if self.check else None
             self._record(f0)
             self.converged = self._converged(f0, fmax, smax)
@@ -452,19 +473,16 @@ class _Relaxation:
                     break
                 valid = False
                 self._move()
-                th.evaluate()
-                self.nsteps += 1
                 # One scalar readback per step: the energy already is a host
                 # float, and a quasi-Newton restart would kick a converged
                 # structure by ``maxstep`` if it were stepped once more.
-                f = self.fmax()
-                valid = math.isfinite(th.energy) and math.isfinite(f)
+                f = self._evaluate()
+                valid = True
+                self.nsteps += 1
                 released = (e0 - self._enthalpy()) / n
-                if not valid or f > max(10.0 * f0, 50.0) or released > 2.0:
+                if f > max(10.0 * f0, 50.0) or released > 2.0:
                     diverged = (
-                        "a non-finite energy or force"
-                        if not valid
-                        else f"max|F| reached {f:.3g} eV/A and the energy "
+                        f"max|F| reached {f:.3g} eV/A and the energy "
                         f"fell {released:.3g} eV/atom"
                     )
                     break
@@ -490,9 +508,6 @@ class _Relaxation:
                     self._discard_results()
                 _sync_atoms(self.atoms, th, results=valid)
         f1 = self.fmax()
-        if diverged is None and not (math.isfinite(th.energy) and math.isfinite(f1)):
-            diverged = "a non-finite energy or force"  # from the restore's evaluation
-            self._discard_results()
         if self._last_recorded != self.nsteps:
             self._record(f1)
         if diverged:

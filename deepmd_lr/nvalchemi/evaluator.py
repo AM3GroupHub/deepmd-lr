@@ -551,6 +551,16 @@ class DistributedEvaluator:
         """Standard masses for this system, in amu."""
         return atomic_masses(self.model, self.atype)
 
+    def clear_results(self) -> None:
+        """Discard a failed evaluation: the results, the virial and the force
+        buffer, filled with NaN in place because other objects hold views of
+        it that must never be rebound. :attr:`Thermo.fresh` reads False for
+        every Thermo on this evaluator until the next evaluation."""
+        self.results.clear()
+        self.virial = None
+        self._virial_dev = None
+        self.forces.fill_(float("nan"))
+
     def set_compute_virial(self, flag: bool) -> None:
         """Switch the virial on or off for the evaluations that follow.
 

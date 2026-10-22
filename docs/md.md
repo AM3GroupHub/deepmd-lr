@@ -115,8 +115,11 @@ Measured on that C/Si model (`ener_lr`, `pref_qn` 100) with (3.5e-3, 1.5e-3):
   the shortest contacts it was trained on, so a minimiser or the first MD
   steps can pull clashing atoms together. `FIRE`, `FIRE2` and `LBFGS` stop
   with a `RelaxationError` once forces grow tenfold or more than 2 eV/atom
-  is released. Pre-relax with a classical force field
-  ([below](#relaxing-a-packed-box-first)).
+  is released; divergence and a non-finite energy, force or virial always
+  stop the run. A failed evaluation, including one during frame
+  restoration, leaves `atoms` and the evaluator in the start's orientation
+  with their cached results invalidated. Pre-relax with a classical force
+  field ([below](#relaxing-a-packed-box-first)).
 - **Check conservation with NVE first**
   ([above](#check-energy-conservation-before-trusting-a-trajectory)).
   Langevin conserves nothing, and under a field nothing is conserved at all.
