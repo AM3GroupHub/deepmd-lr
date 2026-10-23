@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 """A neighbour list that lives on the device: nvalchemiops' cell list, compacted
 into DeePMD-kit's edge graph by two small Warp kernels, with no host round trip.
 

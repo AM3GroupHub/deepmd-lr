@@ -145,3 +145,8 @@ inference and fixes the run's `charge_spin` in the tables. See
 ```bash
 pytest tests/ -q          # compressed-kernel tests need a CUDA build
 ```
+
+## License
+
+MIT, see [LICENSE](LICENSE). DeePMD-kit (LGPL-3.0-or-later) and nvalchemiops
+(Apache-2.0) are dependencies the plugin imports, not code it includes.

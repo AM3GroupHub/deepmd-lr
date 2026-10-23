@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 """The long-range electrostatic term.
 
 Three ways of evaluating the same quantity -- particle-mesh Ewald, an explicit

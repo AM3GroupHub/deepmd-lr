@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 """Compressed DPA4C inference for the ``dp_lr`` model.
 
 What DeePMD-kit's compression is, for DPA4C

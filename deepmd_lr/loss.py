@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 """The ``ener_lr`` loss: DeePMD-kit's energy loss plus a charge-neutrality term.
 
 Why the term exists

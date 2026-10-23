@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 """Small cell algebra on the device, written out.
 
 ``torch.linalg.inv`` and ``det`` check their ``info`` result, which is a read

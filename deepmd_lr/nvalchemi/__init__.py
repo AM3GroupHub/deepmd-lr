@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 """Running MD with nvalchemiops: the evaluator, the state, and the integrators.
 
 - :class:`DistributedEvaluator` computes energy and forces across several

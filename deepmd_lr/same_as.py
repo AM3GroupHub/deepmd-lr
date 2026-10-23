@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 """``same_as``: several branches that are one model with different boundaries.
 
 The problem

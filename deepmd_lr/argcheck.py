@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 """Input-schema arguments for the ``dp_lr`` model type.
 
 DeePMD-kit validates and normalizes the input JSON against a ``dargs``

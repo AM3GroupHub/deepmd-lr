@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 """Evaluate the model across several devices: energy, forces, virial.
 
 This is the driver an MD engine calls. It owns the partitioning, the ghost

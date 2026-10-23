@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 """Relaxation on the GPU (FIRE and FIRE2), on the evaluator the MD shares.
 
 .. code-block:: python

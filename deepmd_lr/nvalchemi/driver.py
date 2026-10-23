@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 """Evaluate a model partition by partition and assemble the global result.
 
 The short-range half is split across partitions; the long-range half is

@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 """An ASE calculator that keeps the long-range term.
 
 Why not DeePMD-kit's own calculator

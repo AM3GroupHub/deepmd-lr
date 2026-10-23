@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 """Fit the scale and sign of a ``dp_lr`` model's Born charges to DFPT labels.
 
     python scripts/calibrate_born.py model.pt valid_BEC.xyz [test_BEC.xyz]

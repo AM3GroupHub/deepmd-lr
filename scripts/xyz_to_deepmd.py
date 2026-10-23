@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 """Convert a trajectory into a DeePMD-kit training system.
 
     python scripts/xyz_to_deepmd.py traj.xyz -o data
