@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 """The ``dp_lr`` model type: a DPA4C energy model with a long-range term.
 
 Why this is a *model* type and not an *atomic model* type

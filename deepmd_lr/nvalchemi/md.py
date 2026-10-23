@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 """ASE-style molecular dynamics on the GPU, driven by a shared evaluator.
 
 .. code-block:: python

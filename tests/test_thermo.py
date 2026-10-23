@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 """The MD state container and its thermodynamic report.
 
 Most of what `Thermo` does is delegate to nvalchemiops, so these tests check

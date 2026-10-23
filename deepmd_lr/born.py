@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 r"""Born effective charge tensors from the model's own predicted charges.
 
 The tensor, adapting 10.1021/acs.jctc.6c00146:

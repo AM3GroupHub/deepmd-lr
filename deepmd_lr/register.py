@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 """Entry-point target: importing this module registers the plugin's types.
 
 ``deepmd/pt_expt/__init__.py`` calls ``load_entry_point("deepmd.pt_expt")``,

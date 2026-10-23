@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 r"""The long-range (reciprocal-space) electrostatic energy.
 
 Evaluated either by particle-mesh Ewald or by an explicit k-vector sum --

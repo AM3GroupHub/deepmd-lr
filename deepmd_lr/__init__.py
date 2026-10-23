@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 """Long-range electrostatics for DPA4C, as a DeePMD-kit pt_expt plugin.
 
 Registration itself lives in :mod:`deepmd_lr.register`, which DeePMD-kit's

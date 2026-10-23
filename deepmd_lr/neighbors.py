@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 """Pick the neighbour-graph builder that suits the frame.
 
 DeePMD-kit ships two relevant backends. ``build_neighbor_graph`` is the
