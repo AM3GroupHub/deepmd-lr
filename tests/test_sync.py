@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 """One evaluation, one download.
 
 The MD engine's step is meant to leave the host free: every device result

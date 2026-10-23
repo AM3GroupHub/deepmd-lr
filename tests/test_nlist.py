@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 """The GPU-direct neighbour list must produce DeePMD-kit's graph exactly.
 
 The oracle is DeePMD-kit's dense ``build_neighbor_graph``, the O(N^2) search

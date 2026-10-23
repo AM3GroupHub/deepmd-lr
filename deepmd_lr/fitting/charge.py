@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 """Environment-dependent partial charges for the long-range term.
 
 DPA4C takes the *total* charge of a frame as an input condition (see

@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 """Any module of ours must be importable first, in a fresh interpreter.
 
 DeePMD-kit fires our entry point from inside ``deepmd.pt_expt.__init__``, so

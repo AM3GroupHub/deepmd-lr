@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 """The state an MD run carries, and what can be measured from it.
 
 :class:`Thermo` **owns** the state -- positions, velocities, masses, the forces

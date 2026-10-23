@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 """The nvalchemiops cell list must produce DeePMD-kit's graph exactly.
 
 The oracle is `build_neighbor_graph`, which DeePMD-kit's own docstring calls a

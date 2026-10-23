@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 """Graft a trained short-range checkpoint into a long-range model.
 
 Why this is needed

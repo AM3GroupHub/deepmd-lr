@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 """Spatial partitioning with a ghost halo, for partitioned evaluation.
 
 Follows DistMLIP's design -- one process, several devices, an owned/halo split

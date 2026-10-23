@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 """Fitting heads contributed by this plugin."""
 
 from deepmd_lr.fitting.charge import (

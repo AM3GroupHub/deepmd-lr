@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 """Getting from a structure file and a checkpoint to something runnable."""
 
 from __future__ import annotations

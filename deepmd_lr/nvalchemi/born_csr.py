@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 """The edge half of the Born tensor, summed along the graph's CSR rows.
 
 :func:`deepmd_lr.born.edge_born_response` forms every edge's outer product

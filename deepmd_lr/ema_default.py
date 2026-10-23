@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 """Enforce EMA for training when the deepmd-lr plugin is loaded.
 
 Ordinary and long-range models always use ``enable_ema=True``, even if the
