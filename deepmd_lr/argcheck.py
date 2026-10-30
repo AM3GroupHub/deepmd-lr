@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: MIT
-"""Input-schema arguments for the ``dp_lr`` model type.
+"""Input-schema arguments for the ``dp_lr`` model type, the charge head and
+the ``ener_lr`` loss.
 
-DeePMD-kit validates and normalizes the input JSON against a ``dargs``
-schema before building anything, so a model type that is not in that schema
-is rejected at ``dp train`` time no matter how it is registered elsewhere.
-``deepmd.utils.argcheck`` exposes its ``ArgsPlugin`` registries at module
-level for exactly this, so the schema extends from a plugin without
-patching DeePMD-kit.
+DeePMD-kit validates the input JSON against a ``dargs`` schema before
+building anything, so a type missing from it is rejected at ``dp train``.
+``deepmd.utils.argcheck``'s ``ArgsPlugin`` registries extend the schema from
+a plugin.
 """
 
 from dargs import (
@@ -27,6 +26,15 @@ from deepmd_lr.fitting.charge import (
 from deepmd_lr.loss import (
     LOSS_TYPE,
 )
+from deepmd_lr.lr.isolated import (
+    DEFAULT_MAX_ISOLATED_ATOMS,
+)
+from deepmd_lr.lr.term import (
+    DEFAULT_ACCURACY,
+    DEFAULT_ALPHA,
+    DEFAULT_SPLINE_ORDER,
+    MAX_SPLINE_ORDER,
+)
 from deepmd_lr.model.lr_model import (
     _LEGACY_RECIPROCAL_KEY,
     LONG_RANGE_KEY,
@@ -43,17 +51,11 @@ from deepmd_lr.same_as import (
 def dp_lr_model_args() -> Argument:
     """Schema for ``model.type: "dp_lr"``.
 
-    Mirrors the built-in ``standard`` model -- a descriptor plus a fitting
-    net -- and reuses the same variant helpers, so every descriptor and
-    fitting DeePMD-kit knows about stays available here and new ones appear
-    automatically.
-
-    ``model_branch_alias`` and ``info`` are carried over from ``standard``
-    because a ``dp_lr`` branch inside a multi-task ``model_dict`` is
-    validated against *this* schema, not that one. Without them, writing
-    either key in a branch fails normalization with "undefined key ... is
-    not allowed in strict mode" -- the model is unusable in exactly the
-    place those keys exist for.
+    Mirrors the built-in ``standard`` model through the same variant
+    helpers, so every descriptor and fitting DeePMD-kit knows stays
+    available. ``model_branch_alias`` and ``info`` are repeated because a
+    ``dp_lr`` branch of a multi-task ``model_dict`` is validated against
+    *this* schema, which would otherwise refuse them in strict mode.
     """
     return Argument(
         MODEL_TYPE,
@@ -144,13 +146,10 @@ def dp_lr_model_args() -> Argument:
 
 @fitting_args_plugin.register(CHARGE_VAR_NAME)
 def charge_fitting_args() -> list[Argument]:
-    """Schema for ``fitting_net.type: "charge"``.
-
-    The same knobs as the energy fitting net, minus the ones that are
-    energy-specific (``atom_ener``, ``tot_ener_zero``) or fixed by this head
-    (``var_name``, ``dim_out``). Returning a list rather than an ``Argument``
-    lets ``ArgsPlugin`` name the block from the registration key, which is how
-    the built-in fitting nets are declared.
+    """Schema for ``fitting_net.type: "charge"``: the energy fitting net's
+    knobs minus the energy-specific (``atom_ener``, ``tot_ener_zero``) and
+    fixed (``var_name``, ``dim_out``) ones. A list, so ``ArgsPlugin`` names
+    the block from the registration key, as for the built-in fitting nets.
     """
     return [
         Argument(
@@ -218,13 +217,138 @@ def charge_fitting_args() -> list[Argument]:
     ]
 
 
-def _long_range_args() -> Argument:
-    """Schema for the optional ``long_range`` block.
+def _reciprocal_args() -> list[Argument]:
+    """The settings of ``long_range.reciprocal``: the sum, then each method's
+    own (refused under another method), then the boundary and the isolated
+    kernel."""
+    return [
+        Argument(
+            "method",
+            str,
+            optional=True,
+            default="pme",
+            doc="How to evaluate the long-range sum. Under periodic "
+            "boundary conditions: 'pme' (mesh + FFT, O(N log N)) or "
+            "'ewald' (explicit k-vector sum, exact but much slower -- "
+            "114 ms vs 3 ms at 2048 atoms); both compute the same "
+            "quantity, so use 'ewald' to check a 'pme' setting, not for "
+            "production. A frame with no periodic axis is summed by the "
+            "isolated term, q_i q_j erf(alpha r) / r over every pair, "
+            "whatever the method: the same quantity again (the periodic "
+            "result converges onto it as the cell grows), so a shared "
+            "descriptor sees the same erfc(alpha r) / r remainder either "
+            "way. 'isolated' makes that the only sum, for a model that "
+            "never sees a periodic frame; it takes `alpha` and the "
+            "isolated-kernel settings, and refuses every periodic one.",
+        ),
+        Argument(
+            "alpha",
+            float,
+            optional=True,
+            default=DEFAULT_ALPHA,
+            doc="Ewald splitting parameter in inverse angstrom. Unlike a "
+            "full Ewald sum this is a real modelling choice: the network "
+            "learns the erfc(alpha r) / r remainder, which must have decayed "
+            "inside the descriptor cutoff -- alpha 0.4 leaves erfc(2.4) = "
+            "7e-4 at a 6 angstrom cutoff. It must match between training "
+            "and any later MD.",
+        ),
+        Argument(
+            "mesh_spacing",
+            [float, None],
+            optional=True,
+            default=None,
+            doc="method='pme' only. Reciprocal-mesh spacing in angstrom; "
+            "the mesh is ceil(L / spacing), a step function of the cell, "
+            "so prefer `mesh_dimensions` if the cell can change. Defaults "
+            "to 1.0 when no mesh is given.",
+        ),
+        Argument(
+            "mesh_dimensions",
+            [list[int], None],
+            optional=True,
+            default=None,
+            doc="method='pme' only. Fixed reciprocal-mesh dimensions "
+            "[nx, ny, nz], overriding `mesh_spacing`. Prefer this under "
+            "NPT: a spacing-derived mesh jumps a whole grid point when a "
+            "cell length crosses a multiple of the spacing, making the "
+            "energy discontinuous there.",
+        ),
+        Argument(
+            "spline_order",
+            int,
+            optional=True,
+            default=DEFAULT_SPLINE_ORDER,
+            doc="method='pme' only. B-spline interpolation order, between "
+            f"3 and {MAX_SPLINE_ORDER}: at 7 and above the underlying library "
+            "silently drops the reciprocal-space sum.",
+        ),
+        Argument(
+            "k_cutoff",
+            [float, None],
+            optional=True,
+            default=None,
+            doc="method='ewald' only. Largest |k| included, in inverse "
+            "angstrom. null derives it from `alpha` and `accuracy` as "
+            "2 alpha sqrt(-ln(accuracy)).",
+        ),
+        Argument(
+            "accuracy",
+            float,
+            optional=True,
+            default=DEFAULT_ACCURACY,
+            doc="method='ewald' only. Target accuracy used to derive "
+            "`k_cutoff` when it is not given.",
+        ),
+        Argument(
+            "slab_correction",
+            bool,
+            optional=True,
+            default=False,
+            doc="Add the Yeh-Berkowitz correction for a 2D-periodic slab. "
+            "A slab in a padded box still interacts with its images through "
+            "the vacuum; with a net dipole that error is large and more "
+            "vacuum barely helps. Requires `pbc` with one axis false. Leave "
+            "off for a genuinely 3D-periodic system.",
+        ),
+        Argument(
+            "pbc",
+            [list[bool], None],
+            optional=True,
+            default=None,
+            doc="Periodicity per axis, e.g. [true, true, false] for a slab "
+            "stacked along z. Defaults to fully periodic. Must have "
+            "exactly one false entry when `slab_correction` is on, and "
+            "none when it is off.",
+        ),
+        Argument(
+            "isolated_kernel",
+            str,
+            optional=True,
+            default="auto",
+            doc="How a frame with no periodic axis is summed (any method: "
+            "such a frame always takes the isolated sum at this alpha). "
+            "'dense': every pair at once, O(N^2) memory, any derivative "
+            "order (force training, Hessians), refused above "
+            "`max_isolated_atoms`. 'chunked': row blocks, O(1024 N) memory, "
+            "first derivatives only. 'auto': dense up to "
+            "`max_isolated_atoms`, chunked beyond. The MD engine always "
+            "runs the chunked kernel.",
+        ),
+        Argument(
+            "max_isolated_atoms",
+            int,
+            optional=True,
+            default=DEFAULT_MAX_ISOLATED_ATOMS,
+            doc="Largest number of isolated atoms in one call (all frames "
+            "of a batch) the dense kernel takes; see `isolated_kernel`.",
+        ),
+    ]
 
-    Optional by design: omitting it leaves ``dp_lr`` behaviourally identical
-    to the standard energy model, which is what makes the "adding the
-    long-range term is the only thing that changed" comparison meaningful.
-    """
+
+def _long_range_args() -> Argument:
+    """Schema for the optional ``long_range`` block. Without it ``dp_lr`` is
+    exactly the standard energy model."""
     charge_net = Argument(
         "charge_net",
         dict,
@@ -234,132 +358,7 @@ def _long_range_args() -> Argument:
     reciprocal = Argument(
         RECIPROCAL_KEY,
         dict,
-        [
-            Argument(
-                "method",
-                str,
-                optional=True,
-                default="pme",
-                doc="How to evaluate the long-range sum. Under periodic "
-                "boundary conditions: 'pme' (mesh + FFT, O(N log N)) or "
-                "'ewald' (explicit k-vector sum, exact but much slower -- "
-                "114 ms vs 3 ms at 2048 atoms); both compute the same "
-                "quantity, so use 'ewald' to check a 'pme' setting, not for "
-                "production. A frame with no periodic axis is summed by the "
-                "isolated term, q_i q_j erf(alpha r) / r over every pair, "
-                "whatever the method: the same quantity again (the periodic "
-                "result converges onto it as the cell grows), so a shared "
-                "descriptor sees the same erfc(alpha r) / r remainder either "
-                "way. 'isolated' makes that the only sum, for a model that "
-                "never sees a periodic frame; it takes `alpha` and the "
-                "isolated-kernel settings, and refuses every periodic one.",
-            ),
-            Argument(
-                "alpha",
-                float,
-                optional=True,
-                default=0.4,
-                doc="Ewald splitting parameter in inverse angstrom. Unlike a "
-                "full Ewald sum this is a real modelling choice: it sets how "
-                "much of the Coulomb interaction is left to the short-range "
-                "network (erfc(alpha r) / r) and how much this term supplies. "
-                "It must be large enough that the network's share has decayed "
-                "inside the descriptor cutoff -- alpha 0.4 leaves erfc(2.4) = "
-                "7e-4 at a 6 angstrom cutoff -- and must match between "
-                "training and any later MD.",
-            ),
-            Argument(
-                "mesh_spacing",
-                [float, None],
-                optional=True,
-                default=None,
-                doc="method='pme' only. Reciprocal-mesh spacing in angstrom; "
-                "the mesh is ceil(L / spacing), a step function of the cell, "
-                "so prefer `mesh_dimensions` if the cell can change. Defaults "
-                "to 1.0 when no mesh is given.",
-            ),
-            Argument(
-                "mesh_dimensions",
-                [list[int], None],
-                optional=True,
-                default=None,
-                doc="method='pme' only. Fixed reciprocal-mesh dimensions "
-                "[nx, ny, nz], overriding `mesh_spacing`. Prefer this under "
-                "NPT: a spacing-derived mesh jumps a whole grid point when a "
-                "cell length crosses a multiple of the spacing, making the "
-                "energy discontinuous there.",
-            ),
-            Argument(
-                "spline_order",
-                int,
-                optional=True,
-                default=6,
-                doc="method='pme' only. B-spline interpolation order, between "
-                "3 and 6: at 7 and above the underlying library silently "
-                "drops the reciprocal-space sum.",
-            ),
-            Argument(
-                "k_cutoff",
-                [float, None],
-                optional=True,
-                default=None,
-                doc="method='ewald' only. Largest |k| included, in inverse "
-                "angstrom. null derives it from `alpha` and `accuracy` as "
-                "2 alpha sqrt(-ln(accuracy)).",
-            ),
-            Argument(
-                "accuracy",
-                float,
-                optional=True,
-                default=1e-6,
-                doc="method='ewald' only. Target accuracy used to derive "
-                "`k_cutoff` when it is not given.",
-            ),
-            Argument(
-                "slab_correction",
-                bool,
-                optional=True,
-                default=False,
-                doc="Add the Yeh-Berkowitz correction for a 2D-periodic slab. "
-                "Ewald assumes 3D periodicity, so a slab in a padded box "
-                "still interacts with its images through the vacuum; for a "
-                "slab with a net dipole that error is large and adding more "
-                "vacuum barely helps. Requires `pbc` with one axis false. "
-                "Leave off for a genuinely 3D-periodic system.",
-            ),
-            Argument(
-                "pbc",
-                [list[bool], None],
-                optional=True,
-                default=None,
-                doc="Periodicity per axis, e.g. [true, true, false] for a slab "
-                "stacked along z. Defaults to fully periodic. Must have "
-                "exactly one false entry when `slab_correction` is on, and "
-                "none when it is off.",
-            ),
-            Argument(
-                "isolated_kernel",
-                str,
-                optional=True,
-                default="auto",
-                doc="How a frame with no periodic axis is summed (any method: "
-                "such a frame always takes the isolated sum at this alpha). "
-                "'dense': every pair at once, O(N^2) memory, any derivative "
-                "order (force training, Hessians), refused above "
-                "`max_isolated_atoms`. 'chunked': row blocks, O(1024 N) memory, "
-                "first derivatives only. 'auto': dense up to "
-                "`max_isolated_atoms`, chunked beyond. The MD engine always "
-                "runs the chunked kernel.",
-            ),
-            Argument(
-                "max_isolated_atoms",
-                int,
-                optional=True,
-                default=5000,
-                doc="Largest number of isolated atoms in one call (all frames "
-                "of a batch) the dense kernel takes; see `isolated_kernel`.",
-            ),
-        ],
+        _reciprocal_args(),
         alias=[_LEGACY_RECIPROCAL_KEY],
         optional=True,
         default={},
