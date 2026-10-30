@@ -78,10 +78,12 @@ from collections.abc import Callable, Iterator, Mapping
 from typing import Any
 
 import numpy as np
+import warp as wp
 from ase import Atoms, units
 from ase.calculators.singlepoint import SinglePointCalculator
 from ase.constraints import FixAtoms
 
+from deepmd_lr.cell import pbc_flags
 from deepmd_lr.nvalchemi.thermo import Thermo, _fixed_atoms
 
 __all__ = [
@@ -191,7 +193,7 @@ def _check_atoms(evaluator: Any, atoms: Atoms) -> None:
         )
     _fixed_atoms(atoms)
     expected_pbc = tuple(getattr(evaluator, "pbc", (True, True, True)))
-    if tuple(bool(p) for p in atoms.pbc) != expected_pbc:
+    if pbc_flags(atoms.pbc) != expected_pbc:
         raise ValueError(
             f"atoms.pbc is {atoms.pbc.tolist()} but the evaluator was built for "
             f"{list(expected_pbc)}; build it from these atoms (build_evaluator "
@@ -436,18 +438,17 @@ class MolecularDynamics:
             raise ValueError("loginterval must be at least 1")
         self.loginterval = int(loginterval)
         self._extra = dict(extra_columns or {})
-        self._logger = (
-            None
-            if logfile is None
-            else _Logger(logfile, self._columns(), append=_restoring)
+        self._open_outputs(
+            logfile,
+            trajectory,
+            traj_interval,
+            trajectory_properties,
+            append_trajectory or _restoring,
+            _restoring,
         )
-        self._traj = None
-        self.traj_interval = int(traj_interval or loginterval)
-        self.trajectory_properties = tuple(trajectory_properties)
-        if trajectory is not None:
-            self._traj = _Trajectory(trajectory, append_trajectory or _restoring)
         self.checkpoint = None if checkpoint is None else pathlib.Path(checkpoint)
         self.checkpoint_interval = checkpoint_interval
+        #: The output settings a checkpoint records and a restore reapplies.
         self._io = {
             "logfile": (
                 str(logfile) if isinstance(logfile, (str, os.PathLike)) else None
@@ -463,6 +464,26 @@ class MolecularDynamics:
         if not _restoring:
             self._remove_com_drift()
         self._snapshot = _sync_atoms(atoms, self.thermo, results=False)
+
+    def _open_outputs(
+        self,
+        logfile: Any,
+        trajectory: Any,
+        traj_interval: int | None,
+        trajectory_properties: tuple,
+        append_trajectory: bool,
+        append_log: bool,
+    ) -> None:
+        self._logger = (
+            None
+            if logfile is None
+            else _Logger(logfile, self._columns(), append=append_log)
+        )
+        self._traj = None
+        self.traj_interval = int(traj_interval or self.loginterval)
+        self.trajectory_properties = tuple(trajectory_properties)
+        if trajectory is not None:
+            self._traj = _Trajectory(trajectory, append_trajectory)
 
     # --- the shared evaluator ----------------------------------------------
 
@@ -847,33 +868,11 @@ class MolecularDynamics:
         overridden; ``extra_columns`` has to be passed again.
         """
         _check_evaluator(evaluator)
-        with np.load(path, allow_pickle=False) as z:
-            meta = json.loads(str(z["meta"]))
-            arrays = {k: z[k] for k in z.files if k != "meta"}
-        if meta.get("version") != CHECKPOINT_VERSION:
-            raise ValueError(
-                f"{path}: checkpoint version {meta.get('version')}, "
-                f"this code reads {CHECKPOINT_VERSION}"
-            )
-        if meta["class"] != cls.__name__:
-            raise ValueError(
-                f"{path} was written by {meta['class']}, not {cls.__name__}"
-            )
-        allowed = {
-            "logfile",
-            "loginterval",
-            "extra_columns",
-            "trajectory",
-            "traj_interval",
-            "trajectory_properties",
-            "checkpoint",
-            "checkpoint_interval",
-            "max_temperature",
-        }
-        if set(io_overrides) - allowed:
+        meta, arrays = cls._read_checkpoint(path)
+        if set(io_overrides) - _RESTORE_OVERRIDABLE:
             raise TypeError(
                 f"only output settings can be overridden on restore: "
-                f"{sorted(set(io_overrides) - allowed)}"
+                f"{sorted(set(io_overrides) - _RESTORE_OVERRIDABLE)}"
             )
         # Checked before anything is written, so a refusal leaves atoms and
         # the evaluator as they were.
@@ -894,20 +893,63 @@ class MolecularDynamics:
         atoms.set_velocities(arrays["velocities"])
         if not np.array_equal(np.asarray(evaluator.cell), arrays["cell"]):
             evaluator.set_cell(arrays["cell"])
-        io = {k: v for k, v in meta["io"].items() if v is not None and k in allowed}
+        io = {
+            k: v
+            for k, v in meta["io"].items()
+            if v is not None and k in _RESTORE_OVERRIDABLE
+        }
         io.update(io_overrides)
-        for key, size_key in (("logfile", "log_bytes"), ("trajectory", "traj_bytes")):
-            target, size = io.get(key), meta.get(size_key)
-            if isinstance(target, (str, os.PathLike)) and size is not None:
-                p = pathlib.Path(target)
-                if p.exists() and p.stat().st_size > size:
-                    os.truncate(p, size)
+        _trim_outputs(io, meta)
         md = cls(
             evaluator, atoms, meta["timestep"], **meta["params"], **io, _restoring=True
         )
         md.nsteps, md._time = int(meta["nsteps"]), float(meta["time"])
         md._load_state(arrays)
         return md
+
+    @classmethod
+    def _read_checkpoint(cls, path: Any) -> tuple[dict, dict]:
+        """``(meta, arrays)`` of a checkpoint this class wrote, this version."""
+        with np.load(path, allow_pickle=False) as z:
+            meta = json.loads(str(z["meta"]))
+            arrays = {k: z[k] for k in z.files if k != "meta"}
+        if meta.get("version") != CHECKPOINT_VERSION:
+            raise ValueError(
+                f"{path}: checkpoint version {meta.get('version')}, "
+                f"this code reads {CHECKPOINT_VERSION}"
+            )
+        if meta["class"] != cls.__name__:
+            raise ValueError(
+                f"{path} was written by {meta['class']}, not {cls.__name__}"
+            )
+        return meta, arrays
+
+
+#: The settings :meth:`MolecularDynamics.from_checkpoint` may override.
+_RESTORE_OVERRIDABLE = frozenset(
+    {
+        "logfile",
+        "loginterval",
+        "extra_columns",
+        "trajectory",
+        "traj_interval",
+        "trajectory_properties",
+        "checkpoint",
+        "checkpoint_interval",
+        "max_temperature",
+    }
+)
+
+
+def _trim_outputs(io: Mapping[str, Any], meta: Mapping[str, Any]) -> None:
+    """Cut the log and an extxyz trajectory back to their sizes at the
+    checkpoint, dropping what a hard kill left after it."""
+    for key, size_key in (("logfile", "log_bytes"), ("trajectory", "traj_bytes")):
+        target, size = io.get(key), meta.get(size_key)
+        if isinstance(target, (str, os.PathLike)) and size is not None:
+            p = pathlib.Path(target)
+            if p.exists() and p.stat().st_size > size:
+                os.truncate(p, size)
 
 
 # ----------------------------------------------------------------------------
@@ -1102,8 +1144,6 @@ class NoseHooverChainNVT(MolecularDynamics):
                 "only tloop=1 (one 3-stage Yoshida-Suzuki sweep) is supported"
             )
         super().__init__(evaluator, atoms, timestep, **kwargs)
-        import warp as wp
-
         th, k = self.thermo, _kernels()
         self.temperature_K, self.tdamp = float(temperature_K), float(tdamp)
         self.tchain, self.tloop = int(tchain), 1
@@ -1153,8 +1193,6 @@ class NoseHooverChainNVT(MolecularDynamics):
         self._chain()
 
     def conserved_energy(self) -> float:
-        import warp as wp
-
         th = self.thermo
         half_eta = wp.array(0.5 * self.eta.numpy(), dtype=wp.float64, device=th.device)
         _kernels().nhc_compute_chain_energy(
@@ -1197,6 +1235,54 @@ _BAROSTAT_MODES = {
     "orthorhombic": "anisotropic",
     "full": "triclinic",
 }
+
+
+def _check_barostat(
+    name: str, evaluator: Any, atoms: Atoms, cell: str, pdamp: float
+) -> np.ndarray:
+    """Refuse what a barostat cannot run; return the evaluator's cell."""
+    if not all(getattr(evaluator, "pbc", (True, True, True))):
+        raise ValueError(
+            f"{name} moves the cell, and a slab's open axis is not a "
+            "periodic length a pressure can act on, nor is a cluster's box; "
+            "run a slab or a cluster in NVE or NVT (a slab's in-plane "
+            "pressure is not controlled)"
+        )
+    if len(_fixed_atoms(atoms)):
+        raise ValueError(
+            f"{name} strains every position with the cell, so fixed atoms "
+            "would not stay fixed; hold them in NVT or NVE, at a cell "
+            "reached without them"
+        )
+    if not evaluator.compute_virial:
+        raise ValueError(
+            f"{name} needs the virial: build the evaluator with "
+            "compute_virial=True or call evaluator.set_compute_virial(True)"
+        )
+    if cell not in _BAROSTAT_MODES:
+        raise ValueError(
+            f"cell must be one of {', '.join(_BAROSTAT_MODES)}; got {cell!r}"
+        )
+    h = np.asarray(evaluator.cell, dtype=np.float64)
+    if cell == "orthorhombic" and np.any(h != np.diag(np.diag(h))):
+        raise ValueError(
+            "cell='orthorhombic' moves the three lengths of a diagonal cell, "
+            "and this cell is sheared; use 'full'"
+        )
+    if not pdamp > 0:
+        raise ValueError("pdamp must be positive")
+    return h
+
+
+def _target_pressure(th: Thermo, cell: str, p: float) -> wp.array:
+    """The hydrostatic target in the layout each mode's kernel reads."""
+    if cell == "isotropic":
+        return th.scalar(p)
+    if cell == "orthorhombic":
+        return wp.array([[p, p, p]], dtype=wp.vec3d, device=th.device)
+    return wp.array(
+        [(p * np.eye(3)).reshape(9)], dtype=_kernels().vec9d, device=th.device
+    )
 
 
 class _MTKBarostat(MolecularDynamics):
@@ -1245,39 +1331,8 @@ class _MTKBarostat(MolecularDynamics):
     ) -> None:
         _check_evaluator(evaluator)
         name = type(self).__name__
-        if not all(getattr(evaluator, "pbc", (True, True, True))):
-            raise ValueError(
-                f"{name} moves the cell, and a slab's open axis is not a "
-                "periodic length a pressure can act on, nor is a cluster's box; "
-                "run a slab or a cluster in NVE or NVT (a slab's in-plane "
-                "pressure is not controlled)"
-            )
-        if len(_fixed_atoms(atoms)):
-            raise ValueError(
-                f"{name} strains every position with the cell, so fixed atoms "
-                "would not stay fixed; hold them in NVT or NVE, at a cell "
-                "reached without them"
-            )
-        if not evaluator.compute_virial:
-            raise ValueError(
-                f"{name} needs the virial: build the evaluator with "
-                "compute_virial=True or call evaluator.set_compute_virial(True)"
-            )
-        if cell not in _BAROSTAT_MODES:
-            raise ValueError(
-                f"cell must be one of {', '.join(_BAROSTAT_MODES)}; got {cell!r}"
-            )
-        h = np.asarray(evaluator.cell, dtype=np.float64)
-        if cell == "orthorhombic" and np.any(h != np.diag(np.diag(h))):
-            raise ValueError(
-                "cell='orthorhombic' moves the three lengths of a diagonal cell, "
-                "and this cell is sheared; use 'full'"
-            )
-        if not pdamp > 0:
-            raise ValueError("pdamp must be positive")
+        h = _check_barostat(name, evaluator, atoms, cell, pdamp)
         super().__init__(evaluator, atoms, timestep, **kwargs)
-        import warp as wp
-
         th = self.thermo
         self.cell_mode = cell
         self.pressure_au, self.pdamp = float(pressure_au), float(pdamp)
@@ -1297,15 +1352,7 @@ class _MTKBarostat(MolecularDynamics):
         self.cell_v = th.zeros(1, dtype=wp.mat33d)
         # N - 1, so the kernels' N_f = 3 * count is 3N - 3.
         self.dof_count = wp.array([th.n_atoms - 1], dtype=wp.int32, device=th.device)
-        p = self.pressure_au
-        if cell == "isotropic":
-            self.target_p = th.scalar(p)
-        elif cell == "orthorhombic":
-            self.target_p = wp.array([[p, p, p]], dtype=wp.vec3d, device=th.device)
-        else:
-            self.target_p = wp.array(
-                [(p * np.eye(3)).reshape(9)], dtype=_kernels().vec9d, device=th.device
-            )
+        self.target_p = _target_pressure(th, cell, self.pressure_au)
         self._velocity_mode = _BAROSTAT_MODES[cell]
         # The kernels' cell: ASE's, transposed (lattice vectors as columns).
         self._h = wp.array(
@@ -1323,8 +1370,6 @@ class _MTKBarostat(MolecularDynamics):
             th.positions, th.velocities, self._h, self.cell_v, self.dt
         )
         k.npt_cell_update(self._h, self.cell_v, self.dt)
-        import warp as wp
-
         # The kernels hold the cell transposed; hand it over on the device.
         th.set_cell_device(wp.to_torch(self._h).reshape(3, 3).T)
 
@@ -1407,8 +1452,6 @@ class MTKNPT(_MTKBarostat):
             barostat_temperature_K=temperature_K,
             **kwargs,
         )
-        import warp as wp
-
         th = self.thermo
         self.temperature_K = float(temperature_K)
         self.tdamp = float(tdamp)
