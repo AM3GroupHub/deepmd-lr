@@ -72,7 +72,15 @@ snapshot) and `maxstep` 0.1 against 0.2 changed seven steps.
 
 The units are ASE's: `timestep` in ASE time (`0.5 * units.fs`), `friction` in
 1/ASE time, `tdamp` and `pdamp` in ASE time, `pressure_au` in eV/Å³,
-`temperature_K` in kelvin.
+`temperature_K` in kelvin. One ASE time unit is 10.181 fs, so the Langevin
+relaxation time is `1/friction` of those:
+
+| `friction` | relaxation time | |
+|---:|---:|---|
+| 0.01 | 1018 fs | too weak to equilibrate a short run |
+| 0.1 | 102 fs | the default in example 06's `02` |
+| 0.5 | 20 fs | very strong; use under a field |
+| `0.01 / units.fs` | 100 fs | |
 
 ### Relaxing the cell
 
@@ -100,11 +108,9 @@ triangle of the cell matrix, so the cell cannot rotate while it relaxes.
 Around the kernels:
 
 - **The cell force** given to FIRE and FIRE2 is −∂(E + PV)/∂H = −V H⁻ᵀ (σ + P)
-  for the rows of ASE's cell, projected onto the mode's directions.
-  nvalchemiops 0.4's `stress_to_cell_force` gave the column-cell gradient
-  instead and was 0.70 eV/Å off the finite-difference gradient on a sheared
-  water cell; 0.5.0 moved to the row convention and agrees (a test pins it).
-  L-BFGS takes the stress, projected the same way.
+  for the rows of ASE's cell, projected onto the mode's directions; a test
+  pins it to the finite-difference gradient on a sheared cell. L-BFGS takes
+  the stress, projected the same way.
 - **The frame.** FIRE and FIRE2 want the lower triangle of ASE's cell, its
   standard form; L-BFGS's kernel holds the lattice vectors as columns and
   wants the upper. A cell not already in the form its kernel needs is rotated
@@ -231,6 +237,12 @@ NPT and NPH, and velocity rescaling; each has a class above. The kernels'
 conventions, which the classes handle and the signatures do not reveal:
 
 - **Temperature is `k_B T` in energy units, not kelvin**: `kT = ase.units.kB * T`.
+- **Temperatures count `3N − 3` degrees of freedom**, assuming the centre of
+  mass is at rest. The classes remove its motion at start-up (warning when it
+  was large) and Langevin's `fixcm` keeps it at rest; a custom loop must do
+  the same or the drift's kinetic energy reads as heat. With fixed atoms the
+  count is three per mobile atom and nothing is removed. `Thermo.ndof` holds
+  whichever applies.
 - **Half-step factors differ between kernels.** `nhc_velocity_half_step` and
   `velocity_verlet_position_update` apply their own ½ (`dv = (F/m) dt/2`),
   `nhc_position_update` does not (`dr = v dt`), and
@@ -251,6 +263,9 @@ conventions, which the classes handle and the signatures do not reveal:
   held `3N/(3N−3)` hot. Refresh `ke_w` and `press_w` (`update_kinetic_energy`,
   `update_pressure`) right before each barostat half-step; `Thermo`'s getters
   never write them.
+- **The tensor kernels want a flat `vec9` layout**, and `kinetic_tensors` is
+  2-D `(B, 9)`; only `cells` is `mat33`. `vec9d` comes from nvalchemiops, not
+  from Warp (`wp.vec9d` does not exist). `Thermo.update_pressure` handles it.
 - **Never rebind a `Thermo` array.** The kernels write into the bound buffers;
   `th.set_state(...)` copies new values in.
 
@@ -427,23 +442,18 @@ differentiable; an uncompressed model gets vectors in its own precision on a
 compact edge axis, at the cost of one edge-count download per partition, because
 its descriptor processes every edge it is handed.
 
-Measured 2026-10-02 on water with the compressed SR model (`DP_CUDA_INFER=2`),
-ms per MD step. The pair-list rows refer to the former implementation:
+Measured on water with the compressed short-range model
+(`DP_CUDA_INFER=2`), ms per MD step, one device:
 
-| GPU | atoms | path | step | graph (+ search) | forward | nodes | peak GiB |
-|---|---:|---|---:|---:|---:|---:|---:|
-| GB10 | 10,368 | pair list | 10.2 | 4.0 (+17 per rebuild, every ~13 steps) | 4.2 | 23,529 | 0.9 |
-| GB10 | 10,368 | GPU list | 3.6 | 1.2 | 2.1 | 10,368 | 0.1 |
-| GB10 | 169,344 | pair list | 146 | 68.5 (+227 per rebuild) | 57.5 | 277,074 | 11.1 |
-| GB10 | 169,344 | GPU list | 53 | 13.6 | 39.1 | 169,344 | 1.9 |
-| H200 | 10,368 | pair list | 4.3 | 0.7 (+3.7 per rebuild, 28 ms repartition) | 1.2 | 23,422 | — |
-| H200 | 10,368 | GPU list | 2.6 | 0.8 | 1.2 | 10,368 | 0.2 |
-| H200 | 1,956,864 | pair list | 213 | 61 (+704 per rebuild, 3.8 s repartition) | 95 | 2,757,158 | 115 |
-| H200 | 1,956,864 | GPU list | 97 | 26 | 68 | 1,956,864 | 22 |
+| GPU | atoms | step | neighbour graph | forward | peak GiB |
+|---|---:|---:|---:|---:|---:|
+| GB10 | 10,368 | 3.6 | 1.2 | 2.1 | 0.1 |
+| GB10 | 169,344 | 53 | 13.6 | 39.1 | 1.9 |
+| H200 | 10,368 | 2.6 | 0.8 | 1.2 | 0.2 |
+| H200 | 1,956,864 | 97 | 26 | 68 | 22 |
 
 At 1.96M atoms on the H200, the list's 26 ms comprises 12.8 ms for the query,
-7.1 for the fill and 6.2 for source CSR, over 175M edges. These measurements
-motivated rebuilding the pair list on the device each step.
+7.1 for the fill and 6.2 for source CSR, over 175M edges.
 
 A graph that is differentiated (the charge response, the virial strain) or a
 model that runs in float64 asks the list for `float64_vectors`: the fill
@@ -464,7 +474,7 @@ rebuilds for more ghost nodes. Two A40s at 98,304 atoms:
 
 | skin (Å) | ms/step | rebuild | serial fraction | 2-GPU Amdahl ceiling |
 |---|---|---|---|---|
-| 1.0 (the old default) | 347 | every 13 steps | 76 % | 1.14x |
+| 1.0 | 347 | every 13 steps | 76 % | 1.14x |
 | 2.0 | 206 | every 40 steps | 54 % | 1.30x |
 | 4.0 | 101 | none in 40 steps | 5 % | 1.90x |
 | 8.0 | 189 | none | 4 % | 1.92x |
@@ -583,7 +593,17 @@ the evaluation counts.
 
   These compressed cases gain little from a second GPU; the uncompressed
   run overlaps at 80–86% across two. More partitions multiply eager-PyTorch
-  dispatch costs. Measure the intended system and hardware before adding GPUs.
+  dispatch costs. A separate NVT series on water, two A40s, ms/step:
+
+  | atoms | uncompressed, 1 GPU | 2 GPUs | compressed, 1 GPU | 2 GPUs |
+  |---:|---:|---:|---:|---:|
+  | 12,288 | 184 | 145 | 14.8 | 18.4 |
+  | 41,472 | 574 | 399 | 36.2 | 36.5 |
+  | 98,304 | — | — | 75.9 | 72.3 |
+
+  Uncompressed, two cards help from about ten thousand atoms; compressed, the
+  host's share dominates below ~100,000 atoms and one card is as fast.
+  Measure the intended system and hardware before adding GPUs.
 
 - **Neighbour lists.** Which builder runs for the descriptor and for the
   charge head, why a rebuilt model must re-resolve `neighbor_graph_method`,

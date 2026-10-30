@@ -90,11 +90,11 @@ finite trajectory random-walks and is not expected to stay near zero.
 ## Units
 
 `--tau` is the baths' relaxation time in fs and becomes `friction = 1 / (tau
-* units.fs)`, in inverse ASE time units as `Langevin` takes it ([example
-06](../06-md_nvalchemi/README.md#units-and-the-one-that-bites) explains the
-unit). Q is in eV and t in ps, so the fitted power is in eV/ps and, with A
-in Å², `J` in eV ps⁻¹ Å⁻²; `1 eV ps⁻¹ Å⁻² = 1.602 × 10¹³ W m⁻²`, which
-puts G in W m⁻² K⁻¹ (printed in MW m⁻² K⁻¹).
+* units.fs)`, in inverse ASE time units as `Langevin` takes it
+([units](../../docs/partitioned-md.md#the-md-classes)). Q is in eV and t in
+ps, so the fitted power is in eV/ps and, with A in Å², `J` in eV ps⁻¹ Å⁻²;
+`1 eV ps⁻¹ Å⁻² = 1.602 × 10¹³ W m⁻²`, which puts G in W m⁻² K⁻¹ (printed in
+MW m⁻² K⁻¹).
 
 ## The outputs
 

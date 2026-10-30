@@ -127,26 +127,21 @@ Measured on that C/Si model (`ener_lr`, `pref_qn` 100) with (3.5e-3, 1.5e-3):
   The classes convert `temperature_K`; a custom loop that passes kelvin
   thermostats to ~11,600× the target.
 - **`friction` is per ASE time unit** (10.18 fs): `friction=0.01` relaxes in
-  1 ps, `friction=0.01 / units.fs` in 100 fs.
+  1 ps, `friction=0.01 / units.fs` in 100 fs
+  ([units](partitioned-md.md#the-md-classes)).
 - **Custom integrators must follow the kernel conventions**, including
-  half-step factors and the Nosé–Hoover chain energy. See
-  [your own loop](partitioned-md.md#your-own-loop) and
+  half-step factors, the `3N − 3` degrees of freedom and the Nosé–Hoover chain
+  energy. See [your own loop](partitioned-md.md#your-own-loop) and
   [conserved quantities](partitioned-md.md#what-is-conserved).
-- **Temperatures count `3N − 3` degrees of freedom**, assuming the centre of
-  mass is at rest. The classes remove its motion at start-up (warning when it
-  was large) and Langevin's `fixcm` keeps it at rest; a custom loop must do the
-  same or the drift's kinetic energy reads as heat. With fixed atoms the count
-  is three per mobile atom and nothing is removed. `Thermo.ndof` holds
-  whichever applies.
 - **NPT needs the virial.** Reach the density with NPT, then produce with NVT;
   NPT under a field is refused. A cell relaxation
   (`FIRE2(..., relax_cell="isotropic")`) reaches the zero-kelvin density far
-  faster and needs the virial too.
-- **Relax a liquid's cell isotropically.** It has no shear stiffness, so
-  `relax_cell="full"` lets its cell shear; keep that for crystals.
+  faster and needs the virial too. Relax a liquid's cell isotropically: it has
+  no shear stiffness, so `relax_cell="full"` lets it shear
+  ([relaxing the cell](partitioned-md.md#relaxing-the-cell)).
 - **An MD object built before an NPT stage refuses to step** once that stage
   has moved the shared evaluator's cell. Build a new one from the stage's
-  `atoms`.
+  `atoms` ([sharing one evaluator](partitioned-md.md#sharing-one-evaluator)).
 - **Unwrapped positions are fine.** Integrators never wrap, trajectories are
   written unwrapped so diffusion can be read off them, and every halo rebuild
   folds the atoms into the cell itself.
