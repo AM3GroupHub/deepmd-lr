@@ -2,12 +2,13 @@
 """The long-range electrostatic term.
 
 Three ways of evaluating the same quantity -- particle-mesh Ewald, an explicit
-k-vector sum, and a direct real-space sum for systems with no cell -- which is
-why the package is ``lr`` rather than ``pme``. Pick one through
-:func:`build_long_range_energy` rather than naming a class, so a config and a
-checkpoint resolve the same way.
+k-vector sum, and a direct real-space sum for systems with no periodic axis
+(:mod:`deepmd_lr.lr.isolated`) -- which is why the package is ``lr`` rather
+than ``pme``. Build one through :func:`build_long_range_energy`, or for a given
+system through :func:`system_reciprocal`, whose ``pbc`` picks the sum.
 """
 
+from deepmd_lr.lr.isolated import isolated_erf_energy_chunked
 from deepmd_lr.lr.term import (
     DEFAULT_ALPHA,
     DEFAULT_SPLINE_ORDER,
@@ -17,6 +18,7 @@ from deepmd_lr.lr.term import (
     LongRangeEnergy,
     LongRangeTerm,
     build_long_range_energy,
+    isolated_term_for,
     system_mesh,
     system_reciprocal,
 )
@@ -30,6 +32,8 @@ __all__ = [
     "LongRangeEnergy",
     "LongRangeTerm",
     "build_long_range_energy",
+    "isolated_erf_energy_chunked",
+    "isolated_term_for",
     "system_mesh",
     "system_reciprocal",
 ]

@@ -70,6 +70,7 @@ model.set_long_range({"alpha": 0.4, "mesh_dimensions": [10, 10, 10],
 
 `long_range=` is also a keyword on `load_model`, `LongRangeCalculator` and
 `build_evaluator`. It replaces the reciprocal block rather than merging into
-it, since `method: "isolated"` refuses every periodic parameter. `alpha` is
+it, since `method: "isolated"` refuses every periodic parameter. A frame's
+`pbc` already picks the 3D, the slab or the isolated sum. `alpha` is
 inherited from the checkpoint and a different one raises: it is where Coulomb
 is split, and the network learned the remainder of that split.

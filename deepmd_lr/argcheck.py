@@ -245,13 +245,14 @@ def _long_range_args() -> Argument:
                 "'ewald' (explicit k-vector sum, exact but much slower -- "
                 "114 ms vs 3 ms at 2048 atoms); both compute the same "
                 "quantity, so use 'ewald' to check a 'pme' setting, not for "
-                "production. For a system with no cell: 'isolated', which "
-                "sums q_i q_j erf(alpha r) / r directly over every pair. That "
-                "is the same quantity again -- the periodic result converges "
-                "onto it as the cell grows -- so a shared descriptor sees the "
-                "same erfc(alpha r) / r remainder either way. 'isolated' "
-                "takes only `alpha`; every other setting here describes a sum "
-                "over periodic images and is refused.",
+                "production. A frame with no periodic axis is summed by the "
+                "isolated term, q_i q_j erf(alpha r) / r over every pair, "
+                "whatever the method: the same quantity again (the periodic "
+                "result converges onto it as the cell grows), so a shared "
+                "descriptor sees the same erfc(alpha r) / r remainder either "
+                "way. 'isolated' makes that the only sum, for a model that "
+                "never sees a periodic frame; it takes `alpha` and the "
+                "isolated-kernel settings, and refuses every periodic one.",
             ),
             Argument(
                 "alpha",
@@ -335,6 +336,28 @@ def _long_range_args() -> Argument:
                 "stacked along z. Defaults to fully periodic. Must have "
                 "exactly one false entry when `slab_correction` is on, and "
                 "none when it is off.",
+            ),
+            Argument(
+                "isolated_kernel",
+                str,
+                optional=True,
+                default="auto",
+                doc="How a frame with no periodic axis is summed (any method: "
+                "such a frame always takes the isolated sum at this alpha). "
+                "'dense': every pair at once, O(N^2) memory, any derivative "
+                "order (force training, Hessians), refused above "
+                "`max_isolated_atoms`. 'chunked': row blocks, O(1024 N) memory, "
+                "first derivatives only. 'auto': dense up to "
+                "`max_isolated_atoms`, chunked beyond. The MD engine always "
+                "runs the chunked kernel.",
+            ),
+            Argument(
+                "max_isolated_atoms",
+                int,
+                optional=True,
+                default=5000,
+                doc="Largest number of isolated atoms in one call (all frames "
+                "of a batch) the dense kernel takes; see `isolated_kernel`.",
             ),
         ],
         alias=[_LEGACY_RECIPROCAL_KEY],

@@ -459,3 +459,193 @@ def test_coincident_pair_has_analytic_limit():
     assert float(energy) == pytest.approx(
         -2 * alpha / np.sqrt(np.pi) * ELECTROSTATIC_CONVERSION
     )
+
+
+def dense_flat(pos, q, alpha=ALPHA, batch=None):
+    """The dense kernel on a flat atom list, frame by frame."""
+    from deepmd_lr.lr.isolated import isolated_erf_energy_dense
+
+    if batch is None:
+        return isolated_erf_energy_dense(pos[None], q[None], alpha)[0]
+    parts = [
+        isolated_erf_energy_dense(pos[batch == b][None], q[batch == b][None], alpha)[0]
+        for b in torch.unique(batch)
+    ]
+    return torch.cat(parts)
+
+
+class TestChunkedKernel:
+    """``isolated_erf_energy_chunked`` is the dense kernel's equal: energies and
+    both first derivatives under any cotangent, the series branch, batches, in
+    blocks that exercise the tail; no second derivatives."""
+
+    @staticmethod
+    def grads(fn, pos, q, w, **kw):
+        p = pos.clone().requires_grad_(True)
+        c = q.clone().requires_grad_(True)
+        e = fn(p, c, ALPHA, **kw)
+        dr, dq = torch.autograd.grad((e * w).sum(), (p, c))
+        return e.detach(), dq, dr
+
+    @staticmethod
+    def flat(n=8, spread=6.0, seed=0):
+        coord, q = cluster(n=n, spread=spread, seed=seed)
+        return coord[0], q[0]
+
+    def test_matches_the_dense_kernel_with_any_cotangent(self):
+        from deepmd_lr.lr.isolated import isolated_erf_energy_chunked
+
+        pos, q = self.flat(n=37, spread=9.0, seed=4)
+        pos[1] = pos[0] + 1e-4  # a near-coincident pair: the series branch
+        w = np.random.default_rng(5).normal(size=37)
+        w = torch.tensor(w, dtype=DT, device=DEVICE)
+        dense = self.grads(dense_flat, pos, q, w)
+        chunked = self.grads(
+            isolated_erf_energy_chunked, pos, q, w, chunk=16, compile=False
+        )
+        for a, b in zip(dense, chunked, strict=True):
+            torch.testing.assert_close(a, b, atol=1e-13, rtol=0)
+
+    def test_batches_keep_frames_apart(self):
+        from deepmd_lr.lr.isolated import isolated_erf_energy_chunked
+
+        c0, q0 = self.flat(seed=1)
+        c1, q1 = self.flat(n=5, seed=2)
+        batch = torch.tensor([0] * 8 + [1] * 5, device=DEVICE)
+        pos, q = torch.cat([c0, c1]), torch.cat([q0, q1])
+        w = torch.ones(13, dtype=DT, device=DEVICE)
+        dense = self.grads(dense_flat, pos, q, w, batch=batch)
+        chunked = self.grads(
+            isolated_erf_energy_chunked, pos, q, w, batch=batch, chunk=4, compile=False
+        )
+        for a, b in zip(dense, chunked, strict=True):
+            torch.testing.assert_close(a, b, atol=1e-13, rtol=0)
+
+    def test_gradcheck_passes_and_double_backward_is_refused(self):
+        from deepmd_lr.lr.isolated import isolated_erf_energy_chunked
+
+        pos, q = self.flat(n=5, seed=6)
+        inputs = (pos.clone().requires_grad_(True), q.clone().requires_grad_(True))
+
+        def fn(p, c):
+            return isolated_erf_energy_chunked(p, c, ALPHA, chunk=2, compile=False)
+
+        assert torch.autograd.gradcheck(fn, inputs, eps=1e-6, atol=1e-6)
+        with pytest.raises(RuntimeError, match="first derivatives only"):
+            torch.autograd.grad(fn(*inputs).sum(), inputs[0], create_graph=True)
+
+    def test_position_dependent_charges_cannot_hide_a_missing_double_backward(self):
+        from deepmd_lr.lr.isolated import isolated_erf_energy_chunked
+
+        pos = torch.tensor([[0.0, 0.0, 0.0], [1.0, 0.2, 0.3]], requires_grad=True)
+        weight = torch.tensor(0.6, requires_grad=True)
+        q = weight * torch.sin(pos[:, 0] + 0.4)
+        energy = isolated_erf_energy_chunked(pos, q, ALPHA).sum()
+        # once_differentiable alone would silently detach dE/dq: the charge
+        # head still supplies a graph, so a force loss would get a partial one.
+        with pytest.raises(RuntimeError, match="first derivatives only"):
+            torch.autograd.grad(energy, pos, create_graph=True)
+
+    def test_compile_failure_warns_once_and_keeps_the_result(self, monkeypatch):
+        import deepmd_lr.lr.isolated as isolated
+
+        calls = []
+
+        def unavailable(*args):
+            calls.append(1)
+            raise RuntimeError()  # even an empty message must allow the fallback
+
+        monkeypatch.setattr(isolated, "_COMPILE_OK", True)
+        monkeypatch.setattr(
+            isolated, "_compiled_blocks", lambda: (unavailable, unavailable)
+        )
+        pos, q = self.flat(n=5)
+        w = torch.linspace(-1.0, 1.0, len(q), dtype=DT, device=DEVICE)
+        expected = self.grads(dense_flat, pos, q, w)
+        with pytest.warns(RuntimeWarning, match="torch.compile") as caught:
+            actual = self.grads(
+                isolated.isolated_erf_energy_chunked, pos, q, w, chunk=2, compile=True
+            )
+        assert len(calls) == len(caught) == 1
+        for a, b in zip(actual, expected, strict=True):
+            torch.testing.assert_close(a, b, atol=1e-13, rtol=0)
+
+    def test_out_of_memory_is_not_mistaken_for_a_compile_failure(self, monkeypatch):
+        """Out of memory propagates (the engine's back-off handles it): the
+        eager blocks need more memory, so falling back would hide it."""
+        import warnings
+
+        import deepmd_lr.lr.isolated as isolated
+
+        def oom(*args):
+            raise torch.cuda.OutOfMemoryError("CUDA out of memory")
+
+        monkeypatch.setattr(isolated, "_COMPILE_OK", True)
+        monkeypatch.setattr(isolated, "_compiled_blocks", lambda: (oom, oom))
+        pos, q = self.flat(n=5)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            with pytest.raises(torch.cuda.OutOfMemoryError):
+                isolated.isolated_erf_energy_chunked(
+                    pos, q, ALPHA, chunk=2, compile=True
+                )
+        assert isolated._COMPILE_OK
+
+    def test_coincident_atoms_stay_finite(self):
+        from deepmd_lr.lr.isolated import isolated_erf_energy_chunked
+
+        leaf = torch.zeros((2, 3), dtype=DT, device=DEVICE, requires_grad=True)
+        q = torch.tensor([1.0, -1.0], dtype=DT, device=DEVICE)
+        e = isolated_erf_energy_chunked(leaf, q, ALPHA, compile=False)
+        assert float(e.sum()) == pytest.approx(-2 * ALPHA / np.sqrt(np.pi), rel=1e-12)
+        (g,) = torch.autograd.grad(e.sum(), leaf)
+        assert torch.isfinite(g).all()
+
+    def test_the_term_dispatches_by_kernel_and_size(self):
+        coord, q = cluster(n=12)
+        mask = torch.ones_like(q)
+        mask[0, -2:] = 0.0  # padding atoms drop out of both kernels alike
+        dense = IsolatedLongRangeEnergy(alpha=ALPHA, isolated_kernel="dense")
+        chunked = IsolatedLongRangeEnergy(alpha=ALPHA, isolated_kernel="chunked")
+        torch.testing.assert_close(
+            dense(coord, q, mask=mask), chunked(coord, q, mask=mask), atol=1e-12, rtol=0
+        )
+        assert build_long_range_energy(chunked.serialize()).isolated_kernel == "chunked"
+        capped = IsolatedLongRangeEnergy(
+            alpha=ALPHA, isolated_kernel="dense", max_isolated_atoms=10
+        )
+        with pytest.raises(ValueError, match="max_isolated_atoms"):
+            capped(coord, q)
+        auto = IsolatedLongRangeEnergy(alpha=ALPHA, max_isolated_atoms=10)
+        coord.requires_grad_(True)
+        force_e = auto(coord, q).sum()  # 12 > 10 atoms: the chunked kernel
+        with pytest.raises(RuntimeError, match="first derivatives only"):
+            torch.autograd.grad(force_e, coord, create_graph=True)
+        periodic = LongRangeEnergy(alpha=ALPHA, isolated_kernel="chunked")
+        assert periodic.serialize()["isolated_kernel"] == "chunked"
+        with pytest.raises(ValueError, match="isolated_kernel"):
+            IsolatedLongRangeEnergy(alpha=ALPHA, isolated_kernel="sparse")
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+    def test_a_large_cluster_matches_dense_and_float32_is_close(self):
+        from deepmd_lr.lr.isolated import isolated_erf_energy_chunked
+
+        n = 6000
+        rng = np.random.default_rng(8)
+        pos = torch.tensor(rng.uniform(0.0, 40.0, size=(n, 3)), dtype=DT, device="cuda")
+        q = rng.normal(size=n)
+        q = torch.tensor(q - q.mean(), dtype=DT, device="cuda")
+        w = torch.ones(n, dtype=DT, device="cuda")
+        dense = self.grads(dense_flat, pos, q, w)
+        compiled = self.grads(isolated_erf_energy_chunked, pos, q, w, compile=True)
+        eager = self.grads(isolated_erf_energy_chunked, pos, q, w, compile=False)
+        for a, b in zip(dense, compiled, strict=True):
+            torch.testing.assert_close(a, b, atol=1e-10, rtol=0)
+        for a, b in zip(compiled, eager, strict=True):
+            torch.testing.assert_close(a, b, atol=1e-10, rtol=0)
+        single = self.grads(
+            isolated_erf_energy_chunked, pos.float(), q.float(), w.float(), compile=True
+        )
+        assert float((single[0].double() - dense[0]).abs().max()) < 2e-5
+        assert float((single[1].double() - dense[1]).abs().max()) < 5e-5
+        assert float((single[2].double() - dense[2]).abs().max()) < 2e-5

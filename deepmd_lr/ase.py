@@ -162,10 +162,10 @@ class LongRangeCalculator(Calculator):
         Omit when passing an already constructed model.
     long_range
         Optional replacement for the reciprocal-space settings, e.g.
-        ``{"method": "isolated"}`` for a molecule. The frame's pbc already
-        picks the 3D or the slab sum. The long-range term carries no weights,
-        so the boundary treatment is a property of the simulation rather than
-        of the checkpoint.
+        ``{"method": "ewald"}`` or ``{"isolated_kernel": "dense"}``. The
+        frame's pbc already picks the 3D, the slab or the isolated sum. The
+        long-range term carries no weights, so the boundary treatment is a
+        property of the simulation rather than of the checkpoint.
     compress
         ``True`` to compress the DPA4C backbone for inference at DeePMD-kit's
         default table stride, or a float stride in angstrom. Needs a
@@ -327,33 +327,17 @@ class LongRangeCalculator(Calculator):
             )
 
     def _check_pbc(self, atoms) -> bool:
-        """Refuse a boundary condition this model cannot evaluate.
+        """Refuse a boundary this model cannot evaluate; return whether any
+        axis is periodic.
 
-        Only a term that actually sums over periodic images needs a cell. This
-        check used to reject every non-periodic frame unconditionally, which
-        was wrong twice over: a short-range model has no such requirement at
-        all, and a slab configured as pbc=[T, T, F] is exactly what
-        `slab_correction` exists to handle. Returns whether any axis is
-        periodic.
+        The long-range term follows the frame's pbc (:meth:`calculate`); what
+        is left to refuse is a slab whose vacuum a cutoff sphere could cross,
+        and a partial pbc for a short-range model, whose graph has no slab
+        mode.
         """
         periodic = bool(atoms.pbc.any())
         if self._has_long_range:
-            term = self.model.long_range_energy
-            if term.needs_cell and not periodic:
-                raise ValueError(
-                    "this model's long-range term uses method "
-                    f"'{term.method}', which sums over "
-                    f"periodic images, but the Atoms object has pbc={atoms.pbc} "
-                    "and so no cell to repeat. For an isolated molecule build the "
-                    "model with `long_range.reciprocal.method: 'isolated'`."
-                )
-            if not term.needs_cell and periodic:
-                raise ValueError(
-                    f"Atoms pbc={atoms.pbc.tolist()} does not match the "
-                    "selected long-range branch pbc=[False, False, False]: the "
-                    "isolated term sums no periodic images"
-                )
-            if term.needs_cell and sum(bool(p) for p in atoms.pbc) == 2:
+            if sum(bool(p) for p in atoms.pbc) == 2:
                 self._check_slab_gap(atoms)
         elif periodic and not atoms.pbc.all():
             raise ValueError(
@@ -370,11 +354,11 @@ class LongRangeCalculator(Calculator):
         super().calculate(atoms, properties or ["energy"], system_changes)
         atoms = self.atoms
         periodic = self._check_pbc(atoms)
-        if self._has_long_range and periodic:
-            # The frame decides how the sum is taken: its pbc picks the 3D or
-            # the slab sum, its cell the PME mesh. The term holds no weights,
-            # so this changes no parameter, and each frame gets the mesh its
-            # own cell needs.
+        if self._has_long_range:
+            # The frame decides how the sum is taken: its pbc picks the 3D, the
+            # slab or the isolated sum, its cell the PME mesh. The term holds
+            # no weights, so this changes no parameter, and each frame gets the
+            # mesh its own cell needs.
             self.model.adapt_long_range(np.asarray(atoms.get_cell()), atoms.pbc)
 
         coord = torch.tensor(

@@ -60,7 +60,7 @@ include `input.json`, and simulation examples include runnable scripts.
 | | case | teaches |
 |---|---|---|
 | [01](examples/01-bulk) | bulk water, 3D-periodic | xyz → dataset → `input.json` → train |
-| [02](examples/02-molecules) | molecules, no cell | `nopbc`, `charge_spin.npy`, `method: "isolated"` |
+| [02](examples/02-molecules) | molecules, no cell | `nopbc`, `charge_spin.npy`, the isolated sum |
 | [03](examples/03-slab) | Li/LiFSI interface, 2D-periodic | vacuum padding, `slab_correction` + `pbc` |
 | [04](examples/04-multi-head) | all three at once | `shared_dict`/`model_dict`, and the gradient clipping it needs |
 | [05](examples/05-pseudo-head) | bulk + slab, one weight set | `same_as`; the long-range type set at load |
@@ -129,7 +129,7 @@ inference and fixes the run's `charge_spin` in the tables. See
 |---|---|
 | [install.md](docs/install.md) | dependencies, environment setup and import check |
 | [alpha-and-mesh.md](docs/alpha-and-mesh.md) | does the term apply to your data; choosing `alpha` and the mesh; `pme` vs `ewald` |
-| [non-periodic.md](docs/non-periodic.md) | molecules: `nopbc`, `method: "isolated"`, what that term computes |
+| [non-periodic.md](docs/non-periodic.md) | molecules and clusters: the isolated sum, its two kernels, MD on the GPU |
 | [multi-head.md](docs/multi-head.md) | several levels of theory: sharing, clipping and branch configuration |
 | [same-as.md](docs/same-as.md) | one theory, bulk + slab: `same_as`; setting the long-range type at load |
 | [dataset-layout.md](docs/dataset-layout.md) | systems, `type_map.raw`, the full-periodic-table convention, HDF5 |

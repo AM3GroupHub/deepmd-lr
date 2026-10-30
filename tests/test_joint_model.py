@@ -471,11 +471,18 @@ class TestGuards:
         with pytest.raises(TypeError, match="rcut"):
             get_model(cfg)
 
-    def test_rejects_missing_box(self):
+    def test_a_frame_without_a_box_takes_the_isolated_sum(self):
+        """No cell: the isolated sum at the model's alpha, the term the model
+        itself would have with method 'isolated'."""
         model = build()
         coord, atype, _ = frame()
-        with pytest.raises(ValueError, match="requires a periodic cell"):
-            model(coord, atype, box=None)
+        out = model(coord, atype, box=None)
+        model.set_long_range({"method": "isolated"})
+        ref = model(coord, atype, box=None)
+        torch.testing.assert_close(out["energy"], ref["energy"])
+        torch.testing.assert_close(out["force"], ref["force"])
+        with pytest.raises(ValueError, match="sums no periodic images"):
+            model(coord, atype, box=frame()[2])
 
     def test_rejects_atomic_virial(self):
         """A per-atom decomposition of a collective k-space sum is undefined."""

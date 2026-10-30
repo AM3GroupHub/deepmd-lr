@@ -158,16 +158,36 @@ _VIRIAL_UNDER_FIELD = (
 )
 
 
+_VIRIAL_ISOLATED = (
+    "compute_virial needs a cell to strain, and a cluster (pbc all False) has "
+    "none: its box is only the neighbour list's. Run it in NVE or NVT."
+)
+
+
 def _checked_pbc(pbc: Any) -> tuple[bool, bool, bool]:
-    """A bulk cell or a slab: the two boundaries partitioned MD handles."""
+    """A bulk cell, a slab or a cluster: the boundaries the engine handles."""
     flags = tuple(bool(p) for p in np.broadcast_to(np.asarray(pbc, dtype=bool), (3,)))
-    if sum(flags) < 2:
+    if sum(flags) == 1:
         raise ValueError(
-            f"pbc={list(flags)}: partitioned MD handles a bulk cell and a slab "
-            "(one open axis). Molecules, clusters and wires run through the "
-            "ASE calculator, deepmd_lr.ase.LongRangeCalculator."
+            f"pbc={list(flags)}: one periodic axis (a wire) is not supported. The "
+            "engine handles a bulk cell, a slab (one open axis) and a cluster "
+            "(no periodic axis)."
         )
     return flags
+
+
+def _isolated_dtype(model: Any, requested: Any) -> torch.dtype:
+    """The dtype a cluster's all-pairs sum runs in: ``requested`` (a dtype or
+    its name), else the charge head's precision. In float32 the sum costs
+    8 + 37 ms per step at 27,000 atoms on a GB10, against 0.8 s in float64."""
+    if requested is None:
+        requested = getattr(model.charge_fitting, "precision", "float64")
+    name = str(requested).removeprefix("torch.")
+    if name not in ("float32", "float64"):
+        raise ValueError(
+            f"isolated_dtype must be float32 or float64, got {requested!r}"
+        )
+    return getattr(torch, name)
 
 
 def _indexed_device(device) -> str:
@@ -198,11 +218,17 @@ class DistributedEvaluator:
         this evaluator's own, :attr:`long_range_energy`
         (:meth:`~deepmd_lr.model.lr_model.LongRangeEnergyModel.long_range_energy_for`).
         A slab's atoms must stay inside the cell along the open axis; see
-        :meth:`_check_open_axes`.
+        :meth:`_check_open_axes`. No periodic axis is a cluster: one device, no
+        virial, the isolated sum on the chunked kernel
+        (:mod:`deepmd_lr.lr.isolated`), and ``cell`` is never read (a zero
+        cell is fine; the neighbour list boxes the atoms itself). One periodic
+        axis (a wire) is refused.
     long_range
         Reciprocal-space settings to adapt instead of the model's, as
         ``set_long_range`` takes them (alpha is the model's and cannot
-        change). For this evaluator only.
+        change). For this evaluator only. A cluster also takes
+        ``isolated_dtype`` (``"float32"`` or ``"float64"``), the dtype of its
+        all-pairs sum; the charge head's precision by default.
     devices
         One device per partition. Repeats are accepted and exercise the
         partitioning arithmetic, but only distinct devices test placement.
@@ -330,18 +356,25 @@ class DistributedEvaluator:
         self.cell_version = 0
         self._skin_stale = False
         self.pbc = _checked_pbc(pbc)
+        #: No periodic axis: the isolated sum, one device, no virial, and a
+        #: cell nothing reads (the neighbour list boxes the atoms itself).
+        self.isolated = not any(self.pbc)
         # The term holds no weights, so this evaluator builds its own: its pbc
-        # picks the 3D or the slab sum, its cell the PME mesh. The mesh is
-        # fixed here for the life of the driver, so the small cell changes of
-        # a barostat keep the energy smooth. The model is left alone: another
-        # evaluator built from it, for another cell or boundary, would
-        # otherwise change the term under this one.
+        # picks the 3D, the slab or the isolated sum, its cell the PME mesh.
+        # The mesh is fixed here for the life of the driver, so the small cell
+        # changes of a barostat keep the energy smooth. The model is left
+        # alone: another evaluator built from it, for another cell or
+        # boundary, would otherwise change the term under this one.
         #: The long-range term this evaluator evaluates, or None for a model
         #: without one.
         self.long_range_energy = None
+        long_range = None if long_range is None else dict(long_range)
+        isolated_dtype = (
+            None if long_range is None else long_range.pop("isolated_dtype", None)
+        )
         if getattr(model, "has_long_range", False):
             self.long_range_energy = model.long_range_energy_for(
-                self.cell, self.pbc, long_range
+                self.cell, self.pbc, long_range or None
             )
         elif long_range is not None:
             raise ValueError("long_range= needs a model with a long-range block")
@@ -349,9 +382,19 @@ class DistributedEvaluator:
             # The cell is validated here and in `set_cell`, on the host; the
             # term's own per-call check would read the device every step.
             self.long_range_energy.check_cell = False
-        det = np.linalg.det(self.cell)
-        if not np.isfinite(det) or abs(det) <= 0:
-            raise ValueError("the cell is degenerate (zero volume)")
+            if self.isolated:
+                # O(chunk N) memory and no host reads; a step needs only first
+                # derivatives.
+                self.long_range_energy.isolated_kernel = "chunked"
+                self.long_range_energy.kernel_dtype = _isolated_dtype(
+                    model, isolated_dtype
+                )
+        if isolated_dtype is not None and not self.isolated:
+            raise ValueError(
+                "isolated_dtype sets the dtype of a cluster's all-pairs sum; this "
+                f"system (pbc={list(self.pbc)}) is periodic"
+            )
+        self._check_cell(self.cell)
         # Checked here as well as per call, to fail before the memory probe.
         check_long_range_boundary(model, self.pbc, self.long_range_energy)
         self.model = model
@@ -363,13 +406,28 @@ class DistributedEvaluator:
         #: partitioned, probed or rebuilt
         #: (:func:`~deepmd_lr.nvalchemi.partition.whole_system`).
         self._whole_system = len(self.devices) == 1
-        self._open_axes = [k for k in range(3) if not self.pbc[k]]
-        if self._whole_system and np.linalg.det(self.cell) <= 0.0:
+        if self.isolated and not self._whole_system:
+            raise ValueError(
+                "a cluster (pbc all False) runs on one device: its long-range "
+                "sum runs over every pair and does not partition"
+            )
+        #: Slab axes whose faces atoms must stay inside. A cluster has none:
+        #: nothing is summed over images, and its list searches its own box.
+        self._open_axes = (
+            [] if self.isolated else [k for k in range(3) if not self.pbc[k]]
+        )
+        if (
+            self._whole_system
+            and not self.isolated
+            and np.linalg.det(self.cell) <= 0.0
+        ):
             raise ValueError(
                 "the cell is left-handed or degenerate (det <= 0); nvalchemiops' "
                 "cell list refuses it. Swap two lattice vectors."
             )
         self.repartition_every = repartition_every
+        if compute_virial and self.isolated:
+            raise ValueError(_VIRIAL_ISOLATED)
         self.compute_virial = bool(compute_virial)
         #: Also assemble Born effective charge tensors, exposed as
         #: ``results['born_charge']`` ``(natoms, 3, 3)``. Costs one extra
@@ -427,7 +485,7 @@ class DistributedEvaluator:
             self.cell, dtype=torch.float64, device=self.home
         )
         self._cell_inv_dev = torch.as_tensor(
-            np.linalg.inv(self.cell), dtype=torch.float64, device=self.home
+            self._cell_inverse(), dtype=torch.float64, device=self.home
         )
         self._reference_cell_dev: torch.Tensor | None = None
         self._pinned = (
@@ -574,6 +632,8 @@ class DistributedEvaluator:
         flag = bool(flag)
         if flag and self.efield is not None:
             raise ValueError(_VIRIAL_UNDER_FIELD)
+        if flag and self.isolated:
+            raise ValueError(_VIRIAL_ISOLATED)
         self.compute_virial = flag
         if not flag:
             self.virial = None
@@ -591,9 +651,28 @@ class DistributedEvaluator:
         as a cap set by measurement: the first-step probe
         (:meth:`_fit_skin_to_memory`), lowered again whenever a device runs out.
         """
+        if self.isolated:
+            # One device, the list searched afresh every step: no halo.
+            return 0.0
         return min(
             default_skin(self.cell, self._rcut, len(self.devices)), self._skin_cap
         )
+
+    def _cell_inverse(self) -> np.ndarray:
+        """``inv(cell)`` on the host; the identity for a cluster, whose cell
+        (possibly all zero) nothing reads."""
+        if self.isolated:
+            return np.eye(3)
+        return np.linalg.inv(self.cell)
+
+    def _check_cell(self, cell: np.ndarray) -> None:
+        """Refuse a degenerate cell before anything stores it. A cluster's
+        cell is never read."""
+        if self.isolated:
+            return
+        det = np.linalg.det(cell)
+        if not np.isfinite(det) or abs(det) <= 0:
+            raise ValueError("the cell is degenerate (zero volume)")
 
     def set_cell(self, cell: Any) -> None:
         """Replace the cell, keeping the partitioning while it still holds.
@@ -611,9 +690,9 @@ class DistributedEvaluator:
         built with. An explicitly chosen skin is the caller's and is left
         alone.
         """
-        self.cell = np.asarray(cell, dtype=np.float64).reshape(3, 3)
-        if abs(np.linalg.det(self.cell)) <= 0:
-            raise ValueError("the cell is degenerate (zero volume)")
+        cell = np.asarray(cell, dtype=np.float64).reshape(3, 3)
+        self._check_cell(cell)
+        self.cell = cell
         self._upload_cell()
         self.cell_version += 1
         if self.long_range_energy is not None:
@@ -658,7 +737,7 @@ class DistributedEvaluator:
 
     def _upload_cell(self) -> None:
         """The host cell and its inverse onto the home device, without a stall."""
-        inverse = np.linalg.inv(self.cell)
+        inverse = self._cell_inverse()
         if self._pinned is None:
             self._cell_dev.copy_(torch.as_tensor(self.cell))
             self._cell_inv_dev.copy_(torch.as_tensor(inverse))

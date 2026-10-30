@@ -230,7 +230,8 @@ class _Relaxation:
         ):
             raise ValueError(
                 "relax_cell moves the cell, and a slab's open axis is not a "
-                "periodic length a stress can act on; relax the positions only"
+                "periodic length a stress can act on, nor is a cluster's box; "
+                "relax the positions only"
             )
         fixed = _fixed_atoms(atoms)
         if relax_cell is not None and len(fixed):
@@ -486,10 +487,11 @@ class _Relaxation:
                         f"fell {released:.3g} eV/atom"
                     )
                     break
-                grown = self.evaluator.volume / v0
-                if not 0.5 < grown < 2.0:
-                    diverged = f"the cell volume changed {grown:.3g}-fold"
-                    break
+                if self.relax_cell is not None:
+                    grown = self.evaluator.volume / v0
+                    if not 0.5 < grown < 2.0:
+                        diverged = f"the cell volume changed {grown:.3g}-fold"
+                        break
                 self.converged = self._converged(f, fmax, smax)
                 if self.nsteps % self.loginterval == 0:
                     self._record(f)

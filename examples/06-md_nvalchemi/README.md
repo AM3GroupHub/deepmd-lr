@@ -36,9 +36,9 @@ python 02_nvt_langevin.py --model ... --structure traj.xyz --index 250
 usually the most equilibrated. **A cell is required** along every periodic
 axis. A slab, whose `pbc` leaves one axis open, runs too: `read_structure` pads
 that axis to at least 20 Å of vacuum (`vacuum=`) and centres the slab, and the
-long-range sum takes its slab form. Molecules and clusters are refused rather
-than quietly treated as periodic; they run through the ASE calculator
-([example 07](../07-ase-calculator)).
+long-range sum takes its slab form. A molecule or cluster (`pbc` all false)
+runs on one GPU with no cell: the long-range term is the direct isolated sum,
+and NPT is refused ([non-periodic](../../docs/non-periodic.md#running-md)).
 
 ## The scripts
 

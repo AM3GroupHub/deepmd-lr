@@ -155,15 +155,15 @@ once is not supported), is safe by construction:
 - **Atoms.** `atoms` must match the evaluator's atom order, cell and pbc.
   `FixAtoms` holds its atoms in place, at rest, with three degrees of freedom
   per mobile atom in the temperature; any other constraint is refused.
-- **Boundary.** The structure's `pbc` decides it: bulk, or a slab with one
-  open axis. Along an open axis there are no images and the long-range sum
-  takes its slab form (Yeh–Berkowitz) whatever the model was trained with,
-  since the term holds no weights. `read_structure` pads the open axis to at
+- **Boundary.** The structure's `pbc` decides it: bulk, a slab with one open
+  axis, or a cluster with none. Along an open axis there are no images and the
+  long-range sum takes its slab form (Yeh–Berkowitz) whatever the model was
+  trained with, since the term holds no weights. `read_structure` pads the open axis to at
   least 20 Å of vacuum (`vacuum=`) and centres the slab. Atoms must stay inside
   the open faces; multiple partitions also require a half-skin margin at each
-  rebuild. NPT, NPH and cell relaxation are refused for a slab.
-  An `isolated` term, molecules and clusters belong to the ASE
-  calculator ([non-periodic](non-periodic.md#running-md)).
+  rebuild. NPT, NPH and cell relaxation are refused for a slab. A cluster
+  runs on one device with no cell and the isolated sum, and refuses the virial
+  ([non-periodic](non-periodic.md#running-md)).
 - **PME mesh.** Set from the cell when the evaluator is built, at least
   `ceil(2 alpha L)` points per axis, and kept for the run
   ([alpha and mesh](alpha-and-mesh.md)).

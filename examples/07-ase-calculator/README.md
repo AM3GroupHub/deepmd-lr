@@ -28,14 +28,13 @@ python ase_calculator.py --model ../../path/to/model.ckpt.pt
 | `efield=[Ex, Ey, Ez]` | a uniform field in V/Å: adds `F = Zᵀ E` to the forces and reports `results["born_charge"]`. A zero field gives the Born charges and moves nothing. Stress is withheld under a field |
 | `eps_inf=` | reports charges and Born tensors screened by `sqrt(eps_inf)`; energies and field-free forces do not change ([Born charges](../../docs/born-charges.md)) |
 | `charge_spin=(Q, 2S+1)` | total charge and spin multiplicity, for a charged or open-shell system |
-| `long_range={...}` | reciprocal-space settings at load, e.g. `{"method": "isolated"}` for a molecule or cluster with no cell ([non-periodic](../../docs/non-periodic.md#running-md)). A slab needs none: each frame's `pbc` picks the 3D or the slab sum, and its cell the PME mesh |
+| `long_range={...}` | reciprocal-space settings at load, e.g. `{"method": "ewald"}`. Rarely needed: each frame's `pbc` picks the 3D, the slab or the isolated sum ([non-periodic](../../docs/non-periodic.md)), and its cell the PME mesh |
 
 ## When to use it
 
 The calculator evaluates the whole system on one device, and ASE moves the
 atoms on the host between steps. That suits small systems and anything built
-on ASE. It is also the route for molecules and clusters, which the GPU classes
-refuse. A slab runs here too, with at least the cutoff of vacuum, because the
+on ASE, molecules included. A slab runs here too, with at least the cutoff of vacuum, because the
 calculator hands the model the whole cell. For long MD, large systems or
 several GPUs, use the classes in
 [example 06](../06-md_nvalchemi): the same model, stepped without leaving the

@@ -451,7 +451,7 @@ class TestBoundaryConditions:
 
     def test_rejects_missing_box(self):
         coord, charge, _ = random_neutral()
-        with pytest.raises(ValueError, match="periodic cell"):
+        with pytest.raises(ValueError, match="needs a cell"):
             LongRangeEnergy()(coord, charge, None)
 
     def test_rejects_degenerate_cell(self):
@@ -727,10 +727,19 @@ class TestSystemSettings:
         # The rest is the model's.
         assert bulk["alpha"] == 0.4 and bulk["spline_order"] == 6
 
-    def test_two_open_axes_are_refused_and_the_isolated_term_is_left_alone(self):
+    def test_no_periodic_axis_takes_the_isolated_sum_and_a_wire_is_refused(self):
         from deepmd_lr.lr import system_reciprocal
 
-        with pytest.raises(ValueError, match="2 axes open"):
+        with pytest.raises(ValueError, match="wire"):
             system_reciprocal(self.WATER, np.eye(3) * 10.0, [True, False, False])
+        cluster = system_reciprocal(self.WATER, np.zeros((3, 3)), [False] * 3)
+        assert cluster == {
+            "alpha": 0.4,
+            "method": "isolated",
+            "isolated_kernel": "auto",
+            "max_isolated_atoms": 5000,
+        }
         isolated = {"method": "isolated", "alpha": 0.4}
-        assert system_reciprocal(isolated, np.eye(3) * 10.0, [True] * 3) == isolated
+        assert system_reciprocal(isolated, np.zeros((3, 3)), [False] * 3) == isolated
+        with pytest.raises(ValueError, match="sums no periodic images"):
+            system_reciprocal(isolated, np.eye(3) * 10.0, [True] * 3)

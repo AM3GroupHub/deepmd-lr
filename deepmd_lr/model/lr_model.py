@@ -91,6 +91,7 @@ from deepmd_lr.fitting.charge import (
 from deepmd_lr.lr.term import (
     LongRangeTerm,
     build_long_range_energy,
+    isolated_term_for,
     system_reciprocal,
 )
 from deepmd_lr.neighbors import (
@@ -306,12 +307,11 @@ class LongRangeEnergyModel(EnergyModel):
         """A long-range term built for one system; this model's own is left
         as it is.
 
-        The system's ``pbc`` picks the 3D sum or the slab one, and its cell
-        the PME mesh (:func:`~deepmd_lr.lr.term.system_reciprocal`). The term
-        holds no weights, so every system can have one of its own: that is
-        how evaluators and calculators share a model without disturbing each
-        other. The ``isolated`` term comes back unchanged, and a model without
-        a long-range block gives None.
+        The system's ``pbc`` picks the 3D, the slab or the isolated sum, and
+        its cell the PME mesh (:func:`~deepmd_lr.lr.term.system_reciprocal`).
+        The term holds no weights, so every system can have one of its own:
+        that is how evaluators and calculators share a model without
+        disturbing each other. A model without a long-range block gives None.
 
         The settings adapted are ``settings``, checked as
         :meth:`set_long_range` checks them, or by default the model's as they
@@ -717,6 +717,13 @@ class LongRangeEnergyModel(EnergyModel):
             None if base_box is None else torch.bmm(base_box, strain.transpose(-1, -2))
         )
 
+        # The frame picks the sum: with no cell, the isolated one at this
+        # model's alpha, whatever method the periodic frames use.
+        term = (
+            self.long_range_energy
+            if base_box is not None
+            else isolated_term_for(self.long_range_energy)
+        )
         mask = charge_mask(self, atype)
         create_graph = self.training
         born = None
@@ -766,7 +773,7 @@ class LongRangeEnergyModel(EnergyModel):
                 return_raw=True,
             )
             charge = filtered(projected)
-            atom_energy = self.long_range_energy(
+            atom_energy = term(
                 strained_coord, charge, strained_box, mask=mask
             )
             energy = atom_energy.sum()
@@ -841,7 +848,7 @@ class LongRangeEnergyModel(EnergyModel):
                 return_raw=True,
             )
             charge = filtered(projected)
-            atom_energy = self.long_range_energy(
+            atom_energy = term(
                 strained_coord, charge, strained_box, mask=mask
             )
             energy = atom_energy.sum()
@@ -901,6 +908,16 @@ class LongRangeEnergyModel(EnergyModel):
             # as the standard one does: the kernel reads the folded state, and
             # a different request would be silently dropped.
             resolve_charge_spin(self, charge_spin, atype.shape[0], coord)
+        if (
+            self.has_long_range
+            and box is not None
+            and not self.long_range_energy.needs_cell
+        ):
+            raise ValueError(
+                "this model's long-range term is method 'isolated', which sums "
+                "no periodic images, but the frame has a cell. A model trained "
+                "with method 'isolated' runs on systems with no periodic axis."
+            )
         with self._capturing_backbone() as captured:
             short_range = super().forward(
                 coord,
@@ -914,15 +931,6 @@ class LongRangeEnergyModel(EnergyModel):
             )
         if not self.has_long_range:
             return short_range
-        if box is None and self.long_range_energy.needs_cell:
-            raise ValueError(
-                "The 'dp_lr' model has a long-range term configured with "
-                f"method '{self.long_range_energy.method}', which requires a "
-                "periodic cell, but box is None. For an isolated system set "
-                "`long_range.reciprocal.method` to 'isolated', which sums the "
-                "same erf-damped interaction directly with no cell."
-            )
-
         long_range = self._long_range(
             coord,
             atype,

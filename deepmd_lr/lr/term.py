@@ -113,6 +113,11 @@ from nvalchemiops.torch.interactions.electrostatics.slab import (
 )
 
 from deepmd_lr.cell import inverse_3x3
+from deepmd_lr.lr.isolated import (
+    DEFAULT_MAX_ISOLATED_ATOMS,
+    ISOLATED_KERNELS,
+    isolated_erf_energy,
+)
 
 #: Ewald's default truncation: ``exp(-k^2 / 4 alpha^2)`` falls to this at
 #: ``k_cutoff``.
@@ -194,6 +199,8 @@ class LongRangeEnergy(torch.nn.Module):
         accuracy: float = DEFAULT_ACCURACY,
         slab_correction: bool = False,
         pbc: tuple[bool, bool, bool] | list[bool] | None = None,
+        isolated_kernel: str = "auto",
+        max_isolated_atoms: int = DEFAULT_MAX_ISOLATED_ATOMS,
         **kwargs: Any,
     ) -> None:
         super().__init__()
@@ -305,6 +312,10 @@ class LongRangeEnergy(torch.nn.Module):
 
         self.alpha = float(alpha)
         self.method = method
+        # How a frame with no cell is summed (:func:`isolated_term_for`).
+        self.isolated_kernel, self.max_isolated_atoms = _checked_isolated_kernel(
+            isolated_kernel, max_isolated_atoms
+        )
         self.slab_correction = slab_correction
         self.pbc = pbc
         #: Refuse a degenerate cell at every call. That check reads the device,
@@ -340,6 +351,8 @@ class LongRangeEnergy(torch.nn.Module):
             "method": self.method,
             "slab_correction": self.slab_correction,
             "pbc": list(self.pbc),
+            "isolated_kernel": self.isolated_kernel,
+            "max_isolated_atoms": self.max_isolated_atoms,
         }
         if self.method == "pme":
             data.update(
@@ -458,10 +471,8 @@ class LongRangeEnergy(torch.nn.Module):
         """
         if box is None:
             raise ValueError(
-                "The long-range term requires a periodic cell, but box is "
-                "None. Ewald summation is only defined under periodic "
-                "boundary conditions; for an isolated system use a real-space "
-                "Coulomb or DSF term instead."
+                "The periodic long-range term needs a cell, but box is None; a "
+                "frame with no cell is summed by isolated_term_for(term)."
             )
         _check_inputs(coord, charge)
 
@@ -549,8 +560,18 @@ class LongRangeEnergy(torch.nn.Module):
         return energy.reshape(nf, nloc, 1)
 
 
+def _checked_isolated_kernel(kernel: str, max_atoms: int) -> tuple[str, int]:
+    if kernel not in ISOLATED_KERNELS:
+        raise ValueError(
+            f"isolated_kernel must be one of {ISOLATED_KERNELS}, got {kernel!r}"
+        )
+    if int(max_atoms) < 1:
+        raise ValueError(f"max_isolated_atoms must be >= 1, got {max_atoms}")
+    return kernel, int(max_atoms)
+
+
 class IsolatedLongRangeEnergy(torch.nn.Module):
-    r"""The same long-range energy, for a system with no cell.
+    r"""The same long-range energy, for a system with no periodic axis.
 
     Ewald splits Coulomb at :math:`\alpha` into a screened part the network
     learns and a smooth part this package supplies:
@@ -565,49 +586,34 @@ class IsolatedLongRangeEnergy(torch.nn.Module):
             }_{\text{this class}}
 
     Under periodicity that second sum is what :class:`LongRangeEnergy`
-    evaluates in reciprocal space. Without a cell it can be summed directly,
-    and doing so is not merely the analogous choice -- it is the *same
-    quantity*. Put a cluster in a cube of side ``L`` and ``recip - self``
-    converges onto this sum as :math:`1/L^3`; measured differences were
-    ``-6.6e-03``, ``-8.3e-04`` and ``-1.0e-04`` eV at ``L = 80, 160, 320``
-    angstrom, pinned by ``tests/test_isolated_term.py``.
+    evaluates in reciprocal space; without a cell it is summed directly, and it
+    is the *same quantity*: put a cluster in a cube of side ``L`` and
+    ``recip - self`` converges onto it as :math:`1/L^3` (``-6.6e-03``,
+    ``-8.3e-04``, ``-1.0e-04`` eV at ``L = 80, 160, 320`` A, pinned by
+    ``tests/test_isolated_term.py``). So a shared descriptor trained on
+    periodic and isolated frames sees the same ``erfc(alpha r)/r`` remainder
+    in both. Three things follow:
 
-    That equality is the whole point. A shared descriptor trained on periodic
-    and isolated frames together sees a remainder of the same
-    ``erfc(alpha r)/r`` shape in both, so it is never asked to do two
-    different jobs -- which is exactly what a damped-shifted-force or
-    hard-truncated Coulomb term would demand.
+    * **No self term.** ``erf(alpha r)/r -> 2 alpha / sqrt(pi)`` as ``r -> 0``,
+      which times ``0.5 * sum_i q_i^2`` is the Ewald self term; summing
+      ``j != i`` already excludes it.
+    * **Charged systems need nothing extra**: no images, no neutralising
+      background, so an ion is just an ion.
+    * **No cutoff.** ``erf(alpha r)/r`` decays as ``1/r``; every pair is summed.
 
-    Three things follow, and each removes a decision:
-
-    * **No self term.** ``erf(alpha r)/r`` tends to ``2 alpha / sqrt(pi)`` as
-      ``r -> 0``, and the Ewald self term is precisely that times
-      ``0.5 * sum_i q_i^2``. Summing ``j != i`` already excludes it, so this
-      returns the same ``recip - self`` content its periodic twin does.
-    * **Charged systems need nothing extra.** Without periodic images there is
-      no conditionally convergent sum and no neutralising background, so an
-      ion is just an ion.
-    * **No cutoff.** ``erf(alpha r)/r`` decays as ``1/r``. Truncating a
-      long-ranged interaction is the error this whole package exists to avoid,
-      so every pair is summed.
-
-    Evaluated densely rather than through nvalchemiops. Its ``ewald_real_space``
-    could give the same number as ``alpha=0`` minus ``alpha``, but only via a
-    dummy cell, all-zero shifts, an all-pairs neighbour list and a ragged
-    relayout -- ``nvalchemiops`` batches by concatenation while DeePMD-kit
-    hands us a padded ``(nf, nloc)`` frame. Its ``dsf_coulomb`` has no position
-    autograd and ``coulomb_energy`` raises under ``create_graph``, so neither
-    survives force-loss training. The dense form takes DeePMD-kit's layout as
-    it comes, is exact, and is twice differentiable. It costs ``O(N^2)``
-    memory -- 8 MiB at 1024 atoms in float64 -- which is the one reason to
-    revisit it, and only for molecules far larger than these.
+    Two kernels evaluate it (:mod:`deepmd_lr.lr.isolated`): the dense one,
+    twice differentiable and O(N^2) in memory, and the chunked one, O(chunk N)
+    and first derivatives only. ``isolated_kernel`` picks: ``"auto"`` is dense
+    up to ``max_isolated_atoms`` atoms per call and chunked beyond. Force
+    training and Hessians need ``"dense"``. ``kernel_dtype`` (a runtime
+    attribute, not part of the config) is the dtype the sum runs in; ``None``
+    is the inputs' own.
 
     Parameters
     ----------
     alpha
         Ewald splitting parameter in inverse angstrom. **Must match the value
-        used by the periodic branches**; it defines where the split falls, and
-        one shared backbone cannot serve two different splits.
+        used by the periodic branches**; it defines where the split falls.
     """
 
     #: No cell required -- this is the whole reason the class exists.
@@ -627,18 +633,16 @@ class IsolatedLongRangeEnergy(torch.nn.Module):
         accuracy: float = DEFAULT_ACCURACY,
         slab_correction: bool = False,
         pbc: tuple[bool, bool, bool] | list[bool] | None = None,
+        isolated_kernel: str = "auto",
+        max_isolated_atoms: int = DEFAULT_MAX_ISOLATED_ATOMS,
         **kwargs: Any,
     ) -> None:
         super().__init__()
         del method
-        # Every periodic setting is accepted and then checked against its
-        # default rather than simply refused, because `dargs` fills the whole
-        # block in before anything is built -- an isolated config arrives here
-        # carrying `spline_order: 6` and `pbc: None` that nobody wrote. What
-        # must still be caught is a value someone *chose*: a setting that looks
-        # applied but is not is the worst kind of configuration bug. Same
-        # default-as-sentinel test LongRangeEnergy uses for its own
-        # cross-method check.
+        # `dargs` fills the whole block in before anything is built, so an
+        # isolated config arrives carrying `spline_order: 6` and `pbc: None`
+        # that nobody wrote. Refuse only a value someone *chose*: a periodic
+        # setting that looks applied but is not.
         supplied = [
             name
             for name, value, unset in (
@@ -648,34 +652,53 @@ class IsolatedLongRangeEnergy(torch.nn.Module):
                 ("k_cutoff", k_cutoff, None),
                 ("accuracy", accuracy, DEFAULT_ACCURACY),
                 ("slab_correction", slab_correction, False),
-                ("pbc", pbc, None),
             )
             if value != unset
         ]
+        if pbc is not None and any(bool(p) for p in pbc):
+            supplied.append("pbc")
         if kwargs:
             supplied += sorted(kwargs)
         if supplied:
             raise ValueError(
                 f"{sorted(supplied)} do not apply to method='isolated', which "
-                "takes only `alpha`. Meshes, k-vector cutoffs, "
-                "`slab_correction` and `pbc` all describe a sum over periodic "
-                "images; an isolated system has none, so these would be "
-                "silently ignored."
+                "takes `alpha`, `isolated_kernel` and `max_isolated_atoms`. "
+                "Meshes, k-vector cutoffs, `slab_correction` and a periodic "
+                "`pbc` describe a sum over periodic images, which an isolated "
+                "system has none of."
             )
         if alpha is None or alpha <= 0:
             raise ValueError(f"alpha must be positive, got {alpha}")
         self.alpha = float(alpha)
         self.method = self.METHOD
+        self.pbc = (False, False, False)
+        self.isolated_kernel, self.max_isolated_atoms = _checked_isolated_kernel(
+            isolated_kernel, max_isolated_atoms
+        )
+        self.kernel_dtype: torch.dtype | None = None
+        #: Interface parity with the periodic term; there is no cell to check.
+        self.check_cell = True
 
     def extra_repr(self) -> str:
-        return f"method='{self.METHOD}', alpha={self.alpha}"
+        return (
+            f"method='{self.METHOD}', alpha={self.alpha}, "
+            f"isolated_kernel='{self.isolated_kernel}'"
+        )
 
     def serialize(self) -> dict[str, Any]:
-        return {"alpha": self.alpha, "method": self.METHOD}
+        return {
+            "alpha": self.alpha,
+            "method": self.METHOD,
+            "isolated_kernel": self.isolated_kernel,
+            "max_isolated_atoms": self.max_isolated_atoms,
+        }
 
     @classmethod
     def deserialize(cls, data: dict[str, Any]) -> "IsolatedLongRangeEnergy":
         return cls(**data)
+
+    def set_k_vectors(self, cell: torch.Tensor | None) -> None:
+        """Nothing to fix: the direct sum has no reciprocal vectors."""
 
     def forward(
         self,
@@ -684,59 +707,38 @@ class IsolatedLongRangeEnergy(torch.nn.Module):
         box: torch.Tensor | None = None,
         mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Per-atom long-range electrostatic energy, in eV.
+        """Per-atom long-range electrostatic energy in eV, ``(nf, nloc, 1)``.
 
-        Parameters
-        ----------
-        coord
-            Coordinates in angstrom, shape ``(nf, nloc, 3)``.
-        charge
-            Per-atom charges in elementary-charge units, shape ``(nf, nloc)``,
-            already satisfying the total-charge constraint.
-        box
-            Ignored. Accepted so this is interchangeable with
-            :class:`LongRangeEnergy`; a cell, if one is passed, simply plays
-            no part in an open-boundary sum.
-        mask
-            Optional ``(nf, nloc)`` mask of real atoms. Padding atoms are given
-            zero charge, which removes them exactly -- every term is bilinear
-            in the charges.
-
-        Returns
-        -------
-        torch.Tensor
-            Per-atom energy in eV, shape ``(nf, nloc, 1)``.
+        ``coord`` ``(nf, nloc, 3)`` in angstrom, ``charge`` ``(nf, nloc)`` in
+        e, already projected onto the total charge; each frame is its own
+        system. ``box`` is ignored (interchangeable with
+        :class:`LongRangeEnergy`). ``mask`` zeroes the charge of padding atoms,
+        which removes them exactly: every term is bilinear in the charges.
         """
         del box
         _check_inputs(coord, charge)
-
-        nf, nloc = coord.shape[0], coord.shape[1]
         q = charge if mask is None else charge * mask.to(charge.dtype)
-
-        delta = coord.unsqueeze(2) - coord.unsqueeze(1)      # (nf, nloc, nloc, 3)
-        r2 = (delta * delta).sum(-1)
-        diagonal = torch.eye(nloc, dtype=torch.bool, device=coord.device)
-        active = ~diagonal
-        if mask is not None:
-            valid = mask.bool()
-            active = active & valid.unsqueeze(2) & valid.unsqueeze(1)
-        # The series in r^2 preserves finite first and second derivatives at
-        # coincidence. Keep the inactive analytic branch away from sqrt(0).
-        x2 = self.alpha**2 * torch.where(active, r2, torch.zeros_like(r2))
-        small = x2 < 1e-4
-        safe_r = torch.sqrt(torch.where(small, torch.ones_like(r2), r2))
-        series = (2 * self.alpha / math.sqrt(math.pi)) * (
-            1 - x2 / 3 + x2**2 / 10 - x2**3 / 42
+        energy = isolated_erf_energy(
+            coord,
+            q,
+            self.alpha,
+            kernel=self.isolated_kernel,
+            max_dense_atoms=self.max_isolated_atoms,
+            dtype=self.kernel_dtype,
         )
-        kernel = torch.where(small, series, torch.erf(self.alpha * safe_r) / safe_r)
-        kernel = torch.where(active, kernel, torch.zeros_like(kernel))
+        return (energy * ELECTROSTATIC_CONVERSION).unsqueeze(-1)
 
-        # Halved because the double sum counts every pair twice; splitting it
-        # symmetrically is what makes this a per-atom energy in the same sense
-        # as the periodic term's energy_reduction="atom".
-        energy = 0.5 * q * (kernel * q.unsqueeze(1)).sum(-1)
-        energy = energy * ELECTROSTATIC_CONVERSION
-        return energy.reshape(nf, nloc, 1)
+
+def isolated_term_for(term: torch.nn.Module) -> IsolatedLongRangeEnergy:
+    """The isolated term with ``term``'s ``alpha`` and kernel settings: how a
+    frame with no cell is summed, whatever method the model was trained with."""
+    if isinstance(term, IsolatedLongRangeEnergy):
+        return term
+    return IsolatedLongRangeEnergy(
+        alpha=term.alpha,
+        isolated_kernel=term.isolated_kernel,
+        max_isolated_atoms=term.max_isolated_atoms,
+    )
 
 
 #: Either long-range term. They are interchangeable at every call site: same
@@ -794,20 +796,33 @@ def system_reciprocal(settings: dict[str, Any], cell: Any, pbc: Any) -> dict[str
     """The reciprocal-space settings a system needs, from a model's own.
 
     The term holds no weights, so how the sum is taken is a property of the
-    system, not of the checkpoint. The system's ``pbc`` picks the sum -- all
+    system, not of the checkpoint. The system's ``pbc`` picks the sum: all
     three axes periodic is the 3D sum, one open axis a slab with the
-    Yeh-Berkowitz correction -- and its cell the PME mesh
-    (:func:`system_mesh`). ``alpha``, the method and the spline order stay
-    the model's.
-
-    The ``isolated`` method comes back unchanged: moving between it and a
-    periodic method changes the physics, so it is asked for explicitly, with
-    ``long_range=``, never inferred from a structure.
+    Yeh-Berkowitz correction, no periodic axis the isolated sum (any trained
+    method; ``alpha`` and the kernel settings carry over). The cell sets the
+    PME mesh (:func:`system_mesh`). A wire (one periodic axis) is refused, and
+    so is a periodic system for a model trained with ``method: isolated``,
+    which has never seen a periodic image.
     """
     method = settings.get("method", "pme")
-    if method not in METHODS:
-        return dict(settings)
     periodic = [bool(p) for p in np.broadcast_to(np.asarray(pbc, dtype=bool), (3,))]
+    if not any(periodic):
+        if method == IsolatedLongRangeEnergy.METHOD:
+            return dict(settings)
+        return {
+            "alpha": float(settings.get("alpha", DEFAULT_ALPHA)),
+            "method": IsolatedLongRangeEnergy.METHOD,
+            "isolated_kernel": settings.get("isolated_kernel", "auto"),
+            "max_isolated_atoms": settings.get(
+                "max_isolated_atoms", DEFAULT_MAX_ISOLATED_ATOMS
+            ),
+        }
+    if method == IsolatedLongRangeEnergy.METHOD:
+        raise ValueError(
+            f"method 'isolated' sums no periodic images, but pbc={periodic} marks "
+            "a periodic axis: a model trained with method 'isolated' runs on "
+            "systems with no periodic axis."
+        )
     out = dict(settings)
     if all(periodic):
         out.update(slab_correction=False, pbc=[True, True, True])
@@ -815,10 +830,9 @@ def system_reciprocal(settings: dict[str, Any], cell: Any, pbc: Any) -> dict[str
         out.update(slab_correction=True, pbc=periodic)
     else:
         raise ValueError(
-            f"pbc={periodic} leaves {3 - sum(periodic)} axes open. The periodic "
-            "sum covers a bulk cell and a slab (one open axis); a molecule or a "
-            "wire runs through the ASE calculator with "
-            "long_range={'method': 'isolated'}."
+            f"pbc={periodic} leaves two axes open: a wire (one periodic axis) is "
+            "not supported. The long-range term sums a bulk cell, a slab (one "
+            "open axis) and a system with no periodic axis."
         )
     if method == "pme":
         out["mesh_dimensions"] = list(system_mesh(settings, cell))

@@ -1207,7 +1207,7 @@ class TestLongRangeBoundary:
         coord, atype, cell, *_ = system
         model = build()
         model.set_long_range({"method": "isolated"})
-        with pytest.raises(ValueError, match="ASE calculator"):
+        with pytest.raises(ValueError, match="sums no periodic images"):
             DistributedEvaluator(model, atype, cell, devices=[DEVICE])
         with pytest.raises(ValueError, match="does not match the system's pbc"):
             evaluate_partitioned(model, coord, atype, cell, n_partitions=1)
@@ -1329,12 +1329,159 @@ class TestSlab:
         with pytest.raises(ValueError, match="outside the cell along the open axis"):
             ev(past)
 
-    def test_two_open_axes_are_refused(self):
+    def test_a_wire_is_refused(self):
         coord, atype, cell = slab()
-        with pytest.raises(ValueError, match="bulk cell and a slab"):
+        with pytest.raises(ValueError, match="wire"):
             DistributedEvaluator(
                 build(), atype, cell, devices=[DEVICE], pbc=(True, False, False)
             )
+
+
+CLUSTER_PBC = (False, False, False)
+
+
+def cluster(n_mol=12, seed=3):
+    """The fixture's molecules as a cluster centred on the origin, as a
+    cluster file would have them, with a zero cell."""
+    coord, atype, _ = frame(n_mol=n_mol, box=12.0, seed=seed)
+    c = coord[0].cpu().numpy().copy()
+    return c - c.mean(axis=0), atype[0].cpu().numpy(), np.zeros((3, 3))
+
+
+def serial_cluster(coord, atype):
+    """The model's own forward with no box: the isolated sum, dense kernel."""
+    out = build()(
+        torch.tensor(coord, dtype=torch.float64, device=DEVICE)[None],
+        torch.tensor(atype, device=DEVICE)[None],
+        box=None,
+    )
+    return {
+        "energy": float(out["energy"].reshape(-1)[0]),
+        "force": out["force"][0].detach().cpu().numpy(),
+        "charge": out["charge"][0].detach().cpu().numpy(),
+        "energy_long_range": float(out["energy_long_range"].reshape(-1)[0]),
+    }
+
+
+class TestCluster:
+    """No periodic axis: the isolated sum on one device, the neighbour list
+    searching its own bounding box, the (zero) cell never read."""
+
+    def evaluator(self, atype, cell=None, **kwargs):
+        kwargs.setdefault("memory_headroom", None)
+        return DistributedEvaluator(
+            build(),
+            atype,
+            np.zeros((3, 3)) if cell is None else cell,
+            devices=[DEVICE],
+            pbc=CLUSTER_PBC,
+            **kwargs,
+        )
+
+    def test_a_cluster_matches_the_serial_model(self):
+        coord, atype, _ = cluster()
+        ref = serial_cluster(coord, atype)
+        ev = self.evaluator(atype)
+        term = ev.long_range_energy
+        assert ev.isolated and term.method == "isolated"
+        assert term.isolated_kernel == "chunked" and term.kernel_dtype == torch.float64
+        e, f = ev(coord)
+        assert float(e) == pytest.approx(ref["energy"], abs=1e-8)
+        np.testing.assert_allclose(f.cpu().numpy(), ref["force"], atol=1e-8)
+        charge = np.asarray(ev.results["charge"])
+        np.testing.assert_allclose(charge, ref["charge"], atol=1e-8)
+        assert float(ev.results["energy_long_range"]) == pytest.approx(
+            ref["energy_long_range"], abs=1e-8
+        )
+
+    def test_atoms_may_leave_the_box(self):
+        """Nothing is summed over images: an atom far outside the list's box
+        of the first search is still a real atom."""
+        coord, atype, _ = cluster()
+        ev = self.evaluator(atype)
+        ev(coord)  # fixes the neighbour list's box
+        far = coord.copy()
+        far[:3] += np.array([0.0, 0.0, 35.0])  # one molecule beyond it
+        ref = serial_cluster(far, atype)
+        e, f = ev(far)
+        assert float(e) == pytest.approx(ref["energy"], abs=1e-8)
+        np.testing.assert_allclose(f.cpu().numpy(), ref["force"], atol=1e-8)
+
+    def test_a_dummy_cell_is_carried_along_unread(self):
+        coord, atype, _ = cluster()
+        e0, _ = self.evaluator(atype)(coord)
+        e1, _ = self.evaluator(atype, cell=np.eye(3) * 30.0)(coord)
+        assert float(e1) == pytest.approx(float(e0), abs=1e-10)
+
+    def test_float32_runs_the_sum_in_single_precision(self):
+        coord, atype, _ = cluster()
+        ref = serial_cluster(coord, atype)
+        ev = self.evaluator(atype, long_range={"isolated_dtype": "float32"})
+        assert ev.long_range_energy.kernel_dtype == torch.float32
+        e, f = ev(coord)
+        assert float(e) == pytest.approx(ref["energy"], abs=1e-4)
+        np.testing.assert_allclose(f.cpu().numpy(), ref["force"], atol=1e-4)
+        coord_p, atype_p, cell_p = slab()
+        with pytest.raises(ValueError, match="isolated_dtype"):
+            DistributedEvaluator(
+                build(), atype_p, cell_p, devices=[DEVICE], pbc=SLAB_PBC,
+                long_range={"isolated_dtype": "float32"},
+            )  # fmt: skip
+
+    def test_several_devices_and_the_virial_are_refused(self):
+        coord, atype, _ = cluster()
+        with pytest.raises(ValueError, match="one device"):
+            DistributedEvaluator(
+                build(), atype, np.zeros((3, 3)), devices=[DEVICE] * 2,
+                pbc=CLUSTER_PBC,
+            )  # fmt: skip
+        with pytest.raises(ValueError, match="compute_virial"):
+            self.evaluator(atype, compute_virial=True)
+        with pytest.raises(ValueError, match="compute_virial"):
+            self.evaluator(atype).set_compute_virial(True)
+
+    def test_read_structure_and_build_evaluator_leave_a_cluster_alone(self, tmp_path):
+        import ase.io
+
+        from deepmd_lr.nvalchemi import build_evaluator, read_structure
+
+        coord, atype, _ = cluster()
+        atoms = Atoms(
+            ["O", "H", "H"] * (len(atype) // 3), positions=coord, pbc=False
+        )
+        ase.io.write(tmp_path / "cluster.extxyz", atoms)
+        read = read_structure(tmp_path / "cluster.extxyz")
+        assert read.pbc.tolist() == [False] * 3
+        np.testing.assert_allclose(read.cell.array, 0.0)
+        np.testing.assert_allclose(read.get_positions(), coord, atol=1e-6)
+        ev = build_evaluator(build(), read, memory_headroom=None)
+        e, _ = ev(read.get_positions())
+        ref = serial_cluster(coord, atype)
+        assert float(e) == pytest.approx(ref["energy"], abs=1e-6)
+        wire = atoms.copy()
+        wire.set_cell(np.eye(3) * 30.0)
+        wire.pbc = (True, False, False)
+        ase.io.write(tmp_path / "wire.extxyz", wire)
+        with pytest.raises(ValueError, match="wire"):
+            read_structure(tmp_path / "wire.extxyz")
+
+    def test_the_periodic_sum_converges_onto_it(self):
+        """A cluster in a growing cube: the explicit Ewald sum converges onto
+        the isolated engine term as 1/L^3."""
+        coord, atype, _ = cluster()
+        ev = self.evaluator(atype)
+        ev(coord)
+        isolated = float(ev.results["energy_long_range"])
+        diffs = []
+        for length in (80.0, 160.0):
+            periodic = DistributedEvaluator(
+                build(), atype, np.eye(3) * length, devices=[DEVICE],
+                memory_headroom=None, long_range={"method": "ewald", "accuracy": 1e-10},
+            )  # fmt: skip
+            periodic(coord + length / 2)
+            diffs.append(abs(float(periodic.results["energy_long_range"]) - isolated))
+        assert diffs[0] > diffs[1]
+        assert diffs[0] / diffs[1] == pytest.approx(8.0, rel=0.15)
 
 
 class TestMeshFollowsTheCell:

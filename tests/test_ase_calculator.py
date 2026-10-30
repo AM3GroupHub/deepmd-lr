@@ -107,13 +107,20 @@ class TestCalculatorMatchesTheModel:
 
 
 class TestCalculatorGuards:
-    def test_rejects_non_periodic_atoms_for_a_periodic_term(self):
-        """A reciprocal sum has nothing to sum over without a cell."""
+    def test_non_periodic_atoms_take_the_isolated_sum(self):
+        """No periodic axis: a periodic model's term becomes the isolated sum
+        at its alpha, the same as asking for method 'isolated' outright."""
         atoms = water_atoms()
         atoms.pbc = False
-        atoms.calc = LongRangeCalculator(build())
-        with pytest.raises(ValueError, match="sums over periodic images"):
-            atoms.get_potential_energy()
+        model = build()
+        atoms.calc = LongRangeCalculator(model)
+        energy, forces = atoms.get_potential_energy(), atoms.get_forces()
+        assert model.long_range_energy.method == "isolated"
+        atoms.calc = LongRangeCalculator(
+            build(), long_range={"method": "isolated", "isolated_kernel": "dense"}
+        )
+        assert atoms.get_potential_energy() == pytest.approx(energy, abs=1e-10)
+        np.testing.assert_allclose(atoms.get_forces(), forces, atol=1e-10)
 
     def test_accepts_non_periodic_atoms_for_a_short_range_model(self):
         """The guard used to fire regardless of whether there was a
@@ -353,8 +360,8 @@ def test_checkpoint_head_to_ase(tmp_path, name):
 @pytest.mark.parametrize(
     "name,pbc,message",
     [
-        ("bulk", [True, False, False], "2 axes open"),
-        ("molecule", [True, True, True], "does not match"),
+        ("bulk", [True, False, False], "wire"),
+        ("molecule", [True, True, True], "sums no periodic images"),
     ],
 )
 def test_reject_boundary_mismatch(name, pbc, message):

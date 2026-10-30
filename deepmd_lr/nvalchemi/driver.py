@@ -269,12 +269,16 @@ def partition_graph(
         keep64 = requires_grad or not with_csr
         if part.is_whole_system:
             # The real cell and periodicity; `v["cell"]` is the tensor
-            # `Partition.set_cell` keeps current, read at every search.
+            # `Partition.set_cell` keeps current, read at every search. A
+            # system with no periodic axis has no cell to search: the list then
+            # boxes the atoms itself (their bounding box plus a margin, fixed
+            # at the first search; an atom that later leaves it is clamped into
+            # an edge cell, which keeps the search complete).
             nlist = GpuNeighborList(
                 part.n_node,
                 rcut,
                 device,
-                cell=v["cell"],
+                cell=v["cell"] if any(part.periodic) else None,
                 pbc=part.periodic,
                 float64_vectors=keep64,
             )
@@ -309,10 +313,10 @@ def check_long_range_boundary(model: Any, pbc, term: Any = None) -> None:
     """Refuse a long-range term whose boundary is not the system's.
 
     ``term`` is the one about to be evaluated, by default the model's own.
-    The check :class:`~deepmd_lr.ase.LongRangeCalculator` makes. Without it the
-    term simply runs: an ``isolated`` term on a periodic cell sums no images,
-    and a slab term corrects a cell that is periodic along z. On the 192-atom
-    water box that was 1.1 eV and 0.03 eV off, with nothing raised.
+    Without this check the term simply runs: an ``isolated`` term on a
+    periodic cell sums no images, and a slab term corrects a cell that is
+    periodic along z. On the 192-atom water box that was 1.1 eV and 0.03 eV
+    off, with nothing raised.
     """
     if not getattr(model, "has_long_range", False):
         return
@@ -327,10 +331,8 @@ def check_long_range_boundary(model: Any, pbc, term: Any = None) -> None:
         raise ValueError(
             f"the long-range term ('{method}', pbc {list(expected)}) does not "
             f"match the system's pbc {list(have)}. DistributedEvaluator builds "
-            "the term a bulk cell or a slab needs; evaluate_partitioned takes "
-            "one as long_range_energy=model.long_range_energy_for(cell, pbc). "
-            "An `isolated` term, and molecules and clusters, belong to the ASE "
-            "calculator, deepmd_lr.ase.LongRangeCalculator"
+            "the term the system needs; evaluate_partitioned takes one as "
+            "long_range_energy=model.long_range_energy_for(cell, pbc)."
         )
 
 

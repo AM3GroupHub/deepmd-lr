@@ -151,11 +151,15 @@ a box and grow it, and the periodic `recip − self` converges onto this sum as
 1/L³. So **`alpha` must match your periodic systems** (0.4, as in `01-bulk`
 and `03-slab`): one descriptor cannot serve two different splits.
 
-Nothing else from the periodic block applies. Meshes, spline orders,
-`slab_correction` and `pbc` all describe a sum over periodic images, and
-passing one is an **error**, not a silent no-op. There is no cutoff either —
-`erf(αr)/r` decays as `1/r`, so truncating it would be wrong. Every pair is
-summed: O(N²), and 8 MiB at 1000 atoms.
+A `nopbc` frame takes this sum whatever the method, so a model that also
+trains on cells keeps `method: "pme"`; `"isolated"` says this model never sees
+a periodic frame, and refuses one. Nothing else from the periodic block
+applies: meshes, spline orders, `slab_correction` and `pbc` describe a sum
+over periodic images, and passing one is an **error**, not a silent no-op.
+There is no cutoff either — `erf(αr)/r` decays as `1/r`, so truncating it
+would be wrong. Every pair is summed, on the dense kernel up to
+`max_isolated_atoms` (5000) atoms per batch and a chunked one beyond
+([non-periodic](../../docs/non-periodic.md#two-kernels)).
 
 ### `start_pref_v: 0`
 
