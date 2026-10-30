@@ -36,7 +36,7 @@ same α:
 Eᵢ = ½ Σ_{j≠i} qᵢqⱼ erf(α rᵢⱼ) / rᵢⱼ
 ```
 
-Put a cluster in a cube of side L and the periodic `recip − self` converges
+Put a neutral cluster in a cube of side L and the periodic `recip − self` converges
 onto this sum as 1/L³: −6.6e-03, −8.3e-04 and −1.0e-04 eV at L = 80, 160 and
 320 Å. It is the same quantity, which is what lets one backbone serve both:
 the remainder left to the network is `erfc(αr)/r` either way. Consequences:
@@ -53,8 +53,11 @@ The sum is O(N²) in pairs. `deepmd_lr.lr.isolated` evaluates it two ways:
 
 | kernel | memory | derivatives |
 |---|---|---|
-| dense | every pair at once, O(N²) (8 MiB at 1000 atoms in float64; 17 GB for the displacements alone at 27,000) | any order: force training, Hessians |
+| dense | every pair at once, O(N²) | any order: force training, Hessians |
 | chunked | row blocks of 1024 atoms against all N, O(1024 N) | first only: `create_graph=True` is refused |
+
+The dense displacement tensor alone uses 24 MB at 1000 atoms in float64 and
+17.5 GB at 27,000; kernel intermediates and autograd need additional memory.
 
 On CUDA, from 1024 atoms, the chunked kernel runs each block as one fused
 reduction under `torch.compile` (a few seconds once per process and system

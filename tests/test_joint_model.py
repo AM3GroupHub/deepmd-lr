@@ -336,11 +336,13 @@ class TestConservation:
 
 
 class TestTraining:
-    def test_gradients_reach_the_charge_head(self):
+    @pytest.mark.parametrize("periodic", [True, False])
+    def test_gradients_reach_the_charge_head(self, periodic):
         """Energy labels alone must be able to train the charge head."""
         model = build()
         model.train()
         coord, atype, cell = frame()
+        cell = cell if periodic else None
         model(coord, atype, box=cell)["energy"].sum().backward()
         grads = [p.grad for p in model.charge_fitting.parameters() if p.requires_grad]
         assert grads and any(
@@ -348,7 +350,8 @@ class TestTraining:
             for g in grads
         )
 
-    def test_force_loss_parameter_gradient_matches_finite_difference(self):
+    @pytest.mark.parametrize("periodic", [True, False])
+    def test_force_loss_parameter_gradient_matches_finite_difference(self, periodic):
         """The deepest link in the chain, and the only one checked by value.
 
         Training minimises a force loss, so it needs ``dL/dtheta`` where
@@ -361,6 +364,7 @@ class TestTraining:
         model = build()
         model.train()
         coord, atype, cell = frame()
+        cell = cell if periodic else None
 
         def force_loss() -> torch.Tensor:
             return (model(coord, atype, box=cell)["force"] ** 2).sum()

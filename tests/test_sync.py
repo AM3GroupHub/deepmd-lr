@@ -97,6 +97,36 @@ class TestOneDevice:
         )
         assert_downloads(count_syncs(ev, x), 2)
 
+    @pytest.mark.parametrize("compress", [False, True])
+    def test_isolated_long_range(self, compress):
+        from .test_compress import build32
+
+        if compress and not compressed_available():
+            pytest.skip("needs the CUDA kernel")
+        x, a, h = system()
+        ev = DistributedEvaluator(
+            build32() if compress else build(),
+            a,
+            h * 0,
+            devices=[DEVICE],
+            pbc=False,
+            memory_headroom=None,
+            compress=compress,
+        )
+        assert_downloads(count_syncs(ev, x), 1 if compress else 2)
+
+    def test_compiled_isolated_kernel(self):
+        from deepmd_lr.lr.isolated import isolated_erf_energy_chunked
+
+        pos = torch.rand((1025, 3), device=DEVICE, requires_grad=True)
+        charge = torch.linspace(-1, 1, len(pos), device=DEVICE, requires_grad=True)
+
+        def step():
+            energy = isolated_erf_energy_chunked(pos, charge, 0.4, compile=True)
+            torch.autograd.grad(energy.sum(), (pos, charge))
+
+        assert_downloads(count_syncs(step), 0)
+
     @pytest.mark.skipif(not compressed_available(), reason="needs the CUDA kernel")
     @pytest.mark.parametrize("long_range", [False, True])
     def test_compressed(self, long_range):

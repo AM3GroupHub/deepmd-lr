@@ -568,29 +568,13 @@ class LongRangeEnergy(torch.nn.Module):
 
 
 class IsolatedLongRangeEnergy(torch.nn.Module):
-    r"""The same long-range energy, for a system with no periodic axis.
+    r"""The isolated ``½ Σ_{j≠i} q_i q_j erf(alpha r_ij)/r_ij`` sum in eV.
 
-    Ewald splits Coulomb at :math:`\alpha` into a screened part the network
-    learns and a smooth part this package supplies:
-
-    .. math::
-        \sum_{i<j} \frac{q_i q_j}{r_{ij}}
-          = \underbrace{\sum_{i<j}
-                \frac{q_i q_j \operatorname{erfc}(\alpha r_{ij})}{r_{ij}}
-            }_{\text{short-ranged; the descriptor covers this}}
-          + \underbrace{\sum_{i<j}
-                \frac{q_i q_j \operatorname{erf}(\alpha r_{ij})}{r_{ij}}
-            }_{\text{this class}}
-
-    The second sum is what :class:`LongRangeEnergy` evaluates in reciprocal
-    space, here summed directly: put a cluster in a cube of side ``L`` and
-    ``recip - self`` converges onto it as :math:`1/L^3` (``-6.6e-03``,
-    ``-8.3e-04``, ``-1.0e-04`` eV at ``L = 80, 160, 320`` A, pinned by
-    ``tests/test_isolated_term.py``). So a shared descriptor trained on
-    periodic and isolated frames sees the same ``erfc(alpha r)/r`` remainder
-    in both. There is no self term (``erf(alpha r)/r -> 2 alpha / sqrt(pi)``
-    as ``r -> 0`` is exactly it, and ``j != i`` excludes it), nothing extra
-    for a charged system (no images, no background) and no cutoff.
+    This is :class:`LongRangeEnergy`'s infinite-volume limit at the same
+    alpha, leaving the same ``erfc(alpha r)/r`` remainder to the descriptor.
+    There are no images, background, self term or cutoff. The kernels and
+    their derivatives are defined in :mod:`deepmd_lr.lr.isolated`; the
+    periodic-limit checks are in ``tests/test_isolated_term.py``.
 
     ``kernel_dtype`` (a runtime attribute, not part of the config) is the
     dtype the sum runs in; ``None`` is the inputs' own.

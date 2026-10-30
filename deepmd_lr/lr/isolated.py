@@ -12,8 +12,7 @@ periodic term's infinite-volume limit). Two kernels evaluate it:
 
 * :func:`isolated_erf_energy_dense` builds the ``(nf, nloc, nloc, 3)``
   displacement tensor and lets autograd through every intermediate, so it is
-  twice differentiable (force training, Hessians). At 27,000 atoms (a 40 A
-  water droplet) that tensor alone is 17 GB in float64.
+  twice differentiable (force training, Hessians).
 * :func:`isolated_erf_energy_chunked` works in row blocks of ``chunk`` atoms
   against all N, so peak memory is O(chunk N), and takes the backward from the
   analytic first derivatives in one more such pass with the cotangent folded
@@ -28,11 +27,8 @@ periodic term's infinite-volume limit). Two kernels evaluate it:
           \frac{k'(r_{kj})}{r_{kj}}\,(\mathbf r_k - \mathbf r_j),
 
   with ``k(r) = erf(alpha r)/r``. Exact for any cotangent, so nothing inspects
-  ``g`` on the host (the MD engine's rule: a step reads nothing back). On CUDA
-  the blocks run under ``torch.compile``, where inductor fuses each into one
-  reduction kernel: at 27,000 atoms in float32 on a GB10, 8 ms forward and
-  37 ms backward, against 1.35 s and 1.68 s eager (0.30 s and 0.50 s compiled
-  in float64). ``create_graph=True`` is refused.
+  ``g`` on the host. On CUDA the blocks can run under ``torch.compile``;
+  ``create_graph=True`` is refused.
 
 :func:`isolated_erf_energy` picks between them (``isolated_kernel``).
 
@@ -73,25 +69,27 @@ _TWO_OVER_SQRT_PI = 2.0 / math.sqrt(math.pi)
 
 
 def _kernel_terms(
-    delta: torch.Tensor, active: torch.Tensor, alpha: float
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """``k(r) = erf(alpha r)/r`` and ``k'(r)/r`` for one block, zero where
-    not ``active``."""
-    r2 = (delta * delta).sum(-1)
+    r2: torch.Tensor, active: torch.Tensor, alpha: float, *, derivative: bool = False
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """``k(r) = erf(alpha r)/r`` and optionally ``k'(r)/r``, masked to active
+    pairs. The series in r² keeps autograd finite at coincidence too."""
     x2 = (alpha * alpha) * r2
     small = x2 < _SERIES_X2
     safe_r2 = torch.where(small, torch.ones_like(r2), r2)
     safe_r = torch.sqrt(safe_r2)
     erf = torch.erf(alpha * safe_r)
     a = _TWO_OVER_SQRT_PI * alpha
-    series_k = a * (1.0 - x2 / 3.0 + x2 * x2 / 10.0 - x2 * x2 * x2 / 42.0)
+    series_k = a * (1.0 - x2 / 3.0 + x2**2 / 10.0 - x2**3 / 42.0)
     k = torch.where(small, series_k, erf / safe_r)
+    zero = torch.zeros_like(k)
+    k = torch.where(active, k, zero)
+    if not derivative:
+        return k, None
     # k'(r)/r = (2 alpha/sqrt(pi)) exp(-x^2)/r^2 - erf(alpha r)/r^3, and the
     # series' derivative, a alpha^2 (-2/3 + 2 x^2/5 - x^4/7), near r = 0.
     series_kp = (a * alpha * alpha) * (-2.0 / 3.0 + 0.4 * x2 - x2 * x2 / 7.0)
     kp = torch.where(small, series_kp, (a * torch.exp(-x2) - erf / safe_r) / safe_r2)
-    zero = torch.zeros_like(k)
-    return torch.where(active, k, zero), torch.where(active, kp, zero)
+    return k, torch.where(active, kp, zero)
 
 
 def _block_pairs(
@@ -121,7 +119,7 @@ def _energy_block(
 ) -> torch.Tensor:
     """``sum_j q_j k(r_ij)`` for the rows ``i`` of the block, shape ``(chunk,)``."""
     delta, active = _block_pairs(pos_i, idx_i, batch_i, positions, batch, index)
-    k, _ = _kernel_terms(delta, active, alpha)
+    k, _ = _kernel_terms((delta * delta).sum(-1), active, alpha)
     return k @ charges
 
 
@@ -140,7 +138,7 @@ def _grad_block(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``dL/dq`` ``(chunk,)`` and ``dL/dr`` ``(chunk, 3)`` for the rows of the block."""
     delta, active = _block_pairs(pos_i, idx_i, batch_i, positions, batch, index)
-    k, kp = _kernel_terms(delta, active, alpha)
+    k, kp = _kernel_terms((delta * delta).sum(-1), active, alpha, derivative=True)
     w = 0.5 * (g_i[:, None] + g[None, :]) * charges[None, :]
     dq = (w * k).sum(1)
     dr = q_i[:, None] * ((w * kp)[:, :, None] * delta).sum(1)
@@ -152,26 +150,29 @@ _COMPILE_OK = True
 
 
 @cache
-def _compiled_blocks() -> tuple:
+def _compiled(fn):
     # Static shapes: a system has one N for the life of a run, and the
     # specialised kernel is the fast one. A new N recompiles.
-    return (
-        torch.compile(_energy_block, dynamic=False),
-        torch.compile(_grad_block, dynamic=False),
-    )
+    return torch.compile(fn, dynamic=False)
 
 
-def _call(compiled_fn, eager_fn, *args):
+def _call(fn, compiled: bool, *args):
     """The compiled block, or the eager one after a failed compile (warned once)."""
     global _COMPILE_OK  # noqa: PLW0603
-    if compiled_fn is not None and _COMPILE_OK:
+    if compiled and _COMPILE_OK:
         try:
-            return compiled_fn(*args)
-        except torch.cuda.OutOfMemoryError:
+            return _compiled(fn)(*args)
+        except (torch.cuda.OutOfMemoryError, MemoryError):
             # Memory, not a missing compiler: the eager blocks need more of it,
             # and the caller's own back-off has to see the error.
             raise
         except Exception as exc:  # no inductor backend, no triton for this device ...
+            # Dynamo wraps backend failures, including allocator failures.
+            if isinstance(
+                getattr(exc, "inner_exception", None),
+                (torch.cuda.OutOfMemoryError, MemoryError),
+            ):
+                raise
             _COMPILE_OK = False
             message = str(exc).split("\n", 1)[0]
             warnings.warn(
@@ -181,7 +182,7 @@ def _call(compiled_fn, eager_fn, *args):
                 RuntimeWarning,
                 stacklevel=3,
             )
-    return eager_fn(*args)
+    return fn(*args)
 
 
 def _should_compile(positions: torch.Tensor, compile: bool | None) -> bool:
@@ -206,13 +207,12 @@ class _IsolatedErf(torch.autograd.Function):
             batch = torch.cat([batch, batch.new_full((pad,), -1)])
         n_pad = n + pad
         index = torch.arange(n_pad, device=positions.device)
-        energy_fn, _ = _compiled_blocks() if compiled else (None, None)
         kq = torch.empty_like(charges)
         for start in range(0, n_pad, chunk):
             stop = start + chunk
             kq[start:stop] = _call(
-                energy_fn,
                 _energy_block,
+                compiled,
                 positions[start:stop],
                 index[start:stop],
                 batch[start:stop],
@@ -242,14 +242,13 @@ class _IsolatedErf(torch.autograd.Function):
         g = grad_energy.to(charges.dtype)
         if n_pad > n:
             g = torch.cat([g, g.new_zeros(n_pad - n)])
-        _, grad_fn = _compiled_blocks() if ctx.compiled else (None, None)
         dq = torch.empty_like(charges)
         dr = torch.empty_like(positions)
         for start in range(0, n_pad, chunk):
             stop = start + chunk
             dq[start:stop], dr[start:stop] = _call(
-                grad_fn,
                 _grad_block,
+                ctx.compiled,
                 positions[start:stop],
                 charges[start:stop],
                 g[start:stop],
@@ -328,14 +327,7 @@ def isolated_erf_energy_dense(
     delta = coord.unsqueeze(2) - coord.unsqueeze(1)  # (nf, nloc, nloc, 3)
     r2 = (delta * delta).sum(-1)
     active = ~torch.eye(nloc, dtype=torch.bool, device=coord.device)
-    # The series in r^2 keeps the first and second derivatives finite at
-    # coincidence; the diagonal never reaches the analytic branch's sqrt(0).
-    x2 = (alpha * alpha) * torch.where(active, r2, torch.zeros_like(r2))
-    small = x2 < _SERIES_X2
-    safe_r = torch.sqrt(torch.where(small, torch.ones_like(r2), r2))
-    series = (_TWO_OVER_SQRT_PI * alpha) * (1 - x2 / 3 + x2**2 / 10 - x2**3 / 42)
-    kernel = torch.where(small, series, torch.erf(alpha * safe_r) / safe_r)
-    kernel = torch.where(active, kernel, torch.zeros_like(kernel))
+    kernel, _ = _kernel_terms(r2, active, alpha)
     # Halved: the double sum counts every pair twice, and splitting it
     # symmetrically makes this a per-atom energy.
     return 0.5 * charge * (kernel * charge.unsqueeze(1)).sum(-1)

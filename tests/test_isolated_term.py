@@ -546,19 +546,27 @@ class TestChunkedKernel:
         with pytest.raises(RuntimeError, match="first derivatives only"):
             torch.autograd.grad(energy, pos, create_graph=True)
 
-    def test_compile_failure_warns_once_and_keeps_the_result(self, monkeypatch):
+    @pytest.mark.parametrize("stage", ["setup", "forward", "backward"])
+    def test_compile_failure_warns_once_and_keeps_the_result(self, monkeypatch, stage):
         import deepmd_lr.lr.isolated as isolated
 
         calls = []
 
-        def unavailable(*args):
+        def unavailable(*args, **kwargs):
             calls.append(1)
             raise RuntimeError()  # even an empty message must allow the fallback
 
         monkeypatch.setattr(isolated, "_COMPILE_OK", True)
-        monkeypatch.setattr(
-            isolated, "_compiled_blocks", lambda: (unavailable, unavailable)
-        )
+        if stage == "setup":
+            monkeypatch.setattr(torch, "compile", unavailable)
+            isolated._compiled.cache_clear()
+        else:
+            failing = (
+                isolated._energy_block if stage == "forward" else isolated._grad_block
+            )
+            monkeypatch.setattr(
+                isolated, "_compiled", lambda fn: unavailable if fn is failing else fn
+            )
         pos, q = self.flat(n=5)
         w = torch.linspace(-1.0, 1.0, len(q), dtype=DT, device=DEVICE)
         expected = self.grads(dense_flat, pos, q, w)
@@ -570,7 +578,10 @@ class TestChunkedKernel:
         for a, b in zip(actual, expected, strict=True):
             torch.testing.assert_close(a, b, atol=1e-13, rtol=0)
 
-    def test_out_of_memory_is_not_mistaken_for_a_compile_failure(self, monkeypatch):
+    @pytest.mark.parametrize("error", [torch.cuda.OutOfMemoryError, MemoryError])
+    def test_out_of_memory_is_not_mistaken_for_a_compile_failure(
+        self, monkeypatch, error
+    ):
         """Out of memory propagates (the engine's back-off handles it): the
         eager blocks need more memory, so falling back would hide it."""
         import warnings
@@ -578,17 +589,36 @@ class TestChunkedKernel:
         import deepmd_lr.lr.isolated as isolated
 
         def oom(*args):
-            raise torch.cuda.OutOfMemoryError("CUDA out of memory")
+            raise error("out of memory")
 
         monkeypatch.setattr(isolated, "_COMPILE_OK", True)
-        monkeypatch.setattr(isolated, "_compiled_blocks", lambda: (oom, oom))
+        monkeypatch.setattr(isolated, "_compiled", lambda fn: oom)
         pos, q = self.flat(n=5)
         with warnings.catch_warnings():
             warnings.simplefilter("error", RuntimeWarning)
-            with pytest.raises(torch.cuda.OutOfMemoryError):
+            with pytest.raises(error):
                 isolated.isolated_erf_energy_chunked(
                     pos, q, ALPHA, chunk=2, compile=True
                 )
+        assert isolated._COMPILE_OK
+
+    def test_compiler_wrapped_out_of_memory_is_not_retried(self, monkeypatch):
+        from torch._dynamo.exc import BackendCompilerFailed
+
+        import deepmd_lr.lr.isolated as isolated
+
+        error = BackendCompilerFailed(
+            lambda: None, torch.cuda.OutOfMemoryError("out of memory"), None
+        )
+
+        def oom(*args):
+            raise error
+
+        monkeypatch.setattr(isolated, "_COMPILE_OK", True)
+        monkeypatch.setattr(isolated, "_compiled", lambda fn: oom)
+        pos, q = self.flat(n=5)
+        with pytest.raises(BackendCompilerFailed):
+            isolated.isolated_erf_energy_chunked(pos, q, ALPHA, compile=True)
         assert isolated._COMPILE_OK
 
     def test_coincident_atoms_stay_finite(self):
