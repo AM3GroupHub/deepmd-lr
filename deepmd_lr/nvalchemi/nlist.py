@@ -2,15 +2,13 @@
 """A neighbour list that lives on the device: nvalchemiops' cell list, compacted
 into DeePMD-kit's edge graph by two small Warp kernels, with no host round trip.
 
-The partitioned evaluator used to build its graph through DeePMD-kit's
-``build_neighbor_graph_nv``: the same nvalchemiops search, then a dense-matrix
-decode, float64 vectors for every candidate pair, two stable argsorts and a
-per-step ``nonzero``/``bincount`` filter. On one H200 at 1.96M water atoms that
-was 649 ms per search and 61 ms per step for the graph, where LAMMPS-Kokkos
-spends 9.7 and 17.7, and every step read the host about ten times. The kernel
-was never the problem; what surrounded it was.
-
-This module keeps the kernel and replaces the surroundings:
+DeePMD-kit's ``build_neighbor_graph_nv`` runs the same nvalchemiops search, then
+a dense-matrix decode, float64 vectors for every candidate pair, two stable
+argsorts and a per-step ``nonzero``/``bincount`` filter. On one H200 at 1.96M
+water atoms that was 649 ms per search and 61 ms per step for the graph, where
+LAMMPS-Kokkos spends 9.7 and 17.7, and every step read the host about ten
+times. The kernel was never the problem; what surrounded it was. This module
+keeps the kernel and replaces the surroundings:
 
 - **Preallocated buffers, updated in place.** The cell-list cache, the
   ``(rows, M)`` neighbour matrix and the edge buffers are allocated once and
@@ -20,8 +18,6 @@ This module keeps the kernel and replaces the surroundings:
   ``query_cell_list`` are cheap enough (0.96 ms at 10k atoms, 56 ms at 1.96M
   on a GB10 whose memory is some fifteen times slower than an H200's) that the
   stateless search costs less than the bookkeeping a reusable list needs.
-  The brief that led here asked for both variants to be measured; the Verlet
-  variant is added only if the per-step query turns out to matter.
 - **The graph comes straight from the matrix.** Row ``i`` of the neighbour
   matrix already holds centre ``i``'s neighbours, so the destination CSR is a
   prefix sum of the row counts, and one Warp kernel compacts the rows into
@@ -42,11 +38,10 @@ nvalchemiops accepts unwrapped positions and folds the images into ``S``
 itself, so an MD trajectory never has to be wrapped for this list.
 
 The graph is a full directed list (both directions of every pair), as the
-descriptor expects. Row order within a destination row follows the query
-kernel, which uses atomics and is therefore not bit-stable from one call to
-the next; order within a source row follows the cursor, likewise. Both move
-results by summation-order rounding only, exactly as today's path does at
-every rebuild.
+descriptor expects. Order within a destination row follows the query kernel
+and order within a source row follows the cursor; both use atomics, so they
+are not bit-stable between calls and move results by summation-order rounding
+only.
 """
 
 from __future__ import annotations
@@ -64,6 +59,8 @@ from nvalchemiops.torch.neighbors.cell_list import (
     query_cell_list,
 )
 from nvalchemiops.torch.neighbors.neighbor_utils import allocate_cell_list
+
+from deepmd_lr.cell import pbc_flags
 
 __all__ = ["GpuNeighborList", "STATUS_MATRIX_OVERFLOW", "STATUS_EDGE_OVERFLOW"]
 
@@ -90,13 +87,12 @@ _BOX_MARGIN_FACTOR = 0.5
 def _torch_stream_scope(device: torch.device):
     """Make Warp launch on PyTorch's current stream for the block.
 
-    Warp has its own default stream per device. It happens to be a blocking
-    stream, which the legacy default stream PyTorch uses orders against, so
-    today everything works without this -- by accident. Once no host sync
-    separates the search from the kernels that consume it, the ordering has
-    to be explicit, and a caller running on a side stream must not be able to
-    race the model against the list. nvalchemiops' own wrappers do not scope
-    their launches, so this wraps them too.
+    Warp has its own default stream per device, which orders against
+    PyTorch's legacy default stream only because it happens to be a blocking
+    stream. With no host sync between the search and the kernels that consume
+    it, the ordering has to be explicit, and a caller running on a side stream
+    must not be able to race the model against the list. nvalchemiops' own
+    wrappers do not scope their launches, so this wraps them too.
     """
     if device.type != "cuda":
         return nullcontext()
@@ -216,6 +212,11 @@ def _source_order(
             edge_vec[e] = wp.vec3f(0.0, 0.0, 0.0)
             if want64 != 0:
                 edge_vec64[e] = wp.vec3d(0.0, 0.0, 0.0)
+
+
+def _wp_view(t: torch.Tensor, dtype) -> wp.array:
+    """A Warp view of ``t``, bound once to a buffer that lives as long."""
+    return wp.from_torch(t, dtype=dtype, requires_grad=False)
 
 
 def _round_up(value: float, multiple: int = 16, floor: int = 16) -> int:
@@ -363,33 +364,8 @@ class GpuNeighborList:
             raise NotImplementedError("edge_index is int64 for now")
         self.n_node = int(n_node)
         self.rcut = float(rcut)
-        self.periodic = cell is not None
-        self._cell = cell
-        if cell is not None and (
-            cell.shape != (1, 3, 3)
-            or cell.dtype != torch.float64
-            or cell.device != self.device
-        ):
-            raise ValueError(
-                "cell must be a (1, 3, 3) float64 tensor on the list's device"
-            )
-        flags = (
-            tuple(bool(p) for p in pbc) if cell is not None else (False, False, False)
-        )
-        self.pbc = flags
-        self._pbc = torch.tensor(flags, dtype=torch.bool, device=self.device)
-        if targets is not None:
-            if targets.dtype != torch.int32 or targets.device != self.device:
-                raise ValueError("targets must be an int32 tensor on the list's device")
-            self._targets = targets.contiguous()
-            self._identity = False
-        else:
-            self._targets = torch.arange(
-                self.n_node, dtype=torch.int32, device=self.device
-            )
-            self._identity = True
-        self.rows = int(self._targets.shape[0])
-        self._targets_long = self._targets.to(torch.int64)
+        self._set_cell(cell, pbc)
+        self._set_targets(targets)
         self._density = density
         #: Keep the kernel's pair vectors in float64 as well, for a graph that
         #: must be differentiable (the charge response, the virial strain) or
@@ -416,6 +392,34 @@ class GpuNeighborList:
         self._lo: torch.Tensor | None = None
 
     # ------------------------------------------------------------------ setup
+
+    def _set_cell(self, cell: torch.Tensor | None, pbc) -> None:
+        self.periodic = cell is not None
+        self._cell = cell
+        if cell is not None and (
+            cell.shape != (1, 3, 3)
+            or cell.dtype != torch.float64
+            or cell.device != self.device
+        ):
+            raise ValueError(
+                "cell must be a (1, 3, 3) float64 tensor on the list's device"
+            )
+        self.pbc = pbc_flags(pbc) if cell is not None else (False, False, False)
+        self._pbc = torch.tensor(self.pbc, dtype=torch.bool, device=self.device)
+
+    def _set_targets(self, targets: torch.Tensor | None) -> None:
+        if targets is not None:
+            if targets.dtype != torch.int32 or targets.device != self.device:
+                raise ValueError("targets must be an int32 tensor on the list's device")
+            self._targets = targets.contiguous()
+            self._identity = False
+        else:
+            self._targets = torch.arange(
+                self.n_node, dtype=torch.int32, device=self.device
+            )
+            self._identity = True
+        self.rows = int(self._targets.shape[0])
+        self._targets_long = self._targets.to(torch.int64)
 
     def _box_for(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """The cell list's positions and box.
@@ -448,10 +452,10 @@ class GpuNeighborList:
         self._cache = allocate_cell_list(self.n_node, n_cells, radius, self.device)
         if self.periodic:
             self._radius_inputs = [
-                wp.from_torch(box, dtype=wp.mat33d, requires_grad=False),
-                wp.from_torch(self._pbc, dtype=wp.bool, requires_grad=False),
-                wp.from_torch(self._cache[0], dtype=wp.int32, requires_grad=False),
-                wp.from_torch(radius, dtype=wp.int32, requires_grad=False),
+                _wp_view(box, wp.mat33d),
+                _wp_view(self._pbc, wp.bool),
+                _wp_view(self._cache[0], wp.int32),
+                _wp_view(radius, wp.int32),
                 self.rcut,
             ]
 
@@ -467,15 +471,9 @@ class GpuNeighborList:
         )
         self.num_neighbors = torch.zeros(self.rows, dtype=torch.int32, device=dev)
         self._counts = torch.zeros(self.rows, dtype=torch.int32, device=dev)
-        self._wp_nbr = wp.from_torch(
-            self.neighbor_matrix, dtype=wp.int32, requires_grad=False
-        )
-        self._wp_shifts = wp.from_torch(
-            self.neighbor_matrix_shifts, dtype=wp.vec3i, requires_grad=False
-        )
-        self._wp_counts = wp.from_torch(
-            self._counts, dtype=wp.int32, requires_grad=False
-        )
+        self._wp_nbr = _wp_view(self.neighbor_matrix, wp.int32)
+        self._wp_shifts = _wp_view(self.neighbor_matrix_shifts, wp.vec3i)
+        self._wp_counts = _wp_view(self._counts, wp.int32)
 
     def _allocate_edges(self, capacity: int) -> None:
         self.capacity = max(int(capacity), 2)
@@ -489,24 +487,12 @@ class GpuNeighborList:
         self.edge_mask = torch.zeros(cap, dtype=torch.bool, device=dev)
         self.source_order = torch.zeros(cap, dtype=torch.int64, device=dev)
         self.destination_order = torch.arange(cap, dtype=torch.int64, device=dev)
-        self._wp_src = wp.from_torch(
-            self.edge_index[0], dtype=wp.int64, requires_grad=False
-        )
-        self._wp_dst = wp.from_torch(
-            self.edge_index[1], dtype=wp.int64, requires_grad=False
-        )
-        self._wp_eshift = wp.from_torch(
-            self.edge_shift, dtype=wp.vec3i, requires_grad=False
-        )
-        self._wp_evec = wp.from_torch(
-            self.edge_vec32, dtype=wp.vec3f, requires_grad=False
-        )
-        self._wp_evec64 = wp.from_torch(
-            self.edge_vec64, dtype=wp.vec3d, requires_grad=False
-        )
-        self._wp_sorder = wp.from_torch(
-            self.source_order, dtype=wp.int64, requires_grad=False
-        )
+        self._wp_src = _wp_view(self.edge_index[0], wp.int64)
+        self._wp_dst = _wp_view(self.edge_index[1], wp.int64)
+        self._wp_eshift = _wp_view(self.edge_shift, wp.vec3i)
+        self._wp_evec = _wp_view(self.edge_vec32, wp.vec3f)
+        self._wp_evec64 = _wp_view(self.edge_vec64, wp.vec3d)
+        self._wp_sorder = _wp_view(self.source_order, wp.int64)
 
     def _allocate_nodes(self) -> None:
         n, dev = self.n_node, self.device
@@ -515,24 +501,12 @@ class GpuNeighborList:
         self._node_counts = torch.zeros(n, dtype=torch.int32, device=dev)
         self._src_count = torch.zeros(n, dtype=torch.int32, device=dev)
         self._cursor = torch.zeros(n, dtype=torch.int32, device=dev)
-        self._wp_row_ptr = wp.from_torch(
-            self.destination_row_ptr, dtype=wp.int64, requires_grad=False
-        )
-        self._wp_n_real = wp.from_torch(
-            self.destination_row_ptr[n:], dtype=wp.int64, requires_grad=False
-        )
-        self._wp_src_count = wp.from_torch(
-            self._src_count, dtype=wp.int32, requires_grad=False
-        )
-        self._wp_cursor = wp.from_torch(
-            self._cursor, dtype=wp.int32, requires_grad=False
-        )
-        self._wp_centre = wp.from_torch(
-            self._targets, dtype=wp.int32, requires_grad=False
-        )
-        self._wp_status = wp.from_torch(
-            self.status, dtype=wp.int64, requires_grad=False
-        )
+        self._wp_row_ptr = _wp_view(self.destination_row_ptr, wp.int64)
+        self._wp_n_real = _wp_view(self.destination_row_ptr[n:], wp.int64)
+        self._wp_src_count = _wp_view(self._src_count, wp.int32)
+        self._wp_cursor = _wp_view(self._cursor, wp.int32)
+        self._wp_centre = _wp_view(self._targets, wp.int32)
+        self._wp_status = _wp_view(self.status, wp.int64)
 
     def _initial_max_neighbors(self, box: torch.Tensor) -> int:
         density = self._density
@@ -584,9 +558,9 @@ class GpuNeighborList:
             self.resizes += 1
         # 1.2x what was counted, whichever side of it the estimate landed:
         # the estimate only has to hold the first search, the margin is what
-        # carries the run. (An estimate between the count and its 1.2x used
-        # to be kept as it was, and a 440-step water run on four partitions
-        # then overflowed at step 395: 113 neighbours against a width of 112.)
+        # carries the run. An estimate kept because it already lay between the
+        # count and its 1.2x overflowed a 440-step water run on four
+        # partitions at step 395 (113 neighbours against a width of 112).
         tight = _round_up(1.2 * max(found, 1))
         if tight != self.max_neighbors:
             self._allocate_matrix(tight)
@@ -637,6 +611,22 @@ class GpuNeighborList:
         self.status.zero_()
         self._query(pos, box)
         mark("query")
+        self._destination_rows()
+        mark("rows")
+        self._src_count.zero_()
+        with _torch_stream_scope(self.device):
+            self._fill(x, box)
+            mark("fill")
+            self._source_rows()
+        mark("source")
+        torch.lt(
+            self.destination_order, self.destination_row_ptr[-1], out=self.edge_mask
+        )
+        mark("mask")
+
+    def _destination_rows(self) -> None:
+        """Clamp the row counts to the matrix, flag an overflow, and prefix-sum
+        them into the destination CSR (per node, not per searched row)."""
         m = self.max_neighbors
         torch.clamp(self.num_neighbors, max=m, out=self._counts)
         self.status[STATUS_MATRIX_OVERFLOW : STATUS_MATRIX_OVERFLOW + 1] |= (
@@ -649,62 +639,60 @@ class GpuNeighborList:
             self._node_counts.index_copy_(0, self._targets_long, self._counts)
             counts = self._node_counts
         torch.cumsum(counts, 0, dtype=torch.int64, out=self.destination_row_ptr[1:])
-        mark("rows")
-        self._src_count.zero_()
-        with _torch_stream_scope(self.device):
-            wp.launch(
-                _fill_edges,
-                dim=(self.rows, self.max_neighbors),
-                inputs=[
-                    wp.from_torch(
-                        x, dtype=wp.vec3d, requires_grad=False, return_ctype=True
-                    ),
-                    wp.from_torch(
-                        box, dtype=wp.mat33d, requires_grad=False, return_ctype=True
-                    ),
-                    self._wp_nbr,
-                    self._wp_shifts,
-                    self._wp_counts,
-                    self._wp_centre,
-                    self._wp_row_ptr,
-                    self.capacity,
-                    self._wp_src,
-                    self._wp_dst,
-                    self._wp_eshift,
-                    self._wp_evec,
-                    self._wp_evec64,
-                    int(self.float64_vectors),
-                    self._wp_src_count,
-                    self._wp_status,
-                ],
-                device=str(self.device),
-            )
-            mark("fill")
-            torch.cumsum(
-                self._src_count, 0, dtype=torch.int64, out=self.source_row_ptr[1:]
-            )
-            self._cursor.copy_(self.source_row_ptr[:-1])
-            wp.launch(
-                _source_order,
-                dim=self.capacity,
-                inputs=[
-                    self._wp_src,
-                    self._wp_dst,
-                    self._wp_eshift,
-                    self._wp_evec,
-                    self._wp_evec64,
-                    int(self.float64_vectors),
-                    self._wp_n_real,
-                    self._wp_cursor,
-                    self._wp_sorder,
-                ],
-                device=str(self.device),
-            )
-        mark("source")
-        torch.lt(
-            self.destination_order, self.destination_row_ptr[-1], out=self.edge_mask
+
+    def _fill(self, x: torch.Tensor, box: torch.Tensor) -> None:
+        """Compact the matrix into the edge buffers (:func:`_fill_edges`)."""
+        wp.launch(
+            _fill_edges,
+            dim=(self.rows, self.max_neighbors),
+            inputs=[
+                wp.from_torch(
+                    x, dtype=wp.vec3d, requires_grad=False, return_ctype=True
+                ),
+                wp.from_torch(
+                    box, dtype=wp.mat33d, requires_grad=False, return_ctype=True
+                ),
+                self._wp_nbr,
+                self._wp_shifts,
+                self._wp_counts,
+                self._wp_centre,
+                self._wp_row_ptr,
+                self.capacity,
+                self._wp_src,
+                self._wp_dst,
+                self._wp_eshift,
+                self._wp_evec,
+                self._wp_evec64,
+                int(self.float64_vectors),
+                self._wp_src_count,
+                self._wp_status,
+            ],
+            device=str(self.device),
         )
-        mark("mask")
+
+    def _source_rows(self) -> None:
+        """The source CSR: prefix-sum the per-source counts the fill kernel
+        made, then scatter every edge into its row (:func:`_source_order`)."""
+        torch.cumsum(
+            self._src_count, 0, dtype=torch.int64, out=self.source_row_ptr[1:]
+        )
+        self._cursor.copy_(self.source_row_ptr[:-1])
+        wp.launch(
+            _source_order,
+            dim=self.capacity,
+            inputs=[
+                self._wp_src,
+                self._wp_dst,
+                self._wp_eshift,
+                self._wp_evec,
+                self._wp_evec64,
+                int(self.float64_vectors),
+                self._wp_n_real,
+                self._wp_cursor,
+                self._wp_sorder,
+            ],
+            device=str(self.device),
+        )
 
     # ------------------------------------------------------------------ graph
 

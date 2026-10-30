@@ -12,10 +12,9 @@ The tensor, adapting 10.1021/acs.jctc.6c00146:
 
 What this is, and what it is not
 --------------------------------
-**It is not the dipole derivative.** That distinction is not pedantic -- it
-decides whether a field force is conservative -- so it was measured rather than
-assumed. For a charge model carrying a global total-charge constraint, the exact
-dipole derivative of an isolated system is
+**It is not the dipole derivative.** That distinction decides whether a field
+force is conservative. For a charge model carrying a global total-charge
+constraint, the exact dipole derivative of an isolated system is
 
 .. math::
     \frac{\partial M_\alpha}{\partial r_{i\beta}}
@@ -66,9 +65,9 @@ Splitting the roles keeps what the constraint is for and drops the artefact:
 the acoustic sum rule :math:`\sum_i Z_i = Q\,\mathbf 1` still holds *exactly*,
 because the ``dst - src`` bracket telescopes to zero whatever the derivative is.
 
-Which is also the reason that sum rule is worthless as a check. It held to
-1e-16 for every variant tried here, including ones disagreeing with each other
-by 100%. It is a regression guard, not a validation.
+Which is also why that sum rule is worthless as a check: it held to 1e-16 for
+variants disagreeing with each other by 100%. It is a regression guard, not a
+validation.
 """
 
 import math

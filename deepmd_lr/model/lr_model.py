@@ -1,42 +1,26 @@
 # SPDX-License-Identifier: MIT
 """The ``dp_lr`` model type: a DPA4C energy model with a long-range term.
 
-Why this is a *model* type and not an *atomic model* type
---------------------------------------------------------
-A long-range electrostatic term needs absolute coordinates and the cell.
-DeePMD-kit's atomic-model contract gives neither: ``forward_common_atomic``
-receives extended coordinates plus a neighbour list, and the graph route is
-narrower still -- ``NeighborGraph`` states that geometry enters the model
-ONLY through ``edge_vec``. The cell is available exactly one level up, at
-``call_common(coord, atype, box, ...)``. So the long-range term hangs off the
-top-level model, which is what this class is.
+The term hangs off the top-level model because it needs absolute coordinates
+and the cell, which DeePMD-kit's atomic-model contract does not provide:
+``forward_common_atomic`` sees extended coordinates and a neighbour list, and
+on the graph route geometry enters ONLY through ``edge_vec``. The cell is
+available one level up, at ``call_common(coord, atype, box, ...)``.
 
-Why the long-range energy is added at the model level, not to the atomic energy
-------------------------------------------------------------------------------
-It is tempting to add the long-range per-atom energy into the atomic output
-and let the existing machinery produce force and virial. That would be
-silently wrong. On the graph route, force and virial come from
-``edge_force_virial``, which differentiates the energy with respect to
-``edge_vec`` and scatters the result along edges. The reciprocal-space energy does not
-depend on ``edge_vec`` at all -- it depends on absolute coordinates and the
-cell -- so it would contribute exactly **zero** force and virial while still
-shifting the energy. Energies would move, forces would not, and the model
-would quietly stop being conservative.
+Nor is its energy added to the atomic output. There, force and virial come
+from ``edge_force_virial``, the derivative with respect to ``edge_vec``; the
+reciprocal-space energy does not depend on ``edge_vec``, so it would shift the
+energy with exactly zero force and virial, and the model would quietly stop
+being conservative. The long-range branch takes its own derivatives instead:
+with respect to the coordinates (force) and to a symmetric strain applied to
+coordinates and cell together (virial), in DeePMD-kit's convention read off
+``edge_force_virial``: ``force = -dE/dr`` and ``virial = -dE/de`` for
+``r -> (I + e) r``.
 
-So the long-range branch carries its own derivatives: the energy is
-differentiated with respect to the coordinates (force) and with respect to a
-symmetric strain applied to coordinates and cell together (virial), then
-added to the short-range results. The strain convention is DeePMD-kit's own,
-read off ``edge_force_virial``: ``force = -dE/dr`` and ``virial = -dE/de``
-for ``r -> (I + e) r``.
-
-Cost
-----
 The charge head reads the descriptor features the energy head has already
-computed: ``_capturing_backbone`` records them during the energy pass, so a
-frame runs the descriptor once. A second pass, ``_predict_charges``, runs only
-when the energy path did not route through the graph lower and so left nothing
-to capture.
+computed (``_capturing_backbone``), so a frame runs the descriptor once. A
+second pass, ``_predict_charges``, runs only when the energy path did not go
+through the graph lower and so left nothing to capture.
 """
 
 import contextlib
@@ -44,11 +28,17 @@ import copy
 import json
 import math
 import os
+from collections.abc import (
+    Callable,
+    Iterator,
+)
 from numbers import Real
 from typing import (
     Any,
+    NamedTuple,
 )
 
+import numpy as np
 import torch
 from deepmd.dpmodel.model.model_factory import (
     get_model_components,
@@ -91,6 +81,7 @@ from deepmd_lr.fitting.charge import (
 from deepmd_lr.lr.term import (
     LongRangeTerm,
     build_long_range_energy,
+    isolated_term_for,
     system_reciprocal,
 )
 from deepmd_lr.neighbors import (
@@ -110,13 +101,11 @@ _ATOMIC_MODEL_TYPE = "standard"
 #: Key of the optional long-range block in the model config.
 LONG_RANGE_KEY = "long_range"
 
-#: Key of the reciprocal-sum settings inside that block. Named after what it
-#: configures -- the reciprocal-space sum -- rather than after one way of
-#: evaluating it, since `method` selects between `pme` and `ewald`.
+#: Key of the long-range sum's settings inside that block, whatever `method`
+#: evaluates it.
 RECIPROCAL_KEY = "reciprocal"
 
-#: The name this block had before the rename. Still accepted, in configs and
-#: in serialized checkpoints, so existing inputs and models keep working.
+#: The old name of that key, still accepted in configs and checkpoints.
 _LEGACY_RECIPROCAL_KEY = "pme"
 
 #: Raised wherever compression is asked for, or found, without the compiled
@@ -144,12 +133,9 @@ def _kernel_available() -> bool:
 def _strip_comments(block: dict) -> dict:
     """Drop DeePMD-kit's ``_comment`` annotation keys from a config block.
 
-    ``dp train`` normalizes the input first and those keys never reach a
-    constructor, but a raw config read straight from JSON -- which is what
-    ``scripts/graft_short_range.py`` and any hand-built call to ``get_model``
-    do -- still carries them. Since this model rejects unknown parameters
-    rather than absorbing them, they have to be removed explicitly or an
-    annotated config fails where the same config works through the CLI.
+    ``dp train`` normalizes them away, but a raw config read straight from
+    JSON (``scripts/graft_short_range.py``, a hand-built ``get_model`` call)
+    still carries them, and the long-range term refuses unknown keys.
     """
     return {k: v for k, v in block.items() if not k.startswith("_comment")}
 
@@ -193,6 +179,85 @@ def _run_backbone(model, graph, atype_flat, charge_spin):
 def _is_compressed(model) -> bool:
     """Whether ``model``'s descriptor is running from compressed tables."""
     return bool(getattr(model.atomic_model.descriptor, "compress", False))
+
+
+class _Strained(NamedTuple):
+    """The leaves one long-range evaluation differentiates against, and the
+    geometry they define."""
+
+    #: ``(nf, nloc, 3)`` coordinate leaf: the force is ``-dE/d(leaf)``.
+    leaf: torch.Tensor
+    #: ``(nf, 3, 3)`` strain leaf: the virial is ``-dE/d(eps)``.
+    eps: torch.Tensor
+    #: ``I + sym(eps)``, per frame.
+    strain: torch.Tensor
+    #: The leaf coordinates and the cell (None: no cell) under ``strain``.
+    coord: torch.Tensor
+    box: torch.Tensor | None
+    #: The unstrained cell, ``(nf, 3, 3)``, detached.
+    base_box: torch.Tensor | None
+
+
+def _strained_geometry(
+    coord: torch.Tensor, box: torch.Tensor | None, nf: int, nloc: int
+) -> _Strained:
+    """Fresh leaves for coordinates and a per-frame symmetric strain.
+
+    The trainer passes coordinates as ``(nf, nloc * 3)`` and the cell as
+    ``(nf, 9)``, eager callers ``(nf, nloc, 3)`` and ``(nf, 3, 3)``; both are
+    normalized. Detaching the geometry is safe for training: the energy still
+    depends on the parameters through the charge head, so ``create_graph``
+    keeps the force differentiable in them. The strain is symmetrized so a
+    rotation cannot leak into the virial. With no cell only the coordinates
+    are strained, which gives the pair virial ``sum_ij r_ij (x) f_ij`` --
+    what DeePMD-kit's own energy model returns for a ``box=None`` frame, so
+    the total stays consistent with the short-range part.
+    """
+    base_box = None if box is None else box.detach().reshape(nf, 3, 3)
+    eps, strain = _symmetric_strain(coord.dtype, coord.device, batch=(nf,))
+    leaf = coord.detach().reshape(nf, nloc, 3).clone().requires_grad_(True)
+    # Row vectors: r' = r (I + eps)^T, and the cell rows transform alike.
+    return _Strained(
+        leaf=leaf,
+        eps=eps,
+        strain=strain,
+        coord=torch.bmm(leaf, strain.transpose(-1, -2)),
+        box=(
+            None if base_box is None else torch.bmm(base_box, strain.transpose(-1, -2))
+        ),
+        base_box=base_box,
+    )
+
+
+@contextlib.contextmanager
+def _restored_on_failure(descriptor: Any) -> Iterator[None]:
+    """Put back the buffers and attributes upstream's ``enable_compression``
+    registers or replaces if the body raises, keeping the original objects
+    so shared references survive a failed compression."""
+    buffers = descriptor._buffers.copy()
+    nonpersistent = descriptor._non_persistent_buffers_set.copy()
+    was_compressed = descriptor.compress
+    had_scalars = hasattr(descriptor, "_compression_scalars")
+    scalars = getattr(descriptor, "_compression_scalars", None)
+    had_folded = FOLDED_ATTR in descriptor.__dict__
+    folded = descriptor.__dict__.get(FOLDED_ATTR)
+    try:
+        yield
+    except BaseException:
+        descriptor._buffers.clear()
+        descriptor._buffers.update(buffers)
+        descriptor._non_persistent_buffers_set.clear()
+        descriptor._non_persistent_buffers_set.update(nonpersistent)
+        descriptor.compress = was_compressed
+        if had_scalars:
+            descriptor._compression_scalars = scalars
+        elif hasattr(descriptor, "_compression_scalars"):
+            del descriptor._compression_scalars
+        if had_folded:
+            setattr(descriptor, FOLDED_ATTR, folded)
+        else:
+            descriptor.__dict__.pop(FOLDED_ATTR, None)
+        raise
 
 
 @BaseModel.register(MODEL_TYPE)
@@ -278,11 +343,9 @@ class LongRangeEnergyModel(EnergyModel):
         *adds*, so with two branches the offsets would land at twice the
         correction. The base branch owns the update; the links stand down.
 
-        The delta itself is identical for every member regardless of which
-        reciprocal method they use, because the regression subtracts the
-        **atomic** model's prediction -- short-range only, since the long-range
-        term lives one level above it. That is what makes fitting the offsets
-        over the group's pooled frames well defined.
+        The delta is the same for every member whatever its long-range
+        method, because the regression subtracts the **atomic** model's
+        prediction, which is short-range only.
         """
         if self._same_as_link:
             return
@@ -290,12 +353,8 @@ class LongRangeEnergyModel(EnergyModel):
 
     @property
     def has_long_range(self) -> bool:
-        """Whether a long-range term is configured.
-
-        Without a ``long_range`` block this model is exactly the standard
-        energy model, which is what makes "Phase 4 reduces to Phase 1" a
-        testable property rather than an aspiration.
-        """
+        """Whether a long-range term is configured. Without one this model is
+        exactly the standard energy model."""
         return (
             self.charge_fitting is not None and self.long_range_energy is not None
         )
@@ -306,12 +365,11 @@ class LongRangeEnergyModel(EnergyModel):
         """A long-range term built for one system; this model's own is left
         as it is.
 
-        The system's ``pbc`` picks the 3D sum or the slab one, and its cell
-        the PME mesh (:func:`~deepmd_lr.lr.term.system_reciprocal`). The term
-        holds no weights, so every system can have one of its own: that is
-        how evaluators and calculators share a model without disturbing each
-        other. The ``isolated`` term comes back unchanged, and a model without
-        a long-range block gives None.
+        The system's ``pbc`` picks the 3D, the slab or the isolated sum, and
+        its cell the PME mesh (:func:`~deepmd_lr.lr.term.system_reciprocal`).
+        The term holds no weights, so every system can have one of its own:
+        that is how evaluators and calculators share a model without
+        disturbing each other. A model without a long-range block gives None.
 
         The settings adapted are ``settings``, checked as
         :meth:`set_long_range` checks them, or by default the model's as they
@@ -351,27 +409,15 @@ class LongRangeEnergyModel(EnergyModel):
     def set_long_range(self, settings: dict[str, Any]) -> None:
         """Swap the long-range term for one built from ``settings``.
 
-        Neither :class:`~deepmd_lr.lr.term.LongRangeEnergy` nor
-        :class:`~deepmd_lr.lr.term.IsolatedLongRangeEnergy` contributes a
-        single ``state_dict`` entry -- every weight lives in the descriptor,
-        the fitting net and the charge head. So how the reciprocal sum is
-        evaluated is not a property of the *checkpoint* at all, and a model
-        trained on slabs can be asked for bulk energies, or for isolated ones,
-        by rebinding this one attribute. That is what makes the mixed-boundary
-        training of `same_as` useful at inference time.
+        The term contributes no ``state_dict`` entry, so how the sum is taken
+        is not a property of the checkpoint: a model trained on slabs can be
+        asked for bulk or isolated energies by rebinding this attribute.
 
         ``settings`` **replaces** the reciprocal block rather than merging into
-        it. Merging cannot work: ``IsolatedLongRangeEnergy`` accepts every
-        periodic parameter and then refuses any that was actually set, so
-        folding a ``pme`` block into ``method: "isolated"`` raises. Replacement
-        is the one shape that is correct for all three methods, and it leaves
-        no merge semantics to get subtly wrong.
-
-        ``alpha`` is the exception, and is inherited rather than replaced. It
-        is where the Ewald split falls, and the descriptor was trained to
-        supply exactly the ``erfc(alpha r)/r`` remainder left at *that* split
-        -- so it defines the model as surely as the weights do. Passing a
-        different one is refused rather than silently honoured.
+        it: the isolated term refuses any periodic setting actually set, so
+        folding a ``pme`` block into ``method: "isolated"`` would raise.
+        ``alpha`` is inherited and may not change -- the descriptor learned
+        the ``erfc(alpha r)/r`` remainder of *that* split.
 
         The new settings are also what :meth:`long_range_energy_for` and
         :meth:`adapt_long_range` adapt from.
@@ -403,9 +449,8 @@ class LongRangeEnergyModel(EnergyModel):
         """The swap itself, leaving :meth:`adapt_long_range`'s base alone."""
         settings = self._checked_long_range(settings)
         self.long_range_energy = build_long_range_energy(settings)
-        # Keep the recorded config in step, so a model that is re-serialised
-        # after a swap describes the term it actually has rather than the one
-        # it was trained with.
+        # Keep the recorded config in step: a model re-serialised after a swap
+        # describes the term it has, not the one it was trained with.
         script = getattr(self, "model_def_script", None)
         if not script:
             return
@@ -444,10 +489,9 @@ class LongRangeEnergyModel(EnergyModel):
                 "electrostatic term is only defined as an energy contribution."
             )
 
-        charge_fitting, long_range_energy = cls._build_long_range(data, descriptor)
-        block = _strip_comments(data.get(LONG_RANGE_KEY) or {})
-        trained_filter = check_charge_filter(block.get("charge_filter"))
-
+        charge_fitting, long_range_energy, trained_filter = cls._build_long_range(
+            data, descriptor
+        )
         model = cls(
             descriptor=descriptor,
             fitting=fitting,
@@ -464,15 +508,12 @@ class LongRangeEnergyModel(EnergyModel):
     @classmethod
     def _build_long_range(
         cls, data: dict, descriptor: Any
-    ) -> tuple[Any, LongRangeTerm | None]:
-        """Build the charge head and the reciprocal term from ``long_range``.
-
-        Returns ``(None, None)`` when the block is absent, which leaves this
-        model behaviourally identical to the standard energy model.
-        """
+    ) -> tuple[Any, LongRangeTerm | None, tuple[float, float] | None]:
+        """The charge head, the long-range term and the trained charge filter
+        from ``long_range``; all None without the block."""
         block = data.get(LONG_RANGE_KEY)
         if not block:
-            return None, None
+            return None, None, None
         block = _strip_comments(block)
 
         charge_net = _strip_comments(copy.deepcopy(block.get("charge_net", {})))
@@ -483,16 +524,12 @@ class LongRangeEnergyModel(EnergyModel):
         charge_net["type_map"] = copy.deepcopy(data["type_map"])
         charge_fitting = BaseFitting.get_class_by_type("charge")(**charge_net)
 
-        # `reciprocal` is the current name; `pme` is the old one, kept working
-        # because it appears in every config written before the rename. The
-        # block configures the reciprocal sum however it is evaluated, so
-        # naming it `pme` was wrong the moment `method: "ewald"` existed.
         settings = block.get(RECIPROCAL_KEY, block.get(_LEGACY_RECIPROCAL_KEY, {}))
         long_range_energy = build_long_range_energy(
             _strip_comments(copy.deepcopy(settings))
         )
-        return charge_fitting, long_range_energy
-
+        trained_filter = check_charge_filter(block.get("charge_filter"))
+        return charge_fitting, long_range_energy, trained_filter
 
     def _predict_charges(
         self,
@@ -505,83 +542,72 @@ class LongRangeEnergyModel(EnergyModel):
         *,
         return_raw: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """Per-atom charges satisfying the frame's total-charge constraint.
-
-        Runs the shared descriptor and the charge head on the graph route,
-        then applies the projection here rather than inside the head -- the
-        head sees a flat node axis with no frame structure and so cannot
-        express a per-frame reduction (see ``deepmd_lr.fitting.charge``).
+        """Per-atom charges from a second backbone pass, projected onto the
+        frame's total charge (a per-frame reduction the head, seeing a flat
+        node axis, cannot express).
 
         ``strain`` is a per-frame ``(nf, 3, 3)`` matrix, ``I + sym(eps)``,
-        applied to the edge vectors AFTER the graph is built -- see below for
-        why it is not applied to the coordinates and cell before.
+        applied to the edge vectors AFTER the graph is built.
         """
         descriptor = self.atomic_model.descriptor
-        if _is_compressed(self):
-            # At DP_CUDA_INFER=1 the compressed branch lives inside
-            # `call_graph`, so the energy pass is always captured and this
-            # second pass never runs. Reaching it means the capture was
-            # bypassed -- refuse rather than quietly run the slow math on a
-            # graph that carries no CSR views.
-            raise RuntimeError(
-                "the fallback charge pass was reached on a compressed model; "
-                "the shared-backbone capture should have been taken. "
-                "Compressed evaluation supports only the captured route -- "
-                "check DP_CUDA_INFER (it must be exactly 1)."
-            )
+        self._refuse_compressed_fallback()
         graph = build_neighbor_graph_fast(coord, atype, box, descriptor.get_rcut())
         if strain is not None:
-            # The virial needs d(charge)/d(strain). Building the graph from
-            # strained coordinates and a strained cell would route that
-            # derivative through the box -- and of DeePMD-kit's four
-            # neighbour builders only the dense O(N^2) one carries
-            # d(edge_vec)/d(box); `nv` returns 6.7e-13 for it, silently. At
-            # 6520 atoms the dense build cost 63 GB and 3 s per training step.
-            #
-            # But the strain is affine, and an edge vector is
-            # ``coord[j] + S @ box - coord[i]``: every term transforms by the
-            # same ``(I + eps)^T``, so straining the finished edge vectors is
-            # identical to straining the inputs, and the derivative now flows
-            # through ``edge_vec`` alone. That is what lets the O(N) builder
-            # be used here. The partitioned path relies on the same fact.
-            #
-            # Edges are flat over all frames, frames occupy contiguous node
-            # blocks of ``nloc``, and both ends of an edge are in the same
-            # frame -- so the destination node picks the frame's strain.
-            # Dummy (masked) edges have zero vectors and stay zero.
+            # The virial needs d(charge)/d(strain). Through a strained cell
+            # that derivative would run through the box, which of DeePMD-kit's
+            # neighbour builders only the dense O(N^2) one carries (`nv`
+            # returns 6.7e-13 for it, silently; the dense build cost 63 GB and
+            # 3 s per training step at 6520 atoms). An edge vector
+            # ``coord[j] + S @ box - coord[i]`` transforms as a whole by
+            # ``(I + eps)^T``, so straining the finished edges is identical and
+            # keeps the O(N) builder; the partitioned path relies on the same.
+            # Frames occupy contiguous node blocks of ``nloc`` and an edge
+            # never crosses frames, so its destination picks the strain;
+            # dummy edges are zero and stay zero.
             nloc = coord.shape[1]
             frame_of_edge = graph.edge_index[1] // nloc
             graph.edge_vec = torch.einsum(
                 "eab,eb->ea", strain[frame_of_edge], graph.edge_vec
             )
         gg, rot_mat = _run_backbone(self, graph, atype.reshape(-1), charge_spin)
-        # The same head and projection a captured backbone goes through. Column
-        # 0 of charge_spin is the frame's total charge; absent it, the frame is
-        # assumed neutral, the common case in training data.
         return self._charges_from_features(
             gg, rot_mat, atype, charge_spin, mask, return_raw=return_raw
         )
+
+    def _refuse_compressed_fallback(self) -> None:
+        """Refuse the second backbone pass on a compressed model.
+
+        At ``DP_CUDA_INFER=1`` the compressed branch lives inside
+        ``call_graph``, so the energy pass is always captured. Reaching the
+        fallback means the capture was bypassed, and it would run the slow
+        math on a graph with no CSR views while the model claims otherwise.
+        """
+        if _is_compressed(self):
+            raise RuntimeError(
+                "the fallback charge pass was reached on a compressed model: "
+                "the shared-backbone capture was not taken, and compressed "
+                "evaluation supports only the captured route. The usual cause "
+                "is DP_CUDA_INFER changed after compression; it must be exactly "
+                "1 (2 selects a fused kernel that bypasses "
+                "`descriptor.call_graph`)."
+            )
 
     @contextlib.contextmanager
     def _capturing_backbone(self) -> Any:
         """Yield a dict that fills with the descriptor's output as it runs.
 
-        The charge head reads the same features as the energy head, so the
-        backbone only needs to run once. Getting at them means observing
-        DeePMD-kit's own forward: the tensors we need are local to
-        ``forward_common_lower_graph``, which creates its own ``edge_vec``
-        leaf and hands it to the descriptor. Overriding that method does not
-        help -- it would still be DeePMD-kit's leaf the descriptor sees -- so
-        ``descriptor.call_graph`` is wrapped for the duration of one forward
-        and restored afterwards, exception or not.
-
-        Yields an empty dict when there is no long-range term to feed.
+        The tensors the charge head needs are local to DeePMD-kit's
+        ``forward_common_lower_graph``, which makes its own ``edge_vec`` leaf
+        and hands it to the descriptor, so ``descriptor.call_graph`` is
+        wrapped for the duration of one forward and restored afterwards,
+        exception or not. Yields an empty dict when there is no long-range
+        term to feed.
 
         While a capture is open the graph lower is permitted
-        (``_capture_depth``): whoever holds this context is the one adding the
-        long-range term afterwards -- ``forward`` here, or the partitioned
-        driver. Any other caller of the lower is one that would silently
-        report the short-range energy alone.
+        (``_capture_depth``): whoever holds this context adds the long-range
+        term afterwards -- ``forward`` here, or the partitioned driver. Any
+        other caller of the lower would silently report the short-range
+        energy alone.
         """
         captured: dict = {}
         if not self.has_long_range:
@@ -606,11 +632,9 @@ class LongRangeEnergyModel(EnergyModel):
                 )
             return out
 
-        # Whether the descriptor already carried its own ``call_graph``
-        # decides how to undo this. Assigning ``unhooked`` back would leave a
-        # bound method sitting in the instance dict, permanently shadowing the
-        # class attribute and holding a reference to the instance; deleting
-        # restores the descriptor to the state it was actually in.
+        # Undo by deleting unless the descriptor carried its own `call_graph`:
+        # assigning `unhooked` back would leave a bound method in the instance
+        # dict, shadowing the class attribute and holding the instance.
         had_own = "call_graph" in descriptor.__dict__
         descriptor.call_graph = capture
         self._capture_depth += 1
@@ -645,11 +669,9 @@ class LongRangeEnergyModel(EnergyModel):
         *,
         return_raw: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """Charges from an already-computed descriptor output.
-
-        The charge head is a per-atom MLP over the same features the energy
-        head reads, so once the backbone has run there is nothing to repeat.
-        """
+        """Projected charges ``(nf, nloc)`` from an already-computed
+        descriptor output, and with ``return_raw`` the raw ones too. Without
+        ``charge_spin`` every frame is neutral."""
         nf, nloc = atype.shape[0], atype.shape[1]
         atype_flat = atype.reshape(-1)
         raw = self.charge_fitting.call_graph(features, atype_flat, gr=rot_mat)[
@@ -681,45 +703,60 @@ class LongRangeEnergyModel(EnergyModel):
 
         The derivatives are taken here rather than inherited because the
         energy is not a function of ``edge_vec``; see the module docstring.
-
-        Coordinates and cell are strained together by a symmetric ``eps`` so
-        one differentiation yields the virial in DeePMD-kit's convention.
-        ``eps`` is symmetrized explicitly: an unsymmetrized strain would let
-        an infinitesimal rotation leak into the derivative, and the virial of
-        a rotation-invariant energy must be symmetric.
+        ``shared`` is the captured backbone (:meth:`_capturing_backbone`), or
+        None to run it again (:meth:`_direct_long_range`).
         """
+        if do_atomic_virial:
+            # The k-space energy is collective: there is no per-atom virial
+            # to attribute, so refuse rather than invent one.
+            raise NotImplementedError(
+                "do_atomic_virial is not supported with a long-range term: "
+                "the reciprocal-space energy is collective and admits no "
+                "meaningful per-atom virial decomposition."
+            )
         nf, nloc = atype.shape[0], atype.shape[1]
-        dtype, device = coord.dtype, coord.device
-
-        # The trainer passes coordinates flattened to (nf, nloc * 3) and the
-        # cell to (nf, 9), while eager callers pass (nf, nloc, 3) and
-        # (nf, 3, 3). Normalize both before any matrix product; `nloc` comes
-        # from `atype`, which is unambiguous either way.
-        #
-        # Differentiate against fresh leaves. Detaching the geometry is safe
-        # for training: the long-range energy still depends on the network
-        # parameters through the charge head, so `create_graph` keeps the
-        # force differentiable with respect to them.
-        base_coord = coord.detach().reshape(nf, nloc, 3)
-        base_box = None if box is None else box.detach().reshape(nf, 3, 3)
-        eps, strain = _symmetric_strain(dtype, device, batch=(nf,))
-
-        leaf_coord = base_coord.clone().requires_grad_(True)
-        # Row vectors: r' = r (I + eps)^T, and the cell rows transform alike.
-        strained_coord = torch.bmm(leaf_coord, strain.transpose(-1, -2))
-        # With no cell there is nothing to strain but the coordinates, and
-        # that is not a degenerate case: straining positions alone gives the
-        # pair virial `sum_ij r_ij (x) f_ij`, which is exactly what
-        # DeePMD-kit's own energy model already returns for a `box=None`
-        # frame. Skipping the virial here would leave our total disagreeing
-        # with the short-range part it is added to.
-        strained_box = (
-            None if base_box is None else torch.bmm(base_box, strain.transpose(-1, -2))
+        geometry = _strained_geometry(coord, box, nf, nloc)
+        # The frame picks the sum: with no cell, the isolated one at this
+        # model's alpha, whatever method the periodic frames use.
+        term = (
+            self.long_range_energy
+            if geometry.base_box is not None
+            else isolated_term_for(self.long_range_energy)
         )
-
         mask = charge_mask(self, atype)
-        create_graph = self.training
-        born = None
+        filtered = self._charge_filter_for(charge_spin, nf, coord, mask)
+        args = (term, geometry, atype, charge_spin, mask, filtered)
+        if shared is not None:
+            result = self._shared_long_range(shared, *args)
+        else:
+            result = self._direct_long_range(*args)
+        atom_energy = result["atom_energy"]
+        out = {
+            "atom_energy": atom_energy,
+            "energy": atom_energy.sum(dim=1),
+            "force": result["force"],
+            # (nf, 9), DeePMD-kit's `energy_derv_c_redu` layout.
+            "virial": result["virial"],
+            # Reported as screened charges, sqrt(eps_inf) q; the energy used
+            # the model's own charges, which it was trained with.
+            "charge": result["charge"] * screening_factor(self.eps_inf),
+            "charge_projection_shift": projection_shift(
+                result["projected"], result["raw"], mask
+            ),
+        }
+        if result["born"] is not None:
+            out["born_charge"] = result["born"]
+        return out
+
+    def _charge_filter_for(
+        self,
+        charge_spin: torch.Tensor | None,
+        nf: int,
+        coord: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> Callable[[torch.Tensor], torch.Tensor]:
+        """The charge filter this evaluation applies, as ``projected ->
+        charge`` (the identity without one)."""
         if self.training and self.charge_filter is not None:
             raise RuntimeError(
                 "a simulation-time charge_filter override is set; clear it "
@@ -727,157 +764,142 @@ class LongRangeEnergyModel(EnergyModel):
                 "for training belongs in the config, long_range.charge_filter"
             )
         charge_filter = self.effective_charge_filter
-        if charge_filter is not None:
-            if self.compute_born:
-                raise NotImplementedError(
-                    "charge_filter cannot be combined with Born charges yet: "
-                    "the Born tensor is built from the unfiltered charges"
-                )
-            total = (
-                charge_spin[:, 0].to(coord.dtype)
-                if charge_spin is not None
-                else torch.zeros(nf, dtype=coord.dtype, device=device)
+        if charge_filter is None:
+            return lambda projected: projected
+        if self.compute_born:
+            raise NotImplementedError(
+                "charge_filter cannot be combined with Born charges yet: "
+                "the Born tensor is built from the unfiltered charges"
             )
+        total = (
+            charge_spin[:, 0].to(coord.dtype)
+            if charge_spin is not None
+            else torch.zeros(nf, dtype=coord.dtype, device=coord.device)
+        )
+        return lambda projected: filter_charges(
+            projected, total, charge_filter, mask=mask
+        )
 
-        def filtered(projected: torch.Tensor) -> torch.Tensor:
-            if charge_filter is None:
-                return projected
-            return filter_charges(projected, total, charge_filter, mask=mask)
+    def _shared_long_range(
+        self,
+        shared: dict,
+        term: LongRangeTerm,
+        geometry: _Strained,
+        atype: torch.Tensor,
+        charge_spin: torch.Tensor | None,
+        mask: torch.Tensor,
+        filtered: Callable[[torch.Tensor], torch.Tensor],
+    ) -> dict[str, torch.Tensor | None]:
+        """The long-range energy and its derivatives on the captured backbone.
 
-        if shared is not None:
-            # SHARED BACKBONE. The energy head already ran the descriptor; its
-            # output is reused here rather than recomputed, which is the same
-            # 144-dim feature per atom feeding a second per-atom MLP.
-            #
-            # DeePMD-kit detaches `edge_vec` into its own leaf before the
-            # backbone runs, so those features carry no dependence on our
-            # coordinate leaf or strain -- only on that leaf. The charge
-            # response is therefore taken with respect to `edge_vec` and
-            # converted by DeePMD-kit's own `edge_force_virial`, exactly as it
-            # converts the short-range energy's edge gradient. Its backward
-            # sets `retain_graph=True`, which is what leaves the captured
-            # graph traversable here.
-            projected, raw_charge = self._charges_from_features(
-                shared["features"],
-                shared["rot_mat"],
-                atype,
-                charge_spin,
-                mask,
-                return_raw=True,
-            )
-            charge = filtered(projected)
-            atom_energy = self.long_range_energy(
-                strained_coord, charge, strained_box, mask=mask
-            )
-            energy = atom_energy.sum()
-            edge_vec = shared["edge_vec"]
-            grad_coord, grad_eps, g_e = torch.autograd.grad(
-                energy,
-                [leaf_coord, eps, edge_vec],
-                create_graph=create_graph,
-                retain_graph=True,
-            )
-            # `leaf_coord`/`eps` now carry ONLY the reciprocal sum's explicit
-            # geometry dependence; the charge response arrives through the
-            # edges. Summing the two is the same total as before.
-            response_force, _atom_virial, response_virial = edge_force_virial(
-                g_e,
+        DeePMD-kit detaches ``edge_vec`` into its own leaf before the backbone
+        runs, so the captured features depend on that leaf alone, not on
+        ``geometry``'s. The charge response is therefore taken with respect to
+        ``edge_vec`` and converted by DeePMD-kit's ``edge_force_virial``,
+        exactly as the short-range energy's is; ``geometry``'s leaves carry
+        the sum's explicit geometry dependence. The energy head's backward
+        sets ``retain_graph=True``, which keeps the captured graph traversable
+        here.
+        """
+        nf, nloc = atype.shape[0], atype.shape[1]
+        create_graph = self.training
+        projected, raw = self._charges_from_features(
+            shared["features"],
+            shared["rot_mat"],
+            atype,
+            charge_spin,
+            mask,
+            return_raw=True,
+        )
+        charge = filtered(projected)
+        atom_energy = term(geometry.coord, charge, geometry.box, mask=mask)
+        edge_vec = shared["edge_vec"]
+        grad_coord, grad_eps, g_e = torch.autograd.grad(
+            atom_energy.sum(),
+            [geometry.leaf, geometry.eps, edge_vec],
+            create_graph=create_graph,
+            retain_graph=True,
+        )
+        response_force, _atom_virial, response_virial = edge_force_virial(
+            g_e,
+            edge_vec,
+            shared["edge_index"],
+            shared["edge_mask"],
+            shared["n_node"],
+        )
+        born = None
+        if self.compute_born:
+            # A second, cheaper VJP over the tape the gradient above left
+            # alive; one pass covers every edge because the descriptor is
+            # one-hop.
+            born = born_charges(
+                charge,
+                raw.reshape(-1),
                 edge_vec,
                 shared["edge_index"],
                 shared["edge_mask"],
-                shared["n_node"],
-            )
-            force = -grad_coord + response_force.reshape(nf, nloc, 3)
-            virial = (-grad_eps).reshape(nf, 9) + response_virial.reshape(nf, 9)
-            if self.compute_born:
-                # A second, cheaper VJP over the same tape the energy gradient
-                # above left alive with `retain_graph=True`. One pass covers
-                # every edge because the descriptor is one-hop.
-                born = born_charges(
-                    charge,
-                    raw_charge.reshape(-1),
-                    edge_vec,
-                    shared["edge_index"],
-                    shared["edge_mask"],
-                    create_graph=create_graph,
-                    eps_inf=self.eps_inf,
-                )
-        else:
-            # Fallback: run the backbone again on our own strained graph. Used
-            # when the energy path did not route through the graph lower, so
-            # nothing was captured.
-            if _is_compressed(self):
-                # Compressed inference is defined only on the captured route;
-                # the fallback would rebuild a CSR-less graph and run the
-                # uncompressed math while the model still claims otherwise.
-                raise RuntimeError(
-                    "a compressed model took the fallback path: the shared "
-                    "backbone was not captured. The usual cause is "
-                    "DP_CUDA_INFER changed after compression; it must be "
-                    "exactly 1 (2 selects a fused kernel that bypasses "
-                    "`descriptor.call_graph`)."
-                )
-            if self.compute_born:
-                # The fallback rebuilds its own graph, so there is no captured
-                # `edge_vec` to differentiate and no cheap route to Z. This
-                # path is taken when the energy never went through the graph
-                # lower -- notably under DP_CUDA_INFER >= 2, where a fused
-                # kernel bypasses `descriptor.call_graph` entirely. Refuse
-                # rather than return a tensor that is quietly absent or wrong.
-                raise NotImplementedError(
-                    "Born effective charges need the shared backbone capture, "
-                    "but this forward took the fallback path, so no edge graph "
-                    "was captured. The usual cause is DP_CUDA_INFER >= 2 "
-                    "selecting a fused energy/force kernel; unset it (or set "
-                    "it below 2) for field simulations."
-                )
-            projected, raw_charge = self._predict_charges(
-                leaf_coord,
-                atype,
-                base_box,
-                charge_spin,
-                mask,
-                strain=strain,
-                return_raw=True,
-            )
-            charge = filtered(projected)
-            atom_energy = self.long_range_energy(
-                strained_coord, charge, strained_box, mask=mask
-            )
-            energy = atom_energy.sum()
-            grad_coord, grad_eps = torch.autograd.grad(
-                energy,
-                [leaf_coord, eps],
                 create_graph=create_graph,
+                eps_inf=self.eps_inf,
             )
-            force = -grad_coord
-            virial = (-grad_eps).reshape(nf, 9)
-
-        out = {
+        return {
             "atom_energy": atom_energy,
-            "energy": atom_energy.sum(dim=1),
-            "force": force,
-            # DeePMD-kit reports the virial flattened to (nf, 9), matching
-            # `energy_derv_c_redu`; match that rather than the natural (nf, 3, 3).
-            "virial": virial,
-            # Reported as screened charges, q~ = sqrt(eps_inf) q. The energy
-            # above was evaluated with the model's own `charge`, which is what
-            # it was trained with; only the diagnostic output is rescaled.
-            "charge": charge * screening_factor(self.eps_inf),
-            "charge_projection_shift": projection_shift(projected, raw_charge, mask),
+            "charge": charge,
+            "projected": projected,
+            "raw": raw,
+            "force": -grad_coord + response_force.reshape(nf, nloc, 3),
+            "virial": (-grad_eps).reshape(nf, 9) + response_virial.reshape(nf, 9),
+            "born": born,
         }
-        if born is not None:
-            out["born_charge"] = born
-        if do_atomic_virial:
-            # A per-atom decomposition of a mesh-based reciprocal sum is not
-            # well defined -- the k-space energy is inherently collective --
-            # so refuse rather than invent an attribution.
+
+    def _direct_long_range(
+        self,
+        term: LongRangeTerm,
+        geometry: _Strained,
+        atype: torch.Tensor,
+        charge_spin: torch.Tensor | None,
+        mask: torch.Tensor,
+        filtered: Callable[[torch.Tensor], torch.Tensor],
+    ) -> dict[str, torch.Tensor | None]:
+        """The long-range energy and its derivatives from a second backbone
+        pass on a graph strained with ``geometry``, for when the energy path
+        did not go through the graph lower and nothing was captured."""
+        self._refuse_compressed_fallback()
+        if self.compute_born:
+            # No captured `edge_vec`, so no cheap route to Z. Notably taken
+            # under DP_CUDA_INFER >= 2, whose fused kernel bypasses
+            # `descriptor.call_graph`.
             raise NotImplementedError(
-                "do_atomic_virial is not supported with a long-range term: "
-                "the reciprocal-space energy is collective and admits no "
-                "meaningful per-atom virial decomposition."
+                "Born effective charges need the shared backbone capture, "
+                "but this forward took the fallback path, so no edge graph "
+                "was captured. The usual cause is DP_CUDA_INFER >= 2 "
+                "selecting a fused energy/force kernel; unset it (or set "
+                "it below 2) for field simulations."
             )
-        return out
+        projected, raw = self._predict_charges(
+            geometry.leaf,
+            atype,
+            geometry.base_box,
+            charge_spin,
+            mask,
+            strain=geometry.strain,
+            return_raw=True,
+        )
+        charge = filtered(projected)
+        atom_energy = term(geometry.coord, charge, geometry.box, mask=mask)
+        grad_coord, grad_eps = torch.autograd.grad(
+            atom_energy.sum(),
+            [geometry.leaf, geometry.eps],
+            create_graph=self.training,
+        )
+        return {
+            "atom_energy": atom_energy,
+            "charge": charge,
+            "projected": projected,
+            "raw": raw,
+            "force": -grad_coord,
+            "virial": (-grad_eps).reshape(atype.shape[0], 9),
+            "born": None,
+        }
 
     def forward(
         self,
@@ -890,10 +912,12 @@ class LongRangeEnergyModel(EnergyModel):
         charge_spin: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> dict[str, torch.Tensor]:
-        """Short-range DPA4C energy plus the long-range electrostatic term."""
-        # The backbone runs once, inside `super().forward()`, and the charge
-        # head reads its output -- the second descriptor pass this replaces
-        # was 18% of the forward at 6520 atoms.
+        """Short-range DPA4C energy plus the long-range electrostatic term.
+
+        The backbone runs once, inside ``super().forward()``, and the charge
+        head reads its output (a second descriptor pass was 18% of the forward
+        at 6520 atoms).
+        """
         if self.has_long_range:
             charge_spin = resolve_charge_spin(self, charge_spin, atype.shape[0], coord)
         elif self._compressed_charge_spin is not None:
@@ -901,6 +925,16 @@ class LongRangeEnergyModel(EnergyModel):
             # as the standard one does: the kernel reads the folded state, and
             # a different request would be silently dropped.
             resolve_charge_spin(self, charge_spin, atype.shape[0], coord)
+        if (
+            self.has_long_range
+            and box is not None
+            and not self.long_range_energy.needs_cell
+        ):
+            raise ValueError(
+                "this model's long-range term is method 'isolated', which sums "
+                "no periodic images, but the frame has a cell. A model trained "
+                "with method 'isolated' runs on systems with no periodic axis."
+            )
         with self._capturing_backbone() as captured:
             short_range = super().forward(
                 coord,
@@ -914,15 +948,6 @@ class LongRangeEnergyModel(EnergyModel):
             )
         if not self.has_long_range:
             return short_range
-        if box is None and self.long_range_energy.needs_cell:
-            raise ValueError(
-                "The 'dp_lr' model has a long-range term configured with "
-                f"method '{self.long_range_energy.method}', which requires a "
-                "periodic cell, but box is None. For an isolated system set "
-                "`long_range.reciprocal.method` to 'isolated', which sums the "
-                "same erf-damped interaction directly with no cell."
-            )
-
         long_range = self._long_range(
             coord,
             atype,
@@ -931,19 +956,21 @@ class LongRangeEnergyModel(EnergyModel):
             do_atomic_virial,
             shared=self._usable(captured),
         )
+        return self._combine(short_range, long_range)
 
+    @staticmethod
+    def _combine(
+        short_range: dict[str, torch.Tensor], long_range: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """The short-range output with the long-range term added, plus the
+        diagnostics: charges, the neutrality projection's per-frame shift
+        ``(nf,)`` (which the ``ener_lr`` loss can penalise), Born charges if
+        computed, and both energies separately."""
         out = dict(short_range)
-        out["energy"] = short_range["energy"] + long_range["energy"]
-        out["atom_energy"] = short_range["atom_energy"] + long_range["atom_energy"]
-        if "force" in out:
-            out["force"] = short_range["force"] + long_range["force"]
-        if "virial" in out:
-            out["virial"] = short_range["virial"] + long_range["virial"]
-        # Diagnostics: the pieces a user needs to see whether the long-range
-        # term is doing anything, without re-running the model.
+        for key in ("energy", "atom_energy", "force", "virial"):
+            if key in out:
+                out[key] = short_range[key] + long_range[key]
         out["charge"] = long_range["charge"]
-        # What the neutrality projection added to every atom of each frame,
-        # (nf,); the `ener_lr` loss can penalise it (`deepmd_lr.loss`).
         out["charge_projection_shift"] = long_range["charge_projection_shift"]
         if "born_charge" in long_range:
             out["born_charge"] = long_range["born_charge"]
@@ -952,19 +979,13 @@ class LongRangeEnergyModel(EnergyModel):
         return out
 
     def _refuse_export(self, what: str) -> None:
-        """Block the graph-lower export path when a long-range term is set.
+        """Refuse an interface that carries no cell, so cannot see the term.
 
         The exported artifact is traced from ``forward_lower_graph*``, which
-        takes ``edge_vec`` and no cell -- so it cannot see the long-range
-        term at all. Left alone, ``dp freeze`` succeeds and produces a model
-        that silently returns only the short-range energy: measured on the
-        Phase 5 benchmark, the frozen artifact came back at -93.74 eV against
-        the eager model's -55.12, having dropped the entire 38.6 eV
-        long-range contribution without a word.
-
-        A loud failure is the only safe behaviour. Use the ASE calculator in
-        ``deepmd_lr.ase`` for MD, which drives the eager model through
-        ``forward`` and therefore has the cell.
+        takes ``edge_vec`` and no cell. Left alone, ``dp freeze`` succeeds and
+        the artifact silently drops the long-range energy: -93.74 eV against
+        the eager model's -55.12 on one benchmark frame, the whole 38.6 eV
+        long-range contribution gone without a word.
         """
         raise NotImplementedError(
             f"{what} is not supported for a 'dp_lr' model with a long_range "
@@ -1017,51 +1038,22 @@ class LongRangeEnergyModel(EnergyModel):
     ) -> dict[str, torch.Tensor]:
         """The graph lower, permitted only where the long-range term is added.
 
-        This is the method ``DeepPot``/``dp test`` call on a checkpoint and
-        the one compiled training traces, and it returns the short-range
-        energy alone -- so outside a ``_capturing_backbone`` context it is
-        refused for the same reason ``dp freeze`` is. ``forward`` and the
-        partitioned driver both hold that context and add the term themselves.
+        ``DeepPot``/``dp test`` call this on a checkpoint and compiled
+        training traces it, and it returns the short-range energy alone -- so
+        outside a ``_capturing_backbone`` context it is refused for the same
+        reason ``dp freeze`` is. ``forward`` and the partitioned driver hold
+        that context and add the term themselves.
 
-        It is also the one choke point every compressed evaluation passes
-        through, serial or partitioned, so the preconditions of the
-        compressed kernel are enforced here on every step: without the CSR
-        views, the operator, or ``DP_CUDA_INFER=1``, ``DescrptDPA4C.call_graph``
-        would fall back to the uncompressed math without saying so.
+        Every compressed evaluation, serial or partitioned, passes through
+        here, so the compressed kernel's preconditions are checked on every
+        step (:meth:`_check_compressed_lower`).
         """
         if self.has_long_range and self._capture_depth == 0:
             self._refuse_export(
                 "The graph-lower interface (DeepPot, `dp test`, compiled training)"
             )
         if _is_compressed(self):
-            if not _kernel_available():
-                raise RuntimeError(_NO_KERNEL)
-            # Level before CSR: at level 0 upstream builds no CSR at all, so
-            # the missing views are the symptom and the level is the cause.
-            # A long-range model needs level 1: at 2 a fused kernel bypasses the
-            # backbone the charge head shares. A short-range model has no charge
-            # head, so level 2 -- DeePMD-kit's fused energy/force pipeline, force
-            # as a value with no autograd tape -- is allowed and is the faster one.
-            level = cuda_infer_level()
-            allowed = (1,) if self.has_long_range else (1, 2)
-            if level not in allowed:
-                raise RuntimeError(
-                    f"DP_CUDA_INFER={level} on a compressed model: at 0 the "
-                    "tables are built and never used"
-                    + (", at 2 a fused kernel bypasses the shared backbone the "
-                       "charge head needs. Set DP_CUDA_INFER=1."
-                       if self.has_long_range else
-                       ". Set DP_CUDA_INFER=1 or 2 (2: the fused energy/force path).")
-                )
-            if destination_order is None or destination_row_ptr is None:
-                raise RuntimeError(
-                    "a compressed DPA4C needs the destination CSR views on "
-                    "every graph and this one carries none, so the descriptor "
-                    "would silently fall back to the uncompressed math. Graphs "
-                    "built by DeePMD-kit's own forward get them from "
-                    "`get_geo_compress()`; a hand-built graph needs "
-                    "`build_neighbor_graph_fast(..., with_csr=True)`."
-                )
+            self._check_compressed_lower(destination_order, destination_row_ptr)
         return super().forward_common_lower_graph(
             atype,
             n_node,
@@ -1074,6 +1066,46 @@ class LongRangeEnergyModel(EnergyModel):
             *args,
             **kwargs,
         )
+
+    def _check_compressed_lower(
+        self,
+        destination_order: torch.Tensor | None,
+        destination_row_ptr: torch.Tensor | None,
+    ) -> None:
+        """Refuse a compressed graph-lower call the kernel would not serve.
+
+        Without the operator, the right ``DP_CUDA_INFER`` or the CSR views,
+        ``DescrptDPA4C.call_graph`` falls back to the uncompressed math
+        without saying so. A long-range model needs level 1 (at 2 a fused
+        kernel bypasses the backbone the charge head shares); a short-range
+        one may use 2, DeePMD-kit's faster fused energy/force pipeline. The
+        level is checked before the CSR views: at level 0 upstream builds
+        none, so the missing views are the symptom and the level the cause.
+        """
+        if not _kernel_available():
+            raise RuntimeError(_NO_KERNEL)
+        level = cuda_infer_level()
+        allowed = (1,) if self.has_long_range else (1, 2)
+        if level not in allowed:
+            raise RuntimeError(
+                f"DP_CUDA_INFER={level} on a compressed model: at 0 the "
+                "tables are built and never used"
+                + (
+                    ", at 2 a fused kernel bypasses the shared backbone the "
+                    "charge head needs. Set DP_CUDA_INFER=1."
+                    if self.has_long_range
+                    else ". Set DP_CUDA_INFER=1 or 2 (2: the fused energy/force path)."
+                )
+            )
+        if destination_order is None or destination_row_ptr is None:
+            raise RuntimeError(
+                "a compressed DPA4C needs the destination CSR views on "
+                "every graph and this one carries none, so the descriptor "
+                "would silently fall back to the uncompressed math. Graphs "
+                "built by DeePMD-kit's own forward get them from "
+                "`get_geo_compress()`; a hand-built graph needs "
+                "`build_neighbor_graph_fast(..., with_csr=True)`."
+            )
 
     def enable_compression(
         self,
@@ -1091,26 +1123,41 @@ class LongRangeEnergyModel(EnergyModel):
         radial table spans ``[0, rcut]`` analytically, so the extrapolation,
         second stride and overflow check are all discarded upstream.
 
-        What it commits you to, and why each is refused rather than warned:
+        What it commits you to (each refused rather than warned):
 
         * The compiled kernel must be loaded (see :mod:`deepmd_lr.compress`).
         * An evaluation snapshot: a compressed DPA4C cannot re-enter training.
         * ``DP_CUDA_INFER`` becomes ``1`` if unset -- the one process-global
-          side effect here, because DeePMD-kit re-reads the variable on every
-          call and offers no API for it; a second switch to remember would be
-          redundant with asking for compression. Level 2 is refused for every
-          model: its fused energy/force kernel bypasses
-          ``descriptor.call_graph``, and with it the shared backbone, the
-          charge response and the Born charges.
+          side effect, because DeePMD-kit re-reads the variable on every call
+          and offers no API for it. Level 2 is refused for a long-range model:
+          its fused energy/force kernel bypasses ``descriptor.call_graph``,
+          and with it the shared backbone, the charge response and the Born
+          charges.
         * The frame condition is **folded into the tables**. With
           ``add_chg_spin_ebd`` the kernel reads the charge state baked in at
           this call, not the one passed at forward time; pass the run's
           ``charge_spin`` here, and a forward with a different one is refused.
 
-        Nothing is persisted. The tables are a deterministic function of the
-        weights, the stride and the charge state, and build in well under a
-        second, so they are rebuilt at load rather than saved.
+        Nothing is persisted: the tables are a deterministic function of the
+        weights, the stride and the charge state, and rebuild at load in well
+        under a second.
         """
+        level = self._check_compression_request(table_stride_1)
+        state = self._charge_state_to_fold(charge_spin)
+        descriptor = self.atomic_model.descriptor
+        with _restored_on_failure(descriptor):
+            super().enable_compression(
+                table_extrapolate, table_stride_1, table_stride_2, check_frequency
+            )
+            if state is not None:
+                descriptor.apply_charge_state(state)
+        # Only successful compression changes the process-wide inference level.
+        if level == 0:
+            os.environ["DP_CUDA_INFER"] = "1"
+
+    def _check_compression_request(self, table_stride_1: Any) -> int:
+        """Refuse a compression this model could not run; the current
+        ``DP_CUDA_INFER`` level."""
         if isinstance(table_stride_1, bool) or not isinstance(table_stride_1, Real):
             raise TypeError("table_stride_1 must be a positive finite number")
         if not math.isfinite(table_stride_1) or table_stride_1 <= 0:
@@ -1131,81 +1178,37 @@ class LongRangeEnergyModel(EnergyModel):
                 "Set DP_CUDA_INFER=1, the level compression needs. (A model "
                 "without `long_range` may use 2.)"
             )
-        descriptor = self.atomic_model.descriptor
-        state = None
-        if self.atomic_model.add_chg_spin_ebd:
-            from deepmd.utils.charge_state import validate_charge_state
+        return level
 
-            condition = torch.as_tensor(
-                self.get_default_chg_spin() if charge_spin is None else charge_spin,
-                dtype=torch.float64,
-            ).reshape(-1)
-            if condition.numel() != 2:
-                raise ValueError(
-                    "charge_spin must hold one [charge, multiplicity] pair"
-                )
-            state = list(validate_charge_state(condition.tolist()))
+    def _charge_state_to_fold(self, charge_spin: Any) -> list | None:
+        """The validated ``[charge, multiplicity]`` to fold into the tables,
+        or None for a descriptor without the frame-condition embedding."""
+        if not self.atomic_model.add_chg_spin_ebd:
+            return None
+        from deepmd.utils.charge_state import validate_charge_state
 
-        # Upstream registers/replaces buffers and sets these attributes. Preserve
-        # the original objects so failed construction also preserves shared refs.
-        buffers = descriptor._buffers.copy()
-        nonpersistent = descriptor._non_persistent_buffers_set.copy()
-        was_compressed = descriptor.compress
-        had_scalars = hasattr(descriptor, "_compression_scalars")
-        scalars = getattr(descriptor, "_compression_scalars", None)
-        had_folded = FOLDED_ATTR in descriptor.__dict__
-        folded = descriptor.__dict__.get(FOLDED_ATTR)
-        try:
-            super().enable_compression(
-                table_extrapolate, table_stride_1, table_stride_2, check_frequency
-            )
-            if state is not None:
-                descriptor.apply_charge_state(state)
-        except BaseException:
-            descriptor._buffers.clear()
-            descriptor._buffers.update(buffers)
-            descriptor._non_persistent_buffers_set.clear()
-            descriptor._non_persistent_buffers_set.update(nonpersistent)
-            descriptor.compress = was_compressed
-            if had_scalars:
-                descriptor._compression_scalars = scalars
-            elif hasattr(descriptor, "_compression_scalars"):
-                del descriptor._compression_scalars
-            if had_folded:
-                setattr(descriptor, FOLDED_ATTR, folded)
-            else:
-                descriptor.__dict__.pop(FOLDED_ATTR, None)
-            raise
-        # Only successful compression changes the process-wide inference level.
-        if level == 0:
-            os.environ["DP_CUDA_INFER"] = "1"
+        condition = torch.as_tensor(
+            self.get_default_chg_spin() if charge_spin is None else charge_spin,
+            dtype=torch.float64,
+        ).reshape(-1)
+        if condition.numel() != 2:
+            raise ValueError("charge_spin must hold one [charge, multiplicity] pair")
+        return list(validate_charge_state(condition.tolist()))
 
     def compute_or_load_stat(
         self, sampled_func: Any, *args: Any, **kwargs: Any
     ) -> None:
         """Compute statistics, tolerating a non-periodic training set.
 
-        DeePMD-kit's ``make_stat_input`` returns an all-**zero** box for a
-        system marked ``nopbc`` rather than ``None``
-        (``utils/model_stat.py``; measured as a ``(nframes, 9)`` array of
-        zeros). Every consumer downstream tests ``box is None`` --
-        ``DescrptDPA4C.compute_input_stats`` does, explicitly -- so the test
-        never fires, a singular cell reaches ``normalize_coord``, and training
-        dies in ``linalg.inv`` before the first step:
-
-            linalg.inv: The diagonal element 1 is zero ... input matrix is
-            singular
-
-        The training loop itself is unaffected: it reads through
-        ``DeepmdDataSetForLoader``, which does return ``None``. Only the
-        statistics pass sees the zeros. So normalise them here, where the
-        sample enters this model, rather than patching DeePMD-kit.
-
-        A zero box is never a legitimate cell -- the term itself refuses one
-        as degenerate -- so treating it as "no cell" cannot mask a real
-        problem.
+        DeePMD-kit's ``make_stat_input`` returns an all-**zero** ``(nframes,
+        9)`` box for a ``nopbc`` system rather than ``None``
+        (``utils/model_stat.py``). Consumers test ``box is None``, so a
+        singular cell reaches ``normalize_coord`` and training dies in
+        ``linalg.inv`` before the first step. The training loop reads through
+        ``DeepmdDataSetForLoader``, which does return ``None``; only the
+        statistics pass sees the zeros, so they are normalized here. A zero box
+        is never a legitimate cell, so this cannot mask a real problem.
         """
-        import numpy as np
 
         def sanitized() -> Any:
             sampled = sampled_func()
@@ -1220,20 +1223,12 @@ class LongRangeEnergyModel(EnergyModel):
     def forward_ragged(self, *args: Any, **kwargs: Any) -> Any:
         """Refuse the flat-node-axis path, which never reaches our forward.
 
-        ``ModelWrapper`` routes a batch to ``forward_ragged`` whenever the
-        dataset supplies ``n_node`` (``pt_expt/train/wrapper.py:255-257``), and
-        the inherited implementation goes straight to the base energy model --
-        so the long-range term is skipped and training silently optimizes a
-        pure short-range model.
-
-        Nothing triggers this today: ``pt_expt`` only turns ragged batching on
-        for datasets exposing ``use_ragged_batches``
-        (``pt_expt/train/training.py:2433-2443``), which is the LMDB dataset
-        alone, so npy and HDF5 runs always take the rectangular ``forward``.
-        But variable-size molecules are exactly what ragged batching is for,
-        and a wrong answer with no error is the worst outcome available. Fail
-        instead, and lift this once ``_long_range`` understands a flat node
-        axis with per-frame offsets.
+        ``ModelWrapper`` routes a batch here whenever the dataset supplies
+        ``n_node`` (``pt_expt/train/wrapper.py``), and the inherited
+        implementation skips the long-range term, so training would silently
+        optimize a short-range model. Only the LMDB dataset turns ragged
+        batching on (``use_ragged_batches``); npy and HDF5 take ``forward``.
+        Lift this once ``_long_range`` understands a flat node axis.
         """
         if self.has_long_range:
             raise NotImplementedError(
@@ -1274,8 +1269,6 @@ class LongRangeEnergyModel(EnergyModel):
         model = super().deserialize(data)
         if block is not None:
             model.charge_fitting = BaseFitting.deserialize(block["charge_net"])
-            # Accept the old key so checkpoints written before the rename
-            # still load.
             settings = block.get(RECIPROCAL_KEY, block.get(_LEGACY_RECIPROCAL_KEY))
             model.long_range_energy = build_long_range_energy(settings)
             model.trained_charge_filter = check_charge_filter(

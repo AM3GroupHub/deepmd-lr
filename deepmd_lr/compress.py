@@ -36,7 +36,7 @@ The seams this module owns
 --------------------------
 :func:`install` patches ``DescrptDPA4C.get_geo_compress`` to report the
 descriptor's own ``compress`` flag. That method is what upstream's eager
-``forward_common_graph`` (``pt_expt/model/make_model.py:945-957``) consults to
+``forward_common_graph`` (``pt_expt/model/make_model.py``) consults to
 decide whether to attach the CSR views -- and DPA4C never overrides it, so a
 compressed DPA4C reached through ``model(coord, atype, box)`` would ask for no
 CSR and silently take the slow branch. DPA1 and DPA2 do override it; this is
@@ -47,11 +47,10 @@ It also wraps ``DescrptDPA4C.enable_compression`` and ``apply_charge_state``
 so that the descriptor records the charge state its tables hold
 (:data:`FOLDED_ATTR`). Upstream folds ``default_chg_spin`` at compression and
 can re-fold later, and the kernel then ignores the runtime ``charge_spin``.
-Keeping the record on the model instead, written only by the plugin's own
-``enable_compression``, left every other route unchecked: a model compressed
-through upstream's method returned the default state's energy for a forward
-at ``[1, 2]``, 18 meV off on 1,536 water atoms, with no error. Recorded on
-the descriptor, the check holds whichever method folded the tables.
+Recorded on the descriptor, the check holds whichever method folded the
+tables; a record kept by the plugin's own ``enable_compression`` alone would
+miss upstream's route, which returned the default state's energy for a
+forward at ``[1, 2]`` (18 meV off on 1,536 water atoms) with no error.
 """
 
 from __future__ import annotations

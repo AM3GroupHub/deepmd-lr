@@ -90,11 +90,11 @@ finite trajectory random-walks and is not expected to stay near zero.
 ## Units
 
 `--tau` is the baths' relaxation time in fs and becomes `friction = 1 / (tau
-* units.fs)`, in inverse ASE time units as `Langevin` takes it ([example
-06](../06-md_nvalchemi/README.md#units-and-the-one-that-bites) explains the
-unit). Q is in eV and t in ps, so the fitted power is in eV/ps and, with A
-in Å², `J` in eV ps⁻¹ Å⁻²; `1 eV ps⁻¹ Å⁻² = 1.602 × 10¹³ W m⁻²`, which
-puts G in W m⁻² K⁻¹ (printed in MW m⁻² K⁻¹).
+* units.fs)`, in inverse ASE time units as `Langevin` takes it
+([units](../../docs/partitioned-md.md#the-md-classes)). Q is in eV and t in
+ps, so the fitted power is in eV/ps and, with A in Å², `J` in eV ps⁻¹ Å⁻²;
+`1 eV ps⁻¹ Å⁻² = 1.602 × 10¹³ W m⁻²`, which puts G in W m⁻² K⁻¹ (printed in
+MW m⁻² K⁻¹).
 
 ## The outputs
 
@@ -164,7 +164,9 @@ separation then grows with the thickness, not with the interface area:
 its square, and the charge-response forces at the interface and the free
 surfaces grow with them until the run fails. Check the three columns on two
 lengths of the same cell before a length series: a physical transfer keeps
-`Q_lower` fixed at fixed area.
+`Q_lower` fixed at fixed area. The cures are the `ener_lr` loss in training
+([neutral raw charges](../../docs/training.md#keeping-the-raw-charges-neutral-the-ener_lr-loss))
+and the [`charge_filter`](../../docs/md.md#switching-small-charges-off-charge_filter).
 
 ## Compression
 
@@ -181,14 +183,10 @@ charges to 1e-7 e. It needs deepmd-kit built with its CUDA operators
 card pays depends on the atom count and on compression; see
 [partitioned MD](../../docs/partitioned-md.md#limits).
 
-## What changed from the paper's script
+## Comparing with the paper's runs
 
-`experiments/nemd/nemd.py` is the driver the paper's runs used, on an older
-version of this package. This example keeps its physics (the symmetric
+The paper's runs used an earlier driver with the same physics (the symmetric
 O–VV–O splitting, the single-interface flux, the reset after the steady
-stage, no running COM correction) and drops what the package now does:
-the hand-frozen layers are `FixAtoms`, the logs, trajectory, checkpoint and
-resume are the MD classes', and the noise comes from a reseeded torch
-generator rather than a saved RNG state. Its `trailing` splitting option
-is gone, so a trajectory here is not step-for-step the old one at the
-same seed; the steady-state powers and profiles are what to compare.
+stage, no running COM correction) but a different noise stream, so a
+trajectory here is not step-for-step the paper's at the same seed; compare
+the steady-state powers and profiles.

@@ -9,6 +9,7 @@ import ase.io
 import numpy as np
 
 from deepmd_lr.ase import load_model
+from deepmd_lr.cell import pbc_flags
 from deepmd_lr.nvalchemi.evaluator import DistributedEvaluator
 
 __all__ = ["DEFAULT_VACUUM", "build_evaluator", "read_structure"]
@@ -36,8 +37,9 @@ def read_structure(path: Any, index: int = -1, vacuum: float = DEFAULT_VACUUM) -
     slab the file wrapped across the cell face is first made whole again by
     lattice vectors, so no atom starts near a face.
 
-    Two or three open axes -- a wire, a molecule, a cluster -- are refused:
-    those run through the ASE calculator.
+    No periodic axis is a molecule or a cluster: it comes back as read, and
+    needs no cell (the neighbour list boxes the atoms itself; the long-range
+    term is the isolated sum). A wire (one periodic axis) is refused.
 
     Atoms the file holds fixed (POSCAR's selective dynamics ``F F F``,
     extxyz's ``move_mask``) come back as ASE's ``FixAtoms``, which the MD
@@ -47,13 +49,14 @@ def read_structure(path: Any, index: int = -1, vacuum: float = DEFAULT_VACUUM) -
     if isinstance(atoms, list):
         atoms = atoms[-1]
     pbc = [bool(p) for p in atoms.pbc]
-    if sum(pbc) < 2:
+    if sum(pbc) == 1:
         raise ValueError(
-            f"{path} has pbc={pbc}: partitioned MD runs a bulk cell or a slab "
-            "(one open axis). A molecule or cluster runs through the ASE "
-            "calculator, deepmd_lr.ase.LongRangeCalculator(model, "
-            "long_range={'method': 'isolated'})."
+            f"{path} has pbc={pbc}: a wire (one periodic axis) is not supported; "
+            "the engine runs a bulk cell, a slab (one open axis) or a cluster "
+            "(no periodic axis)."
         )
+    if not any(pbc):
+        return atoms
     if all(pbc):
         volume = abs(float(np.linalg.det(np.asarray(atoms.get_cell()))))
         if volume < 1e-8:
@@ -119,8 +122,10 @@ def build_evaluator(model: Any, atoms: Any, devices: Any = None,
     ``long_range`` replaces the reciprocal-space settings the checkpoint was
     trained with, for this evaluator only: the term holds no parameters, so
     the choice belongs to the simulation. The structure's ``pbc`` already
-    picks the 3D or the slab sum, so this is rarely needed. A model passed in
-    is never changed, and may serve several evaluators.
+    picks the 3D, the slab or the isolated sum, so this is rarely needed; a
+    cluster also takes ``{"isolated_dtype": "float64"}`` for its all-pairs sum
+    (the charge head's precision by default). A model passed in is never
+    changed, and may serve several evaluators.
 
     ``compress=True`` (or a float table stride) rides ``kwargs`` into the
     evaluator and compresses the DPA4C backbone before the device replicas are
@@ -139,7 +144,7 @@ def build_evaluator(model: Any, atoms: Any, devices: Any = None,
     )
     if devices is None:
         devices = [str(next(loaded.parameters()).device)]
-    kwargs.setdefault("pbc", tuple(bool(p) for p in atoms.pbc))
+    kwargs.setdefault("pbc", pbc_flags(atoms.pbc))
     return DistributedEvaluator(
         loaded,
         atype,

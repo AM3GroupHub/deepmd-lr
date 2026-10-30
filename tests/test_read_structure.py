@@ -102,12 +102,15 @@ def test_a_slab_wrapped_across_the_face_is_made_whole(tmp_path):
                                atol=1e-6)
 
 
-def test_molecules_and_wires_are_refused(tmp_path):
-    for pbc in ([False, False, False], [True, False, False]):
-        atoms = layer()
-        atoms.pbc = pbc
-        with pytest.raises(ValueError, match="bulk cell or a slab"):
-            roundtrip(atoms, tmp_path)
+def test_a_cluster_comes_back_as_read_and_a_wire_is_refused(tmp_path):
+    atoms = layer()
+    atoms.pbc = False
+    out = roundtrip(atoms, tmp_path)
+    np.testing.assert_allclose(out.get_positions(), atoms.get_positions(), atol=1e-6)
+    np.testing.assert_allclose(out.cell.array, atoms.cell.array)
+    atoms.pbc = [True, False, False]
+    with pytest.raises(ValueError, match="wire"):
+        roundtrip(atoms, tmp_path)
 
 
 def test_fixed_atoms_come_along_and_move_with_the_slab(tmp_path):

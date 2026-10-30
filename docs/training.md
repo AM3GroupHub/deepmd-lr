@@ -133,12 +133,10 @@ out["charge"]               # per-atom, after the total-charge projection
 `energy_long_range` is `recip − self`, the reciprocal sum with the Ewald self
 term `(alpha/sqrt(pi)) * sum q_i^2` subtracted, so its complement is exactly
 the screened real-space sum `sum_{i<j} q_i q_j erfc(alpha r_ij) / r_ij` the
-network has to represent. Before 2026-09-07 the self piece was added back, as
-in DeePMD-kit's DPLR `ewald_reciprocal_energy`; that put an on-site quantity
-inside "long-range energy" (103.0 eV of a reported 208.8 eV on the LiFSI
-frame) and, being positive-definite in the charges, biased the optimiser
-toward small charges. **A checkpoint trained before that change is not
-comparable with one after it.**
+network has to represent. Unlike DeePMD-kit's DPLR `ewald_reciprocal_energy`,
+the self piece is not added back: it is an on-site quantity (103.0 eV of
+208.8 eV on the LiFSI frame) and, being positive-definite in the charges, it
+would bias the optimiser toward small charges.
 
 ## Validating a trained model
 

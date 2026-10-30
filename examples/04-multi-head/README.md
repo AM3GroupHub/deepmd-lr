@@ -15,7 +15,9 @@ seen liquid water, charged molecules and a metal/electrolyte interface is a
 better backbone than one that has seen any of them alone.
 
 Everything below was run. The important part is the section on gradients:
-this example does not work without it.
+this example does not work without it. The concepts are in
+[multi-head](../../docs/multi-head.md); this page covers the choices this
+`input.json` makes.
 
 ## Prerequisite
 
@@ -37,9 +39,9 @@ Four things change relative to a single-head file:
 | `training.training_data` | `training.data_dict`, keyed by branch |
 | — | `training.model_prob`, keyed by branch |
 
-Multi-task is triggered by the presence of `model_dict`. Note that `pt_expt`
-does **not** cascade top-level defaults into branches: whatever a branch
-needs, a branch must state.
+Multi-task is triggered by the presence of `model_dict`. The rules for the
+shared parts are in [multi-head](../../docs/multi-head.md#rules-that-will-bite-you);
+below is how this file meets them.
 
 ### Sharing is aliasing, not copying
 
@@ -58,16 +60,9 @@ A branch writes the **name** where a dict would go. Every branch that names
 descriptor parameters are literally the same objects across the three
 branches. One backbone, updated by whichever branch each step was drawn from.
 
-Only **`type_map`, `descriptor` and `fitting_net`** can be shared. `long_range`
-cannot, which is exactly what lets the boundary treatment differ per branch.
-The fitting nets here are deliberately *not* shared — three levels of theory
-need three heads.
-
-### One `type_map`
-
-Multi-task asserts a single `type_map`. Here it is the full periodic table,
-the same list every dataset was converted against, so no dataset is renumbered
-and a type index is the atomic number in every branch.
+The fitting nets here are deliberately *not* shared: three levels of theory
+need three heads. `type_map_all` is the full periodic table every dataset was
+converted against, so no dataset is renumbered.
 
 ### Same `alpha` in every branch
 
@@ -79,87 +74,26 @@ and a type index is the atomic number in every branch.
 "slab":      { "alpha": 0.4, "mesh_dimensions": [12,12,42], "slab_correction": true,  "pbc": [true,true,false] }
 ```
 
-The shared backbone learns the `erfc(αr)/r` remainder. **One backbone can
-only learn one remainder**, so branches that split Coulomb at different
-alphas would be asking it for two functions at once.
+The shared backbone learns the `erfc(αr)/r` remainder of one split, so the
+branches cannot split Coulomb at different alphas.
 
-### `add_chg_spin_ebd` must be true everywhere
+### The other shared settings
 
-It is part of DPA4C's **structural signature** — the set of options that fix
-the module's shape. Branches whose signatures disagree cannot be aliased, so
-turning it on for the molecules means turning it on for all three. Writing it
-once in `shared_dict` makes that automatic. `default_chg_spin: [0, 1]` then
-covers `bulk` and `slab`, whose data carries no `charge_spin.npy`, and is
-deliberately **not** part of the signature.
-
-### `rcut` is now a global constraint
-
-6.0 Å must stay below half of the *smallest* cell in *any* branch — bulk water
-at 12.429 Å gives 6.21 Å. Adding a branch with a smaller cell would force
-`rcut` down for everything, because there is only one descriptor.
-
-### `data_stat_nbatch` is a model key
-
-It sits in each branch of `model_dict`, not in `training`. Putting it in
-`training` fails normalization outright:
-
-```
-undefined key `data_stat_nbatch` is not allowed in strict mode
-```
-
-The default of 10 builds a dense neighbour matrix over 10 frames at once; at
-468 atoms that is tens of GiB, so the slab wants 1.
+- `add_chg_spin_ebd: true` sits once in `shared_dict`, so all three branches
+  carry it, as the molecules need; `default_chg_spin: [0, 1]` covers `bulk`
+  and `slab`, whose data has no `charge_spin.npy`.
+- `rcut = 6.0` stays below half the smallest cell, bulk water's 12.429 Å.
+- `data_stat_nbatch: 1` sits in each branch of `model_dict`; the default of
+  10 needs tens of GiB on the 468-atom slab.
 
 ## The part that actually matters: gradient imbalance
 
-**Without `gradient_max_norm`, this model does not train.** Measured at
-initialization, the gradient norm each branch puts on the shared backbone:
-
-| branch | descriptor `stddev` min | amplification | grad norm on shared backbone |
-|---|---:|---:|---:|
-| `bulk` | 3.6e-05 | ×28,000 | **5.0e+09** |
-| `molecules` | 7.8e-03 | ×128 | 1.9e+06 |
-| `slab` | 1.9e-03 | ×538 | 4.8e+05 |
-
-Four orders of magnitude. One bulk step moves the shared weights further than
-ten thousand slab steps, so the slab branch is simply overwritten.
-
-The cause is DPA4C's calibration. `compute_input_stats` measures the spread of
-each descriptor coordinate on that branch's own data and divides by it — a
-fixed preconditioner set once at initialization. Bulk liquid water is dense and
-isotropic, so **about 20 of its 144 coordinates have a spread below 1e-3**
-(19–21 depending on the frames sampled), the tightest at 3.6e-05. Dividing by that amplifies those directions ×28,000, and
-gradients come back out through the same factor.
-
-Standalone this is harmless: example 01's head is matched to its own
-preconditioner (it is ×48,000 there even with its own 2-element `type_map`, so
-the union is not the cause). **Shared, it is not harmless** — each branch keeps
-its own calibration, but they all write into one set of weights.
-
-Measured at 600 steps, one seed (branch draws are random, so
-expect the slab column to move by ~50% run to run — not by the factor of 15
-that clipping buys):
-
-| `gradient_max_norm` | bulk `rmse_f` | molecules | slab |
-|---|---:|---:|---:|
-| *(unset)* | 0.403 | 1.43 | **15.0** |
-| 5.0 | 0.221 | 1.24 | **1.00** |
-| 1.0 | 0.216 | 1.06 | 1.43 |
-
-Unclipped, the slab sits 150× above its own labels' force scale (rms 0.10
-eV/Å) and stays there — it is not a transient. Clipping fixes the slab and
-improves the other two as well. This example uses **5.0**.
-
-Two ways to see the same problem if you hit it with other data:
-
-- A branch whose error is stuck orders of magnitude above the others, while
-  that branch trains fine on its own.
-- Branch order mattering. With `bulk` first the slab's *first* reported
-  `rmse_f` is 23–530 across three seeds; with `slab` first it is 1.8–4.5 —
-  even though the two models are identical at initialization (verified: the
-  same initial |F|max of 27 eV/Å either way). Order dependence before
-  training has meaningfully begun is the signature of one branch overpowering
-  the rest.
+**Without `gradient_max_norm`, this model does not train.** At
+initialization the bulk branch puts a gradient norm of 5e+09 on the shared
+backbone against the slab's 5e+05, and unclipped the slab's `rmse_f` stays at
+15 eV/Å, 150× its labels' force scale. This example uses **5.0**. The cause,
+the measurements and how to recognise it with other data are in
+[set `gradient_max_norm`](../../docs/multi-head.md#set-gradient_max_norm).
 
 ## `model_prob` is not a data-size weight
 
@@ -182,18 +116,15 @@ Measured: **0.07 s/batch** across the three branches.
 
 ## Using one head afterwards
 
-A multi-head checkpoint holds three models. Selecting one is mandatory —
-there is no default:
+A multi-head checkpoint holds three models, and selecting one is mandatory:
 
 ```python
 from deepmd_lr.ase import load_model
 model = load_model("model.ckpt.pt", head="slab")
 ```
 
-Asking for none raises `Select a checkpoint head from ['bulk', 'molecules',
-'slab']`. Each head carries its own energy zero and its own level of theory,
-so **do not mix heads within one simulation** — the energies are not
-comparable.
+Do not mix heads within one simulation: each has its own energy zero and level
+of theory ([multi-head](../../docs/multi-head.md#running-and-reading-it)).
 
 ## Caveats
 

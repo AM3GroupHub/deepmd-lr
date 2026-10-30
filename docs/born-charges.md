@@ -126,8 +126,7 @@ is summed along the destination and source CSR rows by a Warp kernel
 accumulation, no `(E, 3, 3)` temporary, no atomics, deterministic. The
 array-API `edge_born_response` remains the path for the uncompressed model and
 the oracle the kernel is tested against. GB10, 169k water atoms, compressed,
-one device: the long-range evaluation costs 104 ms, with Born tensors 120 ms
-(138 ms before the kernel).
+one device: the long-range evaluation costs 104 ms, with Born tensors 120 ms.
 
 **Caveats.** It needs the shared-backbone path: under `DP_CUDA_INFER >= 2` the
 model raises rather than return a wrong tensor, so unset that variable for

@@ -77,11 +77,9 @@ data/C1H1O4S2/train/
 ```
 
 **Four systems, one `type_map`.** Every system is written against the full
-periodic table, the same list the model's `input.json` carries, so a type index
-is the atomic number in every directory and systems with different element
-subsets share one model without renumbering anything. (`--type-map present`
-writes a short per-system list instead; DeePMD-kit then remaps each system's
-local indices at load time.)
+periodic table, the same list the model's `input.json` carries, so systems
+with different element subsets share one model without renumbering
+([dataset layout](../../docs/dataset-layout.md)).
 
 **`nopbc`** is an empty file whose *presence* is the mechanism: the loader sees
 it and hands the model `box = None`.
@@ -117,14 +115,10 @@ The first is what makes the model **read `charge_spin.npy` at all**; without it
 the file is ignored silently and every molecule is treated as neutral. The
 second supplies a fallback so systems *without* one still run.
 
-Two consequences worth knowing before a long run:
-
-- `add_chg_spin_ebd` is part of DPA4C's **structural signature**. In a
-  multi-head model it must be `true` for *every* branch or the shared
-  descriptor refuses to link — and turning it on later invalidates existing
-  checkpoints.
-- `default_chg_spin` is deliberately **not** in that signature, which is what
-  lets neutral branches coexist with charged ones.
+`add_chg_spin_ebd` is part of DPA4C's structural signature: turning it on
+later invalidates existing checkpoints, and in a multi-head model it must be
+on for every branch, while `default_chg_spin` lets neutral branches coexist
+([multi-head rules](../../docs/multi-head.md#rules-that-will-bite-you)).
 
 ### The charges sum to the frame's total, not to zero
 
@@ -138,24 +132,17 @@ depending on which system the batch came from.
 "reciprocal": { "method": "isolated", "alpha": 0.4 }
 ```
 
-Ewald splits Coulomb at `alpha` into a screened part the network learns and a
-smooth part this term supplies. Under periodicity the smooth part is the
-reciprocal sum; with no cell it is summed directly:
+With no cell the long-range term is the direct sum
+`1/2 sum_{j != i} q_i q_j erf(alpha r_ij) / r_ij` over every pair, the same
+quantity the periodic sum computes ([non-periodic](../../docs/non-periodic.md)).
+A `nopbc` frame takes it whatever the method, so a model that also trains on
+cells keeps `method: "pme"`. This one never sees a periodic frame, and
+`"isolated"` says so: it refuses periodic frames and every periodic setting
+(meshes, spline orders, `slab_correction`, `pbc`).
 
-```
-E = 1/2 sum_{j != i} q_i q_j erf(alpha r_ij) / r_ij
-```
-
-Not an analogue of the periodic term — the **same quantity**. Put a cluster in
-a box and grow it, and the periodic `recip − self` converges onto this sum as
-1/L³. So **`alpha` must match your periodic systems** (0.4, as in `01-bulk`
-and `03-slab`): one descriptor cannot serve two different splits.
-
-Nothing else from the periodic block applies. Meshes, spline orders,
-`slab_correction` and `pbc` all describe a sum over periodic images, and
-passing one is an **error**, not a silent no-op. There is no cutoff either —
-`erf(αr)/r` decays as `1/r`, so truncating it would be wrong. Every pair is
-summed: O(N²), and 8 MiB at 1000 atoms.
+**`alpha` must match your periodic systems** (0.4, as in `01-bulk` and
+`03-slab`, which share this descriptor in [example 04](../04-multi-head)): one
+descriptor cannot serve two different splits.
 
 ### `start_pref_v: 0`
 

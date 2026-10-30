@@ -1738,6 +1738,59 @@ class TestDipoleCurrent:
         assert not np.allclose(md.dipole_current(), np.einsum("iba,ib->a", z, v))
 
 
+CLUSTER = (False, False, False)
+
+
+def make_cluster(model, seed=0):
+    """The fixture's molecules as a cluster: no periodic axis, a zero cell."""
+    atoms = make_atoms(model, seed=seed)
+    atoms.positions -= atoms.positions.mean(axis=0)
+    atoms.set_cell(np.zeros((3, 3)))
+    atoms.pbc = False
+    return atoms
+
+
+class TestClusters:
+    def test_velocity_verlet_matches_ase_on_the_calculator(self, model):
+        """An independent reference: ASE's VelocityVerlet on the calculator,
+        which sums the cluster with the dense kernel."""
+        atoms = make_cluster(model)
+        ref = atoms.copy()
+        ref.calc = LongRangeCalculator(model)
+        AseVelocityVerlet(ref, timestep=DT).run(10)
+        VelocityVerlet(make_ev(model, atoms, pbc=CLUSTER), atoms, DT).run(10)
+        np.testing.assert_allclose(atoms.positions, ref.positions, atol=1e-9)
+        np.testing.assert_allclose(
+            atoms.get_velocities(), ref.get_velocities(), atol=1e-9
+        )
+
+    def test_nvt_runs_and_a_checkpoint_continues_it(self, model, tmp_path):
+        atoms = make_cluster(model)
+        md = Langevin(make_ev(model, atoms, pbc=CLUSTER), atoms.copy(), DT, T0,
+                      FRICTION, seed=1)
+        md.run(5)
+        path = md.save_checkpoint(tmp_path / "cluster.npz")
+        md.run(5)
+        again = Langevin.from_checkpoint(
+            make_ev(model, atoms, pbc=CLUSTER), atoms.copy(), path
+        )
+        again.run(5)
+        assert np.isfinite(md.thermo.energy)
+        np.testing.assert_allclose(
+            again.thermo.positions.numpy(), md.thermo.positions.numpy(), atol=1e-10
+        )
+
+    def test_barostats_and_a_cell_relaxation_are_refused(self, model):
+        atoms = make_cluster(model)
+        ev = make_ev(model, atoms, pbc=CLUSTER)
+        with pytest.raises(ValueError, match="cluster"):
+            MTKNPT(ev, atoms, DT, T0, PRESSURE, TDAMP, PDAMP, cell="isotropic")
+        with pytest.raises(ValueError, match="relax the positions only"):
+            FIRE2(ev, atoms, relax_cell="isotropic", logfile=None)
+        FIRE2(ev, atoms, logfile=None, check=False).run(fmax=1.0, steps=5)
+        assert atoms.pbc.tolist() == [False] * 3
+
+
 SLAB = (True, True, False)
 
 
