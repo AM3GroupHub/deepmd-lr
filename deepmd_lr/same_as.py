@@ -3,15 +3,12 @@
 
 The problem
 -----------
-A dataset that mixes bulk and slab systems cannot be trained as one model
-today, because the long-range term is welded in: ``slab_correction`` and
-``pbc`` are fixed at construction, so a model that handles a slab cannot
-handle a bulk frame.
-
-It does not have to be. **The long-range term holds no trainable weights** --
-neither :class:`~deepmd_lr.lr.term.LongRangeEnergy` nor
+A branch's long-range settings (``slab_correction``, ``pbc``) are fixed at
+construction, so one branch cannot train on both bulk and slab frames. But
+**the long-range term holds no trainable weights** -- neither
+:class:`~deepmd_lr.lr.term.LongRangeEnergy` nor
 :class:`~deepmd_lr.lr.term.IsolatedLongRangeEnergy` contributes a single
-``state_dict`` entry. One set of weights genuinely serves every boundary
+``state_dict`` entry -- so one set of weights serves every boundary
 condition; only the sum over periodic images differs.
 
 So a branch can declare itself a copy of another, writing only what differs::
@@ -42,16 +39,14 @@ the group's frames, and that the post-training delta is applied once.
 
 Why not per-frame dispatch
 --------------------------
-The alternative was deciding the boundary treatment per frame. The physics
-side of that is nearly free -- ``pbc`` reaches exactly one call in
-``lr/term.py`` (``compute_slab_correction``), the reciprocal kernels never see
-it, and that kernel already takes per-system ``(B, 3)`` ``pbc`` and returns
-exactly zero for a non-slab frame with no host sync. What blocks it is the
-data layer: DeePMD-kit has no per-frame boundary channel (``nopbc`` is a
-per-*system* file read once at load), and registering one means patching the
-batch splitter itself. This keeps the plugin out of the data path.
+The physics would allow choosing the boundary treatment per frame: ``pbc``
+reaches only ``compute_slab_correction``, which already takes per-system
+``pbc``. The data layer does not: DeePMD-kit has no per-frame boundary
+channel (``nopbc`` is a per-*system* file read once at load), and adding one
+means patching the batch splitter. Branches keep the plugin out of the data
+path.
 
-One caveat worth stating: the Yeh-Berkowitz correction is ``2 pi M_z^2 / V``,
+One caveat: the Yeh-Berkowitz correction is ``2 pi M_z^2 / V``,
 which is identically zero for a **non-polar** slab. If your slabs carry no
 dipole across the vacuum, one ordinary 3D branch already serves both and none
 of this is needed. It earns its keep for polar slabs -- a dipolar interface,
@@ -286,6 +281,34 @@ def _validated_base(
     build a *different* model whose weights the aliasing then throws away --
     training would run, converge, and be quietly meaningless.
     """
+    base = _resolved_base(model_dict, key, base_key)
+    _check_link_keys(key, base_key, branch)
+    own_long_range = branch.get("long_range") or {}
+    base_alpha, branch_alpha = _alpha(base["long_range"]), _alpha(own_long_range)
+    if own_long_range and base_alpha != branch_alpha:
+        raise ValueError(
+            f"branch {key!r}: alpha is {branch_alpha} but {base_key!r} uses "
+            f"{base_alpha}. alpha is where Coulomb is split, and the one "
+            "shared descriptor can only learn the `erfc(alpha r)/r` remainder "
+            "of a single split."
+        )
+    if (base.get("fitting_net") or {}).get("dim_case_embd", 0):
+        raise ValueError(
+            f"branch {key!r}: `{SAME_AS_KEY}` is incompatible with "
+            "`fitting_net.dim_case_embd > 0`. A case embedding gives each "
+            "branch a different index in one `case_embd` buffer, which the "
+            "shared fitting net collapses to a single value -- the branches "
+            "would silently share an index. Drop the case embedding: these "
+            "branches are one model, which is what a case embedding exists to "
+            "deny."
+        )
+    return base
+
+
+def _resolved_base(
+    model_dict: dict[str, Any], key: str, base_key: str
+) -> dict[str, Any]:
+    """The base config ``key`` points at, refused unless it can be one."""
     if base_key == key:
         raise ValueError(f"branch {key!r}: `{SAME_AS_KEY}` cannot point at itself")
     if base_key not in model_dict:
@@ -313,7 +336,11 @@ def _validated_base(
             f"branch {key!r}: {base_key!r} has no `long_range` block, so there "
             "is nothing for this branch to differ in."
         )
+    return base
 
+
+def _check_link_keys(key: str, base_key: str, branch: dict[str, Any]) -> None:
+    """Refuse every key a link may not write, at the top and in ``long_range``."""
     extra = _real_keys(branch) - _BRANCH_ALLOWED
     if CHARGE_SAME_AS_KEY in extra:
         raise ValueError(
@@ -329,9 +356,7 @@ def _validated_base(
             f"Set them on {base_key!r}, or drop `{SAME_AS_KEY}` and write the "
             "branch out in full."
         )
-
-    own_long_range = branch.get("long_range") or {}
-    extra = _real_keys(own_long_range) - _LONG_RANGE_ALLOWED
+    extra = _real_keys(branch.get("long_range") or {}) - _LONG_RANGE_ALLOWED
     if extra:
         detail = (
             " `charge_net` holds trainable weights and must be the same module "
@@ -344,27 +369,6 @@ def _validated_base(
             f"under `long_range` in a `{SAME_AS_KEY}` branch, got "
             f"{sorted(extra)}.{detail}"
         )
-
-    base_alpha, branch_alpha = _alpha(base["long_range"]), _alpha(own_long_range)
-    if own_long_range and base_alpha != branch_alpha:
-        raise ValueError(
-            f"branch {key!r}: alpha is {branch_alpha} but {base_key!r} uses "
-            f"{base_alpha}. alpha is where Coulomb is split, and the one "
-            "shared descriptor can only learn the `erfc(alpha r)/r` remainder "
-            "of a single split."
-        )
-
-    if (base.get("fitting_net") or {}).get("dim_case_embd", 0):
-        raise ValueError(
-            f"branch {key!r}: `{SAME_AS_KEY}` is incompatible with "
-            "`fitting_net.dim_case_embd > 0`. A case embedding gives each "
-            "branch a different index in one `case_embd` buffer, which the "
-            "shared fitting net collapses to a single value -- the branches "
-            "would silently share an index. Drop the case embedding: these "
-            "branches are one model, which is what a case embedding exists to "
-            "deny."
-        )
-    return base
 
 
 # --------------------------------------------------------------------------
@@ -479,41 +483,59 @@ def install() -> None:
 
     if getattr(_multi_task.preprocess_shared_params, "_deepmd_lr_patched", False):
         return
+    _wrap_preprocess(_multi_task)
+    _wrap_share_params(_wrapper.ModelWrapper)
+    _wrap_stat_input(_training)
+    _wrap_trainer_init(_training.Trainer)
 
-    _orig_preprocess = _multi_task.preprocess_shared_params
+
+def _wrap_preprocess(module: Any) -> None:
+    """Expand ``same_as`` right after upstream resolves ``shared_dict``."""
+    original = module.preprocess_shared_params
 
     def preprocess_shared_params(model_config: dict[str, Any]) -> tuple:
-        model_config, shared_links = _orig_preprocess(model_config)
+        model_config, shared_links = original(model_config)
         expand_same_as(model_config)
         return model_config, shared_links
 
     preprocess_shared_params._deepmd_lr_patched = True
-    preprocess_shared_params.__doc__ = _orig_preprocess.__doc__
-    _multi_task.preprocess_shared_params = preprocess_shared_params
+    preprocess_shared_params.__doc__ = original.__doc__
+    module.preprocess_shared_params = preprocess_shared_params
 
-    _orig_share = _wrapper.ModelWrapper.share_params
+
+def _wrap_share_params(wrapper_cls: Any) -> None:
+    """Alias the groups after upstream's own parameter sharing."""
+    original = wrapper_cls.share_params
 
     def share_params(self: Any, *args: Any, **kwargs: Any) -> None:
-        _orig_share(self, *args, **kwargs)
+        original(self, *args, **kwargs)
         _alias_groups(self)
 
-    share_params.__doc__ = _orig_share.__doc__
-    _wrapper.ModelWrapper.share_params = share_params
+    share_params.__doc__ = original.__doc__
+    wrapper_cls.share_params = share_params
 
-    # `make_stat_input` is imported into training.py's namespace and called
-    # through the module global, so this is the name that takes effect. The
-    # sampler closures are built and consumed inside `Trainer.__init__` with
-    # no seam between them, which is why the pooling has to happen here rather
-    # than at a call site.
-    _orig_stat_input = _training.make_stat_input
+
+def _wrap_stat_input(training: Any) -> None:
+    """Pool a group's samples for the statistics.
+
+    ``make_stat_input`` is imported into training.py's namespace and called
+    through the module global, so this is the name that takes effect. The
+    sampler closures are built and consumed inside ``Trainer.__init__`` with
+    no seam between them, which is why the pooling has to happen here rather
+    than at a call site.
+    """
+    original = training.make_stat_input
 
     def make_stat_input(data: Any, nbatches: int, **kwargs: Any) -> list:
-        return pool(data, nbatches, _orig_stat_input, **kwargs)
+        return pool(data, nbatches, original, **kwargs)
 
-    make_stat_input.__doc__ = _orig_stat_input.__doc__
-    _training.make_stat_input = make_stat_input
+    make_stat_input.__doc__ = original.__doc__
+    training.make_stat_input = make_stat_input
 
-    _orig_init = _training.Trainer.__init__
+
+def _wrap_trainer_init(trainer_cls: Any) -> None:
+    """Fill :data:`_POOLED` from the training data before the trainer runs."""
+    original = trainer_cls.__init__
 
     def __init__(
         self: Any, config: Any, training_data: Any, *args: Any, **kwargs: Any
@@ -529,7 +551,7 @@ def install() -> None:
                 ]
                 for system in systems:
                     _POOLED[id(system)] = systems
-        _orig_init(self, config, training_data, *args, **kwargs)
+        original(self, config, training_data, *args, **kwargs)
 
-    __init__.__doc__ = _orig_init.__doc__
-    _training.Trainer.__init__ = __init__
+    __init__.__doc__ = original.__doc__
+    trainer_cls.__init__ = __init__
