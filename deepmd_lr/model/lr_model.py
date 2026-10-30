@@ -1123,25 +1123,24 @@ class LongRangeEnergyModel(EnergyModel):
         radial table spans ``[0, rcut]`` analytically, so the extrapolation,
         second stride and overflow check are all discarded upstream.
 
-        What it commits you to, and why each is refused rather than warned:
+        What it commits you to (each refused rather than warned):
 
         * The compiled kernel must be loaded (see :mod:`deepmd_lr.compress`).
         * An evaluation snapshot: a compressed DPA4C cannot re-enter training.
         * ``DP_CUDA_INFER`` becomes ``1`` if unset -- the one process-global
-          side effect here, because DeePMD-kit re-reads the variable on every
-          call and offers no API for it; a second switch to remember would be
-          redundant with asking for compression. Level 2 is refused for every
-          model: its fused energy/force kernel bypasses
-          ``descriptor.call_graph``, and with it the shared backbone, the
-          charge response and the Born charges.
+          side effect, because DeePMD-kit re-reads the variable on every call
+          and offers no API for it. Level 2 is refused for a long-range model:
+          its fused energy/force kernel bypasses ``descriptor.call_graph``,
+          and with it the shared backbone, the charge response and the Born
+          charges.
         * The frame condition is **folded into the tables**. With
           ``add_chg_spin_ebd`` the kernel reads the charge state baked in at
           this call, not the one passed at forward time; pass the run's
           ``charge_spin`` here, and a forward with a different one is refused.
 
-        Nothing is persisted. The tables are a deterministic function of the
-        weights, the stride and the charge state, and build in well under a
-        second, so they are rebuilt at load rather than saved.
+        Nothing is persisted: the tables are a deterministic function of the
+        weights, the stride and the charge state, and rebuild at load in well
+        under a second.
         """
         level = self._check_compression_request(table_stride_1)
         state = self._charge_state_to_fold(charge_spin)
