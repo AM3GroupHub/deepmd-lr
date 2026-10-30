@@ -18,15 +18,13 @@ This module only chooses between them by size. Measured on one GB10, median of
 
 With a cell, ``nv`` wins at every size, so there is nothing to decide. Without
 one the dense path skips ghost materialisation and stays cheaper until about
-a thousand atoms. (The MD engine no longer comes through here: its node sets
-are searched by ``deepmd_lr.nvalchemi.nlist.GpuNeighborList`` on the device.)
+a thousand atoms. The MD engine does not come through here: its node sets are
+searched by ``deepmd_lr.nvalchemi.nlist.GpuNeighborList`` on the device.
 
-An earlier version of this module drove nvalchemiops directly instead of going
-through DeePMD-kit's backend. That was redundant and slower: the in-tree
-builder batches natively over frames, handles ``pair_excl``, and decodes the
-dense neighbour matrix rather than asking for ``return_neighbor_list=True``,
-which nvalchemiops' own docstring warns carries a penalty. Both produce
-identical edge sets and identical ``edge_vec`` gradients.
+DeePMD-kit's ``nv`` builder is used rather than nvalchemiops directly because
+it batches over frames, handles ``pair_excl``, and decodes the dense neighbour
+matrix rather than asking for ``return_neighbor_list=True``, which
+nvalchemiops' own docstring warns carries a penalty.
 """
 
 import torch

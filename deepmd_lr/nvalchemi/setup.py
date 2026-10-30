@@ -9,6 +9,7 @@ import ase.io
 import numpy as np
 
 from deepmd_lr.ase import load_model
+from deepmd_lr.cell import pbc_flags
 from deepmd_lr.nvalchemi.evaluator import DistributedEvaluator
 
 __all__ = ["DEFAULT_VACUUM", "build_evaluator", "read_structure"]
@@ -143,7 +144,7 @@ def build_evaluator(model: Any, atoms: Any, devices: Any = None,
     )
     if devices is None:
         devices = [str(next(loaded.parameters()).device)]
-    kwargs.setdefault("pbc", tuple(bool(p) for p in atoms.pbc))
+    kwargs.setdefault("pbc", pbc_flags(atoms.pbc))
     return DistributedEvaluator(
         loaded,
         atype,

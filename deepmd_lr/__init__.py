@@ -7,14 +7,14 @@ Registration itself lives in :mod:`deepmd_lr.register`, which DeePMD-kit's
 Importing ``deepmd.pt_expt`` here looks redundant -- the entry point would
 fire on its own the moment any submodule touched the backend -- but the
 order matters. Without it, ``import deepmd_lr.nvalchemi`` as the first
-DeePMD-kit import went:
+DeePMD-kit import goes:
 
     deepmd_lr.nvalchemi -> driver -> fitting.charge
       -> deepmd.pt_expt (mid-module)
         -> load_entry_point -> deepmd_lr.register -> argcheck
           -> fitting.charge   <- still executing, CHARGE_VAR_NAME unbound
 
-and failed with ``ImportError: cannot import name 'CHARGE_VAR_NAME' from
+and fails with ``ImportError: cannot import name 'CHARGE_VAR_NAME' from
 partially initialized module``. The names argcheck needs are used in
 module-level decorators, so they cannot be deferred into functions.
 
