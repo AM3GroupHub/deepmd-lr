@@ -94,6 +94,21 @@ def _kernel_terms(
     return torch.where(active, k, zero), torch.where(active, kp, zero)
 
 
+def _block_pairs(
+    pos_i: torch.Tensor,
+    idx_i: torch.Tensor,
+    batch_i: torch.Tensor,
+    positions: torch.Tensor,
+    batch: torch.Tensor,
+    index: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``r_i - r_j`` ``(chunk, N, 3)`` for the rows of a block, and which
+    pairs count: distinct atoms of the same graph."""
+    delta = pos_i[:, None, :] - positions[None, :, :]
+    active = (idx_i[:, None] != index[None, :]) & (batch_i[:, None] == batch[None, :])
+    return delta, active
+
+
 def _energy_block(
     pos_i: torch.Tensor,
     idx_i: torch.Tensor,
@@ -105,8 +120,7 @@ def _energy_block(
     alpha: float,
 ) -> torch.Tensor:
     """``sum_j q_j k(r_ij)`` for the rows ``i`` of the block, shape ``(chunk,)``."""
-    delta = pos_i[:, None, :] - positions[None, :, :]
-    active = (idx_i[:, None] != index[None, :]) & (batch_i[:, None] == batch[None, :])
+    delta, active = _block_pairs(pos_i, idx_i, batch_i, positions, batch, index)
     k, _ = _kernel_terms(delta, active, alpha)
     return k @ charges
 
@@ -125,8 +139,7 @@ def _grad_block(
     alpha: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``dL/dq`` ``(chunk,)`` and ``dL/dr`` ``(chunk, 3)`` for the rows of the block."""
-    delta = pos_i[:, None, :] - positions[None, :, :]
-    active = (idx_i[:, None] != index[None, :]) & (batch_i[:, None] == batch[None, :])
+    delta, active = _block_pairs(pos_i, idx_i, batch_i, positions, batch, index)
     k, kp = _kernel_terms(delta, active, alpha)
     w = 0.5 * (g_i[:, None] + g[None, :]) * charges[None, :]
     dq = (w * k).sum(1)
