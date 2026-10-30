@@ -141,7 +141,8 @@ cells keeps `method: "pme"`. This one never sees a periodic frame, and
 (meshes, spline orders, `slab_correction`, `pbc`).
 
 **`alpha` must match your periodic systems** (0.4, as in `01-bulk` and
-`03-slab`): one descriptor cannot serve two different splits.
+`03-slab`, which share this descriptor in [example 04](../04-multi-head)): one
+descriptor cannot serve two different splits.
 
 ### `start_pref_v: 0`
 

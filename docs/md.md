@@ -52,7 +52,8 @@ A charge head can leave a small charge on every atom of a bulk material
 and y every layer is an infinite charged sheet and the fields add instead of
 cancelling, so the separated charge and the potential drop grow with the
 thickness: 80–280 V across a 32 nm C/Si cell, and the charge-response forces
-broke MD within a picosecond.
+broke MD within a picosecond. The [`ener_lr` loss](training.md#keeping-the-raw-charges-neutral-the-ener_lr-loss)
+attacks the cause in training; the filter removes what is left.
 
 The filter weights projected charges by a C³ polynomial: zero for
 `|q| <= c_t - delta`, one for `|q| >= c_t + delta`. It then restores the

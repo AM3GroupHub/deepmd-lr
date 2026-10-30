@@ -138,7 +138,7 @@ inference and fixes the run's `charge_spin` in the tables. See
 | [md.md](docs/md.md) | ASE workflow, energy conservation, charge filtering and initial relaxation |
 | [compression.md](docs/compression.md) | compressed backbone: requirements, what changes, building the CUDA operators |
 | [born-charges.md](docs/born-charges.md) | Born effective charges, MD in an external field, calibrating against DFPT |
-| [partitioned-md.md](docs/partitioned-md.md) | GPU MD, cell updates, skin and halos, custom integrators and scaling |
+| [partitioned-md.md](docs/partitioned-md.md) | GPU MD and its units, cell updates, skin and halos, custom integrators and scaling |
 | [neighbour-lists.md](docs/neighbour-lists.md) | which neighbour list runs: the serial model's, and the MD engine's GPU-direct one |
 | [tests.md](docs/tests.md) | running the tests and coverage by module |
 
