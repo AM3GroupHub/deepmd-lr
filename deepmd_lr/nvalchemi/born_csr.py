@@ -19,6 +19,15 @@ from deepmd_lr.nvalchemi.nlist import _torch_stream_scope
 __all__ = ["edge_born_response_csr"]
 
 
+@wp.func
+def _outer64(r: wp.vec3f, g: wp.vec3f):
+    """``r (x) g`` in float64."""
+    return wp.outer(
+        wp.vec3d(wp.float64(r[0]), wp.float64(r[1]), wp.float64(r[2])),
+        wp.vec3d(wp.float64(g[0]), wp.float64(g[1]), wp.float64(g[2])),
+    )
+
+
 @wp.kernel(enable_backward=False)
 def _born_rows(
     g: wp.array(dtype=wp.vec3f),
@@ -33,21 +42,16 @@ def _born_rows(
     i = wp.tid()
     acc = wp.mat33d()
     for e in range(int(dst_row_ptr[i]), int(dst_row_ptr[i + 1])):
-        r = vec[e]
-        gg = g[e]
-        acc = acc + wp.outer(
-            wp.vec3d(wp.float64(r[0]), wp.float64(r[1]), wp.float64(r[2])),
-            wp.vec3d(wp.float64(gg[0]), wp.float64(gg[1]), wp.float64(gg[2])),
-        )
+        acc = acc + _outer64(vec[e], g[e])
     for k in range(int(src_row_ptr[i]), int(src_row_ptr[i + 1])):
         e = int(source_order[k])
-        r = vec[e]
-        gg = g[e]
-        acc = acc - wp.outer(
-            wp.vec3d(wp.float64(r[0]), wp.float64(r[1]), wp.float64(r[2])),
-            wp.vec3d(wp.float64(gg[0]), wp.float64(gg[1]), wp.float64(gg[2])),
-        )
+        acc = acc - _outer64(vec[e], g[e])
     out[i] = acc * wp.float64(0.5)
+
+
+def _ctype(t: torch.Tensor, dtype):
+    """A launch argument viewing ``t``, which must stay alive until the launch."""
+    return wp.from_torch(t, dtype=dtype, requires_grad=False, return_ctype=True)
 
 
 def edge_born_response_csr(
@@ -71,38 +75,22 @@ def edge_born_response_csr(
         raise TypeError("edge_born_response_csr takes float32 g and vec")
     if g.device.type != "cuda":
         raise ValueError("edge_born_response_csr needs a CUDA device")
-    g = g.detach().contiguous()
-    vec = vec.detach().contiguous()
+    # Bound to names, so no contiguous copy is freed before the launch.
+    g, vec, dst_ptr, order, src_ptr = (
+        t.detach().contiguous()
+        for t in (g, vec, destination_row_ptr, source_order, source_row_ptr)
+    )
     out = torch.zeros((n_node, 3, 3), dtype=torch.float64, device=g.device)
     with _torch_stream_scope(g.device):
         wp.launch(
             _born_rows,
             dim=n_node,
             inputs=[
-                wp.from_torch(
-                    g, dtype=wp.vec3f, requires_grad=False, return_ctype=True
-                ),
-                wp.from_torch(
-                    vec, dtype=wp.vec3f, requires_grad=False, return_ctype=True
-                ),
-                wp.from_torch(
-                    destination_row_ptr.contiguous(),
-                    dtype=wp.int64,
-                    requires_grad=False,
-                    return_ctype=True,
-                ),
-                wp.from_torch(
-                    source_order.contiguous(),
-                    dtype=wp.int64,
-                    requires_grad=False,
-                    return_ctype=True,
-                ),
-                wp.from_torch(
-                    source_row_ptr.contiguous(),
-                    dtype=wp.int64,
-                    requires_grad=False,
-                    return_ctype=True,
-                ),
+                _ctype(g, wp.vec3f),
+                _ctype(vec, wp.vec3f),
+                _ctype(dst_ptr, wp.int64),
+                _ctype(order, wp.int64),
+                _ctype(src_ptr, wp.int64),
                 wp.from_torch(out, dtype=wp.mat33d, requires_grad=False),
             ],
             device=str(g.device),
