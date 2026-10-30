@@ -1,12 +1,6 @@
 # SPDX-License-Identifier: MIT
-r"""The long-range (reciprocal-space) electrostatic energy.
+r"""The long-range electrostatic energy: the smooth half of the Ewald split.
 
-Evaluated either by particle-mesh Ewald or by an explicit k-vector sum --
-see *Two ways to evaluate the same sum* below. The module is named for what
-it computes rather than for one of the two ways of computing it.
-
-What this computes, and what it deliberately does not
------------------------------------------------------
 Ewald splits the Coulomb energy into a screened real-space part, a smooth
 reciprocal-space part, and a self term:
 
@@ -19,74 +13,47 @@ reciprocal-space part, and a self term:
         }_{\text{long-ranged}}
       - \frac{\alpha}{\sqrt{\pi}}\sum_i q_i^2
 
-This module supplies **only the reciprocal sum**. The real-space part decays
-like ``erfc(alpha r)/r`` and is already inside the descriptor's cutoff, so the
-short-range model represents it directly -- adding it here would ask the
-network to learn to subtract something it can already describe.
-
-For a system with no cell there is no reciprocal space, but there is still the
-same split: see :class:`IsolatedLongRangeEnergy`, which sums the smooth half
-directly. It is not an approximation of this class but its infinite-volume
-limit, which is what lets one descriptor serve periodic and isolated data at
-once. Choose between them with :func:`build_long_range_energy`.
+This module supplies **only the reciprocal sum, minus the self term**. The
+real-space part decays like ``erfc(alpha r)/r`` inside the descriptor cutoff,
+so the short-range model represents it directly; and without it there is no
+neighbour list, no cutoff and no ``rcut < L/2`` constraint.
 
 **The self term stays subtracted.** The bare k-space sum counts each Gaussian
-interacting with itself -- an artifact of replacing point charges with clouds,
-not a physical interaction -- so the Ewald decomposition removes it. Both
-backends already return ``recip - self``, and that is what this module
-returns: the physically meaningful long-range contribution, leaving the
-network the clean screened real-space sum and nothing else.
+interacting with itself, an artifact of the smearing rather than a physical
+interaction. Both backends return ``recip - self``, and so does this module.
+DeePMD-kit's DPLR ``ewald_reciprocal_energy`` reports the bare sum instead:
+on the LiFSI frame that is 103.0 eV of self-interaction in a reported
+208.8 eV, and being positive-definite in ``q_i^2`` it biases training toward
+small charges. Checked against the textbook formula on a random 8-charge
+cell: ``recip - self = -9.25679114`` eV, nvalchemiops ``-9.25679220``.
 
-Verified independently against the textbook formula written out directly:
-``recip = 11.37766014``, ``self = 20.63445128``, ``recip - self =
--9.25679114`` eV for a random 8-charge cell, against nvalchemiops'
-``-9.25679220``.
-
-An earlier version added the self term back, to match DeePMD-kit's DPLR
-``ewald_reciprocal_energy``, which reports the bare k-space sum. That put a
-spurious self-interaction inside the quantity called "long-range energy" --
-on the LiFSI frame, 103.0 eV of a reported 208.8 eV -- and since it is
-positive-definite in ``q_i^2`` it also biases training toward small charges.
-Nothing in this package uses DPLR, so there is no convention to match.
-
-Because there is no real-space part, this module needs **no neighbour list**:
-no cutoff, no capacity to size, no ``rcut < L/2`` constraint.
-
-Two ways to evaluate the same sum
----------------------------------
-``method="pme"`` interpolates the charges onto a mesh and uses an FFT --
-``O(N log N)``, the right choice once systems get large. ``method="ewald"``
-sums the k-vectors explicitly -- ``O(N * K)``, with no interpolation error at
-all. They compute the *same quantity* and agree to the accuracy of whichever
-is coarser, so the explicit sum makes a good reference for checking a PME
-setting, and is often the faster of the two for small cells where the FFT
-overhead dominates.
+Three ways to evaluate the same sum
+-----------------------------------
+``method="pme"`` interpolates the charges onto a mesh and uses an FFT,
+``O(N log N)``. ``method="ewald"`` sums the k-vectors explicitly, ``O(N K)``
+with no interpolation error: the reference for checking a PME setting, and
+often the faster on small cells. ``method="isolated"``
+(:class:`IsolatedLongRangeEnergy`) sums the same split directly for a system
+with no cell; it is the periodic sum's infinite-volume limit, which is what
+lets one descriptor serve periodic and isolated data at once.
+:func:`build_long_range_energy` maps settings onto a class, and
+:func:`system_reciprocal` a system's ``pbc`` onto settings.
 
 Slabs
 -----
-Ewald assumes 3D periodicity. A 2D-periodic system -- an interface, a film, a
-liquid slab with vacuum above it -- is normally handled by adding vacuum and
-running the 3D sum anyway, but that leaves each slab interacting with its
-images through the vacuum. For a slab with a net dipole across the
-non-periodic axis the error is large and converges only slowly with vacuum
-thickness, so more vacuum is not a fix.
-
-``slab_correction=True`` adds the Yeh-Berkowitz term, which removes that
-image-dipole interaction and recovers the 2D-periodic answer. Pass ``pbc``
-with ``False`` on the non-periodic axis. It is off by default because it is
-wrong for a genuinely 3D-periodic system.
+A 2D-periodic system in a padded box still interacts with its images through
+the vacuum; for a slab with a net dipole across the open axis the error is
+large and shrinks only slowly with more vacuum. ``slab_correction=True`` adds
+the Yeh-Berkowitz term, which removes that interaction; ``pbc`` marks the
+open axis ``False``. Off by default: it is wrong for a 3D-periodic system.
 
 Choosing alpha
 --------------
-In a full Ewald sum ``alpha`` is arbitrary -- the total does not depend on it.
-Here it is a real modelling choice, because it sets where the division of
-labour falls: the network handles ``erfc(alpha r)/r`` and this term handles
-the rest. ``alpha`` must be large enough that what is left to the network has
-died inside the descriptor cutoff. At ``rcut = 6`` angstrom, ``alpha = 0.4``
-leaves ``erfc(2.4) = 7e-4``, which is comfortable. Too small an ``alpha``
-hands the network a tail it structurally cannot represent; too large makes
-the reciprocal sum need a fine mesh. It must also match between training and
-any later MD.
+In a full Ewald sum ``alpha`` is arbitrary. Here it sets the division of
+labour: the network handles ``erfc(alpha r)/r``, which must have died inside
+the descriptor cutoff (``alpha = 0.4`` leaves ``erfc(2.4) = 7e-4`` at
+``rcut = 6`` A); too large an ``alpha`` needs a fine mesh. It must match
+between training and any later MD (docs/alpha-and-mesh.md).
 """
 
 import math
@@ -123,18 +90,6 @@ from deepmd_lr.lr.isolated import (
 #: ``k_cutoff``.
 DEFAULT_ACCURACY = 1e-6
 
-
-def _check_inputs(coord: torch.Tensor, charge: torch.Tensor) -> None:
-    """Refuse coordinates and charges whose shapes do not describe frames."""
-    if coord.ndim != 3 or coord.shape[-1] != 3:
-        raise ValueError(f"coord must have shape (nf, nloc, 3), got {coord.shape}")
-    if charge.shape != coord.shape[:2]:
-        raise ValueError(
-            f"charge must have shape (nf, nloc) = {coord.shape[:2]}, "
-            f"got {charge.shape}"
-        )
-
-
 #: Highest B-spline interpolation order nvalchemiops computes correctly.
 #:
 #: At order >= 7 ``pme_reciprocal_space`` silently drops the entire
@@ -148,21 +103,140 @@ MAX_SPLINE_ORDER = 6
 #: Default B-spline order: the highest that is correct.
 DEFAULT_SPLINE_ORDER = 6
 
-#: Default Ewald splitting parameter, in inverse angstrom. Chosen so that
-#: erfc(alpha * 6 A) = 7e-4 for a 6 A descriptor cutoff -- i.e. the part left
-#: to the network dies inside its own reach. A modelling choice, not a fitted
-#: parameter, and it must match between training and MD (see
-#: docs/alpha-and-mesh.md).
+#: Default Ewald splitting parameter, in inverse angstrom: a modelling choice,
+#: not a fitted parameter (see "Choosing alpha" above).
 DEFAULT_ALPHA = 0.4
 
 #: Supported ways of evaluating the reciprocal sum.
 METHODS = ("pme", "ewald")
 
-#: Parameters that only mean something for one method. Passing one to the
-#: other method raises, rather than being silently ignored -- a setting that
-#: looks applied but is not is the worst kind of configuration bug.
-_PME_ONLY = ("mesh_spacing", "mesh_dimensions", "spline_order")
-_EWALD_ONLY = ("k_cutoff", "accuracy")
+#: Settings that only some methods use, as ``(name, unset value, methods)``.
+#: One set to anything but its unset value under another method is refused
+#: rather than ignored: a setting that looks applied but is not is the worst
+#: kind of configuration bug.
+_METHOD_SETTINGS = (
+    ("mesh_spacing", None, ("pme",)),
+    ("mesh_dimensions", None, ("pme",)),
+    ("spline_order", DEFAULT_SPLINE_ORDER, ("pme",)),
+    ("k_cutoff", None, ("ewald",)),
+    ("accuracy", DEFAULT_ACCURACY, ("ewald",)),
+    ("slab_correction", False, METHODS),
+    ("pbc", None, METHODS),
+)
+
+#: Every setting a term takes.
+_SETTINGS = (
+    "alpha",
+    "method",
+    *(name for name, _, _ in _METHOD_SETTINGS),
+    "isolated_kernel",
+    "max_isolated_atoms",
+)
+
+
+def _misplaced(method: str, **settings: Any) -> list[str]:
+    """The names in ``settings`` set although ``method`` does not use them, in
+    table order. A ``None`` marker is compared by identity, so an array value
+    is never compared elementwise."""
+    return [
+        name
+        for name, unset, methods in _METHOD_SETTINGS
+        if name in settings
+        and method not in methods
+        and (
+            settings[name] is not None
+            if unset is None
+            else bool(settings[name] != unset)
+        )
+    ]
+
+
+def _checked_alpha(alpha: Any) -> float:
+    if alpha is None or alpha <= 0:
+        raise ValueError(f"alpha must be positive, got {alpha}")
+    return float(alpha)
+
+
+def _checked_isolated_kernel(kernel: str, max_atoms: int) -> tuple[str, int]:
+    if kernel not in ISOLATED_KERNELS:
+        raise ValueError(
+            f"isolated_kernel must be one of {ISOLATED_KERNELS}, got {kernel!r}"
+        )
+    if int(max_atoms) < 1:
+        raise ValueError(f"max_isolated_atoms must be >= 1, got {max_atoms}")
+    return kernel, int(max_atoms)
+
+
+def _checked_mesh(
+    mesh_spacing: float | None, mesh_dimensions: Any, spline_order: int
+) -> tuple[float | None, tuple[int, int, int] | None]:
+    """PME's ``(mesh_spacing, mesh_dimensions)``, validated, with the default
+    1 A spacing when neither is given."""
+    if spline_order > MAX_SPLINE_ORDER:
+        raise ValueError(
+            f"spline_order={spline_order} exceeds the maximum order "
+            f"nvalchemiops computes correctly ({MAX_SPLINE_ORDER}). At "
+            "order >= 7 the reciprocal-space sum is silently dropped "
+            "and only the self-energy is returned, with no error."
+        )
+    if spline_order < 3:
+        raise ValueError(f"spline_order must be at least 3, got {spline_order}")
+    if mesh_dimensions is not None:
+        mesh_dimensions = tuple(int(m) for m in mesh_dimensions)
+        if len(mesh_dimensions) != 3 or any(m < 2 for m in mesh_dimensions):
+            raise ValueError(
+                f"mesh_dimensions must be three integers >= 2, got {mesh_dimensions}"
+            )
+    if mesh_dimensions is None and mesh_spacing is None:
+        mesh_spacing = 1.0
+    if mesh_spacing is not None and mesh_spacing <= 0:
+        raise ValueError(f"mesh_spacing must be positive, got {mesh_spacing}")
+    return mesh_spacing, mesh_dimensions
+
+
+def _checked_k_cutoff(alpha: float, k_cutoff: float | None, accuracy: float) -> float:
+    """The Ewald sum's ``k_cutoff``, by default where ``exp(-k^2 / 4 alpha^2)``
+    has fallen to ``accuracy``: alpha 0.4 and 1e-6 give 3.0 /A, which reaches
+    1e-10 against the reference."""
+    if not 0 < accuracy < 1:
+        raise ValueError(f"accuracy must be in (0, 1), got {accuracy}")
+    if k_cutoff is None:
+        k_cutoff = 2.0 * alpha * math.sqrt(-math.log(accuracy))
+    if k_cutoff <= 0:
+        raise ValueError(f"k_cutoff must be positive, got {k_cutoff}")
+    return k_cutoff
+
+
+def _checked_pbc(pbc: Any, slab_correction: bool) -> tuple[bool, bool, bool]:
+    """``pbc`` (fully periodic if None) as three bools: all periodic, or one
+    open axis with the slab correction on."""
+    pbc = tuple(bool(p) for p in ((True, True, True) if pbc is None else pbc))
+    if len(pbc) != 3:
+        raise ValueError(f"pbc must have three entries, got {pbc}")
+    if slab_correction and sum(pbc) != 2:
+        raise ValueError(
+            "slab_correction expects exactly one non-periodic axis, but "
+            f"pbc={pbc}. Set pbc with False on the slab normal, e.g. "
+            "[true, true, false] for a slab stacked along z."
+        )
+    if not slab_correction and sum(pbc) != 3:
+        raise ValueError(
+            f"pbc={pbc} marks a non-periodic axis but slab_correction is "
+            "off. Running a plain 3D sum on a slab leaves each image "
+            "interacting through the vacuum; set slab_correction: true."
+        )
+    return pbc
+
+
+def _check_inputs(coord: torch.Tensor, charge: torch.Tensor) -> None:
+    """Refuse coordinates and charges whose shapes do not describe frames."""
+    if coord.ndim != 3 or coord.shape[-1] != 3:
+        raise ValueError(f"coord must have shape (nf, nloc, 3), got {coord.shape}")
+    if charge.shape != coord.shape[:2]:
+        raise ValueError(
+            f"charge must have shape (nf, nloc) = {coord.shape[:2]}, "
+            f"got {charge.shape}"
+        )
 
 
 class LongRangeEnergy(torch.nn.Module):
@@ -173,20 +247,37 @@ class LongRangeEnergy(torch.nn.Module):
     alpha
         Ewald splitting parameter in inverse angstrom. Not arbitrary here --
         see the module docstring.
+    method
+        ``"pme"`` or ``"ewald"``. A setting of the other method is refused.
     mesh_spacing
-        Reciprocal-mesh spacing in angstrom; the mesh is
-        ``ceil(cell_length / mesh_spacing)``. This makes the mesh a *step
-        function* of the cell, so the energy is only piecewise smooth in the
-        cell -- see ``mesh_dimensions``.
+        PME only. Mesh spacing in angstrom; the mesh is
+        ``ceil(cell_length / mesh_spacing)``, a *step function* of the cell,
+        so the energy is only piecewise smooth in it. 1.0 when no mesh is
+        given.
     mesh_dimensions
-        Fixed mesh ``(nx, ny, nz)``, overriding ``mesh_spacing``. Prefer this
-        whenever the cell can change (NPT, or any strain derivative): a
-        spacing-derived mesh jumps a whole grid point as a cell length crosses
-        a multiple of the spacing, which makes the energy discontinuous there.
-        The jump is small but real -- it moved a virial by 2% in testing.
+        PME only. Fixed mesh ``(nx, ny, nz)``, overriding ``mesh_spacing``.
+        Prefer this whenever the cell can change (NPT, any strain
+        derivative): a spacing-derived mesh jumps a whole grid point as a
+        cell length crosses a multiple of the spacing, which moved a virial
+        by 2% in testing.
     spline_order
-        B-spline interpolation order; must not exceed :data:`MAX_SPLINE_ORDER`.
+        PME only. B-spline interpolation order, 3 to
+        :data:`MAX_SPLINE_ORDER`.
+    k_cutoff
+        Ewald only. Largest ``|k|`` summed, in inverse angstrom; derived
+        from ``alpha`` and ``accuracy`` when None.
+    accuracy
+        Ewald only. Where ``exp(-k^2 / 4 alpha^2)`` is truncated.
+    slab_correction
+        Add the Yeh-Berkowitz correction; needs ``pbc`` with one open axis.
+    pbc
+        Periodicity per axis; fully periodic when None.
+    isolated_kernel, max_isolated_atoms
+        How a frame with no cell is summed (:func:`isolated_term_for`).
     """
+
+    #: This term is only defined under periodic boundary conditions.
+    needs_cell = True
 
     def __init__(
         self,
@@ -204,115 +295,49 @@ class LongRangeEnergy(torch.nn.Module):
         **kwargs: Any,
     ) -> None:
         super().__init__()
-        # Reject unknown keys rather than absorb them. This term used to take
-        # a real-space `rcut`; dropping the real-space half made it
-        # meaningless, and a permissive **kwargs silently accepted stale
-        # configs that then ran with different physics than they asked for.
+        # Unknown keys are refused, not absorbed: a stale config (`rcut`, from
+        # when the term had a real-space half) would otherwise run with
+        # different physics than it asked for.
         if kwargs:
             raise TypeError(
                 f"unexpected long-range parameters: {sorted(kwargs)}. "
-                f"Supported: alpha, method, {', '.join(_PME_ONLY)}, "
-                f"{', '.join(_EWALD_ONLY)}. Note `rcut` was removed: this "
+                f"Supported: {', '.join(_SETTINGS)}. There is no `rcut`: this "
                 "term computes only the reciprocal-space half of the Ewald "
                 "sum, which needs no real-space cutoff."
             )
         if method not in METHODS:
+            raise ValueError(f"method must be one of {METHODS}, got {method!r}")
+        alpha = _checked_alpha(alpha)
+        misplaced = _misplaced(
+            method,
+            mesh_spacing=mesh_spacing,
+            mesh_dimensions=mesh_dimensions,
+            spline_order=spline_order,
+            k_cutoff=k_cutoff,
+            accuracy=accuracy,
+        )
+        if misplaced and method == "ewald":
             raise ValueError(
-                f"method must be one of {METHODS}, got {method!r}"
-            )
-        if alpha is None or alpha <= 0:
-            raise ValueError(f"alpha must be positive, got {alpha}")
-
-        # Reject cross-method parameters. Both evaluate the same sum, but
-        # their knobs are not interchangeable, and a mesh setting silently
-        # ignored under `ewald` would be indistinguishable from one applied.
-        supplied_pme = [
-            name
-            for name, value in (
-                ("mesh_spacing", mesh_spacing),
-                ("mesh_dimensions", mesh_dimensions),
-            )
-            if value is not None
-        ]
-        if spline_order != DEFAULT_SPLINE_ORDER:
-            supplied_pme.append("spline_order")
-        supplied_ewald = [
-            name
-            for name, value in (("k_cutoff", k_cutoff),)
-            if value is not None
-        ]
-        if accuracy != DEFAULT_ACCURACY:
-            supplied_ewald.append("accuracy")
-
-        if method == "ewald" and supplied_pme:
-            raise ValueError(
-                f"{supplied_pme} only apply to method='pme'; with "
+                f"{misplaced} only apply to method='pme'; with "
                 "method='ewald' the k-vectors are summed explicitly and "
                 "there is no mesh. Use k_cutoff (or accuracy) instead."
             )
-        if method == "pme" and supplied_ewald:
+        if misplaced:
             raise ValueError(
-                f"{supplied_ewald} only apply to method='ewald'; with "
+                f"{misplaced} only apply to method='ewald'; with "
                 "method='pme' the reciprocal sum is evaluated on a mesh. "
                 "Use mesh_dimensions (or mesh_spacing) instead."
             )
-
         if method == "pme":
-            if spline_order > MAX_SPLINE_ORDER:
-                raise ValueError(
-                    f"spline_order={spline_order} exceeds the maximum order "
-                    f"nvalchemiops computes correctly ({MAX_SPLINE_ORDER}). At "
-                    "order >= 7 the reciprocal-space sum is silently dropped "
-                    "and only the self-energy is returned, with no error."
-                )
-            if spline_order < 3:
-                raise ValueError(
-                    f"spline_order must be at least 3, got {spline_order}"
-                )
-            if mesh_dimensions is not None:
-                mesh_dimensions = tuple(int(m) for m in mesh_dimensions)
-                if len(mesh_dimensions) != 3 or any(m < 2 for m in mesh_dimensions):
-                    raise ValueError(
-                        "mesh_dimensions must be three integers >= 2, got "
-                        f"{mesh_dimensions}"
-                    )
-            if mesh_dimensions is None and mesh_spacing is None:
-                mesh_spacing = 1.0
-            if mesh_spacing is not None and mesh_spacing <= 0:
-                raise ValueError(f"mesh_spacing must be positive, got {mesh_spacing}")
+            mesh_spacing, mesh_dimensions = _checked_mesh(
+                mesh_spacing, mesh_dimensions, spline_order
+            )
         else:
-            if not 0 < accuracy < 1:
-                raise ValueError(f"accuracy must be in (0, 1), got {accuracy}")
-            if k_cutoff is None:
-                # Standard Ewald reciprocal cutoff: the Gaussian
-                # exp(-k^2 / 4 alpha^2) has fallen to `accuracy` by here.
-                # Measured: alpha=0.4 with accuracy=1e-6 gives k_cutoff=3.0,
-                # which reaches 1e-10 against the reference.
-                k_cutoff = 2.0 * alpha * math.sqrt(-math.log(accuracy))
-            if k_cutoff <= 0:
-                raise ValueError(f"k_cutoff must be positive, got {k_cutoff}")
+            k_cutoff = _checked_k_cutoff(alpha, k_cutoff, accuracy)
+        pbc = _checked_pbc(pbc, slab_correction)
 
-        if pbc is None:
-            pbc = (True, True, True)
-        pbc = tuple(bool(p) for p in pbc)
-        if len(pbc) != 3:
-            raise ValueError(f"pbc must have three entries, got {pbc}")
-        if slab_correction and sum(pbc) != 2:
-            raise ValueError(
-                "slab_correction expects exactly one non-periodic axis, but "
-                f"pbc={pbc}. Set pbc with False on the slab normal, e.g. "
-                "[true, true, false] for a slab stacked along z."
-            )
-        if not slab_correction and sum(pbc) != 3:
-            raise ValueError(
-                f"pbc={pbc} marks a non-periodic axis but slab_correction is "
-                "off. Running a plain 3D sum on a slab leaves each image "
-                "interacting through the vacuum; set slab_correction: true."
-            )
-
-        self.alpha = float(alpha)
+        self.alpha = alpha
         self.method = method
-        # How a frame with no cell is summed (:func:`isolated_term_for`).
         self.isolated_kernel, self.max_isolated_atoms = _checked_isolated_kernel(
             isolated_kernel, max_isolated_atoms
         )
@@ -330,9 +355,6 @@ class LongRangeEnergy(torch.nn.Module):
         self.spline_order = int(spline_order)
         self.k_cutoff = None if k_cutoff is None else float(k_cutoff)
 
-    #: This term is only defined under periodic boundary conditions.
-    needs_cell = True
-
     def extra_repr(self) -> str:
         if self.method == "pme":
             return (
@@ -341,9 +363,7 @@ class LongRangeEnergy(torch.nn.Module):
                 f"mesh_dimensions={self.mesh_dimensions}, "
                 f"spline_order={self.spline_order}"
             )
-        return (
-            f"method='ewald', alpha={self.alpha}, k_cutoff={self.k_cutoff}"
-        )
+        return f"method='ewald', alpha={self.alpha}, k_cutoff={self.k_cutoff}"
 
     def serialize(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -369,12 +389,9 @@ class LongRangeEnergy(torch.nn.Module):
         return cls(**data)
 
     def _pbc_on(self, device) -> torch.Tensor:
-        """The periodicity flags as a device tensor, uploaded once per device.
-
-        Building them from the Python tuple at every call is a pageable
-        host-to-device copy, which blocks the host until the device has
-        drained -- one of the per-step synchronisations the MD engine removes.
-        """
+        """The periodicity flags as a device tensor, uploaded once per device:
+        an upload from the tuple at every call is a pageable copy that blocks
+        the host, one of the per-step synchronisations the MD engine removes."""
         cache = self.__dict__.setdefault("_pbc_cache", {})
         key = str(torch.device(device))
         pbc = cache.get(key)
@@ -386,15 +403,14 @@ class LongRangeEnergy(torch.nn.Module):
     def set_k_vectors(self, cell: torch.Tensor | None) -> None:
         """Fix the PME k-vectors for ``cell`` until the next call.
 
-        nvalchemiops regenerates them at every evaluation, which includes a
-        small upload from host memory that stalls the host until the device
-        has drained. A driver that evaluates the same cell step after step --
-        the MD engine -- computes them once here, when it sets the cell, and
-        the term reuses them. The caller owns the cell: it must call again
-        whenever the cell changes (``DistributedEvaluator.set_cell`` does),
-        and pass ``None`` to go back to per-call generation. ``cell`` is
-        ``(3, 3)`` or ``(1, 3, 3)`` on the device the term runs on. Only the
-        PME method has them; the Ewald sum builds its own vectors per call.
+        nvalchemiops regenerates them at every evaluation, including a small
+        host upload that stalls the host until the device has drained. A
+        driver that evaluates the same cell step after step (the MD engine)
+        computes them once here. The caller owns the cell: it must call again
+        whenever the cell changes (``DistributedEvaluator.set_cell`` does), and
+        pass ``None`` to go back to per-call generation. ``cell`` is
+        ``(3, 3)`` or ``(1, 3, 3)`` on the term's device. A no-op for the
+        Ewald sum, which builds its own vectors per call.
         """
         if cell is None or self.method != "pme":
             self._k_cache = None
@@ -406,13 +422,12 @@ class LongRangeEnergy(torch.nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """nvalchemiops' ``generate_k_vectors_pme``, without its host upload.
 
-        The Miller-index grid depends only on the mesh and is cached per mesh,
-        device and dtype; the reciprocal cell is a 3 x 3 inverse written out
+        The Miller-index grid is cached per mesh, device and dtype; the
+        reciprocal cell is a 3 x 3 inverse written out
         (:func:`deepmd_lr.cell.inverse_3x3`); and the floor under ``k^2`` is a
-        clamp rather than a scalar tensor built from a Python float at every
-        call, which is the pageable upload a barostat step would otherwise
-        pay. Same convention as nvalchemiops: ``k = h @ (2 pi inv(H))^T``
-        with ``H`` rows as lattice vectors and ``h`` the Miller indices.
+        clamp rather than a scalar tensor built from a Python float. Same
+        convention as nvalchemiops: ``k = h @ (2 pi inv(H))^T`` with ``H``
+        rows as lattice vectors and ``h`` the Miller indices.
         """
         mesh = tuple(int(m) for m in self._mesh(cell))
         key = (mesh, str(cell.device), cell.dtype)
@@ -475,10 +490,8 @@ class LongRangeEnergy(torch.nn.Module):
                 "frame with no cell is summed by isolated_term_for(term)."
             )
         _check_inputs(coord, charge)
-
         nf, nloc = coord.shape[0], coord.shape[1]
         cell = box.reshape(nf, 3, 3)
-
         if self.check_cell:
             volume = torch.abs(torch.linalg.det(cell.detach()))
             if bool((volume <= 0).any()):
@@ -492,82 +505,66 @@ class LongRangeEnergy(torch.nn.Module):
         charges = charge.reshape(nf * nloc)
         if mask is not None:
             charges = charges * mask.reshape(nf * nloc).to(charges.dtype)
-        # The energy is quadratic in the charges, so the unit conversion goes
-        # onto them rather than onto the energy afterwards. Not cosmetic: the
-        # MD driver differentiates the summed energy, and nvalchemiops'
-        # backward takes its fast, read-free path only when the cotangent it
-        # receives is a plain expanded constant. A multiply after the sum
-        # turns that into a tensor it inspects on the host at every step.
+        # The unit conversion goes onto the charges (the energy is quadratic in
+        # them), not onto the summed energy: nvalchemiops' backward takes its
+        # read-free path only when the cotangent it receives is a plain
+        # expanded constant, and a multiply after the sum makes it a tensor it
+        # inspects on the host at every MD step.
         charges = charges * math.sqrt(ELECTROSTATIC_CONVERSION)
-
         batch_idx = torch.repeat_interleave(
             torch.arange(nf, dtype=torch.int32, device=coord.device), nloc
         )
-        pbc = self._pbc_on(coord.device)
-
-        # Both backends return the k-space sum MINUS the Ewald self term,
-        # which is what we want: the bare k-space sum counts each Gaussian
-        # interacting with itself, an artifact of the smearing rather than a
-        # physical interaction. See the module docstring.
         if self.method == "pme":
-            cached = self._k_cache
-            energy = pme_reciprocal_space(
-                positions,
-                charges,
-                cell,
-                alpha=self.alpha,
-                mesh_dimensions=self._mesh(cell),
-                spline_order=self.spline_order,
-                batch_idx=batch_idx,
-                energy_reduction="atom",
-                k_vectors=None if cached is None else cached[0],
-                k_squared=None if cached is None else cached[1],
-            )
+            energy = self._pme(positions, charges, cell, batch_idx)
         else:
-            # The explicit sum wants alpha per system as a tensor, not a
-            # float, and its own k-vector set for this cell.
-            alpha = torch.full(
-                (nf,), self.alpha, dtype=coord.dtype, device=coord.device
-            )
-            # Keep the reciprocal vectors connected to the strained cell.
-            # Treating them as fixed Cartesian metadata gives correct energies
-            # and position forces but an unphysical cell derivative/virial.
-            # The integer Miller bounds are still discrete setup metadata; the
-            # returned Cartesian vectors themselves must deform with the cell.
-            k_vectors = generate_k_vectors_ewald_summation(cell, self.k_cutoff)
-            energy = ewald_reciprocal_space(
-                positions,
-                charges,
-                cell,
-                k_vectors,
-                alpha,
-                batch_idx=batch_idx,
-                energy_reduction="atom",
-            )
+            energy = self._ewald(positions, charges, cell, batch_idx)
         if self.slab_correction:
-            # Yeh-Berkowitz: cancels the interaction between a slab and its
-            # periodic images across the vacuum. Added to the 3D result, as
-            # nvalchemiops' own docstring prescribes.
+            # Yeh-Berkowitz, added to the 3D result as nvalchemiops prescribes.
             energy = energy + compute_slab_correction(
                 positions,
                 charges,
                 cell,
-                pbc.expand(nf, 3),
+                self._pbc_on(coord.device).expand(nf, 3),
                 batch_idx=batch_idx,
                 energy_reduction="atom",
             )
-
         return energy.reshape(nf, nloc, 1)
 
-
-def _checked_isolated_kernel(kernel: str, max_atoms: int) -> tuple[str, int]:
-    if kernel not in ISOLATED_KERNELS:
-        raise ValueError(
-            f"isolated_kernel must be one of {ISOLATED_KERNELS}, got {kernel!r}"
+    def _pme(self, positions, charges, cell, batch_idx) -> torch.Tensor:
+        """Per-atom ``recip - self`` on the mesh, ``(N,)`` in eV."""
+        cached = self._k_cache
+        return pme_reciprocal_space(
+            positions,
+            charges,
+            cell,
+            alpha=self.alpha,
+            mesh_dimensions=self._mesh(cell),
+            spline_order=self.spline_order,
+            batch_idx=batch_idx,
+            energy_reduction="atom",
+            k_vectors=None if cached is None else cached[0],
+            k_squared=None if cached is None else cached[1],
         )
-    if int(max_atoms) < 1:
-        raise ValueError(f"max_isolated_atoms must be >= 1, got {max_atoms}")
-    return kernel, int(max_atoms)
+
+    def _ewald(self, positions, charges, cell, batch_idx) -> torch.Tensor:
+        """Per-atom ``recip - self`` by the explicit k-vector sum, ``(N,)`` in
+        eV."""
+        alpha = torch.full(
+            (cell.shape[0],), self.alpha, dtype=positions.dtype, device=positions.device
+        )
+        # The k-vectors are built from the (possibly strained) cell and stay
+        # connected to it: as fixed Cartesian metadata they would give correct
+        # energies and forces but a wrong cell derivative, hence virial.
+        k_vectors = generate_k_vectors_ewald_summation(cell, self.k_cutoff)
+        return ewald_reciprocal_space(
+            positions,
+            charges,
+            cell,
+            k_vectors,
+            alpha,
+            batch_idx=batch_idx,
+            energy_reduction="atom",
+        )
 
 
 class IsolatedLongRangeEnergy(torch.nn.Module):
@@ -585,35 +582,35 @@ class IsolatedLongRangeEnergy(torch.nn.Module):
                 \frac{q_i q_j \operatorname{erf}(\alpha r_{ij})}{r_{ij}}
             }_{\text{this class}}
 
-    Under periodicity that second sum is what :class:`LongRangeEnergy`
-    evaluates in reciprocal space; without a cell it is summed directly, and it
-    is the *same quantity*: put a cluster in a cube of side ``L`` and
+    The second sum is what :class:`LongRangeEnergy` evaluates in reciprocal
+    space, here summed directly: put a cluster in a cube of side ``L`` and
     ``recip - self`` converges onto it as :math:`1/L^3` (``-6.6e-03``,
     ``-8.3e-04``, ``-1.0e-04`` eV at ``L = 80, 160, 320`` A, pinned by
     ``tests/test_isolated_term.py``). So a shared descriptor trained on
     periodic and isolated frames sees the same ``erfc(alpha r)/r`` remainder
-    in both. Three things follow:
+    in both. There is no self term (``erf(alpha r)/r -> 2 alpha / sqrt(pi)``
+    as ``r -> 0`` is exactly it, and ``j != i`` excludes it), nothing extra
+    for a charged system (no images, no background) and no cutoff.
 
-    * **No self term.** ``erf(alpha r)/r -> 2 alpha / sqrt(pi)`` as ``r -> 0``,
-      which times ``0.5 * sum_i q_i^2`` is the Ewald self term; summing
-      ``j != i`` already excludes it.
-    * **Charged systems need nothing extra**: no images, no neutralising
-      background, so an ion is just an ion.
-    * **No cutoff.** ``erf(alpha r)/r`` decays as ``1/r``; every pair is summed.
-
-    Two kernels evaluate it (:mod:`deepmd_lr.lr.isolated`): the dense one,
-    twice differentiable and O(N^2) in memory, and the chunked one, O(chunk N)
-    and first derivatives only. ``isolated_kernel`` picks: ``"auto"`` is dense
-    up to ``max_isolated_atoms`` atoms per call and chunked beyond. Force
-    training and Hessians need ``"dense"``. ``kernel_dtype`` (a runtime
-    attribute, not part of the config) is the dtype the sum runs in; ``None``
-    is the inputs' own.
+    ``kernel_dtype`` (a runtime attribute, not part of the config) is the
+    dtype the sum runs in; ``None`` is the inputs' own.
 
     Parameters
     ----------
     alpha
         Ewald splitting parameter in inverse angstrom. **Must match the value
         used by the periodic branches**; it defines where the split falls.
+    isolated_kernel
+        The kernel (:mod:`deepmd_lr.lr.isolated`): ``"dense"`` (twice
+        differentiable, O(N^2) memory: force training and Hessians),
+        ``"chunked"`` (O(chunk N), first derivatives only) or ``"auto"``,
+        dense up to ``max_isolated_atoms`` atoms per call.
+    max_isolated_atoms
+        Largest call the dense kernel takes.
+
+    The periodic settings are accepted at their defaults -- ``dargs`` fills
+    the whole block in, so an isolated config arrives carrying
+    ``spline_order: 6`` nobody wrote -- and refused at any other value.
     """
 
     #: No cell required -- this is the whole reason the class exists.
@@ -639,37 +636,27 @@ class IsolatedLongRangeEnergy(torch.nn.Module):
     ) -> None:
         super().__init__()
         del method
-        # `dargs` fills the whole block in before anything is built, so an
-        # isolated config arrives carrying `spline_order: 6` and `pbc: None`
-        # that nobody wrote. Refuse only a value someone *chose*: a periodic
-        # setting that looks applied but is not.
-        supplied = [
-            name
-            for name, value, unset in (
-                ("mesh_spacing", mesh_spacing, None),
-                ("mesh_dimensions", mesh_dimensions, None),
-                ("spline_order", spline_order, DEFAULT_SPLINE_ORDER),
-                ("k_cutoff", k_cutoff, None),
-                ("accuracy", accuracy, DEFAULT_ACCURACY),
-                ("slab_correction", slab_correction, False),
-            )
-            if value != unset
-        ]
-        if pbc is not None and any(bool(p) for p in pbc):
-            supplied.append("pbc")
-        if kwargs:
-            supplied += sorted(kwargs)
-        if supplied:
+        misplaced = _misplaced(
+            self.METHOD,
+            mesh_spacing=mesh_spacing,
+            mesh_dimensions=mesh_dimensions,
+            spline_order=spline_order,
+            k_cutoff=k_cutoff,
+            accuracy=accuracy,
+            slab_correction=slab_correction,
+            # An all-open pbc describes this system; only a periodic axis
+            # would be a setting silently ignored.
+            pbc=pbc if pbc is not None and any(bool(p) for p in pbc) else None,
+        ) + sorted(kwargs)
+        if misplaced:
             raise ValueError(
-                f"{sorted(supplied)} do not apply to method='isolated', which "
+                f"{sorted(misplaced)} do not apply to method='isolated', which "
                 "takes `alpha`, `isolated_kernel` and `max_isolated_atoms`. "
                 "Meshes, k-vector cutoffs, `slab_correction` and a periodic "
                 "`pbc` describe a sum over periodic images, which an isolated "
                 "system has none of."
             )
-        if alpha is None or alpha <= 0:
-            raise ValueError(f"alpha must be positive, got {alpha}")
-        self.alpha = float(alpha)
+        self.alpha = _checked_alpha(alpha)
         self.method = self.METHOD
         self.pbc = (False, False, False)
         self.isolated_kernel, self.max_isolated_atoms = _checked_isolated_kernel(
@@ -793,16 +780,15 @@ def system_mesh(settings: dict[str, Any], cell: Any) -> tuple[int, int, int]:
 
 
 def system_reciprocal(settings: dict[str, Any], cell: Any, pbc: Any) -> dict[str, Any]:
-    """The reciprocal-space settings a system needs, from a model's own.
+    """The long-range settings a system needs, from a model's own.
 
     The term holds no weights, so how the sum is taken is a property of the
-    system, not of the checkpoint. The system's ``pbc`` picks the sum: all
-    three axes periodic is the 3D sum, one open axis a slab with the
-    Yeh-Berkowitz correction, no periodic axis the isolated sum (any trained
-    method; ``alpha`` and the kernel settings carry over). The cell sets the
-    PME mesh (:func:`system_mesh`). A wire (one periodic axis) is refused, and
-    so is a periodic system for a model trained with ``method: isolated``,
-    which has never seen a periodic image.
+    system, not of the checkpoint. ``pbc`` picks the sum: three periodic axes
+    the 3D sum, two the slab with the Yeh-Berkowitz correction, none the
+    isolated sum (from any trained method; ``alpha`` and the kernel settings
+    carry over). The cell sets the PME mesh (:func:`system_mesh`). A wire (one
+    periodic axis) is refused, and so is a periodic system for a model trained
+    with ``method: isolated``, which has never seen a periodic image.
     """
     method = settings.get("method", "pme")
     periodic = [bool(p) for p in np.broadcast_to(np.asarray(pbc, dtype=bool), (3,))]
