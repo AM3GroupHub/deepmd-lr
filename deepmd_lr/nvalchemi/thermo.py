@@ -104,21 +104,20 @@ class Thermo:
         **moved: Any,
     ) -> None:
         if moved:
-            where = "; ".join(
-                f"{k} -> {_MOVED.get(k, 'nowhere')}" for k in sorted(moved)
-            )
-            raise TypeError(
-                f"Thermo no longer takes {sorted(moved)}. The timestep, the "
-                "target temperature and the log belong to the integrator, "
-                f"which builds its own Thermo: {where}. In a custom kernel "
-                "loop, make them yourself: dt = th.scalar(timestep), "
-                "kT = th.scalar(kB * T)."
-            )
+            _refuse_moved(moved)
         self.evaluator = evaluator
         self.device = str(evaluator.home)
         self.n_atoms = int(evaluator.n_atoms)
+        self._own_state(positions, velocities, masses)
+        self._hold_fixed(_fixed)
+        self._bind_views()
+        self._allocate_scratch()
+        self.energy = float("nan")
+        self._symbols = [
+            evaluator.model.get_type_map()[i] for i in np.asarray(evaluator.atype)
+        ]
 
-        # --- state this object owns -------------------------------------
+    def _own_state(self, positions: Any, velocities: Any, masses: Any) -> None:
         # Allocated here, so contiguous by construction. That matters: warp's
         # view of a non-contiguous tensor is a silent COPY, and kernels would
         # then mutate a temporary while the real positions never moved.
@@ -129,13 +128,14 @@ class Thermo:
         self._v = torch.zeros_like(self._x)
         if velocities is not None:
             self._v.copy_(torch.as_tensor(np.asarray(velocities, dtype=np.float64)))
-        m = evaluator.masses() if masses is None else np.asarray(masses, float)
+        m = self.evaluator.masses() if masses is None else np.asarray(masses, float)
         self._m = torch.tensor(
             np.ascontiguousarray(m), dtype=torch.float64, device=self.device
         )
 
+    def _hold_fixed(self, fixed: Any) -> None:
         #: Indices of the atoms held in place, sorted; empty when none are.
-        self.fixed = np.asarray([] if _fixed is None else _fixed, dtype=np.int64)
+        self.fixed = np.asarray([] if fixed is None else fixed, dtype=np.int64)
         #: The kinetic degrees of freedom every temperature here divides by.
         #: With the centre of mass at rest, 3N - 3. Fixed atoms hold the rest
         #: in place instead, so the mobile atoms' momentum is not conserved
@@ -152,6 +152,8 @@ class Thermo:
             self._anchor = self._x.index_select(0, self._fixed_idx)
             self._v.index_fill_(0, self._fixed_idx, 0.0)
 
+    def _bind_views(self) -> None:
+        evaluator = self.evaluator
         self.positions = self._vec(self._x)
         self.velocities = self._vec(self._v)
         self.masses = wp.from_torch(self._m)
@@ -169,7 +171,6 @@ class Thermo:
         self._forces_ptr = evaluator.forces.data_ptr()
         #: The evaluator's call count after this object's last evaluation.
         self._seen_calls: int | None = None
-
         self.cell = wp.array(
             np.asarray(evaluator.cell, dtype=np.float64)[None],
             dtype=wp.mat33d,
@@ -179,14 +180,14 @@ class Thermo:
         self._cell_version_seen = evaluator.cell_version
         self.natoms = self.scalar(self.n_atoms, dtype=wp.int32)
 
-        # --- scratch, allocated once ------------------------------------
+    def _allocate_scratch(self) -> None:
         #: Kinetic energy as a kernel input, refreshed by update_kinetic_energy.
         self._ke_w = self.zeros(1)
         #: The getters' own kinetic energy. Kernels consume `_ke_w`, and a
         #: getter writing it would let a log change the next step.
         self._ke_probe = self.zeros(1)
         #: Volume as a device array, for kernels that take one.
-        self.volume_w = self.scalar(evaluator.volume)
+        self.volume_w = self.scalar(self.evaluator.volume)
         self._momentum = self.zeros(1, dtype=wp.vec3d)
         self._total_mass = self.zeros(1)
         self._com = self.zeros(1, dtype=wp.vec3d)
@@ -197,11 +198,6 @@ class Thermo:
         self._kin_w = None
         self._press_probe = None
         self._kin_probe = None
-
-        self.energy = float("nan")
-        self._symbols = [
-            evaluator.model.get_type_map()[i] for i in np.asarray(evaluator.atype)
-        ]
 
     @classmethod
     def from_atoms(cls, evaluator: Any, atoms: Any) -> Thermo:
@@ -315,8 +311,7 @@ class Thermo:
         lattice vectors as rows, on this device. It is copied into
         :attr:`cell`, handed to the evaluator (:meth:`DistributedEvaluator.
         set_cell_device`) and its volume computed into :attr:`volume_w`, all
-        on the device. The old seam downloaded the cell, uploaded it, and
-        downloaded it again, every step.
+        on the device, with no host round trip per step.
         """
         h = cell.detach().to(device=self.device, dtype=torch.float64).reshape(3, 3)
         wp.to_torch(self.cell).reshape(3, 3).copy_(h)
@@ -401,9 +396,9 @@ class Thermo:
         before feeding one, in the direction where an error is silent.
 
         From the current velocities and the virial of the last evaluation,
-        computed into scratch of its own, never into :attr:`press_w`. The
-        barostat consumes ``press_w``, and when this getter refreshed it, a
-        log row changed the pressure the next barostat half-step saw.
+        computed into scratch of its own, never into :attr:`press_w`: the
+        barostat consumes ``press_w``, and a log row must not change the
+        pressure the next barostat half-step sees.
         """
         self._pressure_into(probe=True)
         p = self._press_probe.numpy()[0]
@@ -443,9 +438,9 @@ class Thermo:
             self._press_probe = wp.zeros(1, dtype=vec9d, device=self.device)
             self._kin_probe = wp.zeros((1, 9), dtype=wp.float64, device=self.device)
         # Shared by both paths: it only ever holds the evaluator's virial, so
-        # either path rewrites it with the same numbers. Device to device: the
-        # evaluator keeps the virial on the device, and re-uploading its host
-        # copy was a pageable copy that stalled every barostat step.
+        # either path rewrites it with the same numbers. Device to device: a
+        # re-upload of the host copy is a pageable copy that would stall every
+        # barostat step.
         wp.to_torch(self._virial_w).reshape(9).copy_(
             virial.detach().reshape(9).to(torch.float64)
         )
@@ -519,6 +514,17 @@ class Thermo:
         if len(self.fixed):
             atoms.set_constraint(FixAtoms(indices=self.fixed))
         return atoms
+
+
+def _refuse_moved(moved: dict) -> None:
+    where = "; ".join(f"{k} -> {_MOVED.get(k, 'nowhere')}" for k in sorted(moved))
+    raise TypeError(
+        f"Thermo no longer takes {sorted(moved)}. The timestep, the "
+        "target temperature and the log belong to the integrator, "
+        f"which builds its own Thermo: {where}. In a custom kernel "
+        "loop, make them yourself: dt = th.scalar(timestep), "
+        "kT = th.scalar(kB * T)."
+    )
 
 
 def _fixed_atoms(atoms: Any) -> np.ndarray:
