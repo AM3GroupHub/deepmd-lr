@@ -2,9 +2,9 @@
 
 Two prerequisites, then one measurement worth doing before spending GPU time.
 
-**Periodic data uses Ewald; non-periodic data uses the direct sum.** Both are
-supported ([Non-periodic systems](non-periodic.md#non-periodic-systems)), as
-different code paths, and the choice is not automatic.
+**Any boundary works.** A frame's `pbc` picks the sum: the 3D reciprocal sum
+for a bulk cell, the slab form for one open axis, the direct isolated sum for
+none ([which sum runs](non-periodic.md)).
 
 **You need energies and forces, not charges.** The charge head is trained
 through the electrostatic energy, never against charge labels.

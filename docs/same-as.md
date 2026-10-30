@@ -58,19 +58,20 @@ shared buffer), and a `same_as` chain.
 ### Setting the long-range type at load
 
 The same fact, no weights in the term, makes the boundary treatment a property
-of the simulation rather than of the checkpoint:
+of the simulation rather than of the checkpoint. At inference either head runs
+a bulk cell, a slab or a molecule: the frame's `pbc` picks the 3D, the slab or
+the isolated sum ([non-periodic](non-periodic.md)), and its cell the PME mesh.
+What remains to set by hand is how the sum is taken:
 
 ```python
 from deepmd_lr.ase import LongRangeCalculator, load_model
 
 model = load_model("model.ckpt.pt", head="slab")
-model.set_long_range({"alpha": 0.4, "mesh_dimensions": [10, 10, 10],
-                      "slab_correction": False, "pbc": [True, True, True]})
+model.set_long_range({"method": "ewald"})
 ```
 
 `long_range=` is also a keyword on `load_model`, `LongRangeCalculator` and
 `build_evaluator`. It replaces the reciprocal block rather than merging into
-it, since `method: "isolated"` refuses every periodic parameter. A frame's
-`pbc` already picks the 3D, the slab or the isolated sum. `alpha` is
+it, since `method: "isolated"` refuses every periodic parameter. `alpha` is
 inherited from the checkpoint and a different one raises: it is where Coulomb
 is split, and the network learned the remainder of that split.

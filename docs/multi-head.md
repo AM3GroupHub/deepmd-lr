@@ -102,11 +102,12 @@ from deepmd_lr.ase import LongRangeCalculator
 atoms.calc = LongRangeCalculator("model.ckpt.pt", head="interface")
 ```
 
-`head` is required for a multi-head checkpoint, aliases are accepted, and the
-ASE periodic axes must match the branch's boundary. Each head carries its own
-energy zero, so do not mix heads within one simulation. Not available in
-multi-task mode: `zero_stage`, `validating.full_validation`, `lora`,
-`change-bias`.
+`head` is required for a multi-head checkpoint (none raises `Select a
+checkpoint head from [...]`), and aliases are accepted. Any head runs any
+boundary: the frame's `pbc` picks the sum ([non-periodic](non-periodic.md)).
+Each head carries its own energy zero and level of theory, so do not mix heads
+within one simulation. Not available in multi-task mode: `zero_stage`,
+`validating.full_validation`, `lora`, `change-bias`.
 
 **Is it working?** Compare each branch's validation RMSE against a single-task
 model trained on that dataset alone; sharing should be neutral-to-better per

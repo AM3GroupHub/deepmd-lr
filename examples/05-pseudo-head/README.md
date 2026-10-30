@@ -111,23 +111,15 @@ A `same_as` branch may set only `long_range`, `model_branch_alias` and `info`.
 
 ## Step 3 — use it
 
-Load either head; the weights are the same tensors. And because the long-range
-term carries no weights, you can set the boundary treatment at load time
-instead of picking a head to match your system:
+Load either head; the weights are the same tensors, and either one runs a bulk
+cell or a slab, because the frame's `pbc` picks the sum:
 
 ```python
 from deepmd_lr.ase import LongRangeCalculator
 
-# The slab head, run on a bulk cell.
-atoms.calc = LongRangeCalculator(
-    "model.ckpt.pt", head="slab",
-    long_range={"alpha": 0.4, "mesh_dimensions": [10, 10, 10],
-                "slab_correction": False, "pbc": [True, True, True]},
-)
+atoms.calc = LongRangeCalculator("model.ckpt.pt", head="slab")   # any pbc
 ```
 
-`long_range` **replaces** the reciprocal block rather than merging into it, and
-`alpha` is inherited from the checkpoint — passing a different one raises. The
-same keyword works on `load_model` and on `build_evaluator` for an MD run
-([example 06](../06-md_nvalchemi)), and `model.set_long_range({...})` does it to
-a model you already hold.
+The same holds for `build_evaluator` in an MD run
+([example 06](../06-md_nvalchemi)). To change how the sum is taken, see
+[setting the long-range type at load](../../docs/same-as.md#setting-the-long-range-type-at-load).
