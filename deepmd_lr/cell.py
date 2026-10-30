@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""Small cell algebra on the device, written out.
+"""Small cell helpers: 3 x 3 algebra on the device, and pbc flags.
 
 ``torch.linalg.inv`` and ``det`` check their ``info`` result, which is a read
 of the device; a barostat replaces the cell every step, and the one place
@@ -7,9 +7,15 @@ that must not stall the host is exactly there. For a 3 x 3 matrix the
 cofactor formulas are a handful of elementwise ops and have no such check.
 """
 
+import numpy as np
 import torch
 
-__all__ = ["det_3x3", "inverse_3x3"]
+__all__ = ["det_3x3", "inverse_3x3", "pbc_flags"]
+
+
+def pbc_flags(pbc) -> tuple[bool, bool, bool]:
+    """Per-axis periodicity as three Python bools; a scalar applies to all."""
+    return tuple(bool(p) for p in np.broadcast_to(np.asarray(pbc, dtype=bool), (3,)))
 
 
 def _entries(h: torch.Tensor):
