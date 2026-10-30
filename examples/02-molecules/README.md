@@ -77,11 +77,9 @@ data/C1H1O4S2/train/
 ```
 
 **Four systems, one `type_map`.** Every system is written against the full
-periodic table, the same list the model's `input.json` carries, so a type index
-is the atomic number in every directory and systems with different element
-subsets share one model without renumbering anything. (`--type-map present`
-writes a short per-system list instead; DeePMD-kit then remaps each system's
-local indices at load time.)
+periodic table, the same list the model's `input.json` carries, so systems
+with different element subsets share one model without renumbering
+([dataset layout](../../docs/dataset-layout.md)).
 
 **`nopbc`** is an empty file whose *presence* is the mechanism: the loader sees
 it and hands the model `box = None`.

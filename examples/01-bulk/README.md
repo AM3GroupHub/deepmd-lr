@@ -48,21 +48,11 @@ data/valid   60 frames
 note: set the model's `type_map` to the same full table, or training stops at 'Elements [...] are not present in the provided `type_map`'. Use --type-map present for a short one.
 ```
 
-The `type_map` is the whole periodic table, not just `['H', 'O']`, and that is
-the default. A per-dataset map makes the same integer mean different elements
-in different directories, so a dataset only ever works with the model it was
-converted for.
-
-With the full table a **type index is the atomic number** — hydrogen 1, oxygen
-8, everywhere. Index 0 is ASE's dummy `"X"`, which no atom is ever assigned;
-that slot exists so the indices are the numbers you already know rather than
-one less than them. The 116 elements absent from this water get a row in the
-type embedding and the energy bias, never receive a gradient, and cost nothing
-else.
-
-The one thing it commits you to: `input.json`'s `type_map` must be the same
-full list, because DeePMD-kit refuses an element a dataset has and the model
-does not. Pass `--type-map present` for the old per-dataset behaviour.
+The `type_map` is the whole periodic table, not just `['H', 'O']`, so a **type
+index is the atomic number** (hydrogen 1, oxygen 8) in every dataset. It
+commits `input.json`'s `type_map` to the same full list; `--type-map present`
+writes a per-dataset map instead
+([dataset layout](../../docs/dataset-layout.md#the-indices-in-typeraw-are-local-to-that-system)).
 
 Reading goes through `ase.io.read`, so the same command works for `.traj`,
 OUTCAR, CP2K output and anything else ASE knows (`--format` overrides the
@@ -84,10 +74,8 @@ data/train/
 Three things here trip people up:
 
 **`type.raw` indexes this system's `type_map.raw`**, not the model's
-`type_map`; DeePMD-kit remaps them at load time. With the full-table default
-the two coincide, so an index is the atomic number everywhere. Converted with
-`--type-map present`, a system's indices are local to its own short map and
-the remap is what lets different systems share one model.
+`type_map`; DeePMD-kit remaps them at load time
+([dataset layout](../../docs/dataset-layout.md)).
 
 **`box.npy` present ⇔ periodic.** For an isolated molecule there is no
 `box.npy` and instead an empty file named `nopbc`, whose presence makes the
@@ -112,21 +100,11 @@ ill-defined.
 
 ### `long_range.reciprocal.alpha = 0.4`
 
-`alpha` splits the Coulomb interaction in two:
-
-```
-  q_i q_j / r   =   q_i q_j erfc(alpha r)/r     <- short-ranged, the network learns it
-                  + q_i q_j  erf(alpha r)/r     <- this term supplies it
-```
-
-So `alpha` must be large enough that the network's share has *died inside its
-own cutoff*: `erfc(0.4 × 6.0) = 7e-4`. Too small and you ask the network to
-represent something reaching past `rcut`; too large and the reciprocal sum
-needs an impractically fine mesh.
-
-**`alpha` must be identical everywhere it appears** — across branches of a
-multi-head model, and between training and any later MD. It defines what the
-network learned to do.
+`alpha` splits Coulomb into `erfc(alpha r)/r`, which the network learns, and
+the smooth rest, which this term supplies. It must be large enough that the
+network's share has died inside its own cutoff: `erfc(0.4 × 6.0) = 7e-4`. It
+defines the model, so it must not change afterwards
+([choosing alpha and the mesh](../../docs/alpha-and-mesh.md#choosing-alpha-and-the-mesh)).
 
 ### `mesh_dimensions = [10, 10, 10]`
 
@@ -137,18 +115,13 @@ The mesh must resolve the screening Gaussian, so spacing must beat
 ceil(12.429 / 1.25) = 10
 ```
 
-**Use `mesh_dimensions`, never `mesh_spacing`.** A spacing-derived mesh is
-`ceil(L / spacing)` — a *step function* of the cell. Under NPT or any strain
-derivative it jumps a whole grid point as a cell length crosses a multiple of
-the spacing, which makes the energy discontinuous exactly there. It moved a
-virial by 2% in testing.
+Use `mesh_dimensions`, not `mesh_spacing`, whose mesh jumps with the cell
+([why](../../docs/alpha-and-mesh.md#recommended-pairings)).
 
 ### `slab_correction = false`, `pbc = [true, true, true]`
 
 3D-periodic bulk. The Yeh–Berkowitz correction is for a slab with vacuum, and
-these two settings are a *pair*: `slab_correction` without exactly one `false`
-entry in `pbc` is refused, and a `false` entry without the correction is
-refused too.
+the two settings are a pair ([example 03](../03-slab#slab_correction-and-pbc-are-a-pair)).
 
 ### `loss.start_pref_f = 1000 -> limit_pref_f = 1`
 

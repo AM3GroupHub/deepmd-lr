@@ -41,7 +41,7 @@ was not converted for, and why pretrained DPA models carry the full table. The
 model's `type_map` must then be the full table too, or every element the data
 declares and the model lacks is reported at load. Elements with no atoms in
 the data cost a row each in the type embedding and the energy bias and never
-a gradient. `--type-map present` gives the old per-dataset map.
+a gradient. `--type-map present` writes a per-dataset map instead.
 
 ### Several compositions in one training set
 
