@@ -79,7 +79,7 @@ from nvalchemiops.torch.interactions.electrostatics.slab import (
     compute_slab_correction,
 )
 
-from deepmd_lr.cell import inverse_3x3
+from deepmd_lr.cell import inverse_3x3, pbc_flags
 from deepmd_lr.lr.isolated import (
     DEFAULT_MAX_ISOLATED_ATOMS,
     ISOLATED_KERNELS,
@@ -791,7 +791,7 @@ def system_reciprocal(settings: dict[str, Any], cell: Any, pbc: Any) -> dict[str
     with ``method: isolated``, which has never seen a periodic image.
     """
     method = settings.get("method", "pme")
-    periodic = [bool(p) for p in np.broadcast_to(np.asarray(pbc, dtype=bool), (3,))]
+    periodic = list(pbc_flags(pbc))
     if not any(periodic):
         if method == IsolatedLongRangeEnergy.METHOD:
             return dict(settings)

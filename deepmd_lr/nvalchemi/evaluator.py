@@ -48,7 +48,7 @@ from deepmd_lr.born import (
     field_force,
     screening_factor,
 )
-from deepmd_lr.cell import inverse_3x3
+from deepmd_lr.cell import inverse_3x3, pbc_flags
 from deepmd_lr.compress import (
     compress_model,
 )
@@ -174,7 +174,7 @@ def _check_options(devices: Any, skin: Any, memory_headroom: Any) -> None:
 
 def _checked_pbc(pbc: Any) -> tuple[bool, bool, bool]:
     """A bulk cell, a slab or a cluster: the boundaries the engine handles."""
-    flags = tuple(bool(p) for p in np.broadcast_to(np.asarray(pbc, dtype=bool), (3,)))
+    flags = pbc_flags(pbc)
     if sum(flags) == 1:
         raise ValueError(
             f"pbc={list(flags)}: one periodic axis (a wire) is not supported. The "

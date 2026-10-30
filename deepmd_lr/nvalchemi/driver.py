@@ -46,6 +46,7 @@ from deepmd_lr.born import (
     edge_born_response,
     screening_factor,
 )
+from deepmd_lr.cell import pbc_flags
 from deepmd_lr.fitting.charge import (
     charge_mask,
     check_charge_filter,
@@ -346,7 +347,7 @@ def check_long_range_boundary(model: Any, pbc, term: Any = None) -> None:
     expected = (
         tuple(bool(p) for p in term.pbc) if term.needs_cell else (False, False, False)
     )
-    have = tuple(bool(p) for p in np.broadcast_to(np.asarray(pbc, dtype=bool), (3,)))
+    have = pbc_flags(pbc)
     if have != expected:
         method = getattr(term, "method", getattr(term, "METHOD", "?"))
         raise ValueError(
