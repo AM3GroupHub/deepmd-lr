@@ -8,8 +8,8 @@ Why not DeePMD-kit's own calculator
 enough for a strictly local model and structurally insufficient here -- the
 reciprocal-space term is a function of the cell and absolute positions. Used
 with a ``dp_lr`` model it would return only the short-range energy, and
-quietly: on the Phase 5 benchmark the frozen artifact came back at -93.74 eV
-where the eager model gives -55.12.
+quietly (-93.74 eV from the frozen artifact on a benchmark frame where the
+eager model gives -55.12).
 
 This calculator drives the model's full ``forward`` instead, so the cell is
 present and the long-range term is evaluated. It is eager PyTorch rather than
@@ -65,28 +65,9 @@ def load_model(
     are summed without touching a single trained parameter.
     """
     state = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    params = state["model"]["_extra_state"]["model_params"]
-    prefix = _STATE_PREFIX
-    if "model_dict" in params:
-        branches = params["model_dict"]
-        if head is None:
-            raise ValueError(f"Select a checkpoint head from {list(branches)}")
-        matches = [
-            name
-            for name, branch in branches.items()
-            if head == name or head in branch.get("model_branch_alias", [])
-        ]
-        if len(matches) != 1:
-            raise ValueError(
-                f"Unknown or ambiguous head {head!r}; available: {list(branches)}"
-            )
-        name = matches[0]
-        params = branches[name]
-        prefix = f"model.{name}."
-    elif head not in (None, "Default"):
-        raise ValueError(
-            f"Single-head checkpoint has only head 'Default', got {head!r}"
-        )
+    params, prefix = _select_head(
+        state["model"]["_extra_state"]["model_params"], head
+    )
     model = get_model(params)
     weights = {
         key[len(prefix) :]: value
@@ -116,6 +97,29 @@ def load_model(
     return model
 
 
+def _select_head(params: dict, head: str | None) -> tuple[dict, str]:
+    """The branch's model params and its state-dict prefix."""
+    if "model_dict" not in params:
+        if head not in (None, "Default"):
+            raise ValueError(
+                f"Single-head checkpoint has only head 'Default', got {head!r}"
+            )
+        return params, _STATE_PREFIX
+    branches = params["model_dict"]
+    if head is None:
+        raise ValueError(f"Select a checkpoint head from {list(branches)}")
+    matches = [
+        name
+        for name, branch in branches.items()
+        if head == name or head in branch.get("model_branch_alias", [])
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            f"Unknown or ambiguous head {head!r}; available: {list(branches)}"
+        )
+    return branches[matches[0]], f"model.{matches[0]}."
+
+
 def select_neighbor_graph_method(model: Any) -> str:
     """Point the short-range path at the GPU cell list where possible.
 
@@ -126,8 +130,7 @@ def select_neighbor_graph_method(model: Any) -> str:
     O(N^2) all-pairs builder. That is invisible until the system is large:
     on the 6520-atom LiFSI frame the dense path peaks at **48.2 GB** and
     takes 724 ms, against **4.0 GB** and 201 ms through ``"nv"``, for a
-    bit-identical energy. 48 GB does not fit on a 48 GB card, which is how
-    this first showed up -- as an out-of-memory error on an A40.
+    bit-identical energy.
 
     Resolved through DeePMD-kit's own helper, so a CPU model or a missing
     nvalchemiops degrades to ``"dense"`` rather than raising.
@@ -220,11 +223,9 @@ class LongRangeCalculator(Calculator):
         self.device = device
         # A uniform external field in V/angstrom, or None. The force it adds is
         # `F_i = Z_i.T E` with Z the Born effective charge tensor. That is a
-        # response, NOT the gradient of a `-M.E` energy: under periodic
-        # boundaries M is not even defined, and for an isolated system the two
-        # differ by a centroid-dependent term (see `deepmd_lr/born.py`). So the
-        # energy reported here is left untouched, and a constant-field NVE run
-        # will not conserve `E - M.E`. That is by construction, not a bug.
+        # response, NOT the gradient of a `-M.E` energy (see
+        # `deepmd_lr/born.py`), so the energy reported here is left untouched,
+        # and a constant-field NVE run will not conserve `E - M.E`.
         self.efield = (
             None
             if efield is None
@@ -239,12 +240,19 @@ class LongRangeCalculator(Calculator):
         )
         if long_range is not None and not isinstance(model, str):
             self.model.set_long_range(long_range)
-        # A model trained WITHOUT `type: dp_lr` -- the baseline twin the
-        # README asks for -- is a plain EnergyModel and simply has no
-        # `has_long_range` attribute. The distributed driver already reads it
-        # defensively; the calculator used not to, so loading a baseline into
-        # it raised AttributeError instead of just running short-range.
+        # A model trained without `type: dp_lr` is a plain EnergyModel with no
+        # `has_long_range` attribute, and runs short-range only.
         self._has_long_range = bool(getattr(self.model, "has_long_range", False))
+        self._configure_charges(eps_inf, charge_filter)
+        self.type_map = list(self.model.get_type_map())
+        self.charge_spin = _charge_spin_condition(charge_spin, self.device)
+        # Last: the model is on its device and in eval mode, and the run's
+        # charge state is known -- compression folds it into the tables.
+        compress_model(self.model, compress, charge_spin=self.charge_spin)
+
+    def _configure_charges(self, eps_inf: float, charge_filter: Any) -> None:
+        """The field, screening and filter settings, validated now rather
+        than on the first step."""
         if self.efield is not None:
             if not self._has_long_range:
                 raise ValueError(
@@ -255,8 +263,7 @@ class LongRangeCalculator(Calculator):
             self.model.compute_born = True
         # Screened charges: `results["charges"]` and `results["born_charge"]`
         # -- and so the field force -- carry sqrt(eps_inf); the energy and the
-        # field-free forces do not. Validated now rather than on the first
-        # step. A short-range model reports no charges, so nothing to scale.
+        # field-free forces do not. A short-range model reports no charges.
         screening_factor(eps_inf)
         self.eps_inf = float(eps_inf)
         if self._has_long_range:
@@ -276,20 +283,6 @@ class LongRangeCalculator(Calculator):
                     "charge_filter cannot be combined with an efield yet: the "
                     "field force is built from unfiltered Born charges"
                 )
-        self.type_map = list(self.model.get_type_map())
-        self.charge_spin = None
-        if charge_spin is not None:
-            condition = torch.as_tensor(
-                charge_spin, dtype=torch.float64, device=self.device
-            )
-            if condition.numel() != 2:
-                raise ValueError(
-                    "charge_spin must contain (total_charge, spin_multiplicity)"
-                )
-            self.charge_spin = condition.reshape(1, 2)
-        # Last: the model is on its device and in eval mode, and the run's
-        # charge state is known -- compression folds it into the tables.
-        compress_model(self.model, compress, charge_spin=self.charge_spin)
 
     def _atom_types(self, atoms: Any) -> torch.Tensor:
         """Map ASE chemical symbols onto the model's type indices."""
@@ -357,10 +350,20 @@ class LongRangeCalculator(Calculator):
         if self._has_long_range:
             # The frame decides how the sum is taken: its pbc picks the 3D, the
             # slab or the isolated sum, its cell the PME mesh. The term holds
-            # no weights, so this changes no parameter, and each frame gets the
-            # mesh its own cell needs.
+            # no weights, so this changes no parameter.
             self.model.adapt_long_range(np.asarray(atoms.get_cell()), atoms.pbc)
+        coord, cell, atype = self._model_inputs(atoms, periodic)
+        if self._has_long_range:
+            # Re-asserted every call: the model object may be shared between
+            # calculators built with different media, and the last one to be
+            # constructed must not win over the one actually computing.
+            self.model.eps_inf = self.eps_inf
+            self.model.charge_filter = self.charge_filter
+        out = self.model(coord, atype, box=cell, charge_spin=self.charge_spin)
+        self._store(out, atoms, periodic)
 
+    def _model_inputs(self, atoms: Any, periodic: bool) -> tuple:
+        """``(coord, cell, atype)`` as the model's forward takes them."""
         coord = torch.tensor(
             np.asarray(atoms.get_positions()),
             dtype=torch.float64,
@@ -376,16 +379,10 @@ class LongRangeCalculator(Calculator):
             if periodic
             else None
         )
-        atype = self._atom_types(atoms).unsqueeze(0)
+        return coord, cell, self._atom_types(atoms).unsqueeze(0)
 
-        if self._has_long_range:
-            # Re-asserted every call: the model object may be shared between
-            # calculators built with different media, and the last one to be
-            # constructed must not win over the one actually computing.
-            self.model.eps_inf = self.eps_inf
-            self.model.charge_filter = self.charge_filter     # re-asserted, as eps_inf
-        out = self.model(coord, atype, box=cell, charge_spin=self.charge_spin)
-
+    def _store(self, out: dict, atoms: Any, periodic: bool) -> None:
+        """The model's outputs as ASE results, the field force added."""
         energy = float(out["energy"].reshape(-1)[0].detach())
         self.results["energy"] = energy
         self.results["free_energy"] = energy
@@ -403,27 +400,12 @@ class LongRangeCalculator(Calculator):
             forces = forces + np.einsum("iab,a->ib", born, self.efield)
             self.results["born_charge"] = born
         self.results["forces"] = forces
-
-        # Stress is force per area, so it needs a volume to divide by. The
-        # virial itself is still meaningful without a cell -- it is the pair
-        # sum -- but there is nothing to normalize it against.
-        # Under a field, none: the field's own contribution to the stress is a
-        # separate derivation not attempted here, and reporting the field-free
-        # stress would be quietly wrong.
+        # Stress needs a volume to divide by. Under a field there is none
+        # either: the field's own contribution to the stress is not derived
+        # here, and the field-free stress would be quietly wrong.
         if "virial" in out and periodic and self.efield is None:
             virial = out["virial"].reshape(3, 3).detach().cpu().numpy()
-            # ASE wants stress = -virial / volume, in Voigt order.
-            stress = -virial / atoms.get_volume()
-            self.results["stress"] = np.array(
-                [
-                    stress[0, 0],
-                    stress[1, 1],
-                    stress[2, 2],
-                    0.5 * (stress[1, 2] + stress[2, 1]),
-                    0.5 * (stress[0, 2] + stress[2, 0]),
-                    0.5 * (stress[0, 1] + stress[1, 0]),
-                ]
-            )
+            self.results["stress"] = _voigt_stress(virial, atoms.get_volume())
         # Diagnostics. The energy split is per-frame and reduces to a scalar;
         # charges are per-atom and keep their axis.
         for key in ("energy_short_range", "energy_long_range"):
@@ -431,3 +413,28 @@ class LongRangeCalculator(Calculator):
                 self.results[key] = float(out[key].reshape(-1)[0].detach())
         if "charge" in out:
             self.results["charges"] = out["charge"].reshape(-1).detach().cpu().numpy()
+
+
+def _charge_spin_condition(charge_spin: Any, device: Any) -> torch.Tensor | None:
+    """``charge_spin`` as the ``(1, 2)`` condition tensor, or None."""
+    if charge_spin is None:
+        return None
+    condition = torch.as_tensor(charge_spin, dtype=torch.float64, device=device)
+    if condition.numel() != 2:
+        raise ValueError("charge_spin must contain (total_charge, spin_multiplicity)")
+    return condition.reshape(1, 2)
+
+
+def _voigt_stress(virial: np.ndarray, volume: float) -> np.ndarray:
+    """ASE's stress, ``-virial / volume`` in Voigt order, symmetrised."""
+    stress = -virial / volume
+    return np.array(
+        [
+            stress[0, 0],
+            stress[1, 1],
+            stress[2, 2],
+            0.5 * (stress[1, 2] + stress[2, 1]),
+            0.5 * (stress[0, 2] + stress[2, 0]),
+            0.5 * (stress[0, 1] + stress[1, 0]),
+        ]
+    )
