@@ -49,10 +49,9 @@ rotate while it relaxes. What this module adds around the kernels:
 
 - **The cell force** FIRE and FIRE2 are given is -d(E + PV)/dH =
   -V H^-T (sigma + P) for the rows of ASE's cell, projected onto the mode's
-  directions (:meth:`_Relaxation._cell_force`); since 0.5.0 nvalchemiops'
-  ``stress_to_cell_force`` computes the same gradient (0.4 was written for
-  column cells and was 0.70 eV/A off on a sheared water cell; a test pins the
-  agreement). L-BFGS takes the stress itself, projected the same way.
+  directions (:meth:`_Relaxation._cell_force`), the gradient nvalchemiops'
+  ``stress_to_cell_force`` computes too (a test pins the agreement). L-BFGS
+  takes the stress itself, projected the same way.
 - **The frame.** The kernels want the cell triangular: FIRE and FIRE2 the
   lower triangle of ASE's rows (ASE's standard form); L-BFGS, whose kernel
   holds the lattice vectors as columns, the upper. A cell that is not already
@@ -97,6 +96,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import warp as wp
 from ase import Atoms, units
 from ase.calculators.singlepoint import SinglePointCalculator
 from ase.cell import Cell
@@ -167,6 +167,61 @@ def _is_identity(r: np.ndarray) -> bool:
     return bool(np.abs(r - np.eye(3)).max() < 1e-12)
 
 
+def _check_relax_cell(
+    evaluator: Any, atoms: Atoms, relax_cell: str | None, pressure_au: Any
+) -> None:
+    """Refuse a ``relax_cell`` (and target pressure) this system cannot take."""
+    if relax_cell not in (None, *_CELL_MODES):
+        raise ValueError(
+            f"relax_cell must be None or one of {', '.join(_CELL_MODES)}; "
+            f"got {relax_cell!r}"
+        )
+    if relax_cell is not None and not all(
+        getattr(evaluator, "pbc", (True, True, True))
+    ):
+        raise ValueError(
+            "relax_cell moves the cell, and a slab's open axis is not a "
+            "periodic length a stress can act on, nor is a cluster's box; "
+            "relax the positions only"
+        )
+    fixed = _fixed_atoms(atoms)
+    if relax_cell is not None and len(fixed):
+        raise ValueError(
+            "relax_cell strains every position with the cell, so fixed "
+            "atoms would not stay fixed; relax the positions only"
+        )
+    if relax_cell is None and float(pressure_au) != 0.0:
+        raise ValueError(
+            "pressure_au is the target of a cell relaxation; pass relax_cell too"
+        )
+    if relax_cell is not None and not evaluator.compute_virial:
+        raise ValueError(
+            "a cell relaxation needs the virial: build the evaluator with "
+            "compute_virial=True or call evaluator.set_compute_virial(True)"
+        )
+    cell = np.asarray(evaluator.cell)
+    if relax_cell == "orthorhombic" and np.any(cell != np.diag(np.diag(cell))):
+        raise ValueError(
+            "relax_cell='orthorhombic' keeps every angle at 90 degrees, so it "
+            "needs a diagonal cell; use 'full' for this one"
+        )
+
+
+def _log_columns(relax_cell: str | None) -> list:
+    columns = [
+        ("step", 10, "d"),
+        ("Epot[eV]", 18, ".6f"),
+        ("fmax[eV/A]", 14, ".5f"),
+    ]
+    if relax_cell is not None:
+        columns += [
+            ("P[GPa]", 12, ".5f"),
+            ("dS[GPa]", 12, ".5f"),
+            ("V[A^3]", 14, ".3f"),
+        ]
+    return columns
+
+
 class _Relaxation:
     """What the relaxations share: a Thermo of their own on the shared
     evaluator, the loop with its divergence guard, the checks, the log, the
@@ -216,46 +271,11 @@ class _Relaxation:
         maxstep: float = 0.1,
         check: bool = True,
     ) -> None:
-        import warp as wp
-
         _check_evaluator(evaluator)
         _check_atoms(evaluator, atoms)
-        if relax_cell not in (None, *_CELL_MODES):
-            raise ValueError(
-                f"relax_cell must be None or one of {', '.join(_CELL_MODES)}; "
-                f"got {relax_cell!r}"
-            )
-        if relax_cell is not None and not all(
-            getattr(evaluator, "pbc", (True, True, True))
-        ):
-            raise ValueError(
-                "relax_cell moves the cell, and a slab's open axis is not a "
-                "periodic length a stress can act on, nor is a cluster's box; "
-                "relax the positions only"
-            )
-        fixed = _fixed_atoms(atoms)
-        if relax_cell is not None and len(fixed):
-            raise ValueError(
-                "relax_cell strains every position with the cell, so fixed "
-                "atoms would not stay fixed; relax the positions only"
-            )
+        _check_relax_cell(evaluator, atoms, relax_cell, pressure_au)
         self.relax_cell = relax_cell
         self.pressure_au = float(pressure_au)
-        if relax_cell is None and self.pressure_au != 0.0:
-            raise ValueError(
-                "pressure_au is the target of a cell relaxation; pass relax_cell too"
-            )
-        if relax_cell is not None and not evaluator.compute_virial:
-            raise ValueError(
-                "a cell relaxation needs the virial: build the evaluator with "
-                "compute_virial=True or call evaluator.set_compute_virial(True)"
-            )
-        cell = np.asarray(evaluator.cell)
-        if relax_cell == "orthorhombic" and np.any(cell != np.diag(np.diag(cell))):
-            raise ValueError(
-                "relax_cell='orthorhombic' keeps every angle at 90 degrees, so it "
-                "needs a diagonal cell; use 'full' for this one"
-            )
         self.atoms = atoms
         self.thermo = Thermo.from_atoms(evaluator, atoms)
         # A relaxation starts, and hands atoms back, at rest.
@@ -278,19 +298,10 @@ class _Relaxation:
         self._observers: list = []
         self._last_recorded: int | None = None
         self._traj = None if trajectory is None else _Trajectory(trajectory, False)
-        columns = [
-            ("step", 10, "d"),
-            ("Epot[eV]", 18, ".6f"),
-            ("fmax[eV/A]", 14, ".5f"),
-        ]
-        if relax_cell is not None:
-            columns += [
-                ("P[GPa]", 12, ".5f"),
-                ("dS[GPa]", 12, ".5f"),
-                ("V[A^3]", 14, ".3f"),
-            ]
         self._logger = (
-            None if logfile is None else _Logger(logfile, columns, append=False)
+            None
+            if logfile is None
+            else _Logger(logfile, _log_columns(relax_cell), append=False)
         )
 
     @property
@@ -464,7 +475,6 @@ class _Relaxation:
             self._reset()
             f0 = self._evaluate()
             valid = True
-            n = th.n_atoms
             e0, v0 = self._enthalpy(), self.evaluator.volume
             bonds0 = _covalent_bonds(self.atoms) if self.check else None
             self._record(f0)
@@ -480,18 +490,9 @@ class _Relaxation:
                 f = self._evaluate()
                 valid = True
                 self.nsteps += 1
-                released = (e0 - self._enthalpy()) / n
-                if f > max(10.0 * f0, 50.0) or released > 2.0:
-                    diverged = (
-                        f"max|F| reached {f:.3g} eV/A and the energy "
-                        f"fell {released:.3g} eV/atom"
-                    )
+                diverged = self._divergence(f, f0, e0, v0)
+                if diverged:
                     break
-                if self.relax_cell is not None:
-                    grown = self.evaluator.volume / v0
-                    if not 0.5 < grown < 2.0:
-                        diverged = f"the cell volume changed {grown:.3g}-fold"
-                        break
                 self.converged = self._converged(f, fmax, smax)
                 if self.nsteps % self.loginterval == 0:
                     self._record(f)
@@ -523,8 +524,28 @@ class _Relaxation:
             raise RelaxationError(
                 f"relaxation diverged after {self.nsteps} steps ({diverged}): {why}"
             )
-        if not self.check:
-            return
+        if self.check:
+            self._check_result(f1, fmax, smax, e0, bonds0)
+
+    def _divergence(self, f: float, f0: float, e0: float, v0: float) -> str | None:
+        """Why the step just taken counts as divergence, or None."""
+        released = (e0 - self._enthalpy()) / self.thermo.n_atoms
+        if f > max(10.0 * f0, 50.0) or released > 2.0:
+            return (
+                f"max|F| reached {f:.3g} eV/A and the energy "
+                f"fell {released:.3g} eV/atom"
+            )
+        if self.relax_cell is not None:
+            grown = self.evaluator.volume / v0
+            if not 0.5 < grown < 2.0:
+                return f"the cell volume changed {grown:.3g}-fold"
+        return None
+
+    def _check_result(
+        self, f1: float, fmax: float, smax: float, e0: float, bonds0: set
+    ) -> None:
+        """Refuse a finished run that did not converge, raised the energy
+        (without a field) or changed the covalent topology."""
         problems = []
         if not self.converged:
             stress = (
@@ -641,7 +662,6 @@ class FIRE(_Relaxation):
         fa: float = 0.99,
         **kwargs: Any,
     ) -> None:
-        import warp as wp
         from nvalchemiops.dynamics.optimizers import fire_step
 
         _check_fire(dt, dtmax, dtmin, Nmin, finc, fdec, astart, fa)
@@ -787,7 +807,6 @@ class FIRE2(_Relaxation):
         fa: float = 0.985,
         **kwargs: Any,
     ) -> None:
-        import warp as wp
         from nvalchemiops.dynamics.optimizers import fire2_step
 
         _check_fire(dt, dtmax, dtmin, Nmin, finc, fdec, astart, fa)
