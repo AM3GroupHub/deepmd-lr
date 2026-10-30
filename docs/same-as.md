@@ -4,8 +4,10 @@ Worked example: [`examples/05-pseudo-head`](../examples/05-pseudo-head).
 
 [Multi-head](multi-head.md) answers "different levels of theory". `same_as`
 answers a different question: one level of theory whose dataset holds both
-periodic bulk cells and 2D-periodic slabs. Separate heads would each fit their
-own energy zero and each see half the data, and they are unnecessary, because
+periodic bulk cells and 2D-periodic slabs. In training a branch's
+`slab_correction` and `pbc` are fixed when it is built, so one ordinary branch
+cannot take both. Separate heads would each fit their own energy zero and each
+see half the data, and they are unnecessary, because
 **the long-range term holds no trainable weights**. Every parameter lives in
 the descriptor, the energy head and the charge head, so one set of weights
 serves both boundary conditions and only the sum over periodic images differs.
@@ -45,15 +47,27 @@ carry no dipole across the vacuum, one 3D branch already serves both. It earns
 its keep for polar slabs (an electrode under electrolyte, an asymmetric
 interface), where the correction is large and decays only as `1/L_z`.
 
+**What the two subsets must share.** One level of theory (same functional,
+basis, code and settings: the branches share the fitting net's `bias_atom_e`,
+so their energy zero), one `type_map` covering both, and the same `alpha`. If
+the subsets come from different theories, use separate heads sharing a
+descriptor ([multi-head](multi-head.md)); `same_as` would be wrong there.
+
 A `same_as` branch may set only `long_range`, `model_branch_alias` and `info`.
-Anything else is refused rather than ignored, because it would be built and
-then discarded when the modules are aliased. Also refused: a differing `alpha`
-(the shared descriptor learned one split), an overridden `charge_net` (it
-holds weights), `dim_case_embd > 0` (it gives each branch an index in one
-shared buffer), and a `same_as` chain.
+A pseudo-head that quietly diverged would still train and converge, just not
+as the model you asked for, so every divergence is refused, naming the branch:
+
+| written in a `same_as` branch | why it is refused |
+|---|---|
+| `descriptor`, `fitting_net`, `type_map`, ... | would be built, then discarded when the modules are aliased |
+| `long_range.charge_net` | holds weights, so it must be the same object, not an equal copy |
+| a different `alpha` | the shared descriptor learned one split |
+| `fitting_net.dim_case_embd > 0` | gives each branch its own index in one shared buffer |
+| `same_as` pointing at another `same_as` branch | leaves it ambiguous which model is the original |
 
 > Remove `stat_file` when you add or change `same_as`: the offsets are restored
-> from it when present, bypassing the pooled fit.
+> from it when present, bypassing the pooled fit and leaving them fitted on
+> one branch's frames.
 
 ### Setting the long-range type at load
 

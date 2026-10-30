@@ -117,14 +117,10 @@ The first is what makes the model **read `charge_spin.npy` at all**; without it
 the file is ignored silently and every molecule is treated as neutral. The
 second supplies a fallback so systems *without* one still run.
 
-Two consequences worth knowing before a long run:
-
-- `add_chg_spin_ebd` is part of DPA4C's **structural signature**. In a
-  multi-head model it must be `true` for *every* branch or the shared
-  descriptor refuses to link — and turning it on later invalidates existing
-  checkpoints.
-- `default_chg_spin` is deliberately **not** in that signature, which is what
-  lets neutral branches coexist with charged ones.
+`add_chg_spin_ebd` is part of DPA4C's structural signature: turning it on
+later invalidates existing checkpoints, and in a multi-head model it must be
+on for every branch, while `default_chg_spin` lets neutral branches coexist
+([multi-head rules](../../docs/multi-head.md#rules-that-will-bite-you)).
 
 ### The charges sum to the frame's total, not to zero
 
