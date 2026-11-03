@@ -27,6 +27,17 @@ DT = torch.float64
 EPS = 4.0  # sqrt is exactly 2, so the assertions below are exact ratios
 
 
+def short_range_model():
+    """A ``dp_lr`` model with no ``long_range`` block: no charges."""
+    cfg = {
+        "type": "dp_lr",
+        "type_map": ["O", "H"],
+        "descriptor": copy.deepcopy(DESCRIPTOR),
+        "fitting_net": copy.deepcopy(FITTING),
+    }
+    return get_model(cfg).eval()
+
+
 class TestScreeningFactor:
     def test_vacuum_is_one(self):
         assert screening_factor(1.0) == 1.0
@@ -152,19 +163,16 @@ class TestCalculator:
         with pytest.raises(ValueError, match="positive and finite"):
             LongRangeCalculator(model, eps_inf=0.0)
 
-    def test_short_range_model_accepts_the_argument(self):
-        """A model without charges has nothing to scale, but must not choke."""
+    def test_short_range_model_takes_only_vacuum(self):
+        """A model without charges has nothing to scale: ``1.0`` runs, any
+        other value is a mistake and refused at construction."""
         from deepmd_lr.ase import LongRangeCalculator
 
-        cfg = {
-            "type": "dp_lr",
-            "type_map": ["O", "H"],
-            "descriptor": copy.deepcopy(DESCRIPTOR),
-            "fitting_net": copy.deepcopy(FITTING),
-        }
-        model = get_model(cfg).eval()
+        model = short_range_model()
         _model, atoms = self._atoms_and_model()
-        atoms.calc = LongRangeCalculator(model, eps_inf=EPS)
+        with pytest.raises(ValueError, match="predicts no charges"):
+            LongRangeCalculator(model, eps_inf=EPS)
+        atoms.calc = LongRangeCalculator(model, eps_inf=1.0)
         assert np.isfinite(atoms.get_potential_energy())
         assert "charges" not in atoms.calc.results
 
@@ -240,3 +248,12 @@ class TestPartitioned:
         model, _c, a, cl, *_ = self._setup()
         with pytest.raises(ValueError, match="positive and finite"):
             DistributedEvaluator(model, a, cl, devices=[DEVICE], eps_inf=-2.0)
+
+    def test_evaluator_refuses_screening_without_charges(self):
+        from deepmd_lr.nvalchemi import DistributedEvaluator
+
+        _model, _c, a, cl, *_ = self._setup()
+        model = short_range_model().to(DEVICE)
+        with pytest.raises(ValueError, match="predicts no charges"):
+            DistributedEvaluator(model, a, cl, devices=[DEVICE], eps_inf=EPS)
+        assert DistributedEvaluator(model, a, cl, devices=[DEVICE]).eps_inf == 1.0

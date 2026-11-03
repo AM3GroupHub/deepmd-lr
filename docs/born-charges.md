@@ -44,7 +44,8 @@ IR dipole rate `Ṁ = Σ_i Z~_i v_i`. Not scaled: the energy, the field-free
 forces, the stress, and the model itself (tables, checkpoint, training), since
 this rescales the reported response without changing the fitted interaction.
 The default `1.0` leaves it unscaled; non-positive or non-finite values
-are refused. A compressed model is unaffected, as the scaling comes after the
+are refused, and so is any value but `1.0` on a model without a
+`long_range` block, which predicts no charges to scale. A compressed model is unaffected, as the scaling comes after the
 tables.
 
 ### Calibrating the scale and sign against DFPT labels

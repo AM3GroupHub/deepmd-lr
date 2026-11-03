@@ -31,6 +31,7 @@ from deepmd.pt_expt.model.get_model import get_model
 from deepmd.pt_expt.utils.env import DEVICE
 
 from deepmd_lr.born import (
+    EPS_INF_NEEDS_CHARGES,
     screening_factor,
 )
 from deepmd_lr.compress import (
@@ -181,7 +182,8 @@ class LongRangeCalculator(Calculator):
         multiplied by ``sqrt(eps_inf)``, the factor that turns the model's
         Coulomb charges into the screened ones for which the energy reads
         ``q~_i q~_j / (4 pi eps_0 eps_inf r)``. A field force built from those
-        tensors scales with it; the energy and field-free forces do not.
+        tensors scales with it; the energy and field-free forces do not. A
+        model without a ``long_range`` block refuses any value but ``1.0``.
     charge_filter
         ``(c_t, delta)`` in e; ``False`` for none; None (the default) for the
         model's own ``long_range.charge_filter``. As an override, simulation
@@ -263,8 +265,9 @@ class LongRangeCalculator(Calculator):
             self.model.compute_born = True
         # Screened charges: `results["charges"]` and `results["born_charge"]`
         # -- and so the field force -- carry sqrt(eps_inf); the energy and the
-        # field-free forces do not. A short-range model reports no charges.
-        screening_factor(eps_inf)
+        # field-free forces do not. A short-range model has none to scale.
+        if screening_factor(eps_inf) != 1.0 and not self._has_long_range:
+            raise ValueError(EPS_INF_NEEDS_CHARGES)
         self.eps_inf = float(eps_inf)
         if self._has_long_range:
             self.model.eps_inf = self.eps_inf
