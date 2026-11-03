@@ -45,6 +45,7 @@ import numpy as np
 import torch
 
 from deepmd_lr.born import (
+    EPS_INF_NEEDS_CHARGES,
     field_force,
     screening_factor,
 )
@@ -298,7 +299,8 @@ class DistributedEvaluator:
         ``sqrt(eps_inf)``: the model's Coulomb energy ``q_i q_j / (4 pi eps_0 r)``
         is the screened ``q~_i q~_j / (4 pi eps_0 eps_inf r)`` with
         ``q~ = sqrt(eps_inf) q``. The field force, built from ``Z``, scales with
-        it; energies and field-free forces do not change.
+        it; energies and field-free forces do not change. A model without a
+        ``long_range`` block refuses any value but ``1.0``.
     charge_filter
         ``(c_t, delta)`` in e; ``False`` for none; None (the default) for the
         model's own ``long_range.charge_filter``, if it was trained with one.
@@ -511,7 +513,8 @@ class DistributedEvaluator:
         #: ``results['born_charge']`` -- and therefore the field force -- are
         #: scaled by sqrt(eps_inf); energies and field-free forces are not.
         #: Validated here so a typo fails at construction, not mid-run.
-        screening_factor(eps_inf)
+        if screening_factor(eps_inf) != 1.0 and not long_range:
+            raise ValueError(EPS_INF_NEEDS_CHARGES)
         self.eps_inf = float(eps_inf)
 
     def _set_device_buffers(self) -> None:

@@ -83,7 +83,20 @@ from deepmd.dpmodel.utils.neighbor_graph import (
     segment_sum,
 )
 
-__all__ = ["born_charges", "field_force", "screening_factor"]
+__all__ = [
+    "EPS_INF_NEEDS_CHARGES",
+    "born_charges",
+    "field_force",
+    "screening_factor",
+]
+
+#: The refusal for ``eps_inf != 1`` on a model without a charge head: there is
+#: nothing to scale, so the value can only be a mistake.
+EPS_INF_NEEDS_CHARGES = (
+    "eps_inf scales the reported charges, which need the charge head -- this "
+    "model has no `long_range` block, so it predicts no charges. Leave eps_inf "
+    "at 1.0."
+)
 
 
 def screening_factor(eps_inf: Any) -> float:
