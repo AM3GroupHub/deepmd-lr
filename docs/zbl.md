@@ -86,11 +86,14 @@ in covalent-radius sums: H-O 0.90 (window 0.70-0.95). Give these pairs a window
 below their data: "pairs": {"H-O": [0.64, 0.89]}
 ```
 
-Bond lengths differ between materials (0.75 radius sums for Nb–O in PMN, 0.77
-for C–C in SiC, both inside the default), so this is where a pair shorter than
-the default allows shows up. Each window must also end inside
-`descriptor.rcut`; with a type_map that lists the whole periodic table the
-default reaches 4.4 Å between its largest atoms.
+The radii are those of single bonds, and bonds can be shorter: a triple bond
+(C≡C is 0.79 radius sums, N≡N 0.77), a metal–oxygen bond in an off-centred
+octahedron, a contact of a melt. The shortest Nb–O of a PMN set sits at 0.77
+radius sums, the shortest C–C and Si–Si of a set with amorphous carbon and
+silicon at 0.75 and 0.82, all inside the default
+([other models](#other-models)). This is where they show up. Each window must
+also end inside `descriptor.rcut`; with a type_map that lists the whole
+periodic table the default reaches 4.4 Å between its largest atoms.
 
 ## A trained model
 
@@ -111,9 +114,12 @@ ev = build_evaluator(model, atoms, compress=True)  # GPU MD
 With every window below its pair's data this changes nothing fitted: on the
 water test set the energy moved by 5e-6 eV, forces by 2e-6 eV/Å and charges by
 4e-7 e, which is float32 noise. For the same reason training with the block
-gives the same model on the data; `set_zbl(None)` removes the term. Nothing
-checks a trained model against data it no longer has: run the scan with
-`--data` first.
+gives the same model on the data; `set_zbl(None)` removes the term.
+
+`set_zbl` has no data to check the windows against. The check training makes
+is `model.check_zbl_against(sampled)`, on samples in DeePMD-kit's statistics
+format, and `scan.py --data train.xyz` runs it on a structure file: run it
+before trusting the default on a model trained without the block.
 
 ## What it does, measured
 
@@ -139,6 +145,45 @@ fitted contact.
 
 On a 192-atom water box an NVE run conserves energy as before (0.032 meV/atom
 rms without the term, 0.031 with it), since no pair enters a window.
+
+### Other models
+
+The same scan over every pair of elements of two more long-range models, first
+with the bare default, then with the windows the check proposed:
+
+| | water | PMN (Pb, Mg, Nb, O) | silicon/diamond |
+|---|---|---|---|
+| pairs scanned | 3 | 10 | 3 |
+| trained model, lowest energy on a path | −7.4e8 eV | −3.1e10 eV | −2.1 eV |
+| trained model, largest charge of a pair | 1.3e4 e | 1,450 e | 0.75 e |
+| data inside the default window | none | Nb–O, from 0.77 | C–C from 0.75, Si–Si from 0.82 |
+| what the default does to fitted frames | nothing | 16–41 meV/atom, up to 16 eV/Å, in all 30 frames | up to 118 meV/atom, 30 eV/Å, in 890 of 4,552 frames |
+| `pairs` the check proposes | | `"Nb-O": [0.52, 0.77]` | `"C-C": [0.5, 0.75]`, `"Si-Si": [0.57, 0.82]` |
+| fitted frames with those | | unchanged | unchanged |
+| paths that hold | 1 of 3; 3 of 3 with the two pairs above | 10 of 10 | 3 of 3 |
+| largest charge of a pair with the term | 0.27 e | 0.67 e | 0.09 e |
+
+The short-range model fitted to the same water data, which has no charges to
+lose, falls later and less far (to −4.8e4 eV) and holds on all three paths
+with the same block.
+
+Three things to take from it:
+
+- **The default is a starting point that the data confirm or move.** Two of
+  three data sets hold bonds shorter than 0.85 radius sums; the check names
+  them, and with its windows the fitted frames are back to float32 noise.
+  (PMN was checked against 30 DFPT structures rather than its training set.)
+- **How badly a model fails depends on its data.** The silicon/diamond set
+  holds amorphous carbon and silicon from melt-quench runs, and its model
+  never collapses: its walls only fall back, by 7, 6 and 54 eV on the three
+  paths, where with the term they rise all the way in. The water and PMN sets
+  hold nothing of the kind, and their models fall by orders of magnitude.
+- **A path shows whatever is met first.** In a perovskite an oxygen sits
+  between two neighbouring B-site cations, so the Nb–Nb path is an Nb–O
+  collision (64,000 eV of ZBL at 0.05 Å, where the trained model stands at
+  −3.1e10 eV). And only water has the default fail on a non-bonded pair: in
+  PMN the network alone carries O–O from its data at 2.47 Å down to the window
+  at 1.12 Å, rising to 158 eV on the way, which is luck rather than design.
 
 ## What it does not do
 
