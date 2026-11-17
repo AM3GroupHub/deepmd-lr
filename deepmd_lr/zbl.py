@@ -29,19 +29,29 @@ pair's shortest contact in the data, so that nothing fitted changes, and
 no term.
 
 ZBL has no parameters and sees the edge vectors through no network, so its
-force and virial are assembled analytically from the per-edge derivative,
-through the edge-to-node reduction DeePMD-kit uses for the learned energy (its
-fused CUDA kernel when ``DP_CUDA_INFER`` asks for it). On a CUDA device one
-Warp kernel produces the per-edge energy and derivative; elsewhere, and under
-a tracer, the same arithmetic runs as torch ops. The envelope multiplies
-network outputs, so it is a differentiable function of the edge vectors and
-whatever is differentiated through those outputs -- force, virial, the charge
-response, Born charges -- picks its derivative up on the way.
+force and virial are assembled analytically from the per-edge derivative. The
+envelope multiplies network outputs, so whatever is differentiated through
+those outputs -- force, virial, the charge response, Born charges -- has to
+pick its derivative up on the way.
+
+There are two ways through, with the same numbers:
+
+- **Inference on a CUDA device** (:meth:`ZBL.contacts`). One Warp kernel
+  walks the edges and leaves the per-node ZBL energy and envelope and a short
+  list of the edges in contact, with each one's derivatives. In a healthy
+  simulation that list is empty, and nothing the size of the edge list is
+  allocated or passed over again: forces and virials are summed from the
+  list, and the envelope enters the network outputs as a plain factor whose
+  derivative is added from the list wherever one is taken
+  (:func:`contact_output`, :func:`add_envelope_gradient`).
+- **Training, a CPU, a tracer** (:meth:`ZBL.graph_output`,
+  :meth:`ZBL.envelope`). The same arithmetic as torch ops over every edge,
+  the envelope a differentiable function of the edge vectors, to any order.
 """
 
 import math
 from numbers import Real
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 from ase.data import atomic_numbers, covalent_radii
@@ -62,7 +72,7 @@ try:
 except ImportError:  # pragma: no cover - the MD extra is optional
     wp = None
 
-__all__ = ["ZBL", "ZBL_KEY"]
+__all__ = ["ZBL", "ZBL_KEY", "Contacts", "add_envelope_gradient", "contact_output"]
 
 #: Key of the optional block in the model config.
 ZBL_KEY = "zbl"
@@ -155,6 +165,104 @@ def check_windows(windows: Any) -> dict[str, tuple[float, float]]:
             )
         checked[key] = (float(x_lo), float(x_hi))
     return dict(sorted(checked.items()))
+
+
+class Contacts(NamedTuple):
+    """What one pass over an inference graph found (:meth:`ZBL.contacts`).
+
+    Per node, the ZBL energy and the envelope; per edge in contact (closer
+    than the upper edge of its pair's window), its ends, its vector and its
+    two derivatives. The list has a fixed capacity and holds zeros beyond the
+    contacts found, so every sum over it is a sum over the contacts. Float64
+    throughout.
+    """
+
+    #: ``(N,)`` ZBL energy of every node: half of each pair it is the
+    #: destination of, owned nodes only. NaN if the list overflowed.
+    energy: torch.Tensor
+    #: ``(N,)`` envelope ``w``, a plain value: its derivative is in ``dlog``.
+    envelope: torch.Tensor
+    #: ``(K,)`` the contact's edge, and its two ends.
+    edge: torch.Tensor
+    src: torch.Tensor
+    dst: torch.Tensor
+    #: ``(K, 3)`` the edge vector, ``r_src - r_dst``.
+    vec: torch.Tensor
+    #: ``(K, 3)`` ``d E_zbl / d edge_vec`` of that edge.
+    g: torch.Tensor
+    #: ``(K, 3)`` ``d log s / d edge_vec``: the envelope of the edge's
+    #: destination changes by ``w_dst`` times this.
+    dlog: torch.Tensor
+
+
+def add_envelope_gradient(
+    gradient: torch.Tensor, contacts: Contacts, coefficient: torch.Tensor
+) -> torch.Tensor:
+    """Add the envelope's share to a per-edge gradient, in place.
+
+    ``gradient`` is ``d F / d edge_vec`` of some ``F`` taken with the envelope
+    held fixed, ``(E, 3)``; ``coefficient`` is ``d F / d w`` per node. The
+    envelope of a node depends on the edges into it only, so its share is
+    ``coefficient_dst w_dst dlog`` on the edges in contact and nothing
+    anywhere else.
+    """
+    weight = (coefficient.reshape(-1).to(torch.float64) * contacts.envelope)[
+        contacts.dst
+    ]
+    return gradient.index_add_(
+        0, contacts.edge, (weight[:, None] * contacts.dlog).to(gradient.dtype)
+    )
+
+
+def contact_output(
+    contacts: Contacts,
+    fitted: torch.Tensor,
+    n_node: torch.Tensor,
+    n_local: torch.Tensor | None,
+) -> dict[str, torch.Tensor]:
+    """The short-contact share of ``forward_common_lower_graph``'s result,
+    from the list of contacts: the keys ``fit_output_to_model_output_graph``
+    writes for ``energy``, to be added to the learned model's.
+
+    That is the ZBL energy with its force and virial, and the force and
+    virial the envelope adds to the fitted energy: the learned model
+    multiplied ``fitted``, its per-node output ``(N, 1)``, by the envelope as
+    a plain factor, so its own backward gave ``w d fitted``, and ``fitted d
+    w`` is added here. Sums follow DeePMD-kit's ``edge_force_virial``: the
+    gradient to the destination, minus it to the source, and ``-g (x) r``
+    to the frame's virial.
+    """
+    n_cap = contacts.energy.shape[0]
+    nf = n_node.shape[0]
+    coefficient = fitted.detach().reshape(-1).to(torch.float64)
+    # A ghost's energy is another rank's: it is not in the sum the learned
+    # model differentiated either. One frame, the case of every simulation,
+    # is spelled out: this runs every step, with nothing to sum most of them.
+    if n_local is not None and n_local is not n_node:
+        if nf == 1:
+            owned = torch.arange(n_cap, device=n_local.device) < n_local
+        else:
+            owned = node_ownership_mask(n_node, n_local, n_cap)
+        coefficient = coefficient * owned
+    weight = (coefficient * contacts.envelope)[contacts.dst]
+    g = contacts.g + weight[:, None] * contacts.dlog
+    force = torch.zeros((n_cap, 3), dtype=torch.float64, device=g.device)
+    force.index_add_(0, contacts.dst, g).index_add_(0, contacts.src, -g)
+    outer = -(g[:, :, None] * contacts.vec[:, None, :])
+    if nf == 1:
+        virial = outer.sum(dim=0, keepdim=True)
+        energy_redu = contacts.energy.sum().reshape(1)
+    else:
+        frame_id = frame_id_from_n_node(n_node, n_total=n_cap)
+        virial = torch.zeros((nf, 3, 3), dtype=torch.float64, device=g.device)
+        virial.index_add_(0, frame_id[contacts.dst], outer)
+        energy_redu = segment_sum(contacts.energy, frame_id, nf)
+    return {
+        "energy": contacts.energy.unsqueeze(-1),
+        "energy_redu": energy_redu.unsqueeze(-1),
+        "energy_derv_r": force.reshape(n_cap, 1, 3),
+        "energy_derv_c_redu": virial.reshape(nf, 1, 9),
+    }
 
 
 class ZBL(torch.nn.Module):
@@ -477,6 +585,99 @@ class ZBL(torch.nn.Module):
                 )
         factor = torch.where(closed > 0, torch.zeros_like(log_sum), torch.exp(log_sum))
         return factor.to(edge_vec.dtype), dlog
+
+    # ------------------------------------------------------------ contacts
+
+    def explicit(self, edge_vec: torch.Tensor) -> bool:
+        """Whether this graph is evaluated through :meth:`contacts`: an
+        evaluation, on a CUDA device, computed rather than traced."""
+        return not self.training and self._use_warp(edge_vec)
+
+    def contacts(
+        self,
+        atype: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_vec: torch.Tensor,
+        edge_mask: torch.Tensor,
+        owned: torch.Tensor | None = None,
+        capacity: int | None = None,
+    ) -> Contacts:
+        """One pass over the edges of an inference graph: the per-node ZBL
+        energy and envelope, and the list of the edges in contact.
+
+        ``capacity`` is the length of that list, by default one slot per
+        node and 4096 more. A healthy simulation uses none of it; a graph
+        with more contacts than that has collapsed, and its ZBL energies are
+        set to NaN rather than its forces left short of terms. Nothing is
+        read back to the host, the count included.
+        """
+        from deepmd_lr.nvalchemi.nlist import _torch_stream_scope
+
+        n_node, n_edge = atype.shape[0], edge_vec.shape[0]
+        device = edge_vec.device
+        if capacity is None:
+            capacity = n_node + 4096
+        if owned is None:
+            owned = torch.ones(n_node, dtype=torch.bool, device=device)
+        energy = torch.zeros(n_node, dtype=torch.float64, device=device)
+        log_sum = torch.zeros(n_node, dtype=torch.float64, device=device)
+        closed = torch.zeros(n_node, dtype=torch.int32, device=device)
+        count = torch.zeros(1, dtype=torch.int32, device=device)
+        # Not zeroed: only the first `count` slots are read, through `found`.
+        ends = torch.empty((3, capacity), dtype=torch.int64, device=device)
+        values = torch.empty((3, capacity, 3), dtype=torch.float64, device=device)
+        if n_edge:
+            is32 = edge_vec.dtype == torch.float32
+            # Bound to names, so no contiguous copy is freed before the launch.
+            index = edge_index.to(torch.int64).contiguous()
+            mask = edge_mask.to(torch.bool).contiguous()
+            vec = edge_vec.detach().contiguous()
+            types = atype.to(torch.int64).contiguous()
+            own = owned.to(torch.bool).contiguous()
+
+            def view(t, dtype):
+                # A read-only launch argument; `t` is bound above, so it
+                # stays alive until the launch.
+                return wp.from_torch(
+                    t, dtype=dtype, requires_grad=False, return_ctype=True
+                )
+
+            def arr(t, dtype):
+                return wp.from_torch(t, dtype=dtype, requires_grad=False)
+
+            with _torch_stream_scope(device):
+                wp.launch(
+                    _contacts_f32 if is32 else _contacts_f64,
+                    dim=n_edge,
+                    inputs=[
+                        view(index, wp.int64),
+                        view(mask, wp.bool),
+                        view(vec, wp.vec3f if is32 else wp.vec3d),
+                        view(types, wp.int64),
+                        view(own, wp.bool),
+                        view(self.numbers, wp.float64),
+                        view(self.r_lo, wp.float64),
+                        view(self.r_hi, wp.float64),
+                        wp.float64(self.max_outer**2),
+                        capacity,
+                        arr(energy, wp.float64),
+                        arr(log_sum, wp.float64),
+                        arr(closed, wp.int32),
+                        arr(count, wp.int32),
+                        arr(ends, wp.int64),
+                        arr(values, wp.vec3d),
+                    ],
+                    device=str(device),
+                )
+        found = torch.arange(capacity, device=device) < count
+        ends = torch.where(found, ends, torch.zeros_like(ends))
+        values = torch.where(found[None, :, None], values, torch.zeros_like(values))
+        envelope = torch.where(
+            closed > 0, torch.zeros_like(log_sum), torch.exp(log_sum)
+        )
+        return Contacts(
+            energy, envelope, ends[0], ends[1], ends[2], values[0], values[1], values[2]
+        )
 
     # -------------------------------------------------------- graph output
 
@@ -801,3 +1002,124 @@ if wp is not None:
             return
         wp.atomic_add(log_sum, edge_index[1, e], out[0])
         dlog[e] = (out[1] / r) * v
+
+    @wp.func
+    def _contact(
+        e: int,
+        v: wp.vec3d,
+        r2: wp.float64,
+        edge_index: wp.array2d(dtype=wp.int64),
+        atype: wp.array(dtype=wp.int64),
+        owned: wp.array(dtype=wp.bool),
+        numbers: wp.array(dtype=wp.float64),
+        r_lo: wp.array2d(dtype=wp.float64),
+        r_hi: wp.array2d(dtype=wp.float64),
+        capacity: int,
+        energy: wp.array(dtype=wp.float64),
+        log_sum: wp.array(dtype=wp.float64),
+        closed: wp.array(dtype=wp.int32),
+        count: wp.array(dtype=wp.int32),
+        ends: wp.array2d(dtype=wp.int64),
+        values: wp.array2d(dtype=wp.vec3d),
+    ):
+        """One valid edge shorter than the longest window: its ZBL half
+        energy and its step onto the destination, and a slot in the list."""
+        src = edge_index[0, e]
+        dst = edge_index[1, e]
+        i = atype[src]
+        j = atype[dst]
+        ro = r_hi[i, j]
+        r = wp.sqrt(r2)
+        if r >= ro:
+            return
+        ri = r_lo[i, j]
+        g = wp.vec3d()
+        if owned[dst]:
+            pair = _zbl_pair(r, numbers[i], numbers[j], ri, ro)
+            wp.atomic_add(energy, dst, pair[0])
+            g = (pair[1] / r) * v
+        dlog = wp.vec3d()
+        step = _log_step(r, ri, ro)
+        if step[0] > wp.float64(0.0):
+            wp.atomic_add(closed, dst, 1)
+        else:
+            wp.atomic_add(log_sum, dst, step[0])
+            dlog = (step[1] / r) * v
+        slot = wp.atomic_add(count, 0, 1)
+        if slot >= capacity:
+            # More contacts than the list holds: the graph has collapsed.
+            # Say so in the energy rather than leave the forces short.
+            wp.atomic_add(energy, dst, wp.float64(wp.NAN))
+            return
+        ends[0, slot] = wp.int64(e)
+        ends[1, slot] = src
+        ends[2, slot] = dst
+        values[0, slot] = v
+        values[1, slot] = g
+        values[2, slot] = dlog
+
+    @wp.kernel(enable_backward=False)
+    def _contacts_f32(
+        edge_index: wp.array2d(dtype=wp.int64),
+        edge_mask: wp.array(dtype=wp.bool),
+        vec: wp.array(dtype=wp.vec3f),
+        atype: wp.array(dtype=wp.int64),
+        owned: wp.array(dtype=wp.bool),
+        numbers: wp.array(dtype=wp.float64),
+        r_lo: wp.array2d(dtype=wp.float64),
+        r_hi: wp.array2d(dtype=wp.float64),
+        r_max2: wp.float64,
+        capacity: int,
+        energy: wp.array(dtype=wp.float64),
+        log_sum: wp.array(dtype=wp.float64),
+        closed: wp.array(dtype=wp.int32),
+        count: wp.array(dtype=wp.int32),
+        ends: wp.array2d(dtype=wp.int64),
+        values: wp.array2d(dtype=wp.vec3d),
+    ):
+        e = wp.tid()
+        v = wp.vec3d(
+            wp.float64(vec[e][0]), wp.float64(vec[e][1]), wp.float64(vec[e][2])
+        )
+        # The distance first: almost every edge leaves here, having read
+        # nothing but its own vector.
+        r2 = wp.dot(v, v)
+        if r2 >= r_max2:
+            return
+        if not _edge_valid(e, edge_index, edge_mask, atype, numbers.shape[0]):
+            return
+        _contact(
+            e, v, r2, edge_index, atype, owned, numbers, r_lo, r_hi, capacity,
+            energy, log_sum, closed, count, ends, values,
+        )  # fmt: skip
+
+    @wp.kernel(enable_backward=False)
+    def _contacts_f64(
+        edge_index: wp.array2d(dtype=wp.int64),
+        edge_mask: wp.array(dtype=wp.bool),
+        vec: wp.array(dtype=wp.vec3d),
+        atype: wp.array(dtype=wp.int64),
+        owned: wp.array(dtype=wp.bool),
+        numbers: wp.array(dtype=wp.float64),
+        r_lo: wp.array2d(dtype=wp.float64),
+        r_hi: wp.array2d(dtype=wp.float64),
+        r_max2: wp.float64,
+        capacity: int,
+        energy: wp.array(dtype=wp.float64),
+        log_sum: wp.array(dtype=wp.float64),
+        closed: wp.array(dtype=wp.int32),
+        count: wp.array(dtype=wp.int32),
+        ends: wp.array2d(dtype=wp.int64),
+        values: wp.array2d(dtype=wp.vec3d),
+    ):
+        e = wp.tid()
+        v = vec[e]
+        r2 = wp.dot(v, v)
+        if r2 >= r_max2:
+            return
+        if not _edge_valid(e, edge_index, edge_mask, atype, numbers.shape[0]):
+            return
+        _contact(
+            e, v, r2, edge_index, atype, owned, numbers, r_lo, r_hi, capacity,
+            energy, log_sum, closed, count, ends, values,
+        )  # fmt: skip

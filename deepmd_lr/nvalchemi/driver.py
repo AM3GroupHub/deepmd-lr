@@ -71,6 +71,9 @@ from deepmd_lr.nvalchemi.partition import (
     Partition,
     partition_system,
 )
+from deepmd_lr.zbl import (
+    add_envelope_gradient,
+)
 
 __all__ = [
     "device_replicas",
@@ -91,9 +94,14 @@ class _Launched(NamedTuple):
     eps: torch.Tensor | None
     graph: Any
     cap: torch.Tensor | None
-    #: The owned atoms' short-contact envelope, attached like ``raw``; None
-    #: for a model without a ``zbl`` term.
+    #: The owned atoms' short-contact envelope; None for a model without a
+    #: ``zbl`` term.
     envelope: torch.Tensor | None = None
+    #: The short contacts of this partition's graph, when its lower found
+    #: them in one kernel pass: ``envelope`` is then a plain value and its
+    #: derivative comes from this list. None when the envelope is attached
+    #: to the graph like ``raw``.
+    contacts: Any = None
 
 
 @dataclass
@@ -206,15 +214,31 @@ def _owned(values, n_owned: int):
     return None if values is None else values[:n_owned]
 
 
+def _on_nodes(owned_values: torch.Tensor, part: Partition) -> torch.Tensor:
+    """Per-owned-atom values on the partition's node axis, zero on ghosts."""
+    out = torch.zeros(
+        part.n_node, dtype=owned_values.dtype, device=owned_values.device
+    )
+    out[: part.n_owned] = owned_values.detach()
+    return out
+
+
 def charges_from_capture(model, captured, node_type, n_owned: int):
     """Raw charges from already-computed descriptor features, and the
     short-contact envelope on the graph they were computed on (None without
-    a ``zbl`` term): ``(raw, envelope)`` for the owned atoms."""
+    a ``zbl`` term): ``(raw, envelope, contacts)`` for the owned atoms.
+
+    When the graph lower found the short contacts itself, the envelope is
+    theirs, a plain value, and ``contacts`` carries its derivative; otherwise
+    it is computed here, attached to the graph, and ``contacts`` is None."""
     raw = model.raw_charges(captured["features"], captured["rot_mat"], node_type)
+    contacts = captured.get("contacts")
+    if contacts is not None:
+        return raw[:n_owned], contacts.envelope[:n_owned], contacts
     envelope = model.charge_envelope(
         node_type, captured["edge_index"], captured["edge_vec"], captured["edge_mask"]
     )
-    return raw[:n_owned], _owned(envelope, n_owned)
+    return raw[:n_owned], _owned(envelope, n_owned), None
 
 
 def partition_charges(model, graph, node_type, n_owned: int, charge_spin=None):
@@ -663,10 +687,10 @@ def _launch_one(run: _Run, part: Partition, device, charge_spin) -> _Launched:
         # Charges from the same descriptor pass the energy head just ran, kept
         # attached for the charge-response backward; a second pass only when
         # the capture cannot carry the gradient.
-        raw = envelope = cap_edge_vec = None
+        raw = envelope = contacts = cap_edge_vec = None
         if run.long_range:
             if _usable_capture(captured):
-                raw, envelope = charges_from_capture(
+                raw, envelope, contacts = charges_from_capture(
                     local, captured, node_type, part.n_owned
                 )
                 cap_edge_vec = captured["edge_vec"]
@@ -675,7 +699,7 @@ def _launch_one(run: _Run, part: Partition, device, charge_spin) -> _Launched:
                     local, graph, node_type, part.n_owned, condition
                 )
         return _Launched(
-            part, out, raw, node_coord, eps, graph, cap_edge_vec, envelope
+            part, out, raw, node_coord, eps, graph, cap_edge_vec, envelope, contacts
         )
 
 
@@ -798,9 +822,10 @@ def _born_charges_partitioned(
     otherwise by the array-API :func:`~deepmd_lr.born.edge_born_response`.
 
     Returns the screened tensor and, per partition, the unweighted cotangent
-    ``d raw / d edge_vec`` (``None`` where no capture was used, and with an
-    envelope, whose cotangent is not the raw charges' alone), which
-    :func:`_charge_response_force` reuses instead of a second backward.
+    ``d raw / d edge_vec`` -- with a list of contacts ``w_dst d raw``, the
+    envelope a plain factor in it -- which :func:`_charge_response_force`
+    reuses instead of a second backward. ``None`` where no capture was used,
+    and where the envelope is attached to the graph.
     """
     home, dtype = run.home, run.dtype
     born = torch.zeros((run.n_atoms, 3, 3), dtype=dtype, device=home)
@@ -819,10 +844,20 @@ def _born_charges_partitioned(
             leaf = cap if cap is not None else graph.edge_vec
             local = raw
             if item.envelope is not None:
-                local = item.envelope * (
-                    raw + shift.to(device=raw.device, dtype=raw.dtype)
-                )
+                shifted = raw + shift.to(device=raw.device, dtype=raw.dtype)
+                local = item.envelope * shifted
             (g,) = torch.autograd.grad(local.sum(), leaf, retain_graph=True)
+            reusable = None
+            if cap is not None and (
+                item.envelope is None or item.contacts is not None
+            ):
+                reusable = g
+            if item.contacts is not None:
+                # The envelope was a plain factor: d local / d w = raw + shift.
+                # Out of place, so that `reusable` stays the head's own share.
+                g = add_envelope_gradient(
+                    g.clone(), item.contacts, _on_nodes(shifted, part)
+                )
             vec = graph.edge_vec.detach()
             if (
                 _csr_views(graph)
@@ -844,8 +879,7 @@ def _born_charges_partitioned(
                     g, vec, graph.edge_index, graph.edge_mask, part.n_node
                 )
             contributions.append((part, node))
-            reusable = cap is not None and item.envelope is None
-            unweighted.append(g if reusable else None)
+            unweighted.append(reusable)
 
     for part, node in contributions:
         born.index_add_(
@@ -895,7 +929,9 @@ def _charge_response_force(
     partition's unweighted cotangent ``d raw / d edge_vec``. The descriptor
     is one-hop, so ``d (sum_j w_j raw_j) / d edge_vec_e`` is that gradient
     times ``w_{dst(e)}``, and the backward through the descriptor is not
-    repeated.
+    repeated. With a list of contacts the cotangent already holds the
+    envelope, and the weight is divided by it: ``dE/dq_j`` is proportional
+    to the envelope, so the ratio is finite and an atom in contact has none.
     """
     home, dtype = run.home, run.dtype
     force = torch.zeros((run.n_atoms, 3), dtype=dtype, device=home)
@@ -911,9 +947,11 @@ def _charge_response_force(
             owned = part.views(home, dtype)["owned"]
             weights = dE_dq[owned].to(device=raw.device, dtype=raw.dtype)
             response = (raw * weights).sum()
+            through = None
             if item.envelope is not None:
                 through = dE_dw[owned].to(device=raw.device, dtype=raw.dtype)
-                response = response + (item.envelope * through).sum()
+                if item.contacts is None:
+                    response = response + (item.envelope * through).sum()
             targets = [node_coord] if eps is None else [node_coord, eps]
             if cap is None:
                 grads = torch.autograd.grad(response, targets)
@@ -926,11 +964,24 @@ def _charge_response_force(
                 # this is the exact chain rule.
                 g1 = born_grads[k] if born_grads is not None else None
                 if g1 is not None:
+                    per_node = weights
+                    if item.contacts is not None:
+                        per_node = torch.where(
+                            item.envelope > 0,
+                            weights / item.envelope.to(weights.dtype),
+                            torch.zeros_like(weights),
+                        )
                     w_node = torch.zeros(part.n_node, dtype=g1.dtype, device=g1.device)
-                    w_node[: part.n_owned] = weights.to(g1.dtype)
+                    w_node[: part.n_owned] = per_node.to(g1.dtype)
                     g_e = g1 * w_node[graph.edge_index[1]][:, None]
                 else:
                     (g_e,) = torch.autograd.grad(response, cap, retain_graph=True)
+                if item.contacts is not None:
+                    # The envelope was a plain factor: its share of the
+                    # response comes from the list of contacts.
+                    g_e = add_envelope_gradient(
+                        g_e, item.contacts, _on_nodes(through, part)
+                    )
                 grads = torch.autograd.grad(
                     (graph.edge_vec * g_e.detach()).sum(), targets
                 )

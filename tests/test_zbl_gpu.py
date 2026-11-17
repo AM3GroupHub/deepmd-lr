@@ -12,7 +12,7 @@ from deepmd.pt_expt.utils.env import DEVICE
 
 from deepmd_lr.compress import compress_model
 from deepmd_lr.nvalchemi import DistributedEvaluator
-from deepmd_lr.zbl import ZBL
+from deepmd_lr.zbl import ZBL, add_envelope_gradient
 
 from .test_joint_model import LONG_RANGE
 from .test_zbl import WINDOWS, config
@@ -98,9 +98,50 @@ def test_the_envelope_kernel_is_the_torch_arithmetic(dtype):
     assert torch.isfinite(torch.autograd.grad(once.square().sum(), vec)[0]).all()
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_the_contact_list_is_the_torch_arithmetic(dtype):
+    """What inference runs on: one kernel pass, the per-node ZBL energy and
+    envelope, and per edge in contact the two derivatives."""
+    zbl = ZBL(["O", "H"], {"window": WINDOWS}, device=DEVICE).eval()
+    atype, edges, vec, mask, owned = random_graph(dtype, n_node=40, n_edge=120, seed=1)
+    assert zbl.explicit(vec) and not zbl.train().explicit(vec)
+    zbl.eval()
+    found = zbl.contacts(atype, edges, vec, mask, owned)
+    src, dst = edges[0], edges[1]
+    real = (atype >= 0) & (atype < 2)
+    valid = mask & real[src] & real[dst]
+    e_edge, g_ref = zbl._edge_terms_torch(atype, src, dst, vec, valid & owned[dst])
+    e_ref = torch.zeros_like(found.energy).index_add(0, dst, e_edge)
+    leaf = vec.clone().requires_grad_(True)
+    w_ref = zbl._envelope_torch(atype, src, dst, leaf, valid).double()
+    cotangent = torch.randn(
+        40, generator=torch.Generator().manual_seed(2), dtype=torch.float64
+    ).to(DEVICE)
+    (dw_ref,) = torch.autograd.grad((w_ref * cotangent).sum(), leaf)
+    tight = 1e-12 if dtype == torch.float64 else 2e-5
+    torch.testing.assert_close(found.energy, e_ref, rtol=1e-12, atol=1e-12)
+    torch.testing.assert_close(found.envelope, w_ref.detach(), rtol=tight, atol=tight)
+    # The list holds every edge the dense arithmetic has something on.
+    dense = torch.zeros(vec.shape, dtype=torch.float64, device=DEVICE)
+    g = dense.clone().index_add_(0, found.edge, found.g)
+    torch.testing.assert_close(g, g_ref.double(), rtol=10 * tight, atol=10 * tight)
+    dw = add_envelope_gradient(dense.clone(), found, cotangent)
+    assert dw_ref.abs().max() > 1.0
+    torch.testing.assert_close(dw, dw_ref.double(), rtol=10 * tight, atol=10 * tight)
+    torch.testing.assert_close(
+        found.vec[found.g.abs().sum(1) > 0].norm(dim=1).max(),
+        vec.double().norm(dim=1)[g_ref.abs().sum(1) > 0].max(),
+    )
+    # A list too short for the contacts says so in the energy.
+    assert torch.isfinite(found.energy).all()
+    short = zbl.contacts(atype, edges, vec, mask, owned, capacity=4)
+    assert torch.isnan(short.energy).any()
+
+
 @pytest.mark.parametrize("lr", [False, True])
 @pytest.mark.parametrize("compressed", [False, True])
-def test_serial_compressed_and_partitioned_agree(monkeypatch, lr, compressed):
+@pytest.mark.parametrize("r", [0.78, 0.6], ids=["in_the_window", "below_it"])
+def test_serial_compressed_and_partitioned_agree(monkeypatch, lr, compressed, r):
     level = 1
     monkeypatch.setenv("DP_CUDA_INFER", str(level))
     if compressed and not op_available():
@@ -114,8 +155,9 @@ def test_serial_compressed_and_partitioned_agree(monkeypatch, lr, compressed):
     base = get_model(cfg).eval()
     model = get_model(cfg).eval()
     model.load_state_dict(base.state_dict(), strict=True)
-    # Two O-H pairs inside the window (0.78 A), a cutoff apart.
-    xyz = np.array([[0.2, 1, 1], [0.98, 1, 1], [6.5, 1, 1], [7.28, 1, 1]])
+    # Two O-H pairs at the same distance, a cutoff apart: half way through
+    # the window, or below it, where the envelope is exactly zero.
+    xyz = np.array([[0.2, 1, 1], [0.2 + r, 1, 1], [6.5, 1, 1], [6.5 + r, 1, 1]])
     types = np.array([0, 1, 0, 1], dtype=np.int64)
     box = np.eye(3) * 14
     coord = torch.tensor(xyz, dtype=torch.float64, device=DEVICE)[None]

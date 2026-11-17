@@ -144,15 +144,23 @@ model has the same one.
 
 ## Cost
 
-One Warp kernel pass over the edges produces the ZBL energy and its per-edge
-derivative, another the envelope; neither reads the host, so an MD step makes
-the same number of downloads as without the term. Training and any traced path
-use the same arithmetic as torch ops.
+In inference on a CUDA device one Warp kernel pass over the edges leaves the
+per-node ZBL energy and envelope and a short list of the edges in contact,
+which in a healthy simulation is empty. Forces, virials and the envelope's
+derivatives are summed from that list, so nothing the size of the edge list is
+allocated or passed over a second time, and nothing is read back to the host:
+an MD step makes the same number of downloads as without the term. The list
+holds one contact per atom and 4096 more; a graph with more than that has
+collapsed, and its energy is NaN, which stops a run. Training, a CPU and any
+traced path use the same arithmetic as torch ops over every edge.
 
 Measured on the GB10 with the compressed water model, per evaluation:
 
 | atoms | without | with `zbl` |
 |---|---|---|
-| 192 | 11.0 ms | 10.8 ms |
-| 12,288 | 15.1 ms | 17.3 ms |
-| 98,304 | 62.3 ms | 78.0 ms |
+| 192 | 13.0 ms | 14.2 ms |
+| 12,288 | 15.3 ms | 16.3 ms |
+| 98,304 | 62.3 ms | 64.5 ms |
+| 98,304, with Born tensors | 71.6 ms | 75.2 ms |
+
+That is about a millisecond per evaluation, and another per 100,000 atoms.

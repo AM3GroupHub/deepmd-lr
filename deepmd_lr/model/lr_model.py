@@ -25,6 +25,7 @@ through the graph lower and so left nothing to capture.
 
 import contextlib
 import copy
+import functools
 import json
 import math
 import os
@@ -40,6 +41,9 @@ from typing import (
 
 import numpy as np
 import torch
+from deepmd.dpmodel.model.edge_transform_output import (
+    node_ownership_mask,
+)
 from deepmd.dpmodel.model.model_factory import (
     get_model_components,
 )
@@ -90,6 +94,9 @@ from deepmd_lr.neighbors import (
 from deepmd_lr.zbl import (
     ZBL,
     ZBL_KEY,
+    Contacts,
+    add_envelope_gradient,
+    contact_output,
 )
 
 #: The ``model.type`` that selects this class, and the tag written into
@@ -212,6 +219,10 @@ class _Charges(NamedTuple):
     local: torch.Tensor
     #: ``(nf,)``, what the projection added to every atom that carries weight.
     shift: torch.Tensor
+    #: The short-contact envelope the projection was weighted with, or None.
+    #: In inference a leaf, a plain factor whose own derivative comes from
+    #: the list of contacts; otherwise a function of the edge vectors.
+    envelope: torch.Tensor | None = None
 
 
 class _Strained(NamedTuple):
@@ -345,6 +356,9 @@ class LongRangeEnergyModel(EnergyModel):
         #: fitted energy and the raw charge of an atom in contact off there.
         #: It holds no weights; see :meth:`set_zbl`.
         self.zbl: ZBL | None = None
+        #: The contacts of the graph lower now running, for the capture it
+        #: runs inside to take along; None outside one and on the torch path.
+        self._contacts: Contacts | None = None
 
     @property
     def effective_charge_filter(self) -> tuple[float, float] | None:
@@ -729,6 +743,9 @@ class LongRangeEnergyModel(EnergyModel):
                     edge_index=graph.edge_index,
                     edge_mask=graph.edge_mask,
                     n_node=graph.n_node,
+                    # The short contacts the lower found on this graph, in
+                    # inference: the charges weigh in the same envelope.
+                    contacts=self._contacts,
                 )
             return out
 
@@ -748,7 +765,9 @@ class LongRangeEnergyModel(EnergyModel):
                 del descriptor.call_graph
 
     @contextlib.contextmanager
-    def _enveloping_energy(self, atype: torch.Tensor) -> Iterator[None]:
+    def _enveloping_energy(
+        self, atype: torch.Tensor, contacts: Contacts | None = None
+    ) -> Iterator[dict]:
         """Multiply the fitted atomic energies by the short-contact envelope
         for one pass through the graph lower; nothing without a ``zbl`` term.
 
@@ -757,16 +776,22 @@ class LongRangeEnergyModel(EnergyModel):
         per-type energy offsets, so the atomic model's ``forward_atomic_graph``
         is wrapped for the duration of the pass and restored afterwards,
         exception or not -- as :meth:`_capturing_backbone` wraps the
-        descriptor. The factor is computed from the graph's own ``edge_vec``,
-        DeePMD-kit's autograd leaf, so the energy backward that follows
-        yields the force and virial of the product. The offsets are added
-        after this, untouched: an atom in contact keeps its offset and loses
-        what the network added.
+        descriptor. The offsets are added after this, untouched: an atom in
+        contact keeps its offset and loses what the network added.
+
+        Without ``contacts`` the factor is computed from the graph's own
+        ``edge_vec``, DeePMD-kit's autograd leaf, so the energy backward that
+        follows yields the force and virial of the product. With them (an
+        inference graph, :meth:`ZBL.contacts`) it is a plain factor: that
+        backward gives ``w d fitted``, and the yielded dict carries the
+        ``fitted`` energies back so the caller can add ``fitted d w`` from
+        the list of contacts.
 
         ``atype`` is the lower's own, where a padded node still has type -1.
         """
+        state: dict = {}
         if self.zbl is None:
-            yield
+            yield state
             return
         zbl = self.zbl
         atomic_model = self.atomic_model
@@ -774,10 +799,14 @@ class LongRangeEnergyModel(EnergyModel):
 
         def enveloped(graph: Any, atype_clamped: Any, *args: Any, **kwargs: Any) -> Any:
             ret = dict(unhooked(graph, atype_clamped, *args, **kwargs))
-            factor = zbl.envelope(
-                atype, graph.edge_index, graph.edge_vec, graph.edge_mask
-            )
             energy = ret["energy"]
+            if contacts is None:
+                factor = zbl.envelope(
+                    atype, graph.edge_index, graph.edge_vec, graph.edge_mask
+                )
+            else:
+                factor = contacts.envelope
+                state["fitted"] = energy
             ret["energy"] = energy * factor.to(energy.dtype).reshape(
                 -1, *([1] * (energy.ndim - 1))
             )
@@ -786,7 +815,7 @@ class LongRangeEnergyModel(EnergyModel):
         had_own = "forward_atomic_graph" in atomic_model.__dict__
         atomic_model.forward_atomic_graph = enveloped
         try:
-            yield
+            yield state
         finally:
             if had_own:
                 atomic_model.forward_atomic_graph = unhooked
@@ -845,13 +874,20 @@ class LongRangeEnergyModel(EnergyModel):
         mask: torch.Tensor | None,
         edges: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         *,
+        contacts: Contacts | None = None,
         return_raw: bool = False,
     ) -> "torch.Tensor | _Charges":
         """Projected charges ``(nf, nloc)`` from an already-computed
         descriptor output on the graph ``edges = (edge_index, edge_vec,
         edge_mask)``; with ``return_raw`` a :class:`_Charges` with the raw
         and the local ones too. Without ``charge_spin`` every frame is
-        neutral."""
+        neutral.
+
+        ``contacts`` are the short contacts the graph lower found on this
+        graph in inference: the envelope is then a plain factor, returned as
+        a leaf so the caller can ask for the energy's derivative with respect
+        to it and add its share from the list.
+        """
         nf, nloc = atype.shape[0], atype.shape[1]
         atype_flat = atype.reshape(-1)
         raw = self.raw_charges(features, rot_mat, atype_flat).reshape(nf, nloc)
@@ -860,10 +896,15 @@ class LongRangeEnergyModel(EnergyModel):
             if charge_spin is not None
             else torch.zeros(nf, dtype=raw.dtype, device=raw.device)
         )
-        envelope = self.charge_envelope(atype_flat, *edges)
+        if contacts is not None:
+            envelope = contacts.envelope.to(raw.dtype).reshape(nf, nloc)
+            envelope = envelope.clone().requires_grad_(True)
+        else:
+            envelope = self.charge_envelope(atype_flat, *edges)
+            if envelope is not None:
+                envelope = envelope.to(raw.dtype).reshape(nf, nloc)
         weight = mask
         if envelope is not None:
-            envelope = envelope.to(raw.dtype).reshape(nf, nloc)
             weight = envelope if mask is None else envelope * mask.to(raw.dtype)
         projected = project_to_total_charge(raw, total, mask=weight)
         if not return_raw:
@@ -878,7 +919,7 @@ class LongRangeEnergyModel(EnergyModel):
         local = raw
         if envelope is not None:
             local = envelope * (raw + shift.detach()[:, None])
-        return _Charges(projected, raw, local, shift)
+        return _Charges(projected, raw, local, shift, envelope)
 
     def _long_range(
         self,
@@ -998,17 +1039,26 @@ class LongRangeEnergyModel(EnergyModel):
             charge_spin,
             mask,
             (shared["edge_index"], shared["edge_vec"], shared["edge_mask"]),
+            contacts=shared.get("contacts"),
             return_raw=True,
         )
+        contacts = shared.get("contacts")
         charge = filtered(charges.projected)
         atom_energy = term(geometry.coord, charge, geometry.box, mask=mask)
         edge_vec = shared["edge_vec"]
-        grad_coord, grad_eps, g_e = torch.autograd.grad(
+        leaves = [geometry.leaf, geometry.eps, edge_vec]
+        if contacts is not None:
+            leaves.append(charges.envelope)
+        grad_coord, grad_eps, g_e, *through_envelope = torch.autograd.grad(
             atom_energy.sum(),
-            [geometry.leaf, geometry.eps, edge_vec],
+            leaves,
             create_graph=create_graph,
             retain_graph=True,
         )
+        if contacts is not None:
+            # The charges took the envelope as a plain factor: its share of
+            # the response comes from the list of contacts.
+            g_e = add_envelope_gradient(g_e, contacts, through_envelope[0])
         response_force, _atom_virial, response_virial = edge_force_virial(
             g_e,
             edge_vec,
@@ -1021,6 +1071,13 @@ class LongRangeEnergyModel(EnergyModel):
             # A second, cheaper VJP over the tape the gradient above left
             # alive; one pass covers every edge because the descriptor is
             # one-hop.
+            finish = None
+            if contacts is not None:
+                # d local / d w = raw + shift, per node.
+                through = (charges.raw + charges.shift.detach()[:, None]).detach()
+                finish = functools.partial(
+                    add_envelope_gradient, contacts=contacts, coefficient=through
+                )
             born = born_charges(
                 charge,
                 charges.local.reshape(-1),
@@ -1029,6 +1086,7 @@ class LongRangeEnergyModel(EnergyModel):
                 shared["edge_mask"],
                 create_graph=create_graph,
                 eps_inf=self.eps_inf,
+                finish_gradient=finish,
             )
         return {
             "atom_energy": atom_energy,
@@ -1264,23 +1322,45 @@ class LongRangeEnergyModel(EnergyModel):
             # Level 2 is DeePMD-kit's fused energy/force pipeline, which never
             # calls the atomic model the envelope wraps.
             raise RuntimeError(_NO_FUSED_WITH_ZBL)
-        with self._enveloping_energy(atype):
-            result = super().forward_common_lower_graph(
-                atype,
-                n_node,
-                n_local,
-                edge_index,
-                edge_vec,
-                edge_mask,
-                destination_order,
-                destination_row_ptr,
-                source_order,
-                source_row_ptr,
-                destination_sorted=destination_sorted,
-                do_atomic_virial=do_atomic_virial,
-                **kwargs,
-            )
-        if self.zbl is not None:
+        # In inference on a CUDA device one kernel pass finds the short
+        # contacts, and everything the term adds is summed from that list;
+        # training, a CPU, a tracer and the atomic virial take the torch
+        # arithmetic over every edge.
+        contacts = None
+        if (
+            self.zbl is not None
+            and not do_atomic_virial
+            and self.zbl.explicit(edge_vec)
+        ):
+            owned = None
+            if n_local is not None and n_local is not n_node:
+                owned = node_ownership_mask(n_node, n_local, atype.shape[0])
+            contacts = self.zbl.contacts(atype, edge_index, edge_vec, edge_mask, owned)
+        self._contacts = contacts
+        try:
+            with self._enveloping_energy(atype, contacts) as state:
+                result = super().forward_common_lower_graph(
+                    atype,
+                    n_node,
+                    n_local,
+                    edge_index,
+                    edge_vec,
+                    edge_mask,
+                    destination_order,
+                    destination_row_ptr,
+                    source_order,
+                    source_row_ptr,
+                    destination_sorted=destination_sorted,
+                    do_atomic_virial=do_atomic_virial,
+                    **kwargs,
+                )
+        finally:
+            self._contacts = None
+        if contacts is not None:
+            extra = contact_output(contacts, state["fitted"], n_node, n_local)
+            for key, value in extra.items():
+                result[key] = result[key] + value
+        elif self.zbl is not None:
             extra = self.zbl.graph_output(
                 atype,
                 n_node,

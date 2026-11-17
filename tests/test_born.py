@@ -311,7 +311,7 @@ class TestGuards:
         every = model._charges_from_features(
             cap["features"], cap["rot_mat"], atype, None, mask, edges, return_raw=True
         )
-        assert every._fields == ("projected", "raw", "local", "shift")
+        assert every._fields == ("projected", "raw", "local", "shift", "envelope")
         torch.testing.assert_close(every.projected, one)
 
 
