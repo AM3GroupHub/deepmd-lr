@@ -141,21 +141,8 @@ included. (A model with `long_range` exports nothing, with or without the
 block: see [MD](md.md).)
 
 ```bash
-dp --pt-expt freeze -c model.ckpt.pt -o model.pt2
-```
-
-```python
-from deepmd.pt_expt.model.model import BaseModel
-from deepmd.pt_expt.utils.serialization import deserialize_to_file, serialize_from_file
-
-data = serialize_from_file("model.pt2")
-model = BaseModel.deserialize(data["model"]).eval()   # `dp compress` skips the eval(), which this model refuses
-model.enable_compression()
-deserialize_to_file(
-    "model_c.pt2",
-    {"model": model.serialize(), "model_def_script": data.get("model_def_script")},
-    lower_kind="auto",
-)
+dp --pt-expt freeze -c model.ckpt.pt -o model.pt2        # the graph lower
+dp --pt-expt compress -i model.pt2 -o model_c.pt2        # the compact canonical lower
 ```
 
 Checked on the short-range water model with one O–H pair pushed to 0.70 Å and
@@ -164,10 +151,10 @@ another to 0.50 Å, where the term is worth 378 eV and the largest force is
 
 | largest difference in | energy | force |
 |---|---|---|
-| compressed, `DP_CUDA_INFER=2` | 1e-6 eV | 4e-5 eV/Å |
-| `model.pt2` read by `DeepPot` | 1e-6 eV | 6e-5 eV/Å |
-| `model_c.pt2` read by `DeepPot` | 1e-6 eV | 6e-5 eV/Å |
-| `model_c.pt2` in LAMMPS-Kokkos, 1,536 atoms, 1, 2 and 4 ranks | 2e-8 eV/atom | 8e-5 eV/Å |
+| compressed, `DP_CUDA_INFER=2` | 3e-6 eV | 4e-5 eV/Å |
+| `model.pt2` read by `DeepPot` | 3e-6 eV | 6e-5 eV/Å |
+| `model_c.pt2` read by `DeepPot` | 3e-6 eV | 6e-5 eV/Å |
+| `model_c.pt2` in LAMMPS-Kokkos, 1,536 atoms, 1, 2 and 4 ranks | 3e-8 eV/atom | 8e-5 eV/Å |
 
 That is float32 on a 132 eV/Å force; the same frame without contacts agrees
 to 1e-6 eV/Å, and an NVE run of 12,288 atoms is the same trajectory with and

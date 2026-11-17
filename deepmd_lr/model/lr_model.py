@@ -1565,7 +1565,19 @@ class LongRangeEnergyModel(EnergyModel):
         or without a ``zbl`` term. The level is checked before the CSR views:
         at level 0 upstream builds none, so the missing views are the symptom
         and the level the cause.
+
+        Training mode is the same fall-through, and is refused here rather
+        than at compression: DeePMD-kit's ``dp compress`` compresses the
+        model it has just deserialized, which is in training mode, and only
+        serializes it. What must not happen is a forward in that state.
         """
+        if self.training:
+            raise RuntimeError(
+                "a compressed model was called in training mode, where the "
+                "descriptor skips its compressed kernel and runs the "
+                "uncompressed math without saying so. Call `.eval()` first: "
+                "a compressed DPA4C is an inference snapshot."
+            )
         if not _kernel_available():
             raise RuntimeError(_NO_KERNEL)
         level = cuda_infer_level()
@@ -1610,7 +1622,12 @@ class LongRangeEnergyModel(EnergyModel):
         What it commits you to (each refused rather than warned):
 
         * The compiled kernel must be loaded (see :mod:`deepmd_lr.compress`).
-        * An evaluation snapshot: a compressed DPA4C cannot re-enter training.
+        * An inference snapshot. The model may be in either mode when it is
+          compressed (``dp compress`` compresses the one it has just
+          deserialized, in training mode, and serializes it), but it runs in
+          evaluation mode only: a forward in training mode is refused
+          (:meth:`_check_compressed_lower`), and DeePMD-kit refuses
+          ``.train()`` on a compressed descriptor.
         * ``DP_CUDA_INFER`` becomes ``1`` if unset -- the one process-global
           side effect, because DeePMD-kit re-reads the variable on every call
           and offers no API for it. Level 2 is refused for a long-range model:
@@ -1648,11 +1665,6 @@ class LongRangeEnergyModel(EnergyModel):
             raise ValueError("table_stride_1 must be positive and finite")
         if not _kernel_available():
             raise RuntimeError(_NO_KERNEL)
-        if self.training:
-            raise RuntimeError(
-                "compress an evaluation snapshot: call `.eval()` first. A "
-                "compressed DPA4C cannot re-enter training mode."
-            )
         level = cuda_infer_level()
         if level >= 2 and self.has_long_range:
             raise RuntimeError(

@@ -291,17 +291,18 @@ def test_the_canonical_lower_keeps_the_term(monkeypatch, r):
     check(traced(*inputs))
 
 
-@pytest.mark.parametrize("compressed", [False, True])
-def test_a_compiled_export_keeps_the_term(tmp_path, monkeypatch, compressed):
-    """The files LAMMPS loads, made as ``dp freeze`` and a compression make
+def test_the_compiled_exports_keep_the_term(tmp_path, monkeypatch):
+    """The files LAMMPS loads, made as ``dp freeze`` and ``dp compress`` make
     them and read back through DeePMD-kit's own loader: the graph lower of
-    the model as trained, the compact canonical lower of the compressed one.
+    the model as trained, then the compact canonical lower of the compressed
+    one, which ``dp compress`` builds from the frozen file.
 
-    The trace runs at ``DP_CUDA_INFER=2`` and its arithmetic is compiled for
+    A trace runs at ``DP_CUDA_INFER=2`` and its arithmetic is compiled for
     the device, which is where a term can be lost or miscompiled without a
     trace of the lower noticing (``torch.searchsorted`` on a sliced sequence
     is, by torch 2.11's AOTInductor)."""
     from deepmd.infer import DeepPot
+    from deepmd.pt_expt.entrypoints.compress import enable_compression as dp_compress
     from deepmd.pt_expt.utils.serialization import deserialize_to_file
 
     if not op_available():
@@ -326,35 +327,41 @@ def test_a_compiled_export_keeps_the_term(tmp_path, monkeypatch, compressed):
     shift = reference["energy"] - plain(coord, atype, box=cell)["energy"]
     assert shift.abs().min().item() > 1.0, "the pairs must be inside the window"
     assert (reference["energy"][0] - reference["energy"][1]).abs().item() > 0.1
-    monkeypatch.setenv("DP_CUDA_INFER", "1")
-    if compressed:
-        compress_model(model, True)
-    path = str(tmp_path / "model.pt2")
-    deserialize_to_file(path, {"model": model.serialize()}, lower_kind="auto")
-    loaded = DeepPot(path)
-    kind = loaded.deep_eval.metadata["lower_input_kind"]
-    assert kind == ("dpa4c_canonical" if compressed else "graph")
-    energy, force, virial, atom_energy, atom_virial = loaded.eval(
-        coord.cpu().numpy(),
-        cell.cpu().numpy(),
-        atype[0].cpu().numpy(),
-        atomic=True,
-    )
-    expected = {
-        "energy": energy,
-        "force": force,
-        "virial": virial,
-        "atom_energy": atom_energy,
-        "atom_virial": atom_virial,
-    }
-    for key, value in expected.items():
-        np.testing.assert_allclose(
-            np.asarray(value).reshape(-1),
-            reference[key].detach().cpu().numpy().reshape(-1),
-            atol=2e-4,
-            rtol=2e-5,
-            err_msg=key,
+
+    def check(path, kind):
+        loaded = DeepPot(path)
+        assert loaded.deep_eval.metadata["lower_input_kind"] == kind
+        energy, force, virial, atom_energy, atom_virial = loaded.eval(
+            coord.cpu().numpy(),
+            cell.cpu().numpy(),
+            atype[0].cpu().numpy(),
+            atomic=True,
         )
+        expected = {
+            "energy": energy,
+            "force": force,
+            "virial": virial,
+            "atom_energy": atom_energy,
+            "atom_virial": atom_virial,
+        }
+        for key, value in expected.items():
+            np.testing.assert_allclose(
+                np.asarray(value).reshape(-1),
+                reference[key].detach().cpu().numpy().reshape(-1),
+                atol=2e-4,
+                rtol=2e-5,
+                err_msg=f"{kind}: {key}",
+            )
+
+    # `dp freeze`: the model as trained, on the graph lower.
+    monkeypatch.delenv("DP_CUDA_INFER")
+    frozen, compressed = str(tmp_path / "frozen.pt2"), str(tmp_path / "compressed.pt2")
+    deserialize_to_file(frozen, {"model": model.serialize()}, lower_kind="auto")
+    check(frozen, "graph")
+    # `dp compress`: DeePMD-kit's own entry point, on that file. It
+    # compresses the model it deserializes without leaving training mode.
+    dp_compress(frozen, compressed)
+    check(compressed, "dpa4c_canonical")
 
 
 @pytest.mark.parametrize("compress", [False, True])

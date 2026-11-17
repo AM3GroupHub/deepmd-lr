@@ -18,6 +18,25 @@ Compress once per process, after loading; it is inference-only. A failed
 compression leaves the descriptor and `DP_CUDA_INFER` as they were, so the
 inputs can be corrected and retried.
 
+A compressed model runs in evaluation mode only. It may be compressed in
+either mode, but a forward in training mode, where the descriptor would skip
+its kernel without saying so, is refused, and so is `.train()` afterwards.
+
+**For LAMMPS**, a short-range model goes through DeePMD-kit's own commands,
+which write the compact compressed `.pt2` that `pair_style deepmd` runs
+(Kokkos included); a [`zbl`](zbl.md) block stays with it. A model with
+`long_range` has no export ([MD](md.md)).
+
+```bash
+dp --pt-expt freeze -c model.ckpt.pt -o model.pt2
+dp --pt-expt compress -i model.pt2 -o model_c.pt2
+```
+
+The compact lower needs a fitting net DeePMD-kit's fused operators serve:
+`float32` and `"resnet_dt": false`. With the default `resnet_dt` (a per-layer
+timestep, which those operators do not implement) `dp compress` still writes
+a correct file, on the graph lower instead of the compact one.
+
 **Requirements**
 
 - A deepmd-kit **built from source with the CUDA operators** (below). The PyPI
