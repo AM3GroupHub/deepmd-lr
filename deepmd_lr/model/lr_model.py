@@ -136,7 +136,7 @@ _NO_KERNEL = (
 )
 
 #: The smallest envelope a short-contact window may leave any atom of the
-#: training data with (:meth:`LongRangeEnergyModel._check_zbl_against`). A
+#: training data with (:meth:`LongRangeEnergyModel.check_zbl_against`). A
 #: contact that only grazes a window's upper edge leaves more than this.
 _ZBL_ON_DATA = 0.99
 
@@ -587,7 +587,7 @@ class LongRangeEnergyModel(EnergyModel):
         window's upper edge at or below the shortest contact of its data,
         nothing it was fitted to changes. Training checks that against its
         own data (:meth:`compute_or_load_stat`); for a trained model it is
-        the caller's to check (``examples/10-zbl/scan.py --data``). The
+        the caller's to check (:meth:`check_zbl_against`). The
         recorded config follows, so a model saved afterwards describes the
         term it has.
         """
@@ -1552,13 +1552,20 @@ class LongRangeEnergyModel(EnergyModel):
             if not checked:
                 # Once: upstream may ask for the samples several times.
                 checked.append(True)
-                self._check_zbl_against(sampled)
+                self.check_zbl_against(sampled)
             return sampled
 
         return super().compute_or_load_stat(sanitized, *args, **kwargs)
 
-    def _check_zbl_against(self, sampled: Any) -> None:
-        """Refuse a short-contact window that reaches into the training data.
+    def check_zbl_against(self, sampled: Any) -> None:
+        """Refuse a short-contact window that reaches into ``sampled`` data.
+
+        ``sampled`` is DeePMD-kit's statistics format, a list of systems each
+        with ``coord`` ``(nframes, natoms * 3)``, ``atype`` ``(nframes,
+        natoms)`` and ``box`` ``(nframes, 9)`` or None. Training calls this on
+        its own samples; for a trained model given a term afterwards it is
+        the caller's to run, on the data the model was fitted to
+        (``examples/10-zbl/scan.py --data`` does).
 
         Inside a window the network is switched off, so a window that covers
         fitted geometries has the model trained with part of itself turned

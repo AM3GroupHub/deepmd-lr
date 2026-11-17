@@ -261,27 +261,27 @@ class TestTrainingData:
 
     def test_data_above_every_window_passes(self):
         model = get_model({**config(), "zbl": {}})
-        model._check_zbl_against(self.sampled(0.96))
+        model.check_zbl_against(self.sampled(0.96))
 
     def test_a_contact_grazing_the_upper_edge_passes(self):
         model = get_model({**config(), "zbl": {}})
         edge = DEFAULT_WINDOW[1] * pair_sum("O", "H")
-        model._check_zbl_against(self.sampled(edge - 1e-3))
+        model.check_zbl_against(self.sampled(edge - 1e-3))
 
     def test_data_inside_a_window_is_refused_with_a_window_that_fits(self):
         model = get_model({**config(), "zbl": {}})
         r = 0.78  # 0.80 radius sums, inside the default 0.60-0.85
         with pytest.raises(ValueError, match="reaches into the training data") as info:
-            model._check_zbl_against(self.sampled(r))
+            model.check_zbl_against(self.sampled(r))
         message = str(info.value)
         assert "H-O 0.80 (window 0.60-0.85)" in message
         fits = json.loads(message.split('"pairs": ')[1])
         assert fits == {"H-O": [0.55, 0.8]}
         fitted = get_model({**config(), "zbl": {"pairs": fits}})
-        fitted._check_zbl_against(self.sampled(r))
+        fitted.check_zbl_against(self.sampled(r))
 
     def test_a_model_without_the_term_is_not_checked(self):
-        get_model(config(zbl=False))._check_zbl_against(self.sampled(0.3))
+        get_model(config(zbl=False)).check_zbl_against(self.sampled(0.3))
 
 
 class TestPairTerm:

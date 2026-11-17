@@ -564,15 +564,17 @@ class ZBL(torch.nn.Module):
         hi = self.r_hi[ti[src], ti[dst]]
         r = edge_vec.to(torch.float64).norm(dim=1)
         found = edge_mask.bool() & real[src] & real[dst] & (r < hi)
-        pairs: dict[tuple[int, int], float] = {}
-        for i, j, x in zip(
-            ti[src][found].tolist(),
-            ti[dst][found].tolist(),
-            (r[found] / hi[found]).tolist(),
-            strict=True,
-        ):
-            key = (min(i, j), max(i, j))
-            pairs[key] = min(pairs.get(key, 1.0), x)
+        # The shortest edge of every pair of types, one bucket per pair.
+        n_type = self.numbers.numel()
+        low, high = torch.minimum(ti[src], ti[dst]), torch.maximum(ti[src], ti[dst])
+        shortest = torch.full((n_type * n_type,), torch.inf, dtype=torch.float64)
+        shortest = shortest.to(r.device).scatter_reduce_(
+            0, (low * n_type + high)[found], (r / hi)[found], reduce="amin"
+        )
+        pairs = {
+            (int(k) // n_type, int(k) % n_type): float(shortest[k])
+            for k in torch.nonzero(torch.isfinite(shortest)).reshape(-1)
+        }
         return smallest, pairs
 
     # ------------------------------------------------------------ contacts

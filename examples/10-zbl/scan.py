@@ -189,8 +189,9 @@ def judge(result: dict, floor: float, zbl: np.ndarray) -> dict:
 
 
 def plot(report: dict, path: str, title: str) -> None:
-    """One column per pair: the energy on top, the larger of the two charges
-    below (long-range models). Same colour, same model, in every panel."""
+    """One column per pair, five to a row: the energy on top, the larger of
+    the two charges below (long-range models). Same colour, same model, in
+    every panel."""
     import matplotlib
 
     matplotlib.use("Agg")
@@ -202,17 +203,24 @@ def plot(report: dict, path: str, title: str) -> None:
     pairs = report["pairs"]
     charged = report["long_range"]
     rows = 2 if charged else 1
+    per_row = min(len(pairs), 5)
+    blocks = -(-len(pairs) // per_row)
+    height = 3.4 * rows * blocks
     fig, axes = plt.subplots(
-        rows,
-        len(pairs),
-        figsize=(4.2 * len(pairs), 3.4 * rows),
+        rows * blocks,
+        per_row,
+        figsize=(4.2 * per_row, height),
         facecolor=surface,
         squeeze=False,
-        sharex="col",
     )
-    for column, (name, entry) in enumerate(pairs.items()):
+    # The panels of the last row that no pair is left for.
+    for ax in axes[rows * (blocks - 1) :, len(pairs) - per_row * (blocks - 1) :].flat:
+        ax.set_visible(False)
+    for k, (name, entry) in enumerate(pairs.items()):
+        block, column = divmod(k, per_row)
+        panels = axes[rows * block : rows * (block + 1), column]
         r = np.array(entry["r"])
-        top = axes[0, column]
+        top = panels[0]
         for key, (label, colour) in series.items():
             top.plot(r, entry[key]["total"], color=colour, lw=2, label=label)
         shown = [entry["zbl"]["total"], entry["zbl_pair"]]
@@ -230,14 +238,20 @@ def plot(report: dict, path: str, title: str) -> None:
         verdict = "pass" if entry["judgement"]["pass"] else "FAIL"
         top.set_title(f"{name}   {verdict}", loc="left", fontsize=10, color=ink)
         if charged:
-            bottom = axes[1, column]
+            bottom = panels[1]
+            top.sharex(bottom)
+            top.tick_params(labelbottom=False)
+            peak = 0.0
             for key, (_label, colour) in series.items():
                 largest = np.nanmax(
                     np.abs([entry[key]["q_i"], entry[key]["q_j"]]), axis=0
                 )
                 bottom.plot(r, largest, color=colour, lw=2)
-            bottom.set_yscale("symlog", linthresh=1.0)
-        for ax in axes[:, column]:
+                peak = max(peak, float(np.nanmax(largest)))
+            if peak > 2.0:
+                # A runaway head: decades above anything a charge can be.
+                bottom.set_yscale("symlog", linthresh=1.0)
+        for ax in panels:
             ax.axvspan(*entry["window"], color=grid, lw=0)
             ax.axvline(entry["floor"], color=muted, lw=1)
             ax.set_facecolor(surface)
@@ -247,12 +261,13 @@ def plot(report: dict, path: str, title: str) -> None:
                 ax.spines[side].set_visible(False)
             for side in ("left", "bottom"):
                 ax.spines[side].set_color(grid)
-        axes[-1, column].set_xlabel("pair distance (A)", color=muted, fontsize=9)
-    axes[0, 0].set_ylabel("energy change (eV)", color=muted, fontsize=9)
-    if charged:
-        axes[1, 0].set_ylabel(
-            "largest |charge| of the pair (e)", color=muted, fontsize=9
-        )
+        panels[-1].set_xlabel("pair distance (A)", color=muted, fontsize=9)
+        if column == 0:
+            top.set_ylabel("energy change (eV)", color=muted, fontsize=9)
+            if charged:
+                bottom.set_ylabel(
+                    "largest |charge| of the pair (e)", color=muted, fontsize=9
+                )
     # One legend for the figure, above the panels, where no curve runs.
     handles, labels = axes[0, 0].get_legend_handles_labels()
     fig.legend(
@@ -264,15 +279,16 @@ def plot(report: dict, path: str, title: str) -> None:
         fontsize=9,
         labelcolor=muted,
     )
-    fig.suptitle(title, x=0.01, ha="left", fontsize=10, color=ink)
+    # The header keeps its height in inches however many rows there are.
+    fig.suptitle(title, x=0.01, y=1 - 0.14 / height, ha="left", fontsize=10, color=ink)
     fig.text(
         0.01,
-        0.925,
+        1 - 0.51 / height,
         "shaded: the window        vertical line: shortest fitted contact",
         fontsize=9,
         color=muted,
     )
-    fig.tight_layout(rect=(0, 0, 1, 0.91))
+    fig.tight_layout(rect=(0, 0, 1, 1 - 0.61 / height))
     fig.savefig(path, dpi=150, facecolor=surface)
 
 
@@ -281,6 +297,7 @@ def main() -> None:
     parser.add_argument("model", help="training checkpoint")
     parser.add_argument("frame", help="structure file holding the frame")
     parser.add_argument("--index", type=int, default=0)
+    parser.add_argument("--head", help="branch of a multi-head checkpoint")
     parser.add_argument(
         "--window",
         type=float,
@@ -305,8 +322,8 @@ def main() -> None:
     args = parser.parse_args()
 
     frame = read(args.frame, index=args.index)
-    plain = load_model(args.model)
-    model = load_model(args.model)
+    plain = load_model(args.model, head=args.head)
+    model = load_model(args.model, head=args.head)
     settings: dict = {"pairs": {}}
     if args.window:
         settings["window"] = args.window
@@ -317,12 +334,34 @@ def main() -> None:
     type_map = list(model.get_type_map())
     print(f"zbl: {model.zbl.serialize()}")
     calcs = {"plain": LongRangeCalculator(plain), "zbl": LongRangeCalculator(model)}
-    floors = pair_floors(read(args.data, index=":")) if args.data else {}
+    data = read(args.data, index=":") if args.data else []
+    floors = pair_floors(data)
     for name, floor in floors.items():
         print(
             f"shortest {name} in the data: {floor:.3f} A = "
             f"{floor / radius_sum(*name.split('-')):.2f} covalent-radius sums"
         )
+    if data:
+        # What training checks on its own samples: a window that reaches into
+        # the data has the term act on geometries the model was fitted to.
+        try:
+            model.check_zbl_against(
+                [
+                    {
+                        "coord": atoms.positions.reshape(1, -1),
+                        "atype": np.array(
+                            [[type_map.index(s) for s in atoms.get_chemical_symbols()]]
+                        ),
+                        "box": np.asarray(atoms.cell).reshape(1, 9)
+                        if atoms.pbc.any()
+                        else None,
+                    }
+                    for atoms in data
+                ]
+            )
+            print("no window reaches into the data")
+        except ValueError as refusal:
+            print(f"WARNING: {refusal}")
 
     report = {
         "model": args.model,

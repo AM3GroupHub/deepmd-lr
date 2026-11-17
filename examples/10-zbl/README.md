@@ -26,6 +26,16 @@ together inside a frame, with the trained model and with the term:
 python scan.py model.ckpt.pt frame.xyz --data train.xyz --png scan.png
 ```
 
+With `--data` it also makes the check training makes: a window that reaches
+into the data, which would switch the network down on geometries it was fitted
+to, is reported with a window that fits (`--head` picks the branch of a
+multi-task checkpoint):
+
+```
+WARNING: a zbl window reaches into the training data: ... Give these pairs a
+window below their data: "pairs": {"C-C": [0.5, 0.75], "Si-Si": [0.57, 0.82]}
+```
+
 On water the default covers the O–H bond; two oxygens and two hydrogens never
 come anywhere near a bond length in the data (1.78 and 2.05 radius sums), and
 the model falls right below those, so they get a window there:
