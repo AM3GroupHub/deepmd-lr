@@ -1,25 +1,36 @@
 # SPDX-License-Identifier: MIT
-"""ZBL repulsion at short contacts, on the DPA4C neighbour graph.
+"""Short contacts on the DPA4C neighbour graph: ZBL takes over from the network.
 
 A network fitted to condensed-phase data has seen no pair closer than its
-shortest bond, and below that it extrapolates freely: on a water model an O-H
-pair pushed from 0.70 to 0.60 A drops the fitted energy by 230 eV. This module
-hands such a pair over to the screened nuclear repulsion of Ziegler, Biersack
-and Littmark across one window.
+shortest bond, and below that it extrapolates freely. On a water model an O-H
+pair pushed from 0.70 to 0.60 A drops the fitted energy by 230 eV, all of it
+on the two atoms in contact, and a little further in their predicted charges
+reach tens of e. A few eV of pair repulsion added on top change nothing
+there, so this module does two things across one window:
+
+- **ZBL in**: the screened nuclear repulsion of Ziegler, Biersack and
+  Littmark, ``V_ZBL(r) (1 - s)``;
+- **the network out**: each atom's fitted energy and raw charge are
+  multiplied by the envelope ``w_i = prod_j s(r_ij)``, the product over its
+  neighbours (mace-lr's ``charge_net.envelope``, here on the energy too).
 
 The window is ``[x_lo, x_hi]`` in units of the pair's covalent-radius sum,
 ``x = r / (R_i + R_j)`` with ASE's radii, and one C2 step
 ``s(x) = t^3 (10 - 15 t + 6 t^2)``, ``t = (x - x_lo) / (x_hi - x_lo)`` clamped
-to [0, 1], is 0 below it and 1 above. A pair contributes ``V_ZBL(r) (1 - s)``:
-the full repulsion below ``x_lo``, none above ``x_hi``. Choose ``x_hi`` at or
-below the shortest contact in the data, so that nothing fitted changes.
+to [0, 1], is exactly 0 below it and exactly 1 above. Below ``x_lo`` a pair is
+ZBL alone; with every neighbour beyond ``x_hi`` an atom's factor is exactly 1.
+Choose ``x_hi`` at or below the shortest contact in the data, so that nothing
+fitted changes, and ``x_lo`` above where the network starts to fall.
 
-The term has no parameters and sees the edge vectors through no network, so
-its force and virial are assembled analytically from the per-edge derivative,
+ZBL has no parameters and sees the edge vectors through no network, so its
+force and virial are assembled analytically from the per-edge derivative,
 through the edge-to-node reduction DeePMD-kit uses for the learned energy (its
 fused CUDA kernel when ``DP_CUDA_INFER`` asks for it). On a CUDA device one
 Warp kernel produces the per-edge energy and derivative; elsewhere, and under
-a tracer, the same arithmetic runs as torch ops.
+a tracer, the same arithmetic runs as torch ops. The envelope multiplies
+network outputs, so it is a differentiable function of the edge vectors and
+whatever is differentiated through those outputs -- force, virial, the charge
+response, Born charges -- picks its derivative up on the way.
 """
 
 import math
@@ -109,7 +120,8 @@ def check_window(window: Any) -> tuple[float, float]:
 
 
 class ZBL(torch.nn.Module):
-    """Screened nuclear repulsion inside a short-contact window; no parameters.
+    """Screened nuclear repulsion inside a short-contact window, and the
+    envelope that switches the network off there; no parameters.
 
     ``settings`` is the ``zbl`` block of the model config, ``{"window":
     [x_lo, x_hi]}`` in covalent-radius sums. There is no default window: it
@@ -313,6 +325,60 @@ class ZBL(torch.nn.Module):
         """Per-node energy, (N, 1) float64: each destination's half pairs."""
         energy, _g = self.edge_terms(atype, edge_index, edge_vec, edge_mask)
         return energy.unsqueeze(-1)
+
+    # ------------------------------------------------------------ envelope
+
+    def _envelope_torch(
+        self,
+        atype: torch.Tensor,
+        src: torch.Tensor,
+        dst: torch.Tensor,
+        edge_vec: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> torch.Tensor:
+        """The envelope as torch arithmetic, differentiable to any order."""
+        r2 = edge_vec.square().sum(-1)
+        # Padded edges carry a zero vector: give them a harmless distance.
+        r = torch.sqrt(torch.where(valid, r2, torch.ones_like(r2)))
+        ri, ro, _ti = self._pair_window(atype, src, dst)
+        ri, ro = ri.to(r.dtype), ro.to(r.dtype)
+        width = torch.where(ro > ri, ro - ri, torch.ones_like(ro))
+        t = ((r - ri) / width).clamp(0.0, 1.0)
+        s = t * t * t * (t * (6.0 * t - 15.0) + 10.0)
+        inside = valid & (r < ro)
+        # A product of exact zeros and ones, summed as logarithms: an edge
+        # outside its window adds log 1 = 0, and one at or below the lower
+        # edge the constant -inf, which makes the product and its derivatives
+        # exactly zero without differentiating log(0).
+        closed = inside & (s <= 0)
+        log_s = torch.where(inside & ~closed, s, torch.ones_like(s)).log()
+        log_s = torch.where(closed, torch.full_like(s, -torch.inf), log_s)
+        log_w = torch.zeros(atype.shape[0], dtype=r.dtype, device=r.device).index_add(
+            0, dst, log_s
+        )
+        return torch.exp(log_w)
+
+    def envelope(
+        self,
+        atype: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_vec: torch.Tensor,
+        edge_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Per-node factor in [0, 1] that switches the network off at short
+        contacts, ``(N,)`` in ``edge_vec``'s dtype.
+
+        ``w_i`` is the product of the step ``s`` over the edges into node
+        ``i``: exactly 1 when every neighbour is beyond its window, exactly 0
+        when one is at or below the window's lower edge. An edge counts when
+        it is unmasked and both ends are real atoms. The graph holds every
+        edge into an owned node, so an owned node's product is complete; a
+        ghost's is not, and is not used.
+        """
+        src, dst = edge_index[0].long(), edge_index[1].long()
+        real = (atype >= 0) & (atype < self.numbers.numel())
+        valid = edge_mask.bool() & real[src] & real[dst]
+        return self._envelope_torch(atype, src, dst, edge_vec, valid)
 
     # -------------------------------------------------------- graph output
 

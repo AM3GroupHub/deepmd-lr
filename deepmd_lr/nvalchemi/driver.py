@@ -195,11 +195,18 @@ def _usable_capture(captured) -> bool:
 
 
 def charges_from_capture(model, captured, node_type, n_owned: int):
-    """Raw charges from already-computed descriptor features."""
-    raw = model.charge_fitting.call_graph(
-        captured["features"], node_type, gr=captured["rot_mat"]
-    )["charge"]
-    return raw.reshape(-1)[:n_owned]
+    """Raw charges from already-computed descriptor features, on the graph
+    they were computed on (``model.raw_charges``, short-contact envelope
+    included)."""
+    raw = model.raw_charges(
+        captured["features"],
+        captured["rot_mat"],
+        node_type,
+        captured["edge_index"],
+        captured["edge_vec"],
+        captured["edge_mask"],
+    )
+    return raw[:n_owned]
 
 
 def partition_charges(model, graph, node_type, n_owned: int, charge_spin=None):
@@ -221,8 +228,10 @@ def partition_charges(model, graph, node_type, n_owned: int, charge_spin=None):
             "DP_CUDA_INFER (it must be exactly 1)."
         )
     features, rot_mat = _run_backbone(model, graph, node_type, charge_spin)
-    raw = model.charge_fitting.call_graph(features, node_type, gr=rot_mat)["charge"]
-    return raw.reshape(-1)[:n_owned]
+    raw = model.raw_charges(
+        features, rot_mat, node_type, graph.edge_index, graph.edge_vec, graph.edge_mask
+    )
+    return raw[:n_owned]
 
 
 def partition_graph(

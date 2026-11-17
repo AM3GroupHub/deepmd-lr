@@ -188,6 +188,21 @@ def _validated_charge_owner(
             f"branch {key!r}: alpha differs from {owner!r}. One charge head "
             "serves one Coulomb split."
         )
+    if _zbl_window(base) != _zbl_window(branch):
+        raise ValueError(
+            f"branch {key!r}: its `zbl` block differs from {owner!r}'s. The "
+            "short-contact envelope multiplies the shared charge head's "
+            "output, and one head has one envelope; write the same `zbl` "
+            "block on both branches, or on neither."
+        )
+
+
+def _zbl_window(branch: dict[str, Any]) -> list[float] | None:
+    """The branch's ``zbl.window`` as numbers, or None without the block."""
+    block = branch.get("zbl")
+    if not block:
+        return None
+    return [float(x) for x in block.get("window") or []]
 
 
 def groups(model_dict: dict[str, Any]) -> dict[str, list[str]]:

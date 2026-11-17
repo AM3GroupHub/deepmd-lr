@@ -66,10 +66,49 @@ def pieces(model, coord, atype, box=None):
     """Z, the charges, and the raw charges, from one captured forward."""
     with model._capturing_backbone() as cap:
         out = model(coord, atype, box=box)
-    raw = model.charge_fitting.call_graph(
-        cap["features"], atype.reshape(-1), gr=cap["rot_mat"]
-    )["charge"].reshape(-1)
+    raw = model.raw_charges(
+        cap["features"],
+        cap["rot_mat"],
+        atype.reshape(-1),
+        cap["edge_index"],
+        cap["edge_vec"],
+        cap["edge_mask"],
+    )
     return out, raw, cap
+
+
+def pairwise_born(model, coord, atype):
+    """The model's Born tensors, and the same formula summed pair by pair
+    from finite differences of the raw charges: ``(fast, slow)``."""
+    n = coord.shape[1]
+    base = coord[0].cpu().numpy()
+
+    out, _raw, _cap = pieces(model, coord, atype)
+    fast = out["born_charge"][0].cpu().numpy()
+    q = out["charge"][0].detach().cpu().numpy()
+
+    def raw_charges(pos):
+        c = torch.tensor(pos.reshape(1, -1, 3), dtype=DT, device=DEVICE)
+        return pieces(model, c, atype)[1].detach().cpu().numpy()
+
+    h = 1e-6
+    jac = np.zeros((n, n, 3))  # jac[i, k] = d raw_i / d r_k
+    for k in range(n):
+        for b in range(3):
+            plus, minus = base.copy(), base.copy()
+            plus[k, b] += h
+            minus[k, b] -= h
+            jac[:, k, b] = (raw_charges(plus) - raw_charges(minus)) / (2 * h)
+
+    slow = np.zeros((n, 3, 3))
+    for i in range(n):
+        slow[i] = q[i] * np.eye(3)
+        for j in range(n):
+            if j == i:
+                continue
+            r_ji = base[j] - base[i]
+            slow[i] += 0.5 * (np.outer(r_ji, jac[i, j]) - np.outer(-r_ji, jac[j, i]))
+    return fast, slow
 
 
 class TestAgainstBruteForce:
@@ -82,48 +121,7 @@ class TestAgainstBruteForce:
         descriptor being one-hop. If that assumption were wrong, or an index
         swapped src for dst, this is what would catch it.
         """
-        model = build(isolated=True)
-        coord, atype = molecule()
-        n = coord.shape[1]
-        base = coord[0].cpu().numpy()
-
-        out, raw, cap = pieces(model, coord, atype)
-        fast = out["born_charge"][0].cpu().numpy()
-        q = out["charge"][0].detach().cpu().numpy()
-
-        def raw_charges(pos):
-            c = torch.tensor(pos.reshape(1, -1, 3), dtype=DT, device=DEVICE)
-            with model._capturing_backbone() as cp:
-                model(c, atype, box=None)
-            return (
-                model.charge_fitting.call_graph(
-                    cp["features"], atype.reshape(-1), gr=cp["rot_mat"]
-                )["charge"]
-                .reshape(-1)
-                .detach()
-                .cpu()
-                .numpy()
-            )
-
-        h = 1e-6
-        jac = np.zeros((n, n, 3))  # jac[i, k] = d raw_i / d r_k
-        for k in range(n):
-            for b in range(3):
-                plus, minus = base.copy(), base.copy()
-                plus[k, b] += h
-                minus[k, b] -= h
-                jac[:, k, b] = (raw_charges(plus) - raw_charges(minus)) / (2 * h)
-
-        slow = np.zeros((n, 3, 3))
-        for i in range(n):
-            slow[i] = q[i] * np.eye(3)
-            for j in range(n):
-                if j == i:
-                    continue
-                r_ji = base[j] - base[i]
-                slow[i] += 0.5 * (
-                    np.outer(r_ji, jac[i, j]) - np.outer(-r_ji, jac[j, i])
-                )
+        fast, slow = pairwise_born(build(isolated=True), *molecule())
         assert np.abs(fast - slow).max() < 1e-7, np.abs(fast - slow).max()
 
 
@@ -299,12 +297,13 @@ class TestGuards:
         with model._capturing_backbone() as cap:
             model(coord, atype, box=None)
         mask = torch.ones_like(atype, dtype=torch.bool)
+        edges = (cap["edge_index"], cap["edge_vec"], cap["edge_mask"])
         one = model._charges_from_features(
-            cap["features"], cap["rot_mat"], atype, None, mask
+            cap["features"], cap["rot_mat"], atype, None, mask, edges
         )
         assert isinstance(one, torch.Tensor)
         pair = model._charges_from_features(
-            cap["features"], cap["rot_mat"], atype, None, mask, return_raw=True
+            cap["features"], cap["rot_mat"], atype, None, mask, edges, return_raw=True
         )
         assert isinstance(pair, tuple) and len(pair) == 2
 

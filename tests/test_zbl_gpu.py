@@ -60,9 +60,10 @@ def test_the_warp_kernel_is_the_torch_arithmetic(dtype):
     torch.testing.assert_close(g_public, g, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("lr,level", [(False, 1), (False, 2), (True, 1)])
+@pytest.mark.parametrize("lr", [False, True])
 @pytest.mark.parametrize("compressed", [False, True])
-def test_serial_compressed_and_partitioned_agree(monkeypatch, lr, compressed, level):
+def test_serial_compressed_and_partitioned_agree(monkeypatch, lr, compressed):
+    level = 1
     monkeypatch.setenv("DP_CUDA_INFER", str(level))
     if compressed and not op_available():
         pytest.skip("compiled DPA4C compression operator required")
@@ -85,6 +86,10 @@ def test_serial_compressed_and_partitioned_agree(monkeypatch, lr, compressed, le
     plain = get_model({k: v for k, v in cfg.items() if k != "zbl"}).eval()
     plain.load_state_dict(base.state_dict(), strict=True)
     monkeypatch.setenv("DP_CUDA_INFER", "0")
+    keys = ["energy", "force", "virial"]
+    if lr:
+        base.compute_born = model.compute_born = True
+        keys += ["charge", "born_charge"]
     reference = base(coord, atype, box=cell)
     difference = reference["energy"] - plain(coord, atype, box=cell)["energy"]
     assert difference.abs().item() > 1.0, "the pairs must be inside the window"
@@ -92,7 +97,7 @@ def test_serial_compressed_and_partitioned_agree(monkeypatch, lr, compressed, le
     if compressed:
         compress_model(model, True)
     actual = model(coord, atype, box=cell)
-    for key in ("energy", "force", "virial"):
+    for key in keys:
         torch.testing.assert_close(actual[key], reference[key], atol=2e-4, rtol=2e-5)
     # One physical device twice: ownership and halos, not multi-GPU speed.
     evaluator = DistributedEvaluator(
@@ -101,10 +106,11 @@ def test_serial_compressed_and_partitioned_agree(monkeypatch, lr, compressed, le
         box,
         devices=[DEVICE, DEVICE],
         compute_virial=True,
+        compute_born=lr,
         memory_headroom=None,
     )
     evaluator(xyz)
-    for key in ("energy", "force", "virial"):
+    for key in keys:
         target = reference[key].detach().cpu().numpy().reshape(-1)
         np.testing.assert_allclose(
             np.asarray(evaluator.results[key]).reshape(-1),
@@ -112,3 +118,27 @@ def test_serial_compressed_and_partitioned_agree(monkeypatch, lr, compressed, le
             atol=2e-4,
             rtol=2e-5,
         )
+
+
+@pytest.mark.parametrize("compressed", [False, True])
+def test_the_fused_level_is_refused(monkeypatch, compressed):
+    if compressed and not op_available():
+        pytest.skip("compiled DPA4C compression operator required")
+    cfg = config()
+    cfg["descriptor"]["precision"] = "float32"
+    cfg["fitting_net"]["precision"] = "float32"
+    model = get_model(cfg).eval()
+    coord = torch.tensor(
+        [[[0.2, 1, 1], [0.98, 1, 1]]], dtype=torch.float64, device=DEVICE
+    )
+    atype = torch.tensor([[0, 1]], device=DEVICE)
+    cell = torch.eye(3, dtype=torch.float64, device=DEVICE)[None] * 14
+    if compressed:
+        monkeypatch.setenv("DP_CUDA_INFER", "1")
+        compress_model(model, True)
+    monkeypatch.setenv("DP_CUDA_INFER", "2")
+    with pytest.raises(RuntimeError, match="DP_CUDA_INFER=2"):
+        model(coord, atype, box=cell)
+    if not compressed:
+        with pytest.raises(RuntimeError, match="DP_CUDA_INFER=2"):
+            compress_model(model, True)

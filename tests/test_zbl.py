@@ -1,4 +1,4 @@
-"""ZBL at short contacts: a pair term with no weights, inside one window.
+"""Short contacts: ZBL comes in and the network goes out, across one window.
 
 What is pinned:
 - **The settings**: one ``window`` in covalent-radius sums, required, checked;
@@ -6,10 +6,14 @@ What is pinned:
 - **The pair term**: the ZBL formula times the C2 switch, per pair of
   elements, zero beyond the window, nothing for a type that is no element or
   an edge that is masked.
+- **The envelope**: per atom, the product over its neighbours of the same
+  step: exactly 1 beyond the window, exactly 0 below it, C2 between, with
+  derivatives that vanish wherever the value is flat.
 - **The model**: no parameter and no ``state_dict`` entry, so a trained model
-  can be given the term; force and virial are derivatives of the energy;
-  config, checkpoint and ``same_as`` carry it; interfaces that would drop it
-  refuse.
+  can be given the term; untouched wherever no pair is inside the window; a
+  pair below it is its energy offsets plus ZBL, with no charge; force, virial
+  and Born tensors are derivatives through the envelope; config, checkpoint
+  and ``same_as`` carry it; interfaces that would drop it refuse.
 """
 
 import copy
@@ -32,7 +36,7 @@ from deepmd.utils.argcheck import normalize
 
 from deepmd_lr.zbl import ZBL
 
-from .test_joint_model import DESCRIPTOR, DT, FITTING, LONG_RANGE
+from .test_joint_model import DESCRIPTOR, DT, FITTING, LONG_RANGE, frame
 
 #: O-H window 0.679-0.873 A, O-O 0.924-1.188 A, H-H 0.434-0.558 A.
 WINDOW = [0.7, 0.9]
@@ -68,6 +72,21 @@ def dimer(r: float = 0.8):
 
 def pair_sum(a: str, b: str) -> float:
     return float(covalent_radii[atomic_numbers[a]] + covalent_radii[atomic_numbers[b]])
+
+
+def step(r: float, a: str, b: str, window=WINDOW) -> float:
+    """The window's step for one pair: 0 below, 1 above."""
+    r_lo, r_hi = (x * pair_sum(a, b) for x in window)
+    t = min(1.0, max(0.0, (r - r_lo) / (r_hi - r_lo)))
+    return t**3 * (10 - 15 * t + 6 * t**2)
+
+
+def contact_frame(r: float = 0.78):
+    """The periodic water box of the other tests with one O-H pair at ``r``."""
+    coord, atype, cell = frame()
+    coord = coord.clone()
+    coord[0, 1] = coord[0, 0] + torch.tensor([r, 0.0, 0.0], dtype=DT, device=DEVICE)
+    return coord, atype, cell
 
 
 def pair_energy(r: float, a: str, b: str, window=WINDOW) -> float:
@@ -242,6 +261,99 @@ class TestPairTerm:
         assert zbl.atomic_energy(atype, edges, vec, mask).eq(0).all()
 
 
+class TestEnvelope:
+    @pytest.mark.parametrize("pair", [("O", "H"), ("O", "O"), ("H", "H")])
+    def test_one_neighbour_gives_the_step(self, pair):
+        zbl = ZBL(["O", "H"], {"window": WINDOW})
+        types = tuple(["O", "H"].index(s) for s in pair)
+        total = pair_sum(*pair)
+        for x in (0.75, 0.8, 0.85):
+            factor = zbl.envelope(*pair_graph(x * total, types))
+            assert 0.0 < factor[0].item() < 1.0
+            assert factor.tolist() == pytest.approx([step(x * total, *pair)] * 2)
+        # Exact at both ends, not merely close.
+        for x in (0.2, 0.69, 0.7):
+            assert zbl.envelope(*pair_graph(x * total, types)).tolist() == [0.0, 0.0]
+        for x in (0.9, 0.95, 3.0):
+            assert zbl.envelope(*pair_graph(x * total, types)).tolist() == [1.0, 1.0]
+
+    def test_the_product_runs_over_the_neighbours(self):
+        zbl = ZBL(["O", "H"], {"window": WINDOW})
+        # An O with two H at different distances inside the window, the H
+        # atoms far from one another.
+        r1, r2 = 0.76, 0.82
+        edges = torch.tensor([[1, 0, 2, 0], [0, 1, 0, 2]])
+        vec = torch.tensor([[r1, 0, 0], [-r1, 0, 0], [0, r2, 0], [0, -r2, 0]], dtype=DT)
+        factor = zbl.envelope(
+            torch.tensor([0, 1, 1]), edges, vec, torch.ones(4, dtype=torch.bool)
+        )
+        s1, s2 = step(r1, "O", "H"), step(r2, "O", "H")
+        assert factor.tolist() == pytest.approx([s1 * s2, s1, s2], rel=1e-13)
+
+    def test_the_gradient_vanishes_where_the_value_is_flat(self):
+        zbl = ZBL(["O", "H"], {"window": WINDOW})
+        total = pair_sum("O", "H")
+        for x, flat in [
+            (0.3, True),
+            (0.7, True),
+            (0.8, False),
+            (0.9, True),
+            (2.0, True),
+        ]:
+            atype, edges, vec, mask = pair_graph(x * total)
+            vec.requires_grad_(True)
+            factor = zbl.envelope(atype, edges, vec, mask)
+            (grad,) = torch.autograd.grad(factor.sum(), vec, create_graph=True)
+            (hess,) = torch.autograd.grad(grad.square().sum(), vec)
+            assert torch.isfinite(grad).all() and torch.isfinite(hess).all()
+            assert bool(grad.eq(0).all()) is flat
+
+    def test_c2_at_both_window_edges(self):
+        zbl = ZBL(["O", "H"], {"window": WINDOW})
+        atype, edges, _vec, mask = pair_graph(1.0)
+        axis = torch.tensor([[1.0, 0.0, 0.0]], dtype=DT)
+
+        def derivatives(r):
+            distance = torch.tensor(r, dtype=DT, requires_grad=True)
+            vec = torch.stack([distance, -distance])[:, None] * axis
+            value = zbl.envelope(atype, edges, vec, mask)[0]
+            (grad,) = torch.autograd.grad(value, distance, create_graph=True)
+            (hess,) = torch.autograd.grad(grad, distance)
+            return torch.stack([value, grad, hess]).detach()
+
+        for x in WINDOW:
+            edge = x * pair_sum("O", "H")
+            torch.testing.assert_close(
+                derivatives(edge - 1e-10), derivatives(edge + 1e-10), atol=1e-5, rtol=0
+            )
+
+    def test_what_is_no_contact_counts_for_nothing(self):
+        zbl = ZBL(["X", "O", "H"], {"window": WINDOW})
+        ones = [1.0, 1.0]
+        # A masked edge, zero length included.
+        atype, edges, vec, mask = pair_graph(0.5, types=(1, 2))
+        assert zbl.envelope(atype, edges, vec, ~mask).tolist() == ones
+        assert zbl.envelope(atype, edges, vec * 0, ~mask).tolist() == ones
+        # A type that is no element, and a padded node.
+        for types in [(0, 2), (1, -1)]:
+            assert zbl.envelope(*pair_graph(0.5, types=types)).tolist() == ones
+        # No edge at all.
+        empty = torch.zeros((2, 0), dtype=torch.int64)
+        factor = zbl.envelope(
+            torch.tensor([1, 2]),
+            empty,
+            torch.zeros((0, 3), dtype=DT),
+            torch.zeros(0, dtype=torch.bool),
+        )
+        assert factor.tolist() == ones
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+    def test_the_factor_keeps_the_vectors_precision(self, dtype):
+        zbl = ZBL(["O", "H"], {"window": WINDOW})
+        atype, edges, vec, mask = pair_graph(0.8)
+        assert zbl.envelope(atype, edges, vec.to(dtype), mask).dtype == dtype
+
+
 class TestModel:
     @pytest.mark.parametrize("lr", [False, True])
     def test_no_weights_and_a_complete_round_trip(self, lr):
@@ -312,6 +424,114 @@ class TestModel:
         )
 
     @pytest.mark.parametrize("lr", [False, True])
+    def test_fitted_geometries_are_untouched(self, lr):
+        """No pair inside the window: every factor is exactly 1, ZBL exactly
+        0, and the model is the one that was trained."""
+        model, plain = twins(lr)
+        coord, atype, cell = frame()
+        actual, reference = model(coord, atype, box=cell), plain(coord, atype, box=cell)
+        keys = ["energy", "atom_energy", "force", "virial"]
+        if lr:
+            keys += ["charge", "energy_long_range"]
+        for key in keys:
+            torch.testing.assert_close(actual[key], reference[key], rtol=0, atol=1e-13)
+
+    @pytest.mark.parametrize("lr", [False, True])
+    @pytest.mark.parametrize("r", [0.3, 0.6])
+    def test_below_the_window_a_pair_is_its_offsets_and_zbl(self, lr, r):
+        model, plain = twins(lr)
+        offsets = torch.tensor([-3.0, -1.5], dtype=DT, device=DEVICE)
+        for m in (model, plain):
+            m.atomic_model.out_bias[0, :, 0] = offsets
+        coord, atype = dimer(r)
+        out = model(coord, atype)
+        assert out["energy"].item() == pytest.approx(
+            float(offsets.sum()) + pair_energy(r, "O", "H"), abs=1e-10
+        )
+        # The network alone is somewhere else entirely.
+        assert abs(plain(coord, atype)["energy"].item() - float(offsets.sum())) > 0.1
+        if lr:
+            assert out["charge"].eq(0).all()
+            assert out["energy_long_range"].item() == 0.0
+
+    @pytest.mark.parametrize("lr", [False, True])
+    def test_force_and_virial_in_a_periodic_frame(self, lr):
+        """One O-H pair inside the window among ordinary molecules: the
+        envelope's derivative reaches the force through the fitted energy
+        and, with a long-range term, through the charges."""
+        model, plain = twins(lr)
+        coord, atype, cell = contact_frame()
+        out = model(coord, atype, box=cell)
+        different = out["energy"] - plain(coord, atype, box=cell)["energy"]
+        assert different.abs().item() > 1.0
+        h = 1e-5
+        for atom in (0, 1, 2):
+            for axis in range(3):
+                plus, minus = coord.clone(), coord.clone()
+                plus[0, atom, axis] += h
+                minus[0, atom, axis] -= h
+                numeric = -(
+                    float(model(plus, atype, box=cell)["energy"])
+                    - float(model(minus, atype, box=cell)["energy"])
+                ) / (2 * h)
+                assert out["force"][0, atom, axis].item() == pytest.approx(
+                    numeric, rel=2e-6, abs=2e-6
+                )
+        eye = torch.eye(3, dtype=DT, device=DEVICE)
+        numeric = torch.zeros((3, 3), dtype=DT, device=DEVICE)
+        for i in range(3):
+            for j in range(3):
+                delta = torch.zeros((3, 3), dtype=DT, device=DEVICE)
+                delta[i, j] = h
+                delta = 0.5 * (delta + delta.T)
+                energies = [
+                    float(
+                        model(
+                            coord @ (eye + sign * delta).T,
+                            atype,
+                            box=cell @ (eye + sign * delta).T,
+                        )["energy"]
+                    )
+                    for sign in (1.0, -1.0)
+                ]
+                numeric[i, j] = -(energies[0] - energies[1]) / (2 * h)
+        torch.testing.assert_close(
+            out["virial"].reshape(3, 3), numeric, atol=2e-5, rtol=2e-5
+        )
+
+    def test_a_contact_has_no_raw_charge_and_the_total_is_kept(self):
+        from .test_born import pieces
+
+        model, plain = twins(lr=True)
+        coord, atype, cell = contact_frame(0.6)
+        out, raw, _cap = pieces(model, coord, atype, box=cell)
+        _out, raw_plain, _cap = pieces(plain, coord, atype, box=cell)
+        assert raw[:2].eq(0).all() and raw_plain[:2].abs().min() > 1e-4
+        # Two models on a GPU agree to rounding, not to the bit.
+        torch.testing.assert_close(raw[2:], raw_plain[2:], rtol=0, atol=1e-13)
+        assert out["charge"].sum().abs().item() < 1e-12
+        # The projection spreads the deficit evenly, the two atoms included.
+        torch.testing.assert_close(
+            out["charge"][0, :2], -raw.mean().expand(2), rtol=0, atol=1e-14
+        )
+
+    @pytest.mark.parametrize("r", [0.78, 0.6])
+    def test_born_tensors_carry_the_envelopes_derivative(self, r):
+        from .test_born import build, molecule, pairwise_born
+
+        model = build(isolated=True)
+        model.set_zbl({"window": WINDOW})
+        coord, atype = molecule()
+        coord = coord.clone()
+        coord[0, 1] = coord[0, 0] + torch.tensor([r, 0.0, 0.0], dtype=DT, device=DEVICE)
+        fast, slow = pairwise_born(model, coord, atype)
+        assert np.abs(fast - slow).max() < 1e-7, np.abs(fast - slow).max()
+        plain = build(isolated=True)
+        plain.load_state_dict(model.state_dict(), strict=True)
+        changed = np.abs(fast - pairwise_born(plain, coord, atype)[0]).max()
+        assert changed > 1e-3, "the contact must change the tensors"
+
+    @pytest.mark.parametrize("lr", [False, True])
     def test_training_steps_stay_finite(self, lr):
         model = get_model(config(lr)).train()
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
@@ -338,6 +558,20 @@ class TestModel:
         models = build_group(cfg)
         assert models["slab"].zbl.serialize() == models["bulk"].zbl.serialize()
         assert models["slab"].atomic_model is models["bulk"].atomic_model
+
+    def test_a_shared_charge_head_needs_one_window(self):
+        from .test_charge_same_as import build, two_theory_config
+
+        both = two_theory_config(extra_mace={"zbl": {"window": WINDOW}})
+        both["model_dict"]["ttt_dft"]["zbl"] = {"window": WINDOW}
+        models, _wrapper, _cfg = build(both)
+        assert all(m.zbl.serialize() == {"window": WINDOW} for m in models.values())
+        for extra in ({"zbl": {"window": WINDOW}}, {"zbl": {"window": [0.6, 0.9]}}):
+            mixed = two_theory_config(extra_mace=extra)
+            if extra["zbl"]["window"] != WINDOW:
+                mixed["model_dict"]["ttt_dft"]["zbl"] = {"window": WINDOW}
+            with pytest.raises(ValueError, match="`zbl` block differs"):
+                build(mixed)
 
     def test_a_periodic_table_type_map_builds(self):
         cfg = config()
@@ -373,6 +607,15 @@ class TestRefusals:
             model.forward_lower_canonical_graph()
         with pytest.raises(NotImplementedError, match="ZBL"):
             model.enable_hessian()
+
+    def test_the_fused_inference_level(self, monkeypatch):
+        """Level 2's kernel never calls the atomic model the envelope wraps."""
+        monkeypatch.setenv("DP_CUDA_INFER", "2")
+        model = get_model(config()).eval()
+        with pytest.raises(RuntimeError, match="DP_CUDA_INFER=2"):
+            model(*dimer())
+        plain = get_model(config(zbl=False)).eval()
+        assert torch.isfinite(plain(*dimer())["energy"]).all()
 
     def test_the_hessian_first_then_the_term(self):
         model = get_model(config(zbl=False))
