@@ -120,7 +120,9 @@ Measured on that C/Si model (`ener_lr`, `pref_qn` 100) with (3.5e-3, 1.5e-3):
   stop the run. A failed evaluation, including one during frame
   restoration, leaves `atoms` and the evaluator in the start's orientation
   with their cached results invalidated. Pre-relax with a classical force
-  field ([below](#relaxing-a-packed-box-first)).
+  field ([below](#relaxing-a-packed-box-first)). A [`zbl`](zbl.md) block
+  guards a pair contact in otherwise normal surroundings; it does not rescue
+  a packed box.
 - **Check conservation with NVE first**
   ([above](#check-energy-conservation-before-trusting-a-trajectory)).
   Langevin conserves nothing, and under a field nothing is conserved at all.

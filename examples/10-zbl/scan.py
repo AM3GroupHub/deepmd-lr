@@ -3,25 +3,27 @@
     python scan.py model.ckpt.pt frame.xyz --data train.xyz \\
         --window O-H:0.7:0.9 H-H:1.45:2.0 O-O:1.5:1.75
 
-For every pair of elements in the frame, the first atom of one and its nearest
+For every pair of elements in the frame, the first atom of one and a
 neighbour of the other are brought from their own distance down to 0.3
-covalent-radius sums, the neighbour moving along the bond. The trained model
-and the same weights with ``model.set_zbl({"window": ...})`` are compared, and
-below the pair's shortest fitted contact (``--data``; the frame's own distance
-without it) the curve with the term is judged: the energy must never fall
-back below where it stood at that contact, must end at no less than half the
-pair's ZBL energy, and must keep the long-range part and the two charges
-bounded.
+covalent-radius sums. A bonded pair is compressed by moving the one atom
+along the bond; for any other pair the nearest neighbour in another molecule
+is taken and its whole molecule moves, rigid, so that nothing inside either
+molecule is distorted on the way. The trained model and the same weights with
+``model.set_zbl({"window": ...})`` are compared, and below the pair's shortest
+fitted contact (``--data``; the frame's own distance without it) the curve
+with the term is judged: the energy must never fall back below where it stood
+at that contact, must end at no less than half the pair's ZBL energy, and
+must keep the long-range part and the two charges bounded.
 
 A window is ``pair:x_lo:x_hi`` in units of the pair's covalent-radius sum.
 ``--data`` prints every pair's shortest contact in those units, which is where
 a window's upper edge belongs.
 
-Moving one atom can run it into a third one first: the table names the atom
-nearest to the moved one, and that contact is then what the row shows. The
-energy of such a path is not monotone (it falls again once the third atom is
-passed), which is why the verdict asks for no hole rather than for a steady
-rise. To see what a path should look like, write the scanned geometries with
+What moves can meet a third atom before the pair itself closes: the table
+names the closest other contact, and that contact is then what the row shows.
+The energy of such a path need not be monotone (it falls again once the third
+atom is passed), which is why the verdict asks for no hole rather than for a
+steady rise. To see what a path should look like, write the scanned geometries with
 ``--frames``, evaluate them with something you trust (DFT, another model) and
 hand the result back with ``--reference``; it is drawn as a third line:
 
@@ -41,7 +43,8 @@ import numpy as np
 import torch
 from ase.data import atomic_numbers, covalent_radii
 from ase.io import read, write
-from ase.neighborlist import neighbor_list
+from ase.neighborlist import build_neighbor_list, natural_cutoffs, neighbor_list
+from scipy.sparse.csgraph import connected_components
 
 from deepmd_lr.ase import LongRangeCalculator, load_model
 
@@ -94,31 +97,63 @@ def zbl_pair(model, a: str, b: str, radii) -> np.ndarray:
     return np.array(energies)
 
 
+def molecules(frame) -> np.ndarray:
+    """The molecule of every atom: the sets connected by covalent bonds."""
+    # No skin: ASE's default 0.3 A would tie hydrogen-bonded molecules together.
+    bonds = build_neighbor_list(
+        frame,
+        natural_cutoffs(frame, mult=1.2),
+        skin=0.0,
+        self_interaction=False,
+        bothways=True,
+    )
+    return connected_components(bonds.get_connectivity_matrix())[1]
+
+
 def scan(calcs: dict, frame, a: str, b: str, n: int, frames: list) -> dict:
-    """Bring the first ``a`` atom and its nearest ``b`` together; the
-    geometries are appended to ``frames``."""
+    """Bring the first ``a`` atom and a ``b`` together; the geometries are
+    appended to ``frames``.
+
+    A bonded pair is compressed by moving the one atom. For any other pair
+    the nearest ``b`` of another molecule is taken and its whole molecule
+    moves, rigid; in a frame that is one connected network the nearest ``b``
+    moves alone."""
     symbols = np.array(frame.get_chemical_symbols())
+    molecule = molecules(frame)
     i = int(np.flatnonzero(symbols == a)[0])
     others = np.flatnonzero(symbols == b)
     others = others[others != i]
-    j = int(others[frame.get_distances(i, others, mic=True).argmin()])
+    distance = frame.get_distances(i, others, mic=True)
+    apart = others[molecule[others] != molecule[i]]
+    if distance.min() < 1.2 * radius_sum(a, b) or len(apart) == 0:
+        j = int(others[distance.argmin()])
+        moved = [j]
+    else:
+        j = int(apart[frame.get_distances(i, apart, mic=True).argmin()])
+        moved = np.flatnonzero(molecule == molecule[j]).tolist()
     bond = frame.get_distance(i, j, mic=True, vector=True)
     r0 = float(np.linalg.norm(bond))
     radii = np.linspace(r0, 0.3 * radius_sum(a, b), n)
-    rest = [k for k in range(len(frame)) if k not in (i, j)]
-    out = {"atoms": [i, j], "r": radii.tolist(), "third": []}
+    rest = [k for k in range(len(frame)) if k not in moved]
+    out = {"atoms": [i, j], "moved": moved, "r": radii.tolist(), "third": []}
     reference = {name: evaluate(calc, frame) for name, calc in calcs.items()}
     for name in calcs:
         out[name] = {key: [] for key in ("total", "short", "long", "q_i", "q_j")}
     for r in radii:
         atoms = frame.copy()
-        atoms.positions[j] = atoms.positions[i] + bond / r0 * r
+        atoms.positions[moved] += bond / r0 * (r - r0)
         atoms.info = {"scan": f"{a}-{b}", "distance": float(r)}
         frames.append(atoms)
-        if rest:
-            gaps = atoms.get_distances(j, rest, mic=True)
-            k = rest[int(gaps.argmin())]
-            out["third"].append(f"{symbols[k]}{k} {gaps.min():.2f}")
+        # The closest contact of what moved, other than the pair itself.
+        closest = (np.inf, "")
+        for m in moved:
+            fixed = [k for k in rest if not (m == j and k == i)]
+            gaps = atoms.get_distances(m, fixed, mic=True)
+            k = fixed[int(gaps.argmin())]
+            closest = min(
+                closest, (float(gaps.min()), f"{symbols[m]}{m}-{symbols[k]}{k}")
+            )
+        out["third"].append(f"{closest[1]} {closest[0]:.2f}")
         for name, calc in calcs.items():
             energy, short, long, charges = evaluate(calc, atoms)
             row = out[name]
@@ -310,14 +345,15 @@ def main() -> None:
             result, result["floor"], np.array(result["zbl_pair"])
         )
         report["pairs"][name] = result
+        how = "rigid molecule" if len(result["moved"]) > 1 else "one atom"
         print(
-            f"\n{name}: atoms {result['atoms']}, window "
+            f"\n{name}: atoms {result['atoms']} ({how} moves), window "
             f"{result['window'][0]:.3f}-{result['window'][1]:.3f} A, "
             f"floor {result['floor']:.3f} A -> {result['judgement']}"
         )
         print(
             "     r   plain dE     zbl dE  short-range  long-range     q_i     q_j"
-            "  ZBL pair  reference  nearest third atom"
+            "  ZBL pair  reference  closest other contact"
         )
         for k, r in enumerate(result["r"]):
             row = result["zbl"]
@@ -327,7 +363,7 @@ def main() -> None:
                 f"{row['long'][k]:11.3f} {row['q_i'][k]:7.3f} {row['q_j'][k]:7.3f} "
                 f"{result['zbl_pair'][k]:9.3f} "
                 + (f"{result['reference'][k]:10.3f}" if name in trusted else " " * 10)
-                + f"  {result['third'][k] if result['third'] else ''}"
+                + f"  {result['third'][k]}"
             )
     if args.frames:
         write(args.frames, frames)

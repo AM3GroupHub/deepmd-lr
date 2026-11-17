@@ -68,6 +68,7 @@ include `input.json`, and simulation examples include runnable scripts.
 | [07](examples/07-ase-calculator) | the ASE calculator | single points, charges, Born tensors, ASE's optimizers and MD |
 | [08](examples/08-nemd) | thermal conductance by NEMD | a region thermostat with an exact heat account, fixed layers, a slab on the GPU path |
 | [09](examples/09-fire-swap) | B-site order in PMN by FIRE-Swap | relaxed-swap Metropolis on one evaluator, rollback and resume |
+| [10](examples/10-zbl) | short contacts | `zbl`: ZBL repulsion and the network switched off below the data; choosing the windows with a scan |
 
 ## Run MD
 
@@ -138,6 +139,7 @@ inference and fixes the run's `charge_spin` in the tables. See
 | [md.md](docs/md.md) | ASE workflow, energy conservation, charge filtering and initial relaxation |
 | [compression.md](docs/compression.md) | compressed backbone: requirements, what changes, building the CUDA operators |
 | [born-charges.md](docs/born-charges.md) | Born effective charges, MD in an external field, calibrating against DFPT |
+| [zbl.md](docs/zbl.md) | short contacts: ZBL repulsion and the envelope, a window per pair, what it guards and what it does not |
 | [partitioned-md.md](docs/partitioned-md.md) | GPU MD and its units, cell updates, skin and halos, custom integrators and scaling |
 | [neighbour-lists.md](docs/neighbour-lists.md) | which neighbour list runs: the serial model's, and the MD engine's GPU-direct one |
 | [tests.md](docs/tests.md) | running the tests and coverage by module |

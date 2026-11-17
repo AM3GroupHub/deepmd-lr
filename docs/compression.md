@@ -27,8 +27,10 @@ inputs can be corrected and retried.
   torch.ops.deepmd.dpa4c_graph_compress ...`.
 - `DP_CUDA_INFER=1`, set for you if unset. Level 2 is refused for a model with
   `long_range`: its fused energy/force path bypasses the shared backbone, the
-  charge response and the Born charges. A model without `long_range` may set
-  `DP_CUDA_INFER=2` (force as a value, no autograd).
+  charge response and the Born charges. It is refused with a [`zbl`](zbl.md)
+  block too, whose envelope acts on the atomic model that path never calls.
+  A model with neither may set `DP_CUDA_INFER=2` (force as a value, no
+  autograd).
 - A `float32` descriptor with no `exclude_types` (upstream's rule).
 
 **What it changes**
