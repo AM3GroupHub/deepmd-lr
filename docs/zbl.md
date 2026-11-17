@@ -121,6 +121,58 @@ is `model.check_zbl_against(sampled)`, on samples in DeePMD-kit's statistics
 format, and `scan.py --data train.xyz` runs it on a structure file: run it
 before trusting the default on a model trained without the block.
 
+## DeePMD-kit's own routes: level 2, `dp freeze`, LAMMPS
+
+The term stays outside the learned model. DeePMD-kit evaluates the network by
+whichever of its routes is selected, unchanged, and takes the envelope as a
+weight per atom at the one place each route has for one; ZBL and the
+envelope's own force and virial are added to its result from the list of
+contacts.
+
+| DeePMD-kit's route | when | where the envelope goes in |
+|---|---|---|
+| the autograd lower | training; inference at `DP_CUDA_INFER` 0 or 1 | a factor on the fitting net's output |
+| the fused energy/force operators | a compressed model at `DP_CUDA_INFER=2` | the per-node ownership they seed their backward with |
+| the compact canonical lower | a compressed `.pt2` export | the same ownership |
+
+So a short-range model with the block freezes and compresses like any other,
+and LAMMPS runs the file with `pair_style deepmd`, Kokkos and several ranks
+included. (A model with `long_range` exports nothing, with or without the
+block: see [MD](md.md).)
+
+```bash
+dp --pt-expt freeze -c model.ckpt.pt -o model.pt2
+```
+
+```python
+from deepmd.pt_expt.model.model import BaseModel
+from deepmd.pt_expt.utils.serialization import deserialize_to_file, serialize_from_file
+
+data = serialize_from_file("model.pt2")
+model = BaseModel.deserialize(data["model"]).eval()   # `dp compress` skips the eval(), which this model refuses
+model.enable_compression()
+deserialize_to_file(
+    "model_c.pt2",
+    {"model": model.serialize(), "model_def_script": data.get("model_def_script")},
+    lower_kind="auto",
+)
+```
+
+Checked on the short-range water model with one O–H pair pushed to 0.70 Å and
+another to 0.50 Å, where the term is worth 378 eV and the largest force is
+132 eV/Å, against the same model evaluated in process at level 1:
+
+| largest difference in | energy | force |
+|---|---|---|
+| compressed, `DP_CUDA_INFER=2` | 1e-6 eV | 4e-5 eV/Å |
+| `model.pt2` read by `DeepPot` | 1e-6 eV | 6e-5 eV/Å |
+| `model_c.pt2` read by `DeepPot` | 1e-6 eV | 6e-5 eV/Å |
+| `model_c.pt2` in LAMMPS-Kokkos, 1,536 atoms, 1, 2 and 4 ranks | 2e-8 eV/atom | 8e-5 eV/Å |
+
+That is float32 on a 132 eV/Å force; the same frame without contacts agrees
+to 1e-6 eV/Å, and an NVE run of 12,288 atoms is the same trajectory with and
+without the block, since no pair enters a window.
+
 ## What it does, measured
 
 [`scan.py`](../examples/10-zbl/scan.py) pushes one pair of each kind together
@@ -208,8 +260,7 @@ Each of these would silently leave the term out, or meet it half way:
 
 | | why |
 |---|---|
-| `DP_CUDA_INFER=2` | its fused energy/force kernel never calls the atomic model the envelope acts on; use 1 |
-| `forward_lower`, the canonical compressed export | the term is evaluated on the graph lower; the graph export of a short-range model (`dp freeze`) keeps it |
+| the dense (neighbour-list) lower, `forward_lower` | the term is evaluated on the graph lowers, which are what `dp freeze` and a compressed export trace for this model |
 | a Hessian | DeePMD-kit's Hessian wrapper evaluates the atomic model directly |
 | `use_srtab`, atom or pair exclusions, a descriptor other than DPA4C | not supported with the term |
 | `charge_same_as` branches with different `zbl` blocks | one charge head has one envelope |
@@ -219,23 +270,39 @@ model has the same one.
 
 ## Cost
 
-In inference on a CUDA device one Warp kernel pass over the edges leaves the
-per-node ZBL energy and envelope and a short list of the edges in contact,
-which in a healthy simulation is empty. Forces, virials and the envelope's
-derivatives are summed from that list, so nothing the size of the edge list is
-allocated or passed over a second time, and nothing is read back to the host:
-an MD step makes the same number of downloads as without the term. The list
-holds one contact per atom and 4096 more; a graph with more than that has
-collapsed, and its energy is NaN, which stops a run. Training, a CPU and any
-traced path use the same arithmetic as torch ops over every edge.
+An evaluation finds the short contacts in one pass over the edges, and sums
+forces, virials and the envelope's derivatives from the list it leaves, which
+in a healthy simulation is empty. Nothing the size of the edge list is
+computed twice.
 
-Measured on the GB10 with the compressed water model, per evaluation:
+- **In process, on a CUDA device**, the pass is one Warp kernel. Nothing is
+  read back to the host: an MD step makes the same number of downloads as
+  without the term. The list holds one contact per atom and 4096 more; a
+  graph with more than that has collapsed, and its energy is NaN, which stops
+  a run.
+- **In an export, or on a CPU**, where no kernel of ours can run, the pass is
+  torch arithmetic: one comparison per edge, which the compiler makes a
+  single kernel of, and the terms on the edges that pass it. The list is as
+  long as the contacts.
+- **Training** uses torch ops over every edge, with the envelope
+  differentiable to any order.
 
-| atoms | without | with `zbl` |
-|---|---|---|
-| 192 | 10.8 ms | 11.6 ms |
-| 12,288 | 13.8 ms | 14.6 ms |
-| 98,304 | 62.3 ms | 64.3 ms |
-| 98,304, with Born tensors | 71.5 ms | 74.9 ms |
+Measured on the GB10 with the compressed water models, milliseconds per
+evaluation (per step in LAMMPS):
 
-That is about a millisecond per evaluation, and another per 100,000 atoms.
+| | atoms | without | with `zbl` |
+|---|---|---|---|
+| long-range model, level 1 | 192 | 10.8 | 11.6 |
+| | 12,288 | 13.8 | 14.6 |
+| | 98,304 | 62.3 | 64.3 |
+| | 98,304, with Born tensors | 71.5 | 74.9 |
+| short-range model, level 1 | 12,288 | 7.9 | 8.8 |
+| | 98,304 | 34.1 | 35.8 |
+| short-range model, level 2 | 12,288 | 6.6 | 7.3 |
+| | 98,304 | 33.3 | 35.4 |
+| LAMMPS-Kokkos, compressed `.pt2` | 12,288 | 2.93 | 3.37 |
+| | 98,304 | 26.0 | 27.7 |
+
+In process that is about a millisecond per evaluation and another per 100,000
+atoms. In LAMMPS it is a quarter of a millisecond of small kernels and one
+pass over the edge vectors, 1.4 ms at 98,304 atoms on this machine's memory.

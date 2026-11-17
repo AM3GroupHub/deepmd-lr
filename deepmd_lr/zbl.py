@@ -37,19 +37,29 @@ envelope multiplies network outputs, so whatever is differentiated through
 those outputs -- force, virial, the charge response, Born charges -- has to
 pick its derivative up on the way.
 
-There are two ways through, with the same numbers:
+The term stays outside the learned model. In an evaluation the envelope is a
+plain number per atom, handed to whatever evaluates the network as a weight
+on its atomic energies, and everything else is added to that result from here:
+the ZBL energy with its force and virial, and the force and virial of the
+envelope itself, ``(w f)_i d log w_i``. DeePMD-kit's own routes take such a
+weight without being changed: the autograd lower as a factor on the fitting
+net's output, the fused operators of ``DP_CUDA_INFER=2`` and of the compact
+compressed export as the per-node ownership they seed their backward with.
 
-- **Inference on a CUDA device** (:meth:`ZBL.contacts`). One Warp kernel
-  walks the edges and leaves the per-node ZBL energy and envelope and a short
-  list of the edges in contact, with each one's derivatives. In a healthy
-  simulation that list is empty, and nothing the size of the edge list is
-  allocated or passed over again: forces and virials are summed from the
-  list, and the envelope enters the network outputs as a plain factor whose
-  derivative is added from the list wherever one is taken
-  (:func:`contact_output`, :func:`add_envelope_gradient`).
-- **Training, a CPU, a tracer** (:meth:`ZBL.graph_output`,
-  :meth:`ZBL.envelope`). The same arithmetic as torch ops over every edge,
-  the envelope a differentiable function of the edge vectors, to any order.
+Two ways through, with the same numbers:
+
+- **An evaluation** (:meth:`ZBL.contacts`). One pass over the edges leaves
+  the per-node ZBL energy and envelope and a short list of the edges in
+  contact, with each one's derivatives; forces and virials are summed from
+  that list (:func:`contact_output`, :func:`add_envelope_gradient`). In a
+  healthy simulation the list is empty, and nothing the size of the edge
+  list is computed twice. On a CUDA device the pass is one Warp kernel that
+  reads nothing back to the host; where no kernel can run (a trace, which an
+  export compiles; a CPU) it is one comparison per edge and the rest on the
+  edges that passed it, as torch ops.
+- **Training** (:meth:`ZBL.envelope`, :meth:`ZBL.graph_output`). Torch ops
+  over every edge; the envelope is a differentiable function of the edge
+  vectors, to any order, and the model's own backward carries it.
 """
 
 import math
@@ -201,8 +211,9 @@ class Contacts(NamedTuple):
 
     Per node, the ZBL energy and the envelope; per edge in contact (closer
     than the upper edge of its pair's window), its ends, its vector and its
-    two derivatives. The list has a fixed capacity and holds zeros beyond the
-    contacts found, so every sum over it is a sum over the contacts. Float64
+    two derivatives. The kernel's list has a fixed capacity and holds zeros
+    beyond the contacts found, so every sum over it is a sum over the
+    contacts; the torch list is exactly as long as the contacts. Float64
     throughout.
     """
 
@@ -245,25 +256,27 @@ def add_envelope_gradient(
 
 def contact_output(
     contacts: Contacts,
-    fitted: torch.Tensor,
+    enveloped: torch.Tensor,
     n_node: torch.Tensor,
     n_local: torch.Tensor | None,
+    do_atomic_virial: bool = False,
 ) -> dict[str, torch.Tensor]:
     """The short-contact share of ``forward_common_lower_graph``'s result,
     from the list of contacts: the keys ``fit_output_to_model_output_graph``
     writes for ``energy``, to be added to the learned model's.
 
     That is the ZBL energy with its force and virial, and the force and
-    virial the envelope adds to the fitted energy: the learned model
-    multiplied ``fitted``, its per-node output ``(N, 1)``, by the envelope as
-    a plain factor, so its own backward gave ``w d fitted``, and ``fitted d
-    w`` is added here. Sums follow DeePMD-kit's ``edge_force_virial``: the
-    gradient to the destination, minus it to the source, and ``-g (x) r``
-    to the frame's virial.
+    virial the envelope adds to the fitted energy. The learned model was
+    evaluated with the envelope as a plain weight on its fitted energies and
+    returned ``enveloped = w f`` per node, ``(N, 1)``, with the force of
+    ``w d f``; ``f d w = (w f) d log w`` is added here. Sums follow
+    DeePMD-kit's ``edge_force_virial``: the gradient to the destination,
+    minus it to the source, and ``-g (x) r`` to the frame's virial and, per
+    atom, to the edge's source.
     """
     n_cap = contacts.energy.shape[0]
     nf = n_node.shape[0]
-    coefficient = fitted.detach().reshape(-1).to(torch.float64)
+    coefficient = enveloped.detach().reshape(-1).to(torch.float64)
     # A ghost's energy is another rank's: it is not in the sum the learned
     # model differentiated either. One frame, the case of every simulation,
     # is spelled out: this runs every step, with nothing to sum most of them.
@@ -273,8 +286,7 @@ def contact_output(
         else:
             owned = node_ownership_mask(n_node, n_local, n_cap)
         coefficient = coefficient * owned
-    weight = (coefficient * contacts.envelope)[contacts.dst]
-    g = contacts.g + weight[:, None] * contacts.dlog
+    g = contacts.g + coefficient[contacts.dst][:, None] * contacts.dlog
     force = torch.zeros((n_cap, 3), dtype=torch.float64, device=g.device)
     force.index_add_(0, contacts.dst, g).index_add_(0, contacts.src, -g)
     outer = -(g[:, :, None] * contacts.vec[:, None, :])
@@ -286,12 +298,18 @@ def contact_output(
         virial = torch.zeros((nf, 3, 3), dtype=torch.float64, device=g.device)
         virial.index_add_(0, frame_id[contacts.dst], outer)
         energy_redu = segment_sum(contacts.energy, frame_id, nf)
-    return {
+    out = {
         "energy": contacts.energy.unsqueeze(-1),
         "energy_redu": energy_redu.unsqueeze(-1),
         "energy_derv_r": force.reshape(n_cap, 1, 3),
         "energy_derv_c_redu": virial.reshape(nf, 1, 9),
     }
+    if do_atomic_virial:
+        atom_virial = torch.zeros((n_cap, 3, 3), dtype=torch.float64, device=g.device)
+        out["energy_derv_c"] = atom_virial.index_add_(0, contacts.src, outer).reshape(
+            n_cap, 1, 9
+        )
+    return out
 
 
 class ZBL(torch.nn.Module):
@@ -545,6 +563,37 @@ class ZBL(torch.nn.Module):
         valid = edge_mask.bool() & real[src] & real[dst]
         return self._envelope_torch(atype, src, dst, edge_vec, valid)
 
+    def _step_terms_torch(
+        self,
+        atype: torch.Tensor,
+        src: torch.Tensor,
+        dst: torch.Tensor,
+        vec: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Per edge, what its step does to its destination's envelope:
+        ``log s`` (0 unless the edge is inside its window), whether it closes
+        the destination (at or below the lower edge), and ``d log s / d
+        edge_vec`` (0 where the step is flat). The kernel's ``_log_step``,
+        for float64 vectors of any number of edges."""
+        r2 = vec.square().sum(-1)
+        r = torch.sqrt(torch.where(valid, r2, torch.ones_like(r2)))
+        ri, ro, _ti = self._pair_window(atype, src, dst)
+        width = torch.where(ro > ri, ro - ri, torch.ones_like(ro))
+        t = ((r - ri) / width).clamp(0.0, 1.0)
+        s = t * t * t * (t * (6.0 * t - 15.0) + 10.0)
+        inside = valid & (r < ro)
+        closed = inside & (s <= 0)
+        partial = inside & ~closed
+        s = torch.where(partial, s, torch.ones_like(s))
+        # d s / d r = 30 t^2 (1 - t)^2 / width, over s for the logarithm.
+        dlog = torch.where(
+            partial,
+            30.0 * t * t * (1.0 - t) * (1.0 - t) / (width * s),
+            torch.zeros_like(s),
+        )
+        return s.log(), closed, (dlog / r).unsqueeze(-1) * vec
+
     def inside(
         self,
         atype: torch.Tensor,
@@ -580,8 +629,9 @@ class ZBL(torch.nn.Module):
     # ------------------------------------------------------------ contacts
 
     def explicit(self, edge_vec: torch.Tensor) -> bool:
-        """Whether this graph is evaluated through :meth:`contacts`: an
-        evaluation, on a CUDA device, computed rather than traced."""
+        """Whether :meth:`contacts` runs its kernel on this graph: an
+        evaluation, on a CUDA device, computed rather than traced. Anywhere
+        else it builds the same list with torch ops."""
         return (
             not self.training
             and wp is not None
@@ -601,12 +651,24 @@ class ZBL(torch.nn.Module):
         """One pass over the edges of an inference graph: the per-node ZBL
         energy and envelope, and the list of the edges in contact.
 
-        ``capacity`` is the length of that list, by default one slot per
-        node and 4096 more. A healthy simulation uses none of it; a graph
-        with more contacts than that has collapsed, and its ZBL energies are
-        set to NaN rather than its forces left short of terms. Nothing is
-        read back to the host, the count included.
+        On a CUDA device (:meth:`explicit`) the pass is a Warp kernel, and
+        ``capacity`` is the length of its list, by default one slot per node
+        and 4096 more. A healthy simulation uses none of it; a graph with
+        more contacts than that has collapsed, and its ZBL energies are set
+        to NaN rather than its forces left short of terms. Nothing is read
+        back to the host, the count included. Anywhere else the list is
+        built with torch ops (:meth:`_contacts_torch`) and is as long as it
+        has to be.
         """
+        if not self.explicit(edge_vec):
+            return self._contacts_torch(
+                atype,
+                edge_index[0],
+                edge_index[1],
+                edge_vec,
+                edge_mask.to(torch.bool),
+                owned,
+            )
         from deepmd_lr.nvalchemi.nlist import _torch_stream_scope
 
         n_node, n_edge = atype.shape[0], edge_vec.shape[0]
@@ -676,6 +738,94 @@ class ZBL(torch.nn.Module):
             energy, envelope, ends[0], ends[1], ends[2], values[0], values[1], values[2]
         )
 
+    def canonical_contacts(
+        self,
+        atype: torch.Tensor,
+        source: torch.Tensor,
+        edge_vec: torch.Tensor,
+        destination_row_ptr: torch.Tensor,
+        owned: torch.Tensor | None = None,
+    ) -> Contacts:
+        """:meth:`contacts` for DeePMD-kit's compact canonical graph, which a
+        compressed export is traced on: every edge once, grouped by
+        destination, with the source index and the CSR row offsets in place
+        of an edge index. ``Contacts.edge`` is the position in that stream.
+        """
+        return self._contacts_torch(
+            atype, source, None, edge_vec, None, owned, destination_row_ptr
+        )
+
+    def _contacts_torch(
+        self,
+        atype: torch.Tensor,
+        source: torch.Tensor,
+        destination: torch.Tensor | None,
+        edge_vec: torch.Tensor,
+        edge_mask: torch.Tensor | None,
+        owned: torch.Tensor | None,
+        destination_row_ptr: torch.Tensor | None = None,
+    ) -> Contacts:
+        """The list of :meth:`contacts` as torch ops, for where the kernel
+        cannot run: a trace, which an export compiles, and a CPU.
+
+        The graph holds hundreds of edges per atom and a healthy frame no
+        contact at all, so the edges are narrowed twice before anything is
+        computed on them. One comparison per edge, written on the three
+        components so that a compiler makes a single pass of it, keeps those
+        shorter than the longest window of the types present; on those few
+        the pair's own window is looked up, and the terms are evaluated on
+        what is left, a list exactly as long as the contacts. An edge's
+        destination is ``destination`` where the graph lists it, or the row
+        of ``destination_row_ptr`` its position falls in; ``edge_mask`` may
+        be None for a graph without masked edges.
+        """
+        n_node = atype.shape[0]
+        device = edge_vec.device
+        if owned is None:
+            owned = torch.ones(n_node, dtype=torch.bool, device=device)
+        x, y, z = edge_vec.detach().unbind(-1)
+        near = (x * x + y * y + z * z) < self.reach(atype).to(edge_vec.dtype)
+        if edge_mask is not None:
+            near = near & edge_mask
+        edge = torch.nonzero(near)[:, 0]
+        if source.dtype == torch.uint32:
+            # The compact graph's index type, which CUDA cannot gather from;
+            # node indices fit the signed type of the same width.
+            source = source.view(torch.int32)
+        src = source[edge].to(torch.int64)
+        if destination is not None:
+            dst = destination[edge].to(torch.int64)
+            stored = torch.ones_like(edge, dtype=torch.bool)
+        else:
+            # The number of rows that end at or before the edge. On the
+            # whole offsets, not `destination_row_ptr[1:]`: AOTInductor
+            # (torch 2.11) compiles `searchsorted` on a sliced sequence
+            # wrongly for CUDA, and an export is compiled. Storage past the
+            # last row (a graph of fewer than two edges is stored as two)
+            # holds no edge.
+            dst = torch.searchsorted(destination_row_ptr, edge, right=True) - 1
+            dst = dst.clamp(max=n_node - 1)
+            stored = edge < destination_row_ptr[-1]
+        vec = edge_vec.detach()[edge].to(torch.float64)
+        n_type = self.numbers.numel()
+        real = (atype >= 0) & (atype < n_type)
+        ti = atype.clamp(0, n_type - 1).long()
+        longest = self.r_hi[ti[src], ti[dst]]
+        contact = (
+            stored & real[src] & real[dst] & (vec.square().sum(-1) < longest * longest)
+        )
+        kept = torch.nonzero(contact)[:, 0]
+        edge, src, dst, vec = edge[kept], src[kept], dst[kept], vec[kept]
+        valid = torch.ones_like(edge, dtype=torch.bool)
+        e_edge, g = self._edge_terms_torch(atype, src, dst, vec, owned[dst])
+        log_s, closed, dlog = self._step_terms_torch(atype, src, dst, vec, valid)
+        zero = torch.zeros(n_node, dtype=torch.float64, device=device)
+        energy = zero.index_add(0, dst, e_edge)
+        log_w = zero.index_add(0, dst, log_s)
+        n_closed = zero.index_add(0, dst, closed.to(torch.float64))
+        envelope = torch.where(n_closed > 0, zero, torch.exp(log_w))
+        return Contacts(energy, envelope, edge, src, dst, vec, g, dlog)
+
     # -------------------------------------------------------- graph output
 
     def graph_output(
@@ -692,9 +842,12 @@ class ZBL(torch.nn.Module):
         source_row_ptr: torch.Tensor | None = None,
         do_atomic_virial: bool = False,
     ) -> dict[str, torch.Tensor]:
-        """The term's share of ``forward_common_lower_graph``'s result: the
-        keys ``fit_output_to_model_output_graph`` writes for ``energy``, to be
-        added to the learned model's."""
+        """ZBL's share of ``forward_common_lower_graph``'s result in
+        training, as torch ops over every edge: the keys
+        ``fit_output_to_model_output_graph`` writes for ``energy``, to be
+        added to the learned model's, whose own backward has differentiated
+        the envelope. (An evaluation adds both from :func:`contact_output`.)
+        """
         n_cap = atype.shape[0]
         nf = n_node.shape[0]
         owned = (

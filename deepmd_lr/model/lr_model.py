@@ -53,6 +53,9 @@ from deepmd.dpmodel.model.model_factory import (
 from deepmd.dpmodel.utils.neighbor_graph.derivatives import (
     edge_force_virial,
 )
+from deepmd.kernels.cuda.edge_force_virial import (
+    frame_scalar_sum,
+)
 from deepmd.kernels.utils import (
     cuda_infer_level,
 )
@@ -140,20 +143,33 @@ _NO_KERNEL = (
 #: contact that only grazes a window's upper edge leaves more than this.
 _ZBL_ON_DATA = 0.99
 
-#: Raised when the fused inference level meets a model with a ``zbl`` term.
-_NO_FUSED_WITH_ZBL = (
-    "DP_CUDA_INFER=2 selects DeePMD-kit's fused energy/force kernel, which "
-    "never calls the atomic model the short-contact envelope (`zbl`) acts "
-    "on: the fitted energies would not be switched off at a contact. Set "
-    "DP_CUDA_INFER=1."
-)
-
 #: Raised when a Hessian and ZBL meet, from whichever side comes second.
 _NO_HESSIAN = (
     "the Hessian is not supported with ZBL: DeePMD-kit's Hessian wrapper "
     "evaluates the atomic model directly, past the graph lower where the "
     "term is added, so the second derivatives would silently leave it out"
 )
+
+
+def _check_ownership(mask: Any) -> None:
+    """Refuse to weigh something that is not DeePMD-kit's ownership mask.
+
+    The short-contact envelope reaches the fused operators on the per-node
+    boolean mask DeePMD-kit hands them (``DescrptDPA4C.fused_energy_force_graph``
+    and ``_prepare_graph_nodes``, which this module wraps). Should a later
+    DeePMD-kit pass something else in that place, the envelope would weigh
+    the wrong tensor without an error anywhere.
+    """
+    if not isinstance(mask, torch.Tensor) or mask.dtype != torch.bool:
+        raise RuntimeError(
+            "the short-contact envelope (`zbl`) is handed to DeePMD-kit's "
+            "fused energy/force operators on their per-node ownership mask, "
+            "and this DeePMD-kit passed something else in its place "
+            f"({type(mask).__name__}"
+            + (f", {mask.dtype}" if isinstance(mask, torch.Tensor) else "")
+            + "): the interface has changed. Evaluate at DP_CUDA_INFER=1, "
+            "whose autograd lower does not depend on it."
+        )
 
 
 def _kernel_available() -> bool:
@@ -782,26 +798,42 @@ class LongRangeEnergyModel(EnergyModel):
 
     @contextlib.contextmanager
     def _enveloping_energy(
-        self, atype: torch.Tensor, contacts: Contacts | None = None
+        self, atype: torch.Tensor, factor: torch.Tensor | None = None
     ) -> Iterator[dict]:
-        """Multiply the fitted atomic energies by the short-contact envelope
-        for one pass through the graph lower; nothing without a ``zbl`` term.
+        """Weigh the fitted atomic energies by the short-contact envelope for
+        one pass through the graph lower; nothing without a ``zbl`` term.
 
-        The fitting net's output is local to DeePMD-kit's
-        ``forward_common_atomic_graph``, between the descriptor and the
-        per-type energy offsets, so the atomic model's ``forward_atomic_graph``
-        is wrapped for the duration of the pass and restored afterwards,
-        exception or not -- as :meth:`_capturing_backbone` wraps the
-        descriptor. The offsets are added after this, untouched: an atom in
-        contact keeps its offset and loses what the network added.
+        The term stays outside the learned model: DeePMD-kit evaluates the
+        network by whichever route it is configured for, and the envelope
+        goes in as a weight per atom at the one place each route has for it.
 
-        Without ``contacts`` the factor is computed from the graph's own
-        ``edge_vec``, DeePMD-kit's autograd leaf, so the energy backward that
-        follows yields the force and virial of the product. With them (an
-        inference graph, :meth:`ZBL.contacts`) it is a plain factor: that
-        backward gives ``w d fitted``, and the yielded dict carries the
-        ``fitted`` energies back so the caller can add ``fitted d w`` from
-        the list of contacts.
+        * **The autograd lower** (training; inference at ``DP_CUDA_INFER``
+          0 or 1, and at 2 wherever the fused operators do not apply). The
+          fitting net's output is local to ``forward_common_atomic_graph``,
+          between the descriptor and the per-type energy offsets, so the
+          atomic model's ``forward_atomic_graph`` is wrapped and its energy
+          multiplied.
+        * **The fused energy/force operators** (a compressed model at
+          ``DP_CUDA_INFER=2``). They seed their backward with the per-node
+          ownership mask and multiply the atomic energies by it, so the
+          envelope rides in on that mask through the descriptor's
+          ``fused_energy_force_graph``, and the operators return the weighted
+          energies and their forces as values, unchanged themselves.
+
+        Both hooks are set for the pass and removed afterwards, exception or
+        not, as :meth:`_capturing_backbone` wraps the descriptor; DeePMD-kit
+        calls the one its level selects. Either way the per-type offsets stay
+        whole: an atom in contact keeps its offset and loses what the network
+        added.
+
+        ``factor`` is the envelope as a plain value per node (an evaluation:
+        :meth:`ZBL.contacts`). The backward then gives ``w d fitted``, and
+        the yielded dict carries
+        ``enveloped``, the weighted fitted energies ``(N, 1)``, for the
+        caller to add ``fitted d w`` from. Without it (training) the envelope
+        is computed from the graph's own ``edge_vec``, DeePMD-kit's autograd
+        leaf, and the energy backward yields the force and virial of the
+        product.
 
         ``atype`` is the lower's own, where a padded node still has type -1.
         """
@@ -811,25 +843,58 @@ class LongRangeEnergyModel(EnergyModel):
             return
         zbl = self.zbl
         atomic_model = self.atomic_model
+        descriptor = atomic_model.descriptor
         unhooked = atomic_model.forward_atomic_graph
+        unfused = getattr(descriptor, "fused_energy_force_graph", None)
 
         def enveloped(graph: Any, atype_clamped: Any, *args: Any, **kwargs: Any) -> Any:
             ret = dict(unhooked(graph, atype_clamped, *args, **kwargs))
             energy = ret["energy"]
-            if contacts is None:
-                factor = zbl.envelope(
+            weight = factor
+            if weight is None:
+                weight = zbl.envelope(
                     atype, graph.edge_index, graph.edge_vec, graph.edge_mask
                 )
-            else:
-                factor = contacts.envelope
-                state["fitted"] = energy
-            ret["energy"] = energy * factor.to(energy.dtype).reshape(
+            ret["energy"] = energy * weight.to(energy.dtype).reshape(
                 -1, *([1] * (energy.ndim - 1))
             )
+            if factor is not None:
+                state["enveloped"] = ret["energy"]
             return ret
 
+        def fused(
+            fitting: Any,
+            graph: Any,
+            atype_clamped: torch.Tensor,
+            ownership: torch.Tensor,
+            atom_bias: torch.Tensor,
+            *args: Any,
+            **kwargs: Any,
+        ) -> Any:
+            if factor is None:
+                return None  # no plain weight to hand over: the autograd lower
+            _check_ownership(ownership)
+            owned = ownership.to(torch.float64)
+            weight = owned * factor
+            out = unfused(
+                fitting, graph, atype_clamped, weight, atom_bias, *args, **kwargs
+            )
+            if out is None:
+                return None  # not served: DeePMD-kit takes the autograd lower
+            energy, atom_energy, *rest = out
+            # The operators weighed the offsets along with the network. Give
+            # an atom back the part of its offset the envelope took.
+            offset = self._energy_offsets().to(torch.float64)[atype_clamped]
+            state["enveloped"] = atom_energy - (weight * offset).unsqueeze(-1)
+            kept = ((owned - weight) * offset).unsqueeze(-1)
+            energy = energy + frame_scalar_sum(kept, graph.n_node).to(energy.dtype)
+            return (energy, atom_energy + kept.to(atom_energy.dtype), *rest)
+
         had_own = "forward_atomic_graph" in atomic_model.__dict__
+        had_fused = "fused_energy_force_graph" in descriptor.__dict__
         atomic_model.forward_atomic_graph = enveloped
+        if unfused is not None:
+            descriptor.fused_energy_force_graph = fused
         try:
             yield state
         finally:
@@ -837,6 +902,16 @@ class LongRangeEnergyModel(EnergyModel):
                 atomic_model.forward_atomic_graph = unhooked
             else:
                 del atomic_model.forward_atomic_graph
+            if unfused is not None:
+                if had_fused:
+                    descriptor.fused_energy_force_graph = unfused
+                else:
+                    del descriptor.fused_energy_force_graph
+
+    def _energy_offsets(self) -> torch.Tensor:
+        """The per-type energy offsets DeePMD-kit adds after the fitting net,
+        ``(ntypes,)``: its output statistics for the energy."""
+        return self.atomic_model.out_bias[0, :, 0]
 
     @staticmethod
     def _usable(captured: dict) -> dict | None:
@@ -1283,16 +1358,97 @@ class LongRangeEnergyModel(EnergyModel):
             self._refuse_export("The lower (neighbour-list) interface")
         return super().forward_lower(*args, **kwargs)
 
-    def forward_lower_canonical_graph(self, *args: Any, **kwargs: Any) -> Any:
-        """Refuse the compact canonical lower, traced for a compressed export."""
-        if self.zbl is not None:
-            raise NotImplementedError(
-                "the canonical compressed export does not carry ZBL; evaluate "
-                "the model with LongRangeCalculator or the GPU evaluator"
-            )
+    def forward_lower_canonical_graph(
+        self,
+        atype: torch.Tensor,
+        n_node: torch.Tensor,
+        n_local: torch.Tensor,
+        source: torch.Tensor,
+        edge_vec: torch.Tensor,
+        destination_row_ptr: torch.Tensor,
+        source_row_ptr: torch.Tensor,
+        source_order: torch.Tensor,
+        *,
+        do_atomic_virial: bool,
+        spin: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """The compact canonical lower of a compressed model, which a
+        compressed export traces and LAMMPS runs; refused with a long-range
+        term, whose reciprocal part no lower carries.
+
+        A ``zbl`` term goes around DeePMD-kit's operators here as it does on
+        the graph lower. The canonical energy/force operator seeds its
+        backward with the per-node ownership and multiplies the atomic
+        energies by it, so the envelope is handed over on that mask (through
+        the atomic model's ``_prepare_graph_nodes``, wrapped for the call),
+        and the ZBL energy and the envelope's own force and virial are added
+        from the list of contacts found on the same compact edge stream
+        (:meth:`ZBL.canonical_contacts`): torch ops, which a trace records,
+        one comparison per edge and the rest on the few edges that pass it.
+        """
         if self.has_long_range:
             self._refuse_export("Canonical graph-lower export (compressed `dp freeze`)")
-        return super().forward_lower_canonical_graph(*args, **kwargs)
+        lower = functools.partial(
+            super().forward_lower_canonical_graph,
+            atype,
+            n_node,
+            n_local,
+            source,
+            edge_vec,
+            destination_row_ptr,
+            source_row_ptr,
+            source_order,
+            do_atomic_virial=do_atomic_virial,
+            spin=spin,
+        )
+        if self.zbl is None:
+            return lower()
+        n_cap = atype.shape[0]
+        owned = node_ownership_mask(n_node, n_local, n_cap).to(torch.bool)
+        contacts = self.zbl.canonical_contacts(
+            atype, source, edge_vec, destination_row_ptr, owned
+        )
+        atomic_model = self.atomic_model
+        unhooked = atomic_model._prepare_graph_nodes
+        seen: dict = {}
+
+        def weighted(*args: Any, **kwargs: Any) -> Any:
+            atype_clamped, mask = unhooked(*args, **kwargs)
+            _check_ownership(mask)
+            seen.update(atype=atype_clamped, mask=mask)
+            return atype_clamped, mask.to(torch.float64) * contacts.envelope
+
+        had_own = "_prepare_graph_nodes" in atomic_model.__dict__
+        atomic_model._prepare_graph_nodes = weighted
+        try:
+            result = lower()
+        finally:
+            if had_own:
+                atomic_model._prepare_graph_nodes = unhooked
+            else:
+                del atomic_model._prepare_graph_nodes
+        mask = seen["mask"].to(torch.float64)
+        weight = mask * contacts.envelope
+        # As on the graph lower: the operator weighed the offsets with the
+        # network, an atom keeps its own, and the list of contacts adds ZBL
+        # and the envelope's own force and virial.
+        offset = self._energy_offsets().to(torch.float64)[seen["atype"]]
+        enveloped = result["atom_energy"] - (weight * offset).unsqueeze(-1)
+        extra = contact_output(contacts, enveloped, n_node, n_local, do_atomic_virial)
+        added = extra["energy"] + ((mask - weight) * offset).unsqueeze(-1)
+        nf = n_node.shape[0]
+        result["atom_energy"] = result["atom_energy"] + added
+        result["energy"] = result["energy"] + frame_scalar_sum(added, n_node)
+        result["force"] = result["force"] + extra["energy_derv_r"].reshape(n_cap, 3)
+        result["virial"] = result["virial"] + extra["energy_derv_c_redu"].reshape(
+            nf, 3, 3
+        )
+        if do_atomic_virial:
+            result["atom_virial"] = result["atom_virial"] + extra[
+                "energy_derv_c"
+            ].reshape(n_cap, 3, 3)
+        result["mask"] = seen["mask"].to(torch.int32)
+        return result
 
     def forward_common_lower_graph(
         self,
@@ -1322,11 +1478,14 @@ class LongRangeEnergyModel(EnergyModel):
         here, so the compressed kernel's preconditions are checked on every
         step (:meth:`_check_compressed_lower`).
 
-        The short-contact term acts here, on the learned model's result:
-        every route to an energy -- ``forward``, the partitioned driver,
-        DeepPot, an export of the short-range model -- passes through this
-        lower. The fitted energies are enveloped inside the pass
-        (:meth:`_enveloping_energy`) and the ZBL energy added after it.
+        The short-contact term is added here, around the learned model:
+        every route to an energy on a graph -- ``forward``, the partitioned
+        driver, DeepPot, a graph export of the short-range model -- passes
+        through this lower. The model is evaluated with the envelope as a
+        weight on its atomic energies (:meth:`_enveloping_energy`), by the
+        autograd lower or by DeePMD-kit's fused operators, whichever its
+        ``DP_CUDA_INFER`` level selects, and the ZBL energy and the
+        envelope's own force and virial are added to what it returns.
         """
         if self.has_long_range and self._capture_depth == 0:
             self._refuse_export(
@@ -1334,27 +1493,22 @@ class LongRangeEnergyModel(EnergyModel):
             )
         if _is_compressed(self):
             self._check_compressed_lower(destination_order, destination_row_ptr)
-        elif self.zbl is not None and not self.training and cuda_infer_level() >= 2:
-            # Level 2 is DeePMD-kit's fused energy/force pipeline, which never
-            # calls the atomic model the envelope wraps.
-            raise RuntimeError(_NO_FUSED_WITH_ZBL)
-        # In inference on a CUDA device one kernel pass finds the short
-        # contacts, and everything the term adds is summed from that list;
-        # training, a CPU, a tracer and the atomic virial take the torch
-        # arithmetic over every edge.
+        # An evaluation takes the envelope as a plain weight per atom: one
+        # pass over the edges finds the short contacts (a kernel on a CUDA
+        # device, torch ops in a trace or on a CPU), and all the term adds is
+        # summed from that list. Training differentiates the envelope through
+        # the model's own backward, as torch ops over every edge.
+        zbl = self.zbl
         contacts = None
-        if (
-            self.zbl is not None
-            and not do_atomic_virial
-            and self.zbl.explicit(edge_vec)
-        ):
+        if zbl is not None and not self.training:
             owned = None
             if n_local is not None and n_local is not n_node:
                 owned = node_ownership_mask(n_node, n_local, atype.shape[0])
-            contacts = self.zbl.contacts(atype, edge_index, edge_vec, edge_mask, owned)
+            contacts = zbl.contacts(atype, edge_index, edge_vec, edge_mask, owned)
         self._contacts = contacts
+        factor = None if contacts is None else contacts.envelope
         try:
-            with self._enveloping_energy(atype, contacts) as state:
+            with self._enveloping_energy(atype, factor) as state:
                 result = super().forward_common_lower_graph(
                     atype,
                     n_node,
@@ -1373,11 +1527,11 @@ class LongRangeEnergyModel(EnergyModel):
         finally:
             self._contacts = None
         if contacts is not None:
-            extra = contact_output(contacts, state["fitted"], n_node, n_local)
-            for key, value in extra.items():
-                result[key] = result[key] + value
-        elif self.zbl is not None:
-            extra = self.zbl.graph_output(
+            extra = contact_output(
+                contacts, state["enveloped"], n_node, n_local, do_atomic_virial
+            )
+        elif zbl is not None:
+            extra = zbl.graph_output(
                 atype,
                 n_node,
                 n_local,
@@ -1390,8 +1544,10 @@ class LongRangeEnergyModel(EnergyModel):
                 source_row_ptr=source_row_ptr,
                 do_atomic_virial=do_atomic_virial,
             )
-            for key, value in extra.items():
-                result[key] = result[key] + value
+        else:
+            extra = {}
+        for key, value in extra.items():
+            result[key] = result[key] + value
         return result
 
     def _check_compressed_lower(
@@ -1405,15 +1561,14 @@ class LongRangeEnergyModel(EnergyModel):
         ``DescrptDPA4C.call_graph`` falls back to the uncompressed math
         without saying so. A long-range model needs level 1 (at 2 a fused
         kernel bypasses the backbone the charge head shares); a short-range
-        one may use 2, DeePMD-kit's faster fused energy/force pipeline. The
-        level is checked before the CSR views: at level 0 upstream builds
-        none, so the missing views are the symptom and the level the cause.
+        one may use 2, DeePMD-kit's faster fused energy/force pipeline, with
+        or without a ``zbl`` term. The level is checked before the CSR views:
+        at level 0 upstream builds none, so the missing views are the symptom
+        and the level the cause.
         """
         if not _kernel_available():
             raise RuntimeError(_NO_KERNEL)
         level = cuda_infer_level()
-        if level == 2 and self.zbl is not None:
-            raise RuntimeError(_NO_FUSED_WITH_ZBL)
         allowed = (1,) if self.has_long_range else (1, 2)
         if level not in allowed:
             raise RuntimeError(
@@ -1499,8 +1654,6 @@ class LongRangeEnergyModel(EnergyModel):
                 "compressed DPA4C cannot re-enter training mode."
             )
         level = cuda_infer_level()
-        if level >= 2 and self.zbl is not None:
-            raise RuntimeError(_NO_FUSED_WITH_ZBL)
         if level >= 2 and self.has_long_range:
             raise RuntimeError(
                 "DP_CUDA_INFER=2 selects the fused energy/force kernel, which "

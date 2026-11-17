@@ -16,6 +16,11 @@ What is pinned:
   pair below it is its energy offsets plus ZBL, with no charge; force, virial
   and Born tensors are derivatives through the envelope; config, checkpoint
   and ``same_as`` carry it; interfaces that would drop it refuse.
+- **The routes**: an evaluation takes the envelope as a plain weight per atom
+  and adds the rest from a list of contacts, whichever of DeePMD-kit's routes
+  evaluates the network; the list built with torch ops (a trace, a CPU) is
+  the arithmetic over every edge; the per-atom virial and inference level 2
+  give the numbers of level 0.
 """
 
 import copy
@@ -465,6 +470,121 @@ class TestEnvelope:
         assert zbl.envelope(atype, edges, vec.to(dtype), mask).dtype == dtype
 
 
+def random_graph(n_node: int = 60, n_edge: int = 80, seed: int = 3):
+    """Edges of every length around the windows, with what a real graph holds
+    besides: masked zero-length edges, a padded node, ghost destinations."""
+    rng = torch.Generator().manual_seed(seed)
+    atype = torch.randint(0, 2, (n_node,), generator=rng)
+    atype[-1] = -1
+    edges = torch.randint(0, n_node, (2, n_edge), generator=rng)
+    direction = torch.nn.functional.normalize(
+        torch.randn(n_edge, 3, generator=rng, dtype=DT), dim=1
+    )
+    length = 0.4 + 0.8 * torch.rand(n_edge, generator=rng, dtype=DT)
+    mask = torch.rand(n_edge, generator=rng) > 0.1
+    vec = direction * length[:, None]
+    vec[~mask] = 0.0
+    owned = torch.arange(n_node) < n_node - 5
+    return atype, edges, vec, mask, owned
+
+
+class TestContactList:
+    """What an evaluation runs on where no kernel can: the list of contacts
+    built with torch ops, which a trace records and an export compiles."""
+
+    def dense(self, zbl, atype, edges, vec, mask, owned, cotangent):
+        """The same numbers as torch arithmetic over every edge."""
+        src, dst = edges[0], edges[1]
+        real = (atype >= 0) & (atype < 2)
+        valid = mask & real[src] & real[dst]
+        e_edge, g = zbl._edge_terms_torch(atype, src, dst, vec, valid & owned[dst])
+        energy = torch.zeros(atype.shape[0], dtype=DT).index_add(0, dst, e_edge)
+        leaf = vec.clone().requires_grad_(True)
+        envelope = zbl._envelope_torch(atype, src, dst, leaf, valid)
+        (dw,) = torch.autograd.grad((envelope * cotangent).sum(), leaf)
+        return energy, envelope.detach(), g, dw
+
+    def scattered(self, found, shape, cotangent):
+        from deepmd_lr.zbl import add_envelope_gradient
+
+        zero = torch.zeros(shape, dtype=DT)
+        g = zero.clone().index_add_(0, found.edge, found.g)
+        return g, add_envelope_gradient(zero.clone(), found, cotangent)
+
+    def test_the_list_is_the_arithmetic_over_every_edge(self):
+        zbl = ZBL(["O", "H"], BLOCK).eval()
+        atype, edges, vec, mask, owned = random_graph()
+        cotangent = torch.randn(
+            atype.shape[0], generator=torch.Generator().manual_seed(4), dtype=DT
+        )
+        energy, envelope, g, dw = self.dense(
+            zbl, atype, edges, vec, mask, owned, cotangent
+        )
+        assert not zbl.explicit(vec)
+        found = zbl.contacts(atype, edges, vec, mask, owned)
+        assert envelope.eq(0).any() and envelope.eq(1).any()
+        assert ((envelope > 0) & (envelope < 1)).any() and dw.abs().max() > 1.0
+        torch.testing.assert_close(found.energy, energy, rtol=1e-12, atol=1e-12)
+        torch.testing.assert_close(found.envelope, envelope, rtol=1e-12, atol=1e-13)
+        g_list, dw_list = self.scattered(found, vec.shape, cotangent)
+        torch.testing.assert_close(g_list, g, rtol=1e-10, atol=1e-10)
+        torch.testing.assert_close(dw_list, dw, rtol=1e-10, atol=1e-10)
+        # Exactly as long as the contacts: the valid edges inside the window
+        # of their own pair.
+        src, dst = edges[0], edges[1]
+        real = (atype >= 0) & (atype < 2)
+        ti = atype.clamp(0, 1)
+        inside = vec.norm(dim=1) < zbl.r_hi[ti[src], ti[dst]]
+        expected = torch.nonzero(mask & real[src] & real[dst] & inside)[:, 0]
+        assert found.edge.tolist() == expected.tolist()
+        assert 0 < expected.numel() < int(mask.sum())
+
+    def test_the_compact_canonical_stream_gives_the_same_list(self):
+        """A compressed export is traced on DeePMD-kit's compact graph:
+        every edge once, grouped by destination, the destination not
+        listed but read off the row offsets."""
+        zbl = ZBL(["O", "H"], BLOCK).eval()
+        atype, edges, vec, mask, owned = random_graph(seed=5)
+        edges, vec = edges[:, mask], vec[mask]
+        order = torch.argsort(edges[1], stable=True)
+        edges, vec = edges[:, order], vec[order]
+        row_ptr = torch.zeros(atype.shape[0] + 1, dtype=torch.int64)
+        row_ptr[1:] = torch.cumsum(
+            torch.bincount(edges[1], minlength=atype.shape[0]), 0
+        )
+        every = torch.ones(vec.shape[0], dtype=torch.bool)
+        reference = zbl.contacts(atype, edges, vec, every, owned)
+        # Two slots of storage beyond the last row, as a tiny graph has.
+        source = torch.cat([edges[0], torch.zeros(2, dtype=torch.int64)])
+        padded = torch.cat([vec, torch.zeros(2, 3, dtype=DT)])
+        found = zbl.canonical_contacts(
+            atype, source.to(torch.uint32), padded.float(), row_ptr, owned
+        )
+        assert found.dst.tolist() == reference.dst.tolist()
+        assert found.edge.tolist() == reference.edge.tolist()
+        torch.testing.assert_close(found.energy, reference.energy, rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(
+            found.envelope, reference.envelope, rtol=1e-5, atol=1e-5
+        )
+        torch.testing.assert_close(found.g, reference.g, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(found.dlog, reference.dlog, rtol=1e-4, atol=1e-4)
+
+    def test_an_empty_graph_and_no_contact_give_an_empty_list(self):
+        zbl = ZBL(["O", "H"], BLOCK).eval()
+        atype = torch.tensor([0, 1])
+        none = zbl.contacts(
+            atype,
+            torch.zeros((2, 0), dtype=torch.int64),
+            torch.zeros((0, 3), dtype=DT),
+            torch.zeros(0, dtype=torch.bool),
+        )
+        far = zbl.contacts(*pair_graph(3.0))
+        for found in (none, far):
+            assert found.edge.numel() == 0
+            assert found.energy.tolist() == [0.0, 0.0]
+            assert found.envelope.tolist() == [1.0, 1.0]
+
+
 class TestModel:
     @pytest.mark.parametrize("lr", [False, True])
     def test_no_weights_and_a_complete_round_trip(self, lr):
@@ -619,6 +739,40 @@ class TestModel:
             out["virial"].reshape(3, 3), numeric, atol=2e-5, rtol=2e-5
         )
 
+    @pytest.mark.parametrize("r", [0.78, 0.6], ids=["in_the_window", "below_it"])
+    def test_the_per_atom_virial_takes_the_same_term(self, r):
+        """Each contact's virial goes to its source, as DeePMD-kit assigns
+        an edge's; the per-atom virials add up to the frame's."""
+        model, plain = twins()
+        coord, atype, cell = contact_frame(r)
+        reference = model(coord, atype, box=cell)
+        output = model(coord, atype, box=cell, do_atomic_virial=True)
+        for key in ("energy", "force", "virial"):
+            torch.testing.assert_close(
+                output[key], reference[key], rtol=1e-9, atol=1e-9
+            )
+        torch.testing.assert_close(
+            output["atom_virial"].sum(dim=1), reference["virial"], rtol=1e-9, atol=1e-9
+        )
+        without = plain(coord, atype, box=cell, do_atomic_virial=True)
+        assert (output["atom_virial"] - without["atom_virial"]).abs().max() > 0.1
+
+    @pytest.mark.parametrize("lr", [False, True])
+    def test_inference_level_two_falls_back_with_the_term(self, monkeypatch, lr):
+        """DeePMD-kit's fused operators serve a compressed model only; any
+        other takes the autograd lower at level 2 too, the term with it.
+        (``dp freeze`` traces a graph export at that level.)"""
+        model, _plain = twins(lr)
+        coord, atype, cell = contact_frame(0.78)
+        monkeypatch.setenv("DP_CUDA_INFER", "0")
+        reference = model(coord, atype, box=cell)
+        monkeypatch.setenv("DP_CUDA_INFER", "2")
+        output = model(coord, atype, box=cell)
+        for key in ("energy", "force", "virial"):
+            torch.testing.assert_close(
+                output[key], reference[key], rtol=1e-9, atol=1e-9
+            )
+
     def test_an_atom_in_contact_carries_no_charge_and_the_total_is_kept(self):
         """The envelope is the projection's weight: whatever offset the
         head's raw output has, the two atoms in contact end at exactly zero
@@ -717,6 +871,17 @@ class TestModel:
         assert get_model(cfg).zbl.numbers.tolist() == [0.0, 8.0, 1.0]
 
 
+def test_the_weight_goes_onto_an_ownership_mask_only():
+    """The envelope rides into DeePMD-kit's fused operators on their boolean
+    ownership mask; anything else in its place is a changed interface."""
+    from deepmd_lr.model.lr_model import _check_ownership
+
+    _check_ownership(torch.ones(3, dtype=torch.bool))
+    for other in (torch.ones(3), torch.ones(3, dtype=torch.int64), None):
+        with pytest.raises(RuntimeError, match="interface has changed"):
+            _check_ownership(other)
+
+
 class TestRefusals:
     def test_a_window_past_the_cutoff(self):
         cfg = config()
@@ -742,18 +907,7 @@ class TestRefusals:
         with pytest.raises(NotImplementedError, match="ZBL"):
             model.forward_lower()
         with pytest.raises(NotImplementedError, match="ZBL"):
-            model.forward_lower_canonical_graph()
-        with pytest.raises(NotImplementedError, match="ZBL"):
             model.enable_hessian()
-
-    def test_the_fused_inference_level(self, monkeypatch):
-        """Level 2's kernel never calls the atomic model the envelope wraps."""
-        monkeypatch.setenv("DP_CUDA_INFER", "2")
-        model = get_model(config()).eval()
-        with pytest.raises(RuntimeError, match="DP_CUDA_INFER=2"):
-            model(*dimer())
-        plain = get_model(config(zbl=False)).eval()
-        assert torch.isfinite(plain(*dimer())["energy"]).all()
 
     def test_the_hessian_first_then_the_term(self):
         model = get_model(config(zbl=False))

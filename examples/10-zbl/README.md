@@ -17,6 +17,10 @@ model = load_model("model.ckpt.pt")
 model.set_zbl({})
 ```
 
+It stays outside the network, so a short-range model keeps it through
+`dp freeze`, DeePMD-kit's compression and into LAMMPS
+([how](../../docs/zbl.md#deepmd-kits-own-routes-level-2-dp-freeze-lammps)).
+
 [`scan.py`](scan.py) checks it on your model, and shows which pairs need a
 window of their own. It prints the shortest contact of every pair in the
 training data, in covalent-radius sums, then pushes one pair of each kind

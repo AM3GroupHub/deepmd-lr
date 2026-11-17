@@ -1,16 +1,23 @@
 """The short-contact term on the GPU: the kernel's list of contacts is the
-torch arithmetic, and compressed and partitioned evaluation keep the term."""
+torch arithmetic, and compressed and partitioned evaluation keep the term, by
+whichever of DeePMD-kit's routes evaluates the network: the autograd lower,
+the fused operators of ``DP_CUDA_INFER=2``, the compact canonical lower a
+compressed export traces."""
 
 import copy
 
 import numpy as np
 import pytest
 import torch
+from deepmd.dpmodel.utils.neighbor_graph import NeighborGraph, attach_edge_csr
 from deepmd.kernels.cuda.dpa4c.graph_compress import op_available
+from deepmd.kernels.utils import cuda_infer_level
 from deepmd.pt_expt.model.get_model import get_model
+from deepmd.pt_expt.utils.canonical_graph import canonical_graph_from_neighbor_graph
 from deepmd.pt_expt.utils.env import DEVICE
 
 from deepmd_lr.compress import compress_model
+from deepmd_lr.neighbors import build_neighbor_graph_fast
 from deepmd_lr.nvalchemi import DistributedEvaluator
 from deepmd_lr.zbl import ZBL, add_envelope_gradient
 
@@ -18,6 +25,17 @@ from .test_joint_model import LONG_RANGE
 from .test_zbl import BLOCK, config
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+
+
+def fused_config(lr: bool = False) -> dict:
+    """The test model in the form DeePMD-kit compresses and its fused
+    operators serve: float32, and a fitting net without the per-layer
+    timestep, which those operators do not implement."""
+    cfg = config(lr)
+    cfg["descriptor"]["precision"] = "float32"
+    cfg["fitting_net"]["precision"] = "float32"
+    cfg["fitting_net"]["resnet_dt"] = False
+    return cfg
 
 
 def random_graph(dtype, n_node: int = 12, n_edge: int = 600, seed: int = 0):
@@ -78,17 +96,20 @@ def test_the_contact_list_is_the_torch_arithmetic(dtype):
     assert torch.isnan(short.energy).any()
 
 
+@pytest.mark.parametrize("level", [1, 2])
 @pytest.mark.parametrize("lr", [False, True])
 @pytest.mark.parametrize("compressed", [False, True])
 @pytest.mark.parametrize("r", [0.78, 0.6], ids=["in_the_window", "below_it"])
-def test_serial_compressed_and_partitioned_agree(monkeypatch, lr, compressed, r):
-    level = 1
+def test_serial_compressed_and_partitioned_agree(monkeypatch, lr, compressed, r, level):
+    """Level 2 is DeePMD-kit's fused energy/force operators for a compressed
+    short-range model, where the envelope rides in on the ownership mask; a
+    long-range model shares its backbone with the charge head and stays at 1."""
+    if lr and level == 2:
+        pytest.skip("a long-range model is evaluated at level 1")
     monkeypatch.setenv("DP_CUDA_INFER", str(level))
     if compressed and not op_available():
         pytest.skip("compiled DPA4C compression operator required")
-    cfg = config(lr)
-    cfg["descriptor"]["precision"] = "float32"
-    cfg["fitting_net"]["precision"] = "float32"
+    cfg = fused_config(lr)
     if lr:
         cfg["long_range"] = copy.deepcopy(LONG_RANGE)
         cfg["long_range"]["charge_net"]["precision"] = "float32"
@@ -116,9 +137,26 @@ def test_serial_compressed_and_partitioned_agree(monkeypatch, lr, compressed, r)
     monkeypatch.setenv("DP_CUDA_INFER", str(level))
     if compressed:
         compress_model(model, True)
+    served = fused_calls(model)
     actual = model(coord, atype, box=cell)
     for key in keys:
         torch.testing.assert_close(actual[key], reference[key], atol=2e-4, rtol=2e-5)
+    # At level 2 DeePMD-kit asks the fused operators, and they serve the
+    # compressed model; any other takes the autograd lower.
+    assert served == ([compressed] if level == 2 else [])
+    if not lr:
+        # The per-atom virial is summed from the same list of contacts.
+        atomic = model(coord, atype, box=cell, do_atomic_virial=True)
+        for key in keys:
+            torch.testing.assert_close(
+                atomic[key], reference[key], atol=2e-4, rtol=2e-5
+            )
+        torch.testing.assert_close(
+            atomic["atom_virial"].sum(dim=1).double(),
+            reference["virial"],
+            atol=2e-4,
+            rtol=2e-5,
+        )
     # One physical device twice: ownership and halos, not multi-GPU speed.
     evaluator = DistributedEvaluator(
         model,
@@ -140,28 +178,183 @@ def test_serial_compressed_and_partitioned_agree(monkeypatch, lr, compressed, r)
         )
 
 
-@pytest.mark.parametrize("compressed", [False, True])
-def test_the_fused_level_is_refused(monkeypatch, compressed):
-    if compressed and not op_available():
-        pytest.skip("compiled DPA4C compression operator required")
-    cfg = config()
-    cfg["descriptor"]["precision"] = "float32"
-    cfg["fitting_net"]["precision"] = "float32"
-    model = get_model(cfg).eval()
-    coord = torch.tensor(
-        [[[0.2, 1, 1], [0.98, 1, 1]]], dtype=torch.float64, device=DEVICE
+def fused_calls(model) -> list:
+    """Record, for every call of DeePMD-kit's fused energy/force operators on
+    ``model`` from now on, whether they served it."""
+    descriptor = model.atomic_model.descriptor
+    original = descriptor.fused_energy_force_graph
+    served: list = []
+
+    def spy(*args, **kwargs):
+        out = original(*args, **kwargs)
+        if cuda_infer_level() >= 2:
+            served.append(out is not None)
+        return out
+
+    descriptor.fused_energy_force_graph = spy
+    return served
+
+
+def compact_inputs(model, coord, atype, cell):
+    """One frame as the compact canonical lower takes it: every edge once,
+    grouped by destination, float32."""
+    n = atype.numel()
+    graph = attach_edge_csr(
+        build_neighbor_graph_fast(coord, atype, cell, model.get_rcut()),
+        n,
+        canonicalize=True,
     )
-    atype = torch.tensor([[0, 1]], device=DEVICE)
+    counts = torch.tensor([n], device=DEVICE)
+    compact = canonical_graph_from_neighbor_graph(
+        NeighborGraph(
+            n_node=counts,
+            edge_index=graph.edge_index,
+            edge_vec=graph.edge_vec.to(torch.float32),
+            edge_mask=graph.edge_mask,
+            n_local=counts,
+            destination_order=graph.destination_order,
+            destination_row_ptr=graph.destination_row_ptr,
+            source_order=graph.source_order,
+            source_row_ptr=graph.source_row_ptr,
+            destination_sorted=True,
+        )
+    )
+    return (
+        atype.reshape(-1),
+        compact.n_node,
+        compact.n_local,
+        compact.source,
+        compact.edge_vec,
+        compact.destination_row_ptr,
+        compact.source_row_ptr,
+        compact.source_order,
+    )
+
+
+@pytest.mark.parametrize("r", [0.78, 0.6], ids=["in_the_window", "below_it"])
+def test_the_canonical_lower_keeps_the_term(monkeypatch, r):
+    """What a compressed export traces and LAMMPS runs: DeePMD-kit's compact
+    energy/force operator, weighed by the envelope through its ownership
+    mask, with ZBL and the envelope's derivative assembled beside it."""
+    if not op_available():
+        pytest.skip("compiled DPA4C compression operator required")
+    cfg = fused_config()
+    model = get_model(cfg).eval()
+    # Offsets, which the envelope must leave whole.
+    with torch.no_grad():
+        model.atomic_model.out_bias[0, :, 0] = torch.tensor([-3.0, -1.5])
+    plain = get_model({k: v for k, v in cfg.items() if k != "zbl"}).eval()
+    plain.load_state_dict(model.state_dict(), strict=True)
+    xyz = [[0.2, 1, 1], [0.2 + r, 1, 1], [6.5, 1, 1], [6.5 + r, 1, 1], [3.3, 4, 4]]
+    coord = torch.tensor([xyz], dtype=torch.float64, device=DEVICE)
+    atype = torch.tensor([[0, 1, 0, 1, 0]], device=DEVICE)
     cell = torch.eye(3, dtype=torch.float64, device=DEVICE)[None] * 14
-    if compressed:
-        monkeypatch.setenv("DP_CUDA_INFER", "1")
-        compress_model(model, True)
+    monkeypatch.setenv("DP_CUDA_INFER", "0")
+    reference = model(coord, atype, box=cell, do_atomic_virial=True)
+    shift = reference["energy"] - plain(coord, atype, box=cell)["energy"]
+    assert shift.abs().item() > 1.0, "the pairs must be inside the window"
+    monkeypatch.setenv("DP_CUDA_INFER", "1")
+    compress_model(model, True)
     monkeypatch.setenv("DP_CUDA_INFER", "2")
-    with pytest.raises(RuntimeError, match="DP_CUDA_INFER=2"):
-        model(coord, atype, box=cell)
-    if not compressed:
-        with pytest.raises(RuntimeError, match="DP_CUDA_INFER=2"):
-            compress_model(model, True)
+    inputs = compact_inputs(model, coord, atype, cell)
+
+    def check(output):
+        expected = {
+            "energy": reference["energy"],
+            "atom_energy": reference["atom_energy"],
+            "force": reference["force"],
+            "virial": reference["virial"],
+            "atom_virial": reference["atom_virial"],
+        }
+        for key, value in expected.items():
+            torch.testing.assert_close(
+                output[key].double().reshape(-1),
+                value.double().reshape(-1),
+                atol=2e-4,
+                rtol=2e-5,
+            )
+        # An atom the envelope switched off is still an atom of the frame.
+        assert output["mask"].tolist() == [1] * atype.numel()
+
+    check(model.forward_lower_canonical_graph(*inputs, do_atomic_virial=True))
+    lean = model.forward_lower_canonical_graph(*inputs, do_atomic_virial=False)
+    torch.testing.assert_close(
+        lean["force"].double().reshape(-1),
+        reference["force"].reshape(-1),
+        atol=2e-4,
+        rtol=2e-5,
+    )
+    # The trace an export compiles gives the same numbers.
+    traced = model.forward_lower_canonical_graph_exportable(
+        *inputs, do_atomic_virial=True
+    )
+    check(traced(*inputs))
+
+
+@pytest.mark.parametrize("compressed", [False, True])
+def test_a_compiled_export_keeps_the_term(tmp_path, monkeypatch, compressed):
+    """The files LAMMPS loads, made as ``dp freeze`` and a compression make
+    them and read back through DeePMD-kit's own loader: the graph lower of
+    the model as trained, the compact canonical lower of the compressed one.
+
+    The trace runs at ``DP_CUDA_INFER=2`` and its arithmetic is compiled for
+    the device, which is where a term can be lost or miscompiled without a
+    trace of the lower noticing (``torch.searchsorted`` on a sliced sequence
+    is, by torch 2.11's AOTInductor)."""
+    from deepmd.infer import DeepPot
+    from deepmd.pt_expt.utils.serialization import deserialize_to_file
+
+    if not op_available():
+        pytest.skip("compiled DPA4C compression operator required")
+    model = get_model(fused_config()).eval()
+    with torch.no_grad():
+        model.atomic_model.out_bias[0, :, 0] = torch.tensor([-3.0, -1.5])
+    plain = get_model({k: v for k, v in fused_config().items() if k != "zbl"}).eval()
+    plain.load_state_dict(model.state_dict(), strict=True)
+    # Two frames, as a trace is made on several. In each, one O-H pair in
+    # its window and one below it, where the envelope is exactly zero, and
+    # an atom in neither.
+    xyz = [
+        [[0.2, 1, 1], [0.98, 1, 1], [6.5, 1, 1], [7.1, 1, 1], [3.3, 4, 4]],
+        [[0.2, 1, 1], [0.94, 1, 1], [6.5, 1, 1], [7.0, 1, 1], [3.3, 4, 5]],
+    ]
+    coord = torch.tensor(xyz, dtype=torch.float64, device=DEVICE)
+    atype = torch.tensor([[0, 1, 0, 1, 0]] * 2, device=DEVICE)
+    cell = torch.eye(3, dtype=torch.float64, device=DEVICE).repeat(2, 1, 1) * 14
+    monkeypatch.setenv("DP_CUDA_INFER", "0")
+    reference = model(coord, atype, box=cell, do_atomic_virial=True)
+    shift = reference["energy"] - plain(coord, atype, box=cell)["energy"]
+    assert shift.abs().min().item() > 1.0, "the pairs must be inside the window"
+    assert (reference["energy"][0] - reference["energy"][1]).abs().item() > 0.1
+    monkeypatch.setenv("DP_CUDA_INFER", "1")
+    if compressed:
+        compress_model(model, True)
+    path = str(tmp_path / "model.pt2")
+    deserialize_to_file(path, {"model": model.serialize()}, lower_kind="auto")
+    loaded = DeepPot(path)
+    kind = loaded.deep_eval.metadata["lower_input_kind"]
+    assert kind == ("dpa4c_canonical" if compressed else "graph")
+    energy, force, virial, atom_energy, atom_virial = loaded.eval(
+        coord.cpu().numpy(),
+        cell.cpu().numpy(),
+        atype[0].cpu().numpy(),
+        atomic=True,
+    )
+    expected = {
+        "energy": energy,
+        "force": force,
+        "virial": virial,
+        "atom_energy": atom_energy,
+        "atom_virial": atom_virial,
+    }
+    for key, value in expected.items():
+        np.testing.assert_allclose(
+            np.asarray(value).reshape(-1),
+            reference[key].detach().cpu().numpy().reshape(-1),
+            atol=2e-4,
+            rtol=2e-5,
+            err_msg=key,
+        )
 
 
 @pytest.mark.parametrize("compress", [False, True])
