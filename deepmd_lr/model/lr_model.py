@@ -87,6 +87,10 @@ from deepmd_lr.lr.term import (
 from deepmd_lr.neighbors import (
     build_neighbor_graph_fast,
 )
+from deepmd_lr.zbl import (
+    ZBL,
+    ZBL_KEY,
+)
 
 #: The ``model.type`` that selects this class, and the tag written into
 #: checkpoints so a serialized model round-trips back to this class rather
@@ -118,6 +122,13 @@ _NO_KERNEL = (
     "with DP_VARIANT=cuda and run in that environment. Without the kernel the "
     "tables are built and then silently ignored -- `DescrptDPA4C.call_graph` "
     "falls back to the uncompressed math, so nothing gets faster."
+)
+
+#: Raised when a Hessian and ZBL meet, from whichever side comes second.
+_NO_HESSIAN = (
+    "the Hessian is not supported with ZBL: DeePMD-kit's Hessian wrapper "
+    "evaluates the atomic model directly, past the graph lower where the "
+    "term is added, so the second derivatives would silently leave it out"
 )
 
 
@@ -307,6 +318,9 @@ class LongRangeEnergyModel(EnergyModel):
         #: is allowed only inside one -- that is where the long-range term
         #: gets added -- and captures nest, so this is a count, not a flag.
         self._capture_depth = 0
+        #: The short-contact ZBL term (``zbl`` in the config), or None. It
+        #: holds no weights; see :meth:`set_zbl`.
+        self.zbl: ZBL | None = None
 
     @property
     def effective_charge_filter(self) -> tuple[float, float] | None:
@@ -475,6 +489,11 @@ class LongRangeEnergyModel(EnergyModel):
         """
         data = copy.deepcopy(model_params)
         data.pop("type", None)
+        if data.get(ZBL_KEY) is not None and data.get("use_srtab") is not None:
+            raise ValueError(
+                "`zbl` and `use_srtab` both put a pair potential under the "
+                "network; choose one"
+            )
 
         descriptor, fitting, fitting_type = get_model_components(
             data,
@@ -502,8 +521,55 @@ class LongRangeEnergyModel(EnergyModel):
             long_range_energy=long_range_energy,
         )
         model.trained_charge_filter = trained_filter
+        # Before the config is recorded, which already holds the block.
+        model.set_zbl(data.get(ZBL_KEY))
         model.model_def_script = json.dumps(model_params)
         return model
+
+    def set_zbl(self, settings: dict[str, Any] | None) -> None:
+        """Give the model the ZBL term of ``settings``, the config's ``zbl``
+        block; None removes it.
+
+        The term holds no weights and adds no ``state_dict`` entry, so a
+        trained model can be given one: with the window's upper edge at or
+        below the shortest contact of its data, nothing it was fitted to
+        changes. The recorded config follows, so a model saved afterwards
+        describes the term it has.
+        """
+        if settings is None:
+            self.zbl = None
+        else:
+            if getattr(self, "_hessian_enabled", False):
+                raise NotImplementedError(_NO_HESSIAN)
+            descriptor = self.atomic_model.descriptor
+            if type(descriptor).__name__ != "DescrptDPA4C":
+                raise ValueError("zbl supports the dpa4c descriptor only")
+            if (
+                self.atomic_model.atom_exclude_types
+                or self.atomic_model.pair_exclude_types
+            ):
+                raise ValueError("zbl with atom or pair exclusions is not supported")
+            zbl = ZBL(
+                self.get_type_map(), settings, device=next(self.parameters()).device
+            )
+            rcut = float(descriptor.get_rcut())
+            if zbl.max_outer > rcut:
+                raise ValueError(
+                    f"zbl.window ends at {zbl.max_outer:g} A for the largest "
+                    f"pair of this type_map, beyond descriptor.rcut {rcut:g} A: "
+                    "a pair entering the neighbour list would arrive inside "
+                    "the switch. Lower x_hi."
+                )
+            self.zbl = zbl
+        script = getattr(self, "model_def_script", None)
+        if not script:
+            return
+        recorded = json.loads(script)
+        if self.zbl is None:
+            recorded.pop(ZBL_KEY, None)
+        else:
+            recorded[ZBL_KEY] = self.zbl.serialize()
+        self.model_def_script = json.dumps(recorded)
 
     @classmethod
     def _build_long_range(
@@ -1013,12 +1079,22 @@ class LongRangeEnergyModel(EnergyModel):
 
     def forward_lower(self, *args: Any, **kwargs: Any) -> Any:
         """Refuse the dense lower path, which also carries no cell."""
+        if self.zbl is not None:
+            raise NotImplementedError(
+                "ZBL is evaluated on the graph lower; the dense "
+                "(neighbour-list) lower would drop it"
+            )
         if self.has_long_range:
             self._refuse_export("The lower (neighbour-list) interface")
         return super().forward_lower(*args, **kwargs)
 
     def forward_lower_canonical_graph(self, *args: Any, **kwargs: Any) -> Any:
         """Refuse the compact canonical lower, traced for a compressed export."""
+        if self.zbl is not None:
+            raise NotImplementedError(
+                "the canonical compressed export does not carry ZBL; evaluate "
+                "the model with LongRangeCalculator or the GPU evaluator"
+            )
         if self.has_long_range:
             self._refuse_export("Canonical graph-lower export (compressed `dp freeze`)")
         return super().forward_lower_canonical_graph(*args, **kwargs)
@@ -1033,7 +1109,10 @@ class LongRangeEnergyModel(EnergyModel):
         edge_mask: torch.Tensor,
         destination_order: torch.Tensor | None = None,
         destination_row_ptr: torch.Tensor | None = None,
-        *args: Any,
+        source_order: torch.Tensor | None = None,
+        source_row_ptr: torch.Tensor | None = None,
+        destination_sorted: bool = False,
+        do_atomic_virial: bool = False,
         **kwargs: Any,
     ) -> dict[str, torch.Tensor]:
         """The graph lower, permitted only where the long-range term is added.
@@ -1047,6 +1126,10 @@ class LongRangeEnergyModel(EnergyModel):
         Every compressed evaluation, serial or partitioned, passes through
         here, so the compressed kernel's preconditions are checked on every
         step (:meth:`_check_compressed_lower`).
+
+        The ZBL term is added here, to the learned model's result: every
+        route to an energy -- ``forward``, the partitioned driver, DeepPot,
+        an export of the short-range model -- passes through this lower.
         """
         if self.has_long_range and self._capture_depth == 0:
             self._refuse_export(
@@ -1054,7 +1137,7 @@ class LongRangeEnergyModel(EnergyModel):
             )
         if _is_compressed(self):
             self._check_compressed_lower(destination_order, destination_row_ptr)
-        return super().forward_common_lower_graph(
+        result = super().forward_common_lower_graph(
             atype,
             n_node,
             n_local,
@@ -1063,9 +1146,29 @@ class LongRangeEnergyModel(EnergyModel):
             edge_mask,
             destination_order,
             destination_row_ptr,
-            *args,
+            source_order,
+            source_row_ptr,
+            destination_sorted=destination_sorted,
+            do_atomic_virial=do_atomic_virial,
             **kwargs,
         )
+        if self.zbl is not None:
+            extra = self.zbl.graph_output(
+                atype,
+                n_node,
+                n_local,
+                edge_index,
+                edge_vec,
+                edge_mask,
+                destination_order=destination_order,
+                destination_row_ptr=destination_row_ptr,
+                source_order=source_order,
+                source_row_ptr=source_row_ptr,
+                do_atomic_virial=do_atomic_virial,
+            )
+            for key, value in extra.items():
+                result[key] = result[key] + value
+        return result
 
     def _check_compressed_lower(
         self,
@@ -1220,6 +1323,13 @@ class LongRangeEnergyModel(EnergyModel):
 
         return super().compute_or_load_stat(sanitized, *args, **kwargs)
 
+    def enable_hessian(self) -> None:
+        """Refuse the Hessian with ZBL: DeePMD-kit's Hessian wrapper calls
+        the atomic model directly, past the lower where the term is added."""
+        if self.zbl is not None:
+            raise NotImplementedError(_NO_HESSIAN)
+        super().enable_hessian()
+
     def forward_ragged(self, *args: Any, **kwargs: Any) -> Any:
         """Refuse the flat-node-axis path, which never reaches our forward.
 
@@ -1258,6 +1368,8 @@ class LongRangeEnergyModel(EnergyModel):
             }
             if self.trained_charge_filter is not None:
                 data[LONG_RANGE_KEY]["charge_filter"] = list(self.trained_charge_filter)
+        if self.zbl is not None:
+            data[ZBL_KEY] = self.zbl.serialize()
         return data
 
     @classmethod
@@ -1266,7 +1378,9 @@ class LongRangeEnergyModel(EnergyModel):
         data = data.copy()
         data["type"] = _ATOMIC_MODEL_TYPE
         block = data.pop(LONG_RANGE_KEY, None)
+        zbl = data.pop(ZBL_KEY, None)
         model = super().deserialize(data)
+        model.set_zbl(zbl)
         if block is not None:
             model.charge_fitting = BaseFitting.deserialize(block["charge_net"])
             settings = block.get(RECIPROCAL_KEY, block.get(_LEGACY_RECIPROCAL_KEY))

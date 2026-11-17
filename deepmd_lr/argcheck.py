@@ -45,6 +45,9 @@ from deepmd_lr.same_as import (
     CHARGE_SAME_AS_KEY,
     SAME_AS_KEY,
 )
+from deepmd_lr.zbl import (
+    ZBL_KEY,
+)
 
 
 @model_args_plugin.register(MODEL_TYPE)
@@ -133,6 +136,7 @@ def dp_lr_model_args() -> Argument:
                     "same alpha; `same_as` links of either branch follow it."
                 ),
             ),
+            _zbl_args(),
             _long_range_args(),
         ],
         doc=(
@@ -140,6 +144,35 @@ def dp_lr_model_args() -> Argument:
             "(PME or Ewald via nvalchemi-toolkit-ops, or the isolated term for "
             "systems without a cell). Without a `long_range` block it is "
             "exactly the standard energy model."
+        ),
+    )
+
+
+def _zbl_args() -> Argument:
+    """The optional ``zbl`` block: ZBL repulsion at short contacts."""
+    window = Argument(
+        "window",
+        list[float],
+        doc=(
+            "`[x_lo, x_hi]` in units of each pair's covalent-radius sum "
+            "(ASE radii): the full ZBL repulsion below `x_lo`, none above "
+            "`x_hi`, a C2 switch between. There is no default: put `x_hi` at "
+            "or below the shortest contact in the training data, so that "
+            "nothing fitted changes, and keep `2 R_max x_hi` inside "
+            "`descriptor.rcut`."
+        ),
+    )
+    return Argument(
+        ZBL_KEY,
+        dict,
+        [window],
+        optional=True,
+        default=None,
+        doc=(
+            "Screened nuclear (ZBL) repulsion for pairs closer than the data "
+            "the model was fitted to. Absent, the model has none. It holds no "
+            "weights, so a trained model can be given one afterwards "
+            "(`model.set_zbl`). DPA4C only."
         ),
     )
 

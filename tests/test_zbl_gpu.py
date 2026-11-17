@@ -1,0 +1,114 @@
+"""ZBL on the GPU: the Warp kernel is the torch arithmetic, and compressed and
+partitioned evaluation keep the term."""
+
+import copy
+
+import numpy as np
+import pytest
+import torch
+from deepmd.kernels.cuda.dpa4c.graph_compress import op_available
+from deepmd.pt_expt.model.get_model import get_model
+from deepmd.pt_expt.utils.env import DEVICE
+
+from deepmd_lr.compress import compress_model
+from deepmd_lr.nvalchemi import DistributedEvaluator
+from deepmd_lr.zbl import ZBL
+
+from .test_joint_model import LONG_RANGE
+from .test_zbl import WINDOW, config
+
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+
+
+def random_graph(dtype, n_node: int = 12, n_edge: int = 600, seed: int = 0):
+    """Edges of every length around the windows, with what a real graph holds
+    besides: masked zero-length edges, a padded node, ghost destinations."""
+    rng = torch.Generator().manual_seed(seed)
+    atype = torch.randint(0, 2, (n_node,), generator=rng)
+    atype[-1] = -1
+    edges = torch.randint(0, n_node, (2, n_edge), generator=rng)
+    direction = torch.nn.functional.normalize(
+        torch.randn(n_edge, 3, generator=rng, dtype=torch.float64), dim=1
+    )
+    length = 0.2 + 1.2 * torch.rand(n_edge, generator=rng, dtype=torch.float64)
+    mask = torch.rand(n_edge, generator=rng) > 0.1
+    vec = (direction * length[:, None]).to(dtype)
+    vec[~mask] = 0.0
+    owned = torch.arange(n_node) < n_node - 3
+    return (t.to(DEVICE) for t in (atype, edges, vec, mask, owned))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_the_warp_kernel_is_the_torch_arithmetic(dtype):
+    zbl = ZBL(["O", "H"], {"window": WINDOW}, device=DEVICE)
+    atype, edges, vec, mask, owned = random_graph(dtype)
+    energy, g = zbl._edge_terms_warp(atype, edges, vec, mask, owned)
+    src, dst = edges[0], edges[1]
+    real = (atype >= 0) & (atype < 2)
+    valid = mask & real[src] & real[dst] & owned[dst]
+    e_edge, g_ref = zbl._edge_terms_torch(atype, src, dst, vec, valid)
+    e_ref = torch.zeros_like(energy).index_add(0, dst, e_edge)
+    assert e_ref.abs().max() > 1.0, "the graph must reach inside the windows"
+    torch.testing.assert_close(energy, e_ref, rtol=1e-12, atol=1e-12)
+    tight = 1e-12 if dtype == torch.float64 else 1e-6
+    torch.testing.assert_close(g, g_ref, rtol=tight, atol=tight)
+    # The public entry takes the kernel on a CUDA tensor. The per-edge
+    # derivative is written once; the energies are atomic sums, whose order
+    # differs from launch to launch.
+    energy_public, g_public = zbl.edge_terms(atype, edges, vec, mask, owned)
+    torch.testing.assert_close(energy_public, energy, rtol=1e-13, atol=1e-13)
+    torch.testing.assert_close(g_public, g, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("lr,level", [(False, 1), (False, 2), (True, 1)])
+@pytest.mark.parametrize("compressed", [False, True])
+def test_serial_compressed_and_partitioned_agree(monkeypatch, lr, compressed, level):
+    monkeypatch.setenv("DP_CUDA_INFER", str(level))
+    if compressed and not op_available():
+        pytest.skip("compiled DPA4C compression operator required")
+    cfg = config(lr)
+    cfg["descriptor"]["precision"] = "float32"
+    cfg["fitting_net"]["precision"] = "float32"
+    if lr:
+        cfg["long_range"] = copy.deepcopy(LONG_RANGE)
+        cfg["long_range"]["charge_net"]["precision"] = "float32"
+    base = get_model(cfg).eval()
+    model = get_model(cfg).eval()
+    model.load_state_dict(base.state_dict(), strict=True)
+    # Two O-H pairs inside the window (0.78 A), a cutoff apart.
+    xyz = np.array([[0.2, 1, 1], [0.98, 1, 1], [6.5, 1, 1], [7.28, 1, 1]])
+    types = np.array([0, 1, 0, 1], dtype=np.int64)
+    box = np.eye(3) * 14
+    coord = torch.tensor(xyz, dtype=torch.float64, device=DEVICE)[None]
+    atype = torch.tensor(types, device=DEVICE)[None]
+    cell = torch.tensor(box, dtype=torch.float64, device=DEVICE)[None]
+    plain = get_model({k: v for k, v in cfg.items() if k != "zbl"}).eval()
+    plain.load_state_dict(base.state_dict(), strict=True)
+    monkeypatch.setenv("DP_CUDA_INFER", "0")
+    reference = base(coord, atype, box=cell)
+    difference = reference["energy"] - plain(coord, atype, box=cell)["energy"]
+    assert difference.abs().item() > 1.0, "the pairs must be inside the window"
+    monkeypatch.setenv("DP_CUDA_INFER", str(level))
+    if compressed:
+        compress_model(model, True)
+    actual = model(coord, atype, box=cell)
+    for key in ("energy", "force", "virial"):
+        torch.testing.assert_close(actual[key], reference[key], atol=2e-4, rtol=2e-5)
+    # One physical device twice: ownership and halos, not multi-GPU speed.
+    evaluator = DistributedEvaluator(
+        model,
+        types,
+        box,
+        devices=[DEVICE, DEVICE],
+        compute_virial=True,
+        memory_headroom=None,
+    )
+    evaluator(xyz)
+    for key in ("energy", "force", "virial"):
+        target = reference[key].detach().cpu().numpy().reshape(-1)
+        np.testing.assert_allclose(
+            np.asarray(evaluator.results[key]).reshape(-1),
+            target,
+            atol=2e-4,
+            rtol=2e-5,
+        )
