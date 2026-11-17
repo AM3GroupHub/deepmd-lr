@@ -1,5 +1,5 @@
-"""ZBL on the GPU: the Warp kernel is the torch arithmetic, and compressed and
-partitioned evaluation keep the term."""
+"""The short-contact term on the GPU: the Warp kernels are the torch
+arithmetic, and compressed and partitioned evaluation keep the term."""
 
 import copy
 
@@ -58,6 +58,44 @@ def test_the_warp_kernel_is_the_torch_arithmetic(dtype):
     energy_public, g_public = zbl.edge_terms(atype, edges, vec, mask, owned)
     torch.testing.assert_close(energy_public, energy, rtol=1e-13, atol=1e-13)
     torch.testing.assert_close(g_public, g, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_the_envelope_kernel_is_the_torch_arithmetic(dtype):
+    zbl = ZBL(["O", "H"], {"window": WINDOW}, device=DEVICE).eval()
+    # Few edges per node, so that open, partly closed and closed nodes all occur.
+    atype, edges, vec, mask, _owned = random_graph(dtype, n_node=40, n_edge=120, seed=1)
+    vec = vec.clone().requires_grad_(True)
+    fast = zbl.envelope(atype, edges, vec, mask)
+    assert "EnvelopeFunction" in type(fast.grad_fn).__name__, "the kernel must run"
+    src, dst = edges[0], edges[1]
+    real = (atype >= 0) & (atype < 2)
+    slow = zbl._envelope_torch(atype, src, dst, vec, mask & real[src] & real[dst])
+    for count in (
+        (slow == 0).sum(),
+        (slow == 1).sum(),
+        ((slow > 0) & (slow < 1)).sum(),
+    ):
+        assert count > 2, "the graph must hold every kind of node"
+    tight = 1e-12 if dtype == torch.float64 else 2e-5
+    torch.testing.assert_close(fast, slow, rtol=tight, atol=tight)
+    assert torch.equal(fast == 0, slow == 0) and torch.equal(fast == 1, slow == 1)
+    cotangent = torch.randn(
+        40, generator=torch.Generator().manual_seed(2), dtype=torch.float64
+    ).to(device=DEVICE, dtype=dtype)
+    (g_fast,) = torch.autograd.grad((fast * cotangent).sum(), vec, retain_graph=True)
+    (g_slow,) = torch.autograd.grad((slow * cotangent).sum(), vec)
+    assert g_slow.abs().max() > 1.0
+    torch.testing.assert_close(g_fast, g_slow, rtol=10 * tight, atol=10 * tight)
+    # First derivatives only: a second backward is refused, not returned wrong.
+    (once,) = torch.autograd.grad(fast.sum(), vec, create_graph=True)
+    with pytest.raises(RuntimeError):
+        torch.autograd.grad(once.sum(), vec)
+    # Training needs the second one, and takes the torch arithmetic.
+    trained = zbl.train().envelope(atype, edges, vec, mask)
+    assert "EnvelopeFunction" not in type(trained.grad_fn).__name__
+    (once,) = torch.autograd.grad(trained.sum(), vec, create_graph=True)
+    assert torch.isfinite(torch.autograd.grad(once.square().sum(), vec)[0]).all()
 
 
 @pytest.mark.parametrize("lr", [False, True])
@@ -142,3 +180,22 @@ def test_the_fused_level_is_refused(monkeypatch, compressed):
     if not compressed:
         with pytest.raises(RuntimeError, match="DP_CUDA_INFER=2"):
             compress_model(model, True)
+
+
+@pytest.mark.parametrize("compress", [False, True])
+@pytest.mark.parametrize("long_range", [False, True])
+def test_the_md_step_reads_the_host_no_more_often(compress, long_range):
+    """The kernels read nothing back: a step with the term makes the same
+    number of downloads as one without (`tests/test_sync.py`)."""
+    from .test_compress import build32
+    from .test_sync import assert_downloads, count_syncs, system
+
+    if compress and not op_available():
+        pytest.skip("compiled DPA4C compression operator required")
+    coord, atype, cell = system()
+    model = build32(long_range=long_range)
+    model.set_zbl({"window": WINDOW})
+    evaluator = DistributedEvaluator(
+        model, atype, cell, devices=[DEVICE], memory_headroom=None, compress=compress
+    )
+    assert_downloads(count_syncs(evaluator, coord), 1 if compress else 2)

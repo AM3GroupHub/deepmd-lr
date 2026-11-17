@@ -377,10 +377,19 @@ class TestModel:
         coord, atype = dimer()
         assert plain.zbl is None
         plain.set_zbl({"window": WINDOW})
+        # In the model's own mode: a module made after `.eval()` would
+        # otherwise stay in training mode and miss the inference kernel.
+        assert plain.zbl.training is False
+        assert plain.train().zbl.training is True and plain.eval().zbl.training is False
         assert json.loads(plain.model_def_script)["zbl"] == {"window": WINDOW}
+        # Two evaluations agree to rounding, not to the bit: the kernels sum
+        # with atomics, in whatever order the threads arrive.
         for key in ("energy", "force", "virial"):
             torch.testing.assert_close(
-                plain(coord, atype)[key], model(coord, atype)[key], rtol=0, atol=0
+                plain(coord, atype)[key],
+                model(coord, atype)[key],
+                rtol=1e-12,
+                atol=1e-12,
             )
         reference = get_model(config(lr, zbl=False)).eval()
         reference.load_state_dict(model.state_dict(), strict=True)
@@ -389,8 +398,8 @@ class TestModel:
         torch.testing.assert_close(
             plain(coord, atype)["energy"],
             reference(coord, atype)["energy"],
-            rtol=0,
-            atol=0,
+            rtol=1e-12,
+            atol=1e-12,
         )
 
     @pytest.mark.parametrize("lr", [False, True])

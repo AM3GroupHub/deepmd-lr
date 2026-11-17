@@ -573,7 +573,9 @@ class LongRangeEnergyModel(EnergyModel):
                     "a pair entering the neighbour list would arrive inside "
                     "the switch. Lower x_hi."
                 )
-            self.zbl = zbl
+            # A module made after `.eval()` would still be in training mode,
+            # where the envelope takes the slower torch arithmetic.
+            self.zbl = zbl.train(self.training)
         script = getattr(self, "model_def_script", None)
         if not script:
             return
