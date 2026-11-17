@@ -10,8 +10,9 @@ and 130 KB out.
 Two things are necessarily global and so happen after the gather:
 
 - **The total-charge projection.** ``sum_i q_i = Q_total`` is a constraint
-  over every atom. Partitions produce *raw* charges; the projection runs once
-  on the assembled vector.
+  over every atom. Partitions produce *raw* charges and, for a model with a
+  short-contact term, each owned atom's envelope; the projection runs once on
+  the assembled vectors, the envelope as its weight.
 - **The reciprocal sum itself**, a structure factor over every atom. Split
   across ranks in a LAMMPS domain decomposition it gave 2.0% error at 2 ranks
   and 36.5% at 8.
@@ -52,6 +53,7 @@ from deepmd_lr.fitting.charge import (
     check_charge_filter,
     filter_charges,
     project_to_total_charge,
+    projection_shift,
     resolve_charge_spin,
 )
 from deepmd_lr.model.lr_model import (
@@ -89,6 +91,9 @@ class _Launched(NamedTuple):
     eps: torch.Tensor | None
     graph: Any
     cap: torch.Tensor | None
+    #: The owned atoms' short-contact envelope, attached like ``raw``; None
+    #: for a model without a ``zbl`` term.
+    envelope: torch.Tensor | None = None
 
 
 @dataclass
@@ -112,6 +117,9 @@ class _Run:
     atom_energy: torch.Tensor
     raw_charge: torch.Tensor | None
     virial: torch.Tensor | None
+    #: The short-contact envelope of every atom, gathered beside the raw
+    #: charges; None for a model without a ``zbl`` term.
+    envelope: torch.Tensor | None = None
 
     @property
     def n_atoms(self) -> int:
@@ -194,23 +202,24 @@ def _usable_capture(captured) -> bool:
     return bool(captured) and captured["edge_vec"].requires_grad
 
 
+def _owned(values, n_owned: int):
+    return None if values is None else values[:n_owned]
+
+
 def charges_from_capture(model, captured, node_type, n_owned: int):
-    """Raw charges from already-computed descriptor features, on the graph
-    they were computed on (``model.raw_charges``, short-contact envelope
-    included)."""
-    raw = model.raw_charges(
-        captured["features"],
-        captured["rot_mat"],
-        node_type,
-        captured["edge_index"],
-        captured["edge_vec"],
-        captured["edge_mask"],
+    """Raw charges from already-computed descriptor features, and the
+    short-contact envelope on the graph they were computed on (None without
+    a ``zbl`` term): ``(raw, envelope)`` for the owned atoms."""
+    raw = model.raw_charges(captured["features"], captured["rot_mat"], node_type)
+    envelope = model.charge_envelope(
+        node_type, captured["edge_index"], captured["edge_vec"], captured["edge_mask"]
     )
-    return raw[:n_owned]
+    return raw[:n_owned], _owned(envelope, n_owned)
 
 
 def partition_charges(model, graph, node_type, n_owned: int, charge_spin=None):
-    """Raw (unprojected) charges for one partition's owned atoms.
+    """Raw (unprojected) charges for one partition's owned atoms, and their
+    short-contact envelope (None without a ``zbl`` term): ``(raw, envelope)``.
 
     Runs the shared descriptor and the charge head on the subgraph, mirroring
     ``LongRangeEnergyModel._predict_charges``. Only owned entries are kept:
@@ -228,10 +237,11 @@ def partition_charges(model, graph, node_type, n_owned: int, charge_spin=None):
             "DP_CUDA_INFER (it must be exactly 1)."
         )
     features, rot_mat = _run_backbone(model, graph, node_type, charge_spin)
-    raw = model.raw_charges(
-        features, rot_mat, node_type, graph.edge_index, graph.edge_vec, graph.edge_mask
+    raw = model.raw_charges(features, rot_mat, node_type)
+    envelope = model.charge_envelope(
+        node_type, graph.edge_index, graph.edge_vec, graph.edge_mask
     )
-    return raw[:n_owned]
+    return raw[:n_owned], _owned(envelope, n_owned)
 
 
 def partition_graph(
@@ -475,6 +485,7 @@ def evaluate_partitioned(
             charge_spin=charge_spin,
             term=long_range_energy,
             charge_filter=charge_filter,
+            envelope=run.envelope,
         )
     )
     born_grads = None
@@ -482,9 +493,11 @@ def evaluate_partitioned(
         # Before the charge-response force, which backpropagates through the
         # same raw charges without retaining the graph.
         result["born_charge"], born_grads = _born_charges_partitioned(
-            run, launched, result["charge"], eps_inf
+            run, launched, result["charge"], eps_inf, result["charge_shift"]
         )
-    response = _charge_response_force(run, launched, result["dE_dq"], born_grads)
+    response = _charge_response_force(
+        run, launched, result["dE_dq"], born_grads, result.get("dE_dw")
+    )
     return _assembled(result, response, compute_virial, eps_inf)
 
 
@@ -547,6 +560,11 @@ def _prepared(
     force = torch.zeros((n_atoms, 3), dtype=dtype, device=home)
     atom_energy = torch.zeros(n_atoms, dtype=dtype, device=home)
     raw_charge = torch.zeros(n_atoms, dtype=dtype, device=home) if long_range else None
+    envelope = (
+        torch.ones(n_atoms, dtype=dtype, device=home)
+        if long_range and getattr(model, "zbl", None) is not None
+        else None
+    )
     virial = torch.zeros((3, 3), dtype=dtype, device=home) if compute_virial else None
     # One copy of the coordinates per device, not per partition: every
     # partition on a device gathers its rows out of the same array. All of
@@ -574,6 +592,7 @@ def _prepared(
         atom_energy=atom_energy,
         raw_charge=raw_charge,
         virial=virial,
+        envelope=envelope,
     )
 
 
@@ -644,16 +663,20 @@ def _launch_one(run: _Run, part: Partition, device, charge_spin) -> _Launched:
         # Charges from the same descriptor pass the energy head just ran, kept
         # attached for the charge-response backward; a second pass only when
         # the capture cannot carry the gradient.
-        raw = cap_edge_vec = None
+        raw = envelope = cap_edge_vec = None
         if run.long_range:
             if _usable_capture(captured):
-                raw = charges_from_capture(local, captured, node_type, part.n_owned)
+                raw, envelope = charges_from_capture(
+                    local, captured, node_type, part.n_owned
+                )
                 cap_edge_vec = captured["edge_vec"]
             else:
-                raw = partition_charges(
+                raw, envelope = partition_charges(
                     local, graph, node_type, part.n_owned, condition
                 )
-        return _Launched(part, out, raw, node_coord, eps, graph, cap_edge_vec)
+        return _Launched(
+            part, out, raw, node_coord, eps, graph, cap_edge_vec, envelope
+        )
 
 
 def _gather(run: _Run, launched: list[_Launched]) -> None:
@@ -667,7 +690,8 @@ def _gather(run: _Run, launched: list[_Launched]) -> None:
     Each edge survives in exactly one partition, so the virials sum exactly.
     """
     home, dtype = run.home, run.dtype
-    for part, out, raw, *_ in launched:
+    for item in launched:
+        part, out, raw, envelope = item.part, item.out, item.raw, item.envelope
         v = part.views(home, dtype)
         if run.compute_virial:
             run.virial += (
@@ -684,11 +708,15 @@ def _gather(run: _Run, launched: list[_Launched]) -> None:
             run.force.copy_(node_force)
             if run.long_range:
                 run.raw_charge.copy_(raw.detach().to(home, dtype))
+            if envelope is not None:
+                run.envelope.copy_(envelope.detach().to(home, dtype))
             continue
         run.atom_energy.index_add_(0, v["owned"], per_atom[: part.n_owned])
         run.force.index_add_(0, v["ids"], node_force)
         if run.long_range:
             run.raw_charge.index_copy_(0, v["owned"], raw.detach().to(home, dtype))
+        if envelope is not None:
+            run.envelope.index_copy_(0, v["owned"], envelope.detach().to(home, dtype))
 
 
 def _assembled(
@@ -743,7 +771,7 @@ def _csr_views(graph) -> bool:
 
 
 def _born_charges_partitioned(
-    run: _Run, launched: list[_Launched], charge, eps_inf: float
+    run: _Run, launched: list[_Launched], charge, eps_inf: float, shift=None
 ) -> tuple[torch.Tensor, list]:
     r"""Born effective charge tensors, assembled across partitions.
 
@@ -751,8 +779,10 @@ def _born_charges_partitioned(
     term, which arrives already projected (``charge``). The derivative half
     uses the **raw** charges, which are strictly local -- DPA4C is one-hop, so
     an atom's raw charge sees only edges where it is the centre -- and
-    therefore partition exactly. Each partition contributes both halves of the
-    pair sum for every edge it owns::
+    therefore partition exactly. With a short-contact envelope the local
+    charge is ``w (raw + shift)`` at the fixed ``shift`` the projection
+    found, as local as the raw one. Each partition contributes both halves of
+    the pair sum for every edge it owns::
 
         + 1/2 (r_e (x) g_e)  ->  dst(e)     always owned
         - 1/2 (r_e (x) g_e)  ->  src(e)     owned OR a ghost
@@ -768,7 +798,8 @@ def _born_charges_partitioned(
     otherwise by the array-API :func:`~deepmd_lr.born.edge_born_response`.
 
     Returns the screened tensor and, per partition, the unweighted cotangent
-    ``d raw / d edge_vec`` (``None`` where no capture was used), which
+    ``d raw / d edge_vec`` (``None`` where no capture was used, and with an
+    envelope, whose cotangent is not the raw charges' alone), which
     :func:`_charge_response_force` reuses instead of a second backward.
     """
     home, dtype = run.home, run.dtype
@@ -777,7 +808,8 @@ def _born_charges_partitioned(
     unweighted = []
     # Every backward is launched before anything is transferred, as in the
     # forward pass.
-    for part, _out, raw, _node_coord, _eps, graph, cap in launched:
+    for item in launched:
+        part, raw, graph, cap = item.part, item.raw, item.graph, item.cap
         with _current_device(raw.device):
             # One VJP per partition: `raw` holds owned atoms only and every
             # kept edge has an owned destination, so this is exactly
@@ -785,7 +817,12 @@ def _born_charges_partitioned(
             # features hang off the leaf `forward_common_lower_graph` made,
             # numerically identical to `graph.edge_vec`.
             leaf = cap if cap is not None else graph.edge_vec
-            (g,) = torch.autograd.grad(raw.sum(), leaf, retain_graph=True)
+            local = raw
+            if item.envelope is not None:
+                local = item.envelope * (
+                    raw + shift.to(device=raw.device, dtype=raw.dtype)
+                )
+            (g,) = torch.autograd.grad(local.sum(), leaf, retain_graph=True)
             vec = graph.edge_vec.detach()
             if (
                 _csr_views(graph)
@@ -807,7 +844,8 @@ def _born_charges_partitioned(
                     g, vec, graph.edge_index, graph.edge_mask, part.n_node
                 )
             contributions.append((part, node))
-            unweighted.append(g if cap is not None else None)
+            reusable = cap is not None and item.envelope is None
+            unweighted.append(g if reusable else None)
 
     for part, node in contributions:
         born.index_add_(
@@ -827,6 +865,7 @@ def _charge_response_force(
     launched: list[_Launched],
     dE_dq,
     born_grads: list | None = None,
+    dE_dw=None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     r"""The force (and virial) from charges shifting as atoms move.
 
@@ -847,7 +886,10 @@ def _charge_response_force(
     on its own device, through the graph the launch phase kept: no autograd
     graph spans devices and nothing is communicated beyond the halo.
     ``dE_dq`` already passed through the global projection (and its exclusion
-    mask) in :func:`_long_range_global`; it is not projected again.
+    mask) in :func:`_long_range_global`; it is not projected again. With a
+    short-contact envelope the charges also move through it: ``dE_dw`` is the
+    energy's derivative with respect to each atom's envelope, and the
+    partition backpropagates ``sum_j (dE/dq_j raw_j + dE/dw_j w_j)``.
 
     ``born_grads``, when the Born tensors were just computed, holds each
     partition's unweighted cotangent ``d raw / d edge_vec``. The descriptor
@@ -862,14 +904,19 @@ def _charge_response_force(
     )
     # Every backward first, then the transfers, as in the forward pass.
     gradients = []
-    for k, (part, _out, raw, node_coord, eps, graph, cap) in enumerate(launched):
+    for k, item in enumerate(launched):
+        part, raw, node_coord = item.part, item.raw, item.node_coord
+        eps, graph, cap = item.eps, item.graph, item.cap
         with _current_device(raw.device):
-            weights = dE_dq[part.views(home, dtype)["owned"]].to(
-                device=raw.device, dtype=raw.dtype
-            )
+            owned = part.views(home, dtype)["owned"]
+            weights = dE_dq[owned].to(device=raw.device, dtype=raw.dtype)
+            response = (raw * weights).sum()
+            if item.envelope is not None:
+                through = dE_dw[owned].to(device=raw.device, dtype=raw.dtype)
+                response = response + (item.envelope * through).sum()
             targets = [node_coord] if eps is None else [node_coord, eps]
             if cap is None:
-                grads = torch.autograd.grad((raw * weights).sum(), targets)
+                grads = torch.autograd.grad(response, targets)
             else:
                 # Two stages: the captured features hang off the detached leaf
                 # `forward_common_lower_graph` created, which has no path back
@@ -883,9 +930,7 @@ def _charge_response_force(
                     w_node[: part.n_owned] = weights.to(g1.dtype)
                     g_e = g1 * w_node[graph.edge_index[1]][:, None]
                 else:
-                    (g_e,) = torch.autograd.grad(
-                        (raw * weights).sum(), cap, retain_graph=True
-                    )
+                    (g_e,) = torch.autograd.grad(response, cap, retain_graph=True)
                 grads = torch.autograd.grad(
                     (graph.edge_vec * g_e.detach()).sum(), targets
                 )
@@ -915,13 +960,17 @@ def _long_range_global(
     charge_spin=None,
     term=None,
     charge_filter=None,
+    envelope=None,
 ) -> dict:
     """The global half: project the charges, then evaluate the reciprocal sum.
 
     ``term`` is the long-range term to evaluate, by default the model's own.
+    ``envelope`` is every atom's short-contact factor (None without a ``zbl``
+    term): the projection's weight, ``q_i = w_i (raw_i + shift)``.
 
     Returns the direct force ``-dE/dr`` at fixed charge, and ``dE/dq`` with
-    respect to the raw charges. The remaining *charge-response* force,
+    respect to the raw charges -- with an envelope also ``dE/dw`` -- and the
+    projection's ``charge_shift``. The remaining *charge-response* force,
     ``-sum_j (dE/dq_j) dq_j/dr_i``, is short-ranged and is added per partition
     by :func:`_charge_response_force`; taking ``dE/dq`` out as a plain value
     here is what keeps the autograd graph on one device.
@@ -950,7 +999,11 @@ def _long_range_global(
     total_charge = 0.0 if condition is None else condition[:, 0]
     types = torch.as_tensor(atype, dtype=torch.int64, device=device).reshape(1, -1)
     mask = charge_mask(model, types)
-    charge = project_to_total_charge(charge_t, total_charge, mask=mask)
+    weight, envelope_t = mask, None
+    if envelope is not None:
+        envelope_t = envelope.detach().reshape(1, n_atoms).clone().requires_grad_(True)
+        weight = envelope_t * mask.to(dtype)
+    charge = projected = project_to_total_charge(charge_t, total_charge, mask=weight)
     if charge_filter is not None:
         # Inside this graph, so dE/dq below already carries the filter to the
         # charge-response force.
@@ -959,17 +1012,26 @@ def _long_range_global(
         term = model.long_range_energy
     atom_energy = term(coord_in, charge, cell_in)
     total = atom_energy.sum()
-    targets = [coord_t, charge_t] if eps is None else [coord_t, charge_t, eps]
-    grads = torch.autograd.grad(total, targets)
-    grad_coord, grad_charge = grads[0], grads[1]
+    leaves = {"coord": coord_t, "charge": charge_t, "eps": eps, "w": envelope_t}
+    leaves = {key: leaf for key, leaf in leaves.items() if leaf is not None}
+    grads = dict(
+        zip(leaves, torch.autograd.grad(total, list(leaves.values())), strict=True)
+    )
 
     out = {
         "charge": charge.reshape(-1).detach(),
         "energy_long_range": total.detach(),
         "atom_energy_long_range": atom_energy.reshape(-1).detach(),
-        "force_long_range": -grad_coord.reshape(n_atoms, 3).detach(),
-        "dE_dq": grad_charge.reshape(-1).detach(),
+        "force_long_range": -grads["coord"].reshape(n_atoms, 3).detach(),
+        "dE_dq": grads["charge"].reshape(-1).detach(),
+        # What the projection added to every atom that carries weight: the
+        # Born tensor differentiates the charges with this shift held fixed.
+        "charge_shift": projection_shift(projected, charge_t, weight)
+        .reshape(())
+        .detach(),
     }
     if eps is not None:
-        out["virial_long_range"] = -grads[2].reshape(3, 3).detach()
+        out["virial_long_range"] = -grads["eps"].reshape(3, 3).detach()
+    if envelope_t is not None:
+        out["dE_dw"] = grads["w"].reshape(-1).detach()
     return out

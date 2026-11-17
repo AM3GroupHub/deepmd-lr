@@ -197,12 +197,15 @@ def _validated_charge_owner(
         )
 
 
-def _zbl_window(branch: dict[str, Any]) -> list[float] | None:
-    """The branch's ``zbl.window`` as numbers, or None without the block."""
+def _zbl_window(branch: dict[str, Any]) -> dict | None:
+    """The branch's ``zbl.window`` as the model reads it (each pair under one
+    name, numbers as floats), or None without the block."""
+    from deepmd_lr.zbl import check_windows
+
     block = branch.get("zbl")
     if not block:
         return None
-    return [float(x) for x in block.get("window") or []]
+    return check_windows(block.get("window"))
 
 
 def groups(model_dict: dict[str, Any]) -> dict[str, list[str]]:

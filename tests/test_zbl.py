@@ -40,6 +40,8 @@ from .test_joint_model import DESCRIPTOR, DT, FITTING, LONG_RANGE, frame
 
 #: O-H window 0.679-0.873 A, O-O 0.924-1.188 A, H-H 0.434-0.558 A.
 WINDOW = [0.7, 0.9]
+#: The same window for every pair of water, under the names the model keeps.
+WINDOWS = {"H-H": WINDOW, "H-O": WINDOW, "O-O": WINDOW}
 
 
 def config(lr: bool = False, zbl: bool = True) -> dict:
@@ -50,7 +52,7 @@ def config(lr: bool = False, zbl: bool = True) -> dict:
         "fitting_net": copy.deepcopy(FITTING),
     }
     if zbl:
-        cfg["zbl"] = {"window": list(WINDOW)}
+        cfg["zbl"] = {"window": copy.deepcopy(WINDOWS)}
     if lr:
         cfg["long_range"] = copy.deepcopy(LONG_RANGE)
     return cfg
@@ -115,12 +117,29 @@ def pair_graph(r: float, types=(0, 1)):
 
 
 class TestSettings:
-    def test_window_round_trip(self):
-        zbl = ZBL(["O", "H"], {"window": [0.7, 0.9], "_comment": "ignored"})
-        assert zbl.serialize() == {"window": [0.7, 0.9]}
+    def test_windows_round_trip_under_one_name_per_pair(self):
+        written = {"O-H": [0.7, 0.9], "O-O": [1.5, 1.75], "_comment": "ignored"}
+        zbl = ZBL(["O", "H"], {"window": written, "_comment": "ignored"})
+        kept = {"H-O": [0.7, 0.9], "O-O": [1.5, 1.75]}
+        assert zbl.serialize() == {"window": kept}
+        assert ZBL(["H", "O"], zbl.serialize()).serialize() == {"window": kept}
         assert list(zbl.parameters()) == []
         assert zbl.state_dict() == {}
-        assert zbl.max_outer == pytest.approx(0.9 * pair_sum("O", "O"))
+        assert zbl.max_outer == pytest.approx(1.75 * pair_sum("O", "O"))
+
+    def test_each_pair_has_its_own_window_and_an_unlisted_pair_none(self):
+        zbl = ZBL(["O", "H"], {"window": {"O-H": [0.7, 0.9], "O-O": [1.5, 1.75]}})
+        o, h = 0, 1
+        for (i, j), window in {(o, h): (0.7, 0.9), (o, o): (1.5, 1.75)}.items():
+            total = pair_sum(*(["O", "H"][k] for k in (i, j)))
+            for table, x in zip((zbl.r_lo, zbl.r_hi), window, strict=True):
+                assert table[i, j].item() == pytest.approx(x * total)
+                assert table[j, i].item() == table[i, j].item()
+        # H-H was not listed: no ZBL and a factor of 1 at any distance.
+        assert zbl.r_hi[h, h].item() == 0.0
+        graph = pair_graph(0.3, types=(h, h))
+        assert zbl.atomic_energy(*graph).eq(0).all()
+        assert zbl.envelope(*graph).tolist() == [1.0, 1.0]
 
     @pytest.mark.parametrize(
         "window",
@@ -139,7 +158,23 @@ class TestSettings:
     )
     def test_bad_windows_are_refused(self, window):
         with pytest.raises(ValueError, match="window"):
-            ZBL(["O", "H"], {"window": window})
+            ZBL(["O", "H"], {"window": {"O-H": window}})
+
+    @pytest.mark.parametrize(
+        ("windows", "message"),
+        [
+            ([0.7, 0.9], "maps pairs of elements"),
+            ({}, "maps pairs of elements"),
+            ({"OH": WINDOW}, "not a pair of elements"),
+            ({"O-H-H": WINDOW}, "not a pair of elements"),
+            ({"X-O": WINDOW}, "not a pair of elements"),
+            ({"O-H": WINDOW, "H-O": WINDOW}, "twice"),
+            ({"Si-O": WINDOW}, "type_map has no Si"),
+        ],
+    )
+    def test_bad_pairs_are_refused(self, windows, message):
+        with pytest.raises(ValueError, match=message):
+            ZBL(["X", "O", "H"], {"window": windows})
 
     def test_the_window_is_required(self):
         with pytest.raises(ValueError, match="window is required"):
@@ -147,13 +182,9 @@ class TestSettings:
 
     def test_retired_keys_are_named(self):
         with pytest.raises(ValueError, match="first implementation"):
-            ZBL(["O", "H"], {"window": WINDOW, "clamp": True})
+            ZBL(["O", "H"], {"window": WINDOWS, "clamp": True})
         with pytest.raises(ValueError, match="accepts only"):
-            ZBL(["O", "H"], {"window": WINDOW, "trainable": True})
-
-    def test_a_type_map_without_an_element_is_refused(self):
-        with pytest.raises(ValueError, match="at least one element"):
-            ZBL(["X", "Y0"], {"window": WINDOW})
+            ZBL(["O", "H"], {"window": WINDOWS, "trainable": True})
 
     def test_the_schema_takes_the_block_and_requires_the_window(self):
         def training_input(model):
@@ -165,7 +196,7 @@ class TestSettings:
             }
 
         normalized = normalize(training_input(config()))
-        assert get_model(normalized["model"]).zbl.serialize() == {"window": WINDOW}
+        assert get_model(normalized["model"]).zbl.serialize() == {"window": WINDOWS}
         assert normalize(training_input(config(zbl=False)))["model"]["zbl"] is None
         missing = config()
         missing["zbl"] = {}
@@ -176,7 +207,7 @@ class TestSettings:
 class TestPairTerm:
     @pytest.mark.parametrize("pair", [("O", "H"), ("O", "O"), ("H", "H")])
     def test_energy_is_the_formula_for_every_pair(self, pair):
-        zbl = ZBL(["O", "H"], {"window": WINDOW})
+        zbl = ZBL(["O", "H"], {"window": WINDOWS})
         types = tuple(["O", "H"].index(s) for s in pair)
         total = pair_sum(*pair)
         for x in (0.3, 0.7, 0.75, 0.8, 0.85):
@@ -188,13 +219,13 @@ class TestPairTerm:
             assert zbl.atomic_energy(*pair_graph(x * total, types)).sum().item() == 0.0
 
     def test_each_atom_takes_half(self):
-        zbl = ZBL(["O", "H"], {"window": WINDOW})
+        zbl = ZBL(["O", "H"], {"window": WINDOWS})
         energy = zbl.atomic_energy(*pair_graph(0.75)).reshape(-1)
         assert energy[0].item() == pytest.approx(energy[1].item(), rel=1e-14)
         assert energy.sum().item() == pytest.approx(pair_energy(0.75, "O", "H"))
 
     def test_the_edge_derivative_is_the_gradient(self):
-        zbl = ZBL(["O", "H"], {"window": WINDOW})
+        zbl = ZBL(["O", "H"], {"window": WINDOWS})
         atype, edges, vec, mask = pair_graph(0.78)
         # Off the axis, so every component is exercised.
         vec = vec @ torch.tensor(
@@ -206,7 +237,7 @@ class TestPairTerm:
         torch.testing.assert_close(g, auto, rtol=1e-12, atol=1e-12)
 
     def test_the_switch_is_c2_at_both_window_edges(self):
-        zbl = ZBL(["O", "H"], {"window": WINDOW})
+        zbl = ZBL(["O", "H"], {"window": WINDOWS})
         atype, edges, _vec, mask = pair_graph(1.0)
         axis = torch.tensor([[1.0, 0.0, 0.0]], dtype=DT)
 
@@ -231,7 +262,7 @@ class TestPairTerm:
             )
 
     def test_masked_edges_and_an_empty_graph_give_nothing(self):
-        zbl = ZBL(["O", "H"], {"window": WINDOW})
+        zbl = ZBL(["O", "H"], {"window": WINDOWS})
         for n in (0, 1):
             edges = torch.zeros((2, n), dtype=torch.int64)
             vec = torch.zeros((n, 3), dtype=DT, requires_grad=True)
@@ -243,7 +274,7 @@ class TestPairTerm:
 
     def test_a_type_that_is_no_element_has_no_nucleus(self):
         # The repository's periodic-table type maps start with ASE's dummy "X".
-        zbl = ZBL(["X", "O", "H"], {"window": WINDOW})
+        zbl = ZBL(["X", "O", "H"], {"window": WINDOWS})
         assert zbl.numbers.tolist() == [0.0, 8.0, 1.0]
         edges = torch.tensor([[0, 1, 1, 2], [1, 0, 2, 1]])
         vec = torch.tensor(
@@ -256,7 +287,7 @@ class TestPairTerm:
         assert energy[1:].sum().item() == pytest.approx(pair_energy(0.75, "O", "H"))
 
     def test_a_padded_node_is_skipped(self):
-        zbl = ZBL(["O", "H"], {"window": WINDOW})
+        zbl = ZBL(["O", "H"], {"window": WINDOWS})
         atype, edges, vec, mask = pair_graph(0.75, types=(0, -1))
         assert zbl.atomic_energy(atype, edges, vec, mask).eq(0).all()
 
@@ -264,7 +295,7 @@ class TestPairTerm:
 class TestEnvelope:
     @pytest.mark.parametrize("pair", [("O", "H"), ("O", "O"), ("H", "H")])
     def test_one_neighbour_gives_the_step(self, pair):
-        zbl = ZBL(["O", "H"], {"window": WINDOW})
+        zbl = ZBL(["O", "H"], {"window": WINDOWS})
         types = tuple(["O", "H"].index(s) for s in pair)
         total = pair_sum(*pair)
         for x in (0.75, 0.8, 0.85):
@@ -278,7 +309,7 @@ class TestEnvelope:
             assert zbl.envelope(*pair_graph(x * total, types)).tolist() == [1.0, 1.0]
 
     def test_the_product_runs_over_the_neighbours(self):
-        zbl = ZBL(["O", "H"], {"window": WINDOW})
+        zbl = ZBL(["O", "H"], {"window": WINDOWS})
         # An O with two H at different distances inside the window, the H
         # atoms far from one another.
         r1, r2 = 0.76, 0.82
@@ -291,7 +322,7 @@ class TestEnvelope:
         assert factor.tolist() == pytest.approx([s1 * s2, s1, s2], rel=1e-13)
 
     def test_the_gradient_vanishes_where_the_value_is_flat(self):
-        zbl = ZBL(["O", "H"], {"window": WINDOW})
+        zbl = ZBL(["O", "H"], {"window": WINDOWS})
         total = pair_sum("O", "H")
         for x, flat in [
             (0.3, True),
@@ -309,7 +340,7 @@ class TestEnvelope:
             assert bool(grad.eq(0).all()) is flat
 
     def test_c2_at_both_window_edges(self):
-        zbl = ZBL(["O", "H"], {"window": WINDOW})
+        zbl = ZBL(["O", "H"], {"window": WINDOWS})
         atype, edges, _vec, mask = pair_graph(1.0)
         axis = torch.tensor([[1.0, 0.0, 0.0]], dtype=DT)
 
@@ -328,7 +359,7 @@ class TestEnvelope:
             )
 
     def test_what_is_no_contact_counts_for_nothing(self):
-        zbl = ZBL(["X", "O", "H"], {"window": WINDOW})
+        zbl = ZBL(["X", "O", "H"], {"window": WINDOWS})
         ones = [1.0, 1.0]
         # A masked edge, zero length included.
         atype, edges, vec, mask = pair_graph(0.5, types=(1, 2))
@@ -349,7 +380,7 @@ class TestEnvelope:
 
     @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
     def test_the_factor_keeps_the_vectors_precision(self, dtype):
-        zbl = ZBL(["O", "H"], {"window": WINDOW})
+        zbl = ZBL(["O", "H"], {"window": WINDOWS})
         atype, edges, vec, mask = pair_graph(0.8)
         assert zbl.envelope(atype, edges, vec.to(dtype), mask).dtype == dtype
 
@@ -364,7 +395,7 @@ class TestModel:
         assert model.state_dict().keys() == plain.state_dict().keys()
         restored = BaseModel.deserialize(model.serialize()).eval()
         restored.load_state_dict(model.state_dict(), strict=True)
-        assert restored.zbl.serialize() == {"window": WINDOW}
+        assert restored.zbl.serialize() == {"window": WINDOWS}
         coord, atype = dimer()
         for key in ("energy", "force", "virial"):
             torch.testing.assert_close(
@@ -376,12 +407,12 @@ class TestModel:
         model, plain = twins(lr)
         coord, atype = dimer()
         assert plain.zbl is None
-        plain.set_zbl({"window": WINDOW})
+        plain.set_zbl({"window": WINDOWS})
         # In the model's own mode: a module made after `.eval()` would
         # otherwise stay in training mode and miss the inference kernel.
         assert plain.zbl.training is False
         assert plain.train().zbl.training is True and plain.eval().zbl.training is False
-        assert json.loads(plain.model_def_script)["zbl"] == {"window": WINDOW}
+        assert json.loads(plain.model_def_script)["zbl"] == {"window": WINDOWS}
         # Two evaluations agree to rounding, not to the bit: the kernels sum
         # with atomics, in whatever order the threads arrive.
         for key in ("energy", "force", "virial"):
@@ -508,28 +539,39 @@ class TestModel:
             out["virial"].reshape(3, 3), numeric, atol=2e-5, rtol=2e-5
         )
 
-    def test_a_contact_has_no_raw_charge_and_the_total_is_kept(self):
+    def test_an_atom_in_contact_carries_no_charge_and_the_total_is_kept(self):
+        """The envelope is the projection's weight: whatever offset the
+        head's raw output has, the two atoms in contact end at exactly zero
+        and the others share the deficit."""
         from .test_born import pieces
 
         model, plain = twins(lr=True)
+        # A raw offset like a model trained without the neutrality penalty.
+        for m in (model, plain):
+            m.charge_fitting.bias_atom_e[:] = -0.4
         coord, atype, cell = contact_frame(0.6)
         out, raw, _cap = pieces(model, coord, atype, box=cell)
         _out, raw_plain, _cap = pieces(plain, coord, atype, box=cell)
-        assert raw[:2].eq(0).all() and raw_plain[:2].abs().min() > 1e-4
-        # Two models on a GPU agree to rounding, not to the bit.
-        torch.testing.assert_close(raw[2:], raw_plain[2:], rtol=0, atol=1e-13)
-        assert out["charge"].sum().abs().item() < 1e-12
-        # The projection spreads the deficit evenly, the two atoms included.
+        torch.testing.assert_close(raw, raw_plain, rtol=0, atol=1e-13)
+        assert raw.mean().item() < -0.3
+        charge = out["charge"][0]
+        assert charge[:2].eq(0).all()
+        assert charge.sum().abs().item() < 1e-12
+        shift = -raw[2:].mean()
+        torch.testing.assert_close(charge[2:], raw[2:] + shift, rtol=0, atol=1e-13)
         torch.testing.assert_close(
-            out["charge"][0, :2], -raw.mean().expand(2), rtol=0, atol=1e-14
+            out["charge_projection_shift"], shift.reshape(1), rtol=0, atol=1e-13
         )
+        # Half way through the window the two keep a share, smoothly.
+        half = model(*contact_frame(0.78)[:2], box=cell)["charge"][0]
+        assert (half[:2].abs() > 0).all() and half.sum().abs().item() < 1e-12
 
     @pytest.mark.parametrize("r", [0.78, 0.6])
     def test_born_tensors_carry_the_envelopes_derivative(self, r):
         from .test_born import build, molecule, pairwise_born
 
         model = build(isolated=True)
-        model.set_zbl({"window": WINDOW})
+        model.set_zbl({"window": WINDOWS})
         coord, atype = molecule()
         coord = coord.clone()
         coord[0, 1] = coord[0, 0] + torch.tensor([r, 0.0, 0.0], dtype=DT, device=DEVICE)
@@ -563,7 +605,7 @@ class TestModel:
         from .test_same_as import build_group, pseudo_head_config
 
         cfg = pseudo_head_config()
-        cfg["model_dict"]["bulk"]["zbl"] = {"window": WINDOW}
+        cfg["model_dict"]["bulk"]["zbl"] = {"window": WINDOWS}
         models = build_group(cfg)
         assert models["slab"].zbl.serialize() == models["bulk"].zbl.serialize()
         assert models["slab"].atomic_model is models["bulk"].atomic_model
@@ -571,16 +613,25 @@ class TestModel:
     def test_a_shared_charge_head_needs_one_window(self):
         from .test_charge_same_as import build, two_theory_config
 
-        both = two_theory_config(extra_mace={"zbl": {"window": WINDOW}})
-        both["model_dict"]["ttt_dft"]["zbl"] = {"window": WINDOW}
+        both = two_theory_config(extra_mace={"zbl": {"window": WINDOWS}})
+        both["model_dict"]["ttt_dft"]["zbl"] = {"window": WINDOWS}
         models, _wrapper, _cfg = build(both)
-        assert all(m.zbl.serialize() == {"window": WINDOW} for m in models.values())
-        for extra in ({"zbl": {"window": WINDOW}}, {"zbl": {"window": [0.6, 0.9]}}):
+        assert all(m.zbl.serialize() == {"window": WINDOWS} for m in models.values())
+        other = {"window": {**WINDOWS, "H-O": [0.6, 0.9]}}
+        for extra in ({"zbl": {"window": WINDOWS}}, {"zbl": other}):
             mixed = two_theory_config(extra_mace=extra)
-            if extra["zbl"]["window"] != WINDOW:
-                mixed["model_dict"]["ttt_dft"]["zbl"] = {"window": WINDOW}
+            if extra["zbl"] is other:
+                mixed["model_dict"]["ttt_dft"]["zbl"] = {"window": WINDOWS}
             with pytest.raises(ValueError, match="`zbl` block differs"):
                 build(mixed)
+        # The same windows written the other way round are the same block.
+        same = two_theory_config(
+            extra_mace={
+                "zbl": {"window": {"H-H": WINDOW, "O-H": WINDOW, "O-O": WINDOW}}
+            }
+        )
+        same["model_dict"]["ttt_dft"]["zbl"] = {"window": WINDOWS}
+        build(same)
 
     def test_a_periodic_table_type_map_builds(self):
         cfg = config()
@@ -591,7 +642,7 @@ class TestModel:
 class TestRefusals:
     def test_a_window_past_the_cutoff(self):
         cfg = config()
-        cfg["zbl"] = {"window": [2.0, 5.0]}  # O-O would end at 6.6 A, rcut is 6
+        cfg["zbl"] = {"window": {"O-O": [2.0, 5.0]}}  # ends at 6.6 A, rcut is 6
         with pytest.raises(ValueError, match="beyond descriptor.rcut"):
             get_model(cfg)
 
@@ -630,7 +681,7 @@ class TestRefusals:
         model = get_model(config(zbl=False))
         model.enable_hessian()
         with pytest.raises(NotImplementedError, match="ZBL"):
-            model.set_zbl({"window": WINDOW})
+            model.set_zbl({"window": WINDOWS})
 
 
 def test_the_graph_export_keeps_the_term():
@@ -715,7 +766,7 @@ def test_cli_training_checkpoint_and_restart(tmp_path, lr):
     assert proc.returncode == 0, proc.stdout + proc.stderr
     checkpoint = tmp_path / "model.ckpt.pt"
     model = load_model(str(checkpoint), device="cpu")
-    assert model.zbl.serialize() == {"window": WINDOW}
+    assert model.zbl.serialize() == {"window": WINDOWS}
     coord, atype = (v.cpu() for v in dimer())
     box = torch.eye(3, dtype=DT).unsqueeze(0) * 20
     assert torch.isfinite(model(coord, atype, box=box)["force"]).all()
@@ -731,5 +782,5 @@ def test_cli_training_checkpoint_and_restart(tmp_path, lr):
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     restored = load_model(str(tmp_path / "model_ema.ckpt.pt"), device="cpu")
-    assert restored.zbl.serialize() == {"window": WINDOW}
+    assert restored.zbl.serialize() == {"window": WINDOWS}
     assert torch.isfinite(restored(coord, atype, box=box)["energy"]).all()

@@ -1,19 +1,27 @@
 """Push one pair together inside a real frame, with and without ``zbl``.
 
-    python scan.py model.ckpt.pt frame.xyz --window 0.7 0.9 --data train.xyz
+    python scan.py model.ckpt.pt frame.xyz --data train.xyz \\
+        --window O-H:0.7:0.9 H-H:1.45:2.0 O-O:1.5:1.75
 
 For every pair of elements in the frame, the first atom of one and its nearest
 neighbour of the other are brought from their own distance down to 0.3
 covalent-radius sums, the neighbour moving along the bond. The trained model
 and the same weights with ``model.set_zbl({"window": ...})`` are compared, and
 below the pair's shortest fitted contact (``--data``; the frame's own distance
-without it) the curve with the term is judged: the energy must rise
-monotonically, reach at least half the pair's ZBL energy, and keep the
-long-range part and the two charges bounded.
+without it) the curve with the term is judged: the energy must never fall
+back below where it stood at that contact, must end at no less than half the
+pair's ZBL energy, and must keep the long-range part and the two charges
+bounded.
+
+A window is ``pair:x_lo:x_hi`` in units of the pair's covalent-radius sum.
+``--data`` prints every pair's shortest contact in those units, which is where
+a window's upper edge belongs.
 
 Moving one atom can run it into a third one first: the table names the atom
-nearest to the moved one, and that contact is then what the row shows. To see
-what such a path should look like, write the scanned geometries with
+nearest to the moved one, and that contact is then what the row shows. The
+energy of such a path is not monotone (it falls again once the third atom is
+passed), which is why the verdict asks for no hole rather than for a steady
+rise. To see what a path should look like, write the scanned geometries with
 ``--frames``, evaluate them with something you trust (DFT, another model) and
 hand the result back with ``--reference``; it is drawn as a third line:
 
@@ -27,6 +35,7 @@ hand the result back with ``--reference``; it is drawn as a third line:
 import argparse
 import itertools
 import json
+import os
 
 import numpy as np
 import torch
@@ -122,7 +131,7 @@ def scan(calcs: dict, frame, a: str, b: str, n: int, frames: list) -> dict:
 
 
 def judge(result: dict, floor: float, zbl: np.ndarray) -> dict:
-    """The curve with the term, below ``floor``: monotone, repulsive, bounded."""
+    """The curve with the term, below ``floor``: no hole, repulsive, bounded."""
     r = np.array(result["r"])
     below = r < floor
     row = {key: np.array(value)[below] for key, value in result["zbl"].items()}
@@ -130,7 +139,8 @@ def judge(result: dict, floor: float, zbl: np.ndarray) -> dict:
     charge = np.nanmax(np.abs([row["q_i"], row["q_j"]])) if below.any() else 0.0
     checks = {
         "finite": bool(np.isfinite(total).all()),
-        "monotone": bool((np.diff(total) >= -1e-3).all()),
+        # Never more than 1 eV below where it stood entering the region.
+        "no_hole": bool(below.any() and (total >= total[0] - 1.0).all()),
         "repulsive": bool(below.any() and total[-1] >= 0.5 * zbl[below][-1]),
         "long_range_bounded": bool(
             (np.abs(long) <= np.maximum(0.5 * np.abs(total), 1.0)).all()
@@ -216,14 +226,15 @@ def plot(report: dict, path: str, title: str) -> None:
         fontsize=9,
         labelcolor=muted,
     )
-    fig.suptitle(
-        f"{title}: shaded = the window, vertical line = shortest fitted contact",
-        x=0.01,
-        ha="left",
-        fontsize=10,
-        color=ink,
+    fig.suptitle(title, x=0.01, ha="left", fontsize=10, color=ink)
+    fig.text(
+        0.01,
+        0.925,
+        "shaded: the window        vertical line: shortest fitted contact",
+        fontsize=9,
+        color=muted,
     )
-    fig.tight_layout(rect=(0, 0, 1, 0.93))
+    fig.tight_layout(rect=(0, 0, 1, 0.91))
     fig.savefig(path, dpi=150, facecolor=surface)
 
 
@@ -232,7 +243,13 @@ def main() -> None:
     parser.add_argument("model", help="training checkpoint")
     parser.add_argument("frame", help="structure file holding the frame")
     parser.add_argument("--index", type=int, default=0)
-    parser.add_argument("--window", type=float, nargs=2, required=True)
+    parser.add_argument(
+        "--window",
+        nargs="+",
+        required=True,
+        metavar="PAIR:X_LO:X_HI",
+        help="one window per pair of elements, in covalent-radius sums",
+    )
     parser.add_argument("--data", help="training set, for the pair floors")
     parser.add_argument("--points", type=int, default=29)
     parser.add_argument("--frames", help="write the scanned geometries here")
@@ -245,7 +262,12 @@ def main() -> None:
     frame = read(args.frame, index=args.index)
     plain = load_model(args.model)
     model = load_model(args.model)
-    model.set_zbl({"window": args.window})
+    windows = {}
+    for spec in args.window:
+        pair, x_lo, x_hi = spec.split(":")
+        windows[pair] = [float(x_lo), float(x_hi)]
+    model.set_zbl({"window": windows})
+    windows = model.zbl.windows  # each pair under the one name the model keeps
     calcs = {"plain": LongRangeCalculator(plain), "zbl": LongRangeCalculator(model)}
     floors = pair_floors(read(args.data, index=":")) if args.data else {}
     for name, floor in floors.items():
@@ -256,7 +278,7 @@ def main() -> None:
 
     report = {
         "model": args.model,
-        "window": args.window,
+        "window": {name: list(window) for name, window in windows.items()},
         "long_range": bool(getattr(model, "has_long_range", False)),
         "reference_label": args.reference_label,
         "pairs": {},
@@ -282,7 +304,7 @@ def main() -> None:
                 raise SystemExit(f"--reference holds another scan of {name}")
             result["reference"] = trusted[name]
         result["zbl_pair"] = zbl_pair(model, a, b, result["r"]).tolist()
-        result["window"] = [x * radius_sum(a, b) for x in args.window]
+        result["window"] = [x * radius_sum(a, b) for x in windows.get(name, (0, 0))]
         result["floor"] = floors.get(name, result["r"][0])
         result["judgement"] = judge(
             result, result["floor"], np.array(result["zbl_pair"])
@@ -313,7 +335,7 @@ def main() -> None:
         with open(args.json, "w") as handle:
             json.dump(report, handle, indent=1)
     if args.png:
-        plot(report, args.png, f"window {args.window}")
+        plot(report, args.png, os.path.basename(args.model))
 
 
 if __name__ == "__main__":

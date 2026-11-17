@@ -152,14 +152,16 @@ def _zbl_args() -> Argument:
     """The optional ``zbl`` block: ZBL repulsion at short contacts."""
     window = Argument(
         "window",
-        list[float],
+        dict,
         doc=(
-            "`[x_lo, x_hi]` in units of each pair's covalent-radius sum "
-            "(ASE radii): the full ZBL repulsion below `x_lo`, none above "
-            "`x_hi`, a C2 switch between. There is no default: put `x_hi` at "
-            "or below the shortest contact in the training data, so that "
-            "nothing fitted changes, and keep `2 R_max x_hi` inside "
-            "`descriptor.rcut`."
+            'One window per pair of elements, `{"O-H": [x_lo, x_hi], ...}`, '
+            "in units of that pair's covalent-radius sum (ASE radii): the "
+            "full ZBL repulsion below `x_lo`, none above `x_hi`, a C2 switch "
+            "between, and the network switched off across the same range. "
+            "There is no default: put each `x_hi` at or below the pair's "
+            "shortest contact in the training data, so that nothing fitted "
+            "changes, and inside `descriptor.rcut`. A pair that is not "
+            "listed has no term."
         ),
     )
     return Argument(

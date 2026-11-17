@@ -66,30 +66,36 @@ def pieces(model, coord, atype, box=None):
     """Z, the charges, and the raw charges, from one captured forward."""
     with model._capturing_backbone() as cap:
         out = model(coord, atype, box=box)
-    raw = model.raw_charges(
-        cap["features"],
-        cap["rot_mat"],
-        atype.reshape(-1),
-        cap["edge_index"],
-        cap["edge_vec"],
-        cap["edge_mask"],
-    )
+    raw = model.raw_charges(cap["features"], cap["rot_mat"], atype.reshape(-1))
     return out, raw, cap
+
+
+def local_charges(model, coord, atype, shift):
+    """What the Born tensor differentiates: the raw charges, or with a
+    short-contact envelope ``w (raw + shift)`` at the given, fixed shift."""
+    _out, raw, cap = pieces(model, coord, atype)
+    envelope = model.charge_envelope(
+        atype.reshape(-1), cap["edge_index"], cap["edge_vec"], cap["edge_mask"]
+    )
+    return raw if envelope is None else envelope * (raw + shift)
 
 
 def pairwise_born(model, coord, atype):
     """The model's Born tensors, and the same formula summed pair by pair
-    from finite differences of the raw charges: ``(fast, slow)``."""
+    from finite differences of the local charges: ``(fast, slow)``."""
     n = coord.shape[1]
     base = coord[0].cpu().numpy()
 
     out, _raw, _cap = pieces(model, coord, atype)
     fast = out["born_charge"][0].cpu().numpy()
     q = out["charge"][0].detach().cpu().numpy()
+    # The projection's shift at this geometry, held fixed as the tensor
+    # holds it; it only matters with a short-contact envelope.
+    shift = out["charge_projection_shift"].reshape(()).detach()
 
     def raw_charges(pos):
         c = torch.tensor(pos.reshape(1, -1, 3), dtype=DT, device=DEVICE)
-        return pieces(model, c, atype)[1].detach().cpu().numpy()
+        return local_charges(model, c, atype, shift).detach().cpu().numpy()
 
     h = 1e-6
     jac = np.zeros((n, n, 3))  # jac[i, k] = d raw_i / d r_k
@@ -302,10 +308,11 @@ class TestGuards:
             cap["features"], cap["rot_mat"], atype, None, mask, edges
         )
         assert isinstance(one, torch.Tensor)
-        pair = model._charges_from_features(
+        every = model._charges_from_features(
             cap["features"], cap["rot_mat"], atype, None, mask, edges, return_raw=True
         )
-        assert isinstance(pair, tuple) and len(pair) == 2
+        assert every._fields == ("projected", "raw", "local", "shift")
+        torch.testing.assert_close(every.projected, one)
 
 
 class TestAtScale:

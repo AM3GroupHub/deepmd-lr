@@ -15,7 +15,7 @@ from deepmd_lr.nvalchemi import DistributedEvaluator
 from deepmd_lr.zbl import ZBL
 
 from .test_joint_model import LONG_RANGE
-from .test_zbl import WINDOW, config
+from .test_zbl import WINDOWS, config
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -40,7 +40,7 @@ def random_graph(dtype, n_node: int = 12, n_edge: int = 600, seed: int = 0):
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_the_warp_kernel_is_the_torch_arithmetic(dtype):
-    zbl = ZBL(["O", "H"], {"window": WINDOW}, device=DEVICE)
+    zbl = ZBL(["O", "H"], {"window": WINDOWS}, device=DEVICE)
     atype, edges, vec, mask, owned = random_graph(dtype)
     energy, g = zbl._edge_terms_warp(atype, edges, vec, mask, owned)
     src, dst = edges[0], edges[1]
@@ -62,7 +62,7 @@ def test_the_warp_kernel_is_the_torch_arithmetic(dtype):
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_the_envelope_kernel_is_the_torch_arithmetic(dtype):
-    zbl = ZBL(["O", "H"], {"window": WINDOW}, device=DEVICE).eval()
+    zbl = ZBL(["O", "H"], {"window": WINDOWS}, device=DEVICE).eval()
     # Few edges per node, so that open, partly closed and closed nodes all occur.
     atype, edges, vec, mask, _owned = random_graph(dtype, n_node=40, n_edge=120, seed=1)
     vec = vec.clone().requires_grad_(True)
@@ -194,7 +194,7 @@ def test_the_md_step_reads_the_host_no_more_often(compress, long_range):
         pytest.skip("compiled DPA4C compression operator required")
     coord, atype, cell = system()
     model = build32(long_range=long_range)
-    model.set_zbl({"window": WINDOW})
+    model.set_zbl({"window": WINDOWS})
     evaluator = DistributedEvaluator(
         model, atype, cell, devices=[DEVICE], memory_headroom=None, compress=compress
     )

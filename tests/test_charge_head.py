@@ -134,6 +134,26 @@ class TestProjection:
             lambda x: project_to_total_charge(x, 1.0), (raw,)
         )
 
+    def test_a_weight_switches_a_charge_off_smoothly(self):
+        """A mask in [0, 1] is a weight, ``q = w (raw + shift)``: the atom
+        with weight 0 carries nothing whatever offset the raw charges have,
+        the total is kept, and weight 1 everywhere is the plain projection."""
+        from deepmd_lr.fitting.charge import projection_shift
+
+        kind = {"dtype": torch.float64, "device": DEVICE}
+        raw = torch.tensor([[-0.6, -0.3, -0.3, -0.7]], **kind)
+        for first in (0.0, 0.25, 1.0):
+            weight = torch.tensor([[first, 1.0, 1.0, 1.0]], **kind)
+            charge = project_to_total_charge(raw, 0.5, mask=weight)
+            shift = projection_shift(charge, raw, weight)
+            assert charge.sum().item() == pytest.approx(0.5, abs=1e-14)
+            torch.testing.assert_close(charge, weight * (raw + shift[:, None]))
+            if first == 0.0:
+                assert charge[0, 0].item() == 0.0
+                assert shift.item() == pytest.approx((0.5 + 1.3) / 3)
+            if first == 1.0:
+                torch.testing.assert_close(charge, project_to_total_charge(raw, 0.5))
+
     def test_no_nan_for_fully_masked_frame(self):
         """An all-padding frame must not poison the batch's gradients."""
         raw = torch.randn(2, 4, dtype=torch.float64, requires_grad=True)

@@ -200,6 +200,20 @@ def _is_compressed(model) -> bool:
     return bool(getattr(model.atomic_model.descriptor, "compress", False))
 
 
+class _Charges(NamedTuple):
+    """The charges of one evaluation, ``(nf, nloc)`` each, and the shift."""
+
+    #: On the frame's total charge: what the long-range term sums.
+    projected: torch.Tensor
+    #: The charge head's output.
+    raw: torch.Tensor
+    #: What the Born tensor differentiates: the raw charges, or with a
+    #: short-contact envelope ``w (raw + shift)`` at a fixed shift.
+    local: torch.Tensor
+    #: ``(nf,)``, what the projection added to every atom that carries weight.
+    shift: torch.Tensor
+
+
 class _Strained(NamedTuple):
     """The leaves one long-range evaluation differentiates against, and the
     geometry they define."""
@@ -568,10 +582,9 @@ class LongRangeEnergyModel(EnergyModel):
             rcut = float(descriptor.get_rcut())
             if zbl.max_outer > rcut:
                 raise ValueError(
-                    f"zbl.window ends at {zbl.max_outer:g} A for the largest "
-                    f"pair of this type_map, beyond descriptor.rcut {rcut:g} A: "
-                    "a pair entering the neighbour list would arrive inside "
-                    "the switch. Lower x_hi."
+                    f"a zbl.window ends at {zbl.max_outer:g} A, beyond "
+                    f"descriptor.rcut {rcut:g} A: a pair entering the neighbour "
+                    "list would arrive inside the switch. Lower its x_hi."
                 )
             # A module made after `.eval()` would still be in training mode,
             # where the envelope takes the slower torch arithmetic.
@@ -622,7 +635,7 @@ class LongRangeEnergyModel(EnergyModel):
         strain: torch.Tensor | None = None,
         *,
         return_raw: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    ) -> "torch.Tensor | _Charges":
         """Per-atom charges from a second backbone pass, projected onto the
         frame's total charge (a per-frame reduction the head, seeing a flat
         node axis, cannot express).
@@ -793,33 +806,35 @@ class LongRangeEnergyModel(EnergyModel):
         return None
 
     def raw_charges(
+        self, features: torch.Tensor, rot_mat: torch.Tensor | None, atype_flat: Any
+    ) -> torch.Tensor:
+        """The charge head's output for every node, ``(N,)``, from an
+        already-computed descriptor output: raw, before the projection onto
+        the total charge."""
+        return self.charge_fitting.call_graph(features, atype_flat, gr=rot_mat)[
+            "charge"
+        ].reshape(-1)
+
+    def charge_envelope(
         self,
-        features: torch.Tensor,
-        rot_mat: torch.Tensor | None,
         atype_flat: torch.Tensor,
         edge_index: torch.Tensor,
         edge_vec: torch.Tensor,
         edge_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """Raw (unprojected) charges of every node, ``(N,)``, from an
-        already-computed descriptor output and the graph it was computed on.
+    ) -> torch.Tensor | None:
+        """The short-contact envelope of every node, ``(N,)``, on the graph
+        the charges were computed on; None for a model without ``zbl``.
 
-        The one place raw charges are made: the charge head's output, times
-        the short-contact envelope when the model has a ``zbl`` term. The
-        envelope is a function of the same ``edge_vec`` the features hang
-        off and of the edges into each node only, so everything that
-        differentiates the raw charges -- the charge-response force, the Born
-        tensor, the partitioned driver's one-hop reuse -- carries it with no
-        further code. The projection onto the total charge runs afterwards
-        and may hand an atom in contact a small charge back.
+        It enters the charges as the projection's weight, ``q_i = w_i (raw_i
+        + shift)``: an atom in contact carries no charge at all, whatever
+        offset the head's raw output has, and the others share the deficit.
+        Being a function of the edges into each node only, it is as local as
+        the raw charges, so the charge-response force and the Born tensor
+        differentiate it per node and per partition the same way.
         """
-        raw = self.charge_fitting.call_graph(features, atype_flat, gr=rot_mat)[
-            "charge"
-        ].reshape(-1)
-        if self.zbl is not None:
-            factor = self.zbl.envelope(atype_flat, edge_index, edge_vec, edge_mask)
-            raw = raw * factor.to(raw.dtype)
-        return raw
+        if self.zbl is None:
+            return None
+        return self.zbl.envelope(atype_flat, edge_index, edge_vec, edge_mask)
 
     def _charges_from_features(
         self,
@@ -831,25 +846,39 @@ class LongRangeEnergyModel(EnergyModel):
         edges: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         *,
         return_raw: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    ) -> "torch.Tensor | _Charges":
         """Projected charges ``(nf, nloc)`` from an already-computed
         descriptor output on the graph ``edges = (edge_index, edge_vec,
-        edge_mask)``, and with ``return_raw`` the raw ones too. Without
-        ``charge_spin`` every frame is neutral."""
+        edge_mask)``; with ``return_raw`` a :class:`_Charges` with the raw
+        and the local ones too. Without ``charge_spin`` every frame is
+        neutral."""
         nf, nloc = atype.shape[0], atype.shape[1]
-        raw = self.raw_charges(features, rot_mat, atype.reshape(-1), *edges)
-        raw = raw.reshape(nf, nloc)
+        atype_flat = atype.reshape(-1)
+        raw = self.raw_charges(features, rot_mat, atype_flat).reshape(nf, nloc)
         total = (
             charge_spin[:, 0].to(raw.dtype)
             if charge_spin is not None
             else torch.zeros(nf, dtype=raw.dtype, device=raw.device)
         )
-        projected = project_to_total_charge(raw, total, mask=mask)
-        # The Born tensor differentiates the RAW charges, not these. The
-        # projection subtracts a global mean, which couples every atom to every
-        # other one and would put unbounded distant terms into a quantity that
-        # must be local -- see `deepmd_lr/born.py`.
-        return (projected, raw) if return_raw else projected
+        envelope = self.charge_envelope(atype_flat, *edges)
+        weight = mask
+        if envelope is not None:
+            envelope = envelope.to(raw.dtype).reshape(nf, nloc)
+            weight = envelope if mask is None else envelope * mask.to(raw.dtype)
+        projected = project_to_total_charge(raw, total, mask=weight)
+        if not return_raw:
+            return projected
+        shift = projection_shift(projected, raw, weight)
+        # The Born tensor differentiates the LOCAL charges, not the projected
+        # ones. The projection's shift is a global mean, which couples every
+        # atom to every other one and would put unbounded distant terms into
+        # a quantity that must be local -- see `deepmd_lr/born.py` -- so it is
+        # held fixed: the raw charges themselves without an envelope, and
+        # ``w (raw + shift)`` with one.
+        local = raw
+        if envelope is not None:
+            local = envelope * (raw + shift.detach()[:, None])
+        return _Charges(projected, raw, local, shift)
 
     def _long_range(
         self,
@@ -901,9 +930,7 @@ class LongRangeEnergyModel(EnergyModel):
             # Reported as screened charges, sqrt(eps_inf) q; the energy used
             # the model's own charges, which it was trained with.
             "charge": result["charge"] * screening_factor(self.eps_inf),
-            "charge_projection_shift": projection_shift(
-                result["projected"], result["raw"], mask
-            ),
+            "charge_projection_shift": result["shift"],
         }
         if result["born"] is not None:
             out["born_charge"] = result["born"]
@@ -964,7 +991,7 @@ class LongRangeEnergyModel(EnergyModel):
         """
         nf, nloc = atype.shape[0], atype.shape[1]
         create_graph = self.training
-        projected, raw = self._charges_from_features(
+        charges = self._charges_from_features(
             shared["features"],
             shared["rot_mat"],
             atype,
@@ -973,7 +1000,7 @@ class LongRangeEnergyModel(EnergyModel):
             (shared["edge_index"], shared["edge_vec"], shared["edge_mask"]),
             return_raw=True,
         )
-        charge = filtered(projected)
+        charge = filtered(charges.projected)
         atom_energy = term(geometry.coord, charge, geometry.box, mask=mask)
         edge_vec = shared["edge_vec"]
         grad_coord, grad_eps, g_e = torch.autograd.grad(
@@ -996,7 +1023,7 @@ class LongRangeEnergyModel(EnergyModel):
             # one-hop.
             born = born_charges(
                 charge,
-                raw.reshape(-1),
+                charges.local.reshape(-1),
                 edge_vec,
                 shared["edge_index"],
                 shared["edge_mask"],
@@ -1006,8 +1033,7 @@ class LongRangeEnergyModel(EnergyModel):
         return {
             "atom_energy": atom_energy,
             "charge": charge,
-            "projected": projected,
-            "raw": raw,
+            "shift": charges.shift,
             "force": -grad_coord + response_force.reshape(nf, nloc, 3),
             "virial": (-grad_eps).reshape(nf, 9) + response_virial.reshape(nf, 9),
             "born": born,
@@ -1037,7 +1063,7 @@ class LongRangeEnergyModel(EnergyModel):
                 "selecting a fused energy/force kernel; unset it (or set "
                 "it below 2) for field simulations."
             )
-        projected, raw = self._predict_charges(
+        charges = self._predict_charges(
             geometry.leaf,
             atype,
             geometry.base_box,
@@ -1046,7 +1072,7 @@ class LongRangeEnergyModel(EnergyModel):
             strain=geometry.strain,
             return_raw=True,
         )
-        charge = filtered(projected)
+        charge = filtered(charges.projected)
         atom_energy = term(geometry.coord, charge, geometry.box, mask=mask)
         grad_coord, grad_eps = torch.autograd.grad(
             atom_energy.sum(),
@@ -1056,8 +1082,7 @@ class LongRangeEnergyModel(EnergyModel):
         return {
             "atom_energy": atom_energy,
             "charge": charge,
-            "projected": projected,
-            "raw": raw,
+            "shift": charges.shift,
             "force": -grad_coord,
             "virial": (-grad_eps).reshape(atype.shape[0], 9),
             "born": None,

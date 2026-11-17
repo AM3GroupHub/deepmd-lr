@@ -92,13 +92,19 @@ def projection_shift(
     measured from the two charge sets so it holds for any mask. It is the
     per-atom gap between the raw and the projected charges, and the quantity
     the ``ener_lr`` loss penalises (:mod:`deepmd_lr.loss` says why).
+
+    ``mask`` may be a weight in [0, 1] rather than a boolean, as the
+    projection's may: with ``q_i = w_i (raw_i + shift)`` the shift is
+    ``sum_i (q_i - w_i raw_i) / sum_i w_i`` over the atoms that carry weight.
     """
-    diff = charge - raw_charge
     if mask is None:
-        return diff.mean(dim=-1)
-    weight = mask.to(diff.dtype)
-    n_real = weight.sum(dim=-1)
-    return (diff * weight).sum(dim=-1) / torch.clamp(n_real, min=1.0)
+        return (charge - raw_charge).mean(dim=-1)
+    weight = mask.to(charge.dtype)
+    carried = ((charge - raw_charge * weight) * (weight > 0)).sum(dim=-1)
+    total = weight.sum(dim=-1)
+    return torch.where(
+        total > 0, carried / torch.where(total > 0, total, torch.ones_like(total)), 0.0
+    )
 
 
 def check_charge_filter(charge_filter: Any) -> tuple[float, float] | None:
@@ -223,7 +229,11 @@ def project_to_total_charge(
     mask
         Optional ``(nf, nloc)`` mask of real atoms; falsy entries are treated
         as padding, take no share of the deficit, and are returned as zero.
-        ``None`` means every atom is real.
+        ``None`` means every atom is real. A weight in [0, 1] is taken as it
+        is, ``q_i = w_i (raw_i + shift)`` with the shift fixed by the total:
+        that is how the short-contact envelope switches an atom's charge off
+        (:mod:`deepmd_lr.zbl`), smoothly and whatever offset the raw charges
+        carry.
 
     Returns
     -------
