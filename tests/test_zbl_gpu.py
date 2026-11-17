@@ -1,5 +1,5 @@
-"""The short-contact term on the GPU: the Warp kernels are the torch
-arithmetic, and compressed and partitioned evaluation keep the term."""
+"""The short-contact term on the GPU: the kernel's list of contacts is the
+torch arithmetic, and compressed and partitioned evaluation keep the term."""
 
 import copy
 
@@ -36,66 +36,6 @@ def random_graph(dtype, n_node: int = 12, n_edge: int = 600, seed: int = 0):
     vec[~mask] = 0.0
     owned = torch.arange(n_node) < n_node - 3
     return (t.to(DEVICE) for t in (atype, edges, vec, mask, owned))
-
-
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
-def test_the_warp_kernel_is_the_torch_arithmetic(dtype):
-    zbl = ZBL(["O", "H"], {"window": WINDOWS}, device=DEVICE)
-    atype, edges, vec, mask, owned = random_graph(dtype)
-    energy, g = zbl._edge_terms_warp(atype, edges, vec, mask, owned)
-    src, dst = edges[0], edges[1]
-    real = (atype >= 0) & (atype < 2)
-    valid = mask & real[src] & real[dst] & owned[dst]
-    e_edge, g_ref = zbl._edge_terms_torch(atype, src, dst, vec, valid)
-    e_ref = torch.zeros_like(energy).index_add(0, dst, e_edge)
-    assert e_ref.abs().max() > 1.0, "the graph must reach inside the windows"
-    torch.testing.assert_close(energy, e_ref, rtol=1e-12, atol=1e-12)
-    tight = 1e-12 if dtype == torch.float64 else 1e-6
-    torch.testing.assert_close(g, g_ref, rtol=tight, atol=tight)
-    # The public entry takes the kernel on a CUDA tensor. The per-edge
-    # derivative is written once; the energies are atomic sums, whose order
-    # differs from launch to launch.
-    energy_public, g_public = zbl.edge_terms(atype, edges, vec, mask, owned)
-    torch.testing.assert_close(energy_public, energy, rtol=1e-13, atol=1e-13)
-    torch.testing.assert_close(g_public, g, rtol=0, atol=0)
-
-
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
-def test_the_envelope_kernel_is_the_torch_arithmetic(dtype):
-    zbl = ZBL(["O", "H"], {"window": WINDOWS}, device=DEVICE).eval()
-    # Few edges per node, so that open, partly closed and closed nodes all occur.
-    atype, edges, vec, mask, _owned = random_graph(dtype, n_node=40, n_edge=120, seed=1)
-    vec = vec.clone().requires_grad_(True)
-    fast = zbl.envelope(atype, edges, vec, mask)
-    assert "EnvelopeFunction" in type(fast.grad_fn).__name__, "the kernel must run"
-    src, dst = edges[0], edges[1]
-    real = (atype >= 0) & (atype < 2)
-    slow = zbl._envelope_torch(atype, src, dst, vec, mask & real[src] & real[dst])
-    for count in (
-        (slow == 0).sum(),
-        (slow == 1).sum(),
-        ((slow > 0) & (slow < 1)).sum(),
-    ):
-        assert count > 2, "the graph must hold every kind of node"
-    tight = 1e-12 if dtype == torch.float64 else 2e-5
-    torch.testing.assert_close(fast, slow, rtol=tight, atol=tight)
-    assert torch.equal(fast == 0, slow == 0) and torch.equal(fast == 1, slow == 1)
-    cotangent = torch.randn(
-        40, generator=torch.Generator().manual_seed(2), dtype=torch.float64
-    ).to(device=DEVICE, dtype=dtype)
-    (g_fast,) = torch.autograd.grad((fast * cotangent).sum(), vec, retain_graph=True)
-    (g_slow,) = torch.autograd.grad((slow * cotangent).sum(), vec)
-    assert g_slow.abs().max() > 1.0
-    torch.testing.assert_close(g_fast, g_slow, rtol=10 * tight, atol=10 * tight)
-    # First derivatives only: a second backward is refused, not returned wrong.
-    (once,) = torch.autograd.grad(fast.sum(), vec, create_graph=True)
-    with pytest.raises(RuntimeError):
-        torch.autograd.grad(once.sum(), vec)
-    # Training needs the second one, and takes the torch arithmetic.
-    trained = zbl.train().envelope(atype, edges, vec, mask)
-    assert "EnvelopeFunction" not in type(trained.grad_fn).__name__
-    (once,) = torch.autograd.grad(trained.sum(), vec, create_graph=True)
-    assert torch.isfinite(torch.autograd.grad(once.square().sum(), vec)[0]).all()
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])

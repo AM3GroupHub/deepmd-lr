@@ -359,8 +359,8 @@ class ZBL(torch.nn.Module):
         valid: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Half pair energy per edge, (E,) float64, and ``dE_edge/d edge_vec``,
-        (E, 3) in ``edge_vec``'s dtype. Portable torch arithmetic; the Warp
-        kernel below is the same formulas in one pass."""
+        (E, 3) in ``edge_vec``'s dtype, over every edge; the Warp kernel
+        below is the same formulas for the edges in contact."""
         r2 = edge_vec.to(torch.float64).square().sum(-1)
         # Padded edges carry a zero vector: give them a harmless distance.
         r = torch.sqrt(torch.where(valid, r2, torch.ones_like(r2)))
@@ -390,62 +390,6 @@ class ZBL(torch.nn.Module):
         g = (dedr / r).unsqueeze(-1) * edge_vec.to(torch.float64)
         return energy, g.to(edge_vec.dtype)
 
-    def _edge_terms_warp(
-        self,
-        atype: torch.Tensor,
-        edge_index: torch.Tensor,
-        edge_vec: torch.Tensor,
-        edge_mask: torch.Tensor,
-        owned: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """One pass over the edges: validity, pair terms, the energy summed
-        onto its destination node (float64 atomics), the derivative per edge."""
-        from deepmd_lr.nvalchemi.nlist import _torch_stream_scope
-
-        n_edge = edge_vec.shape[0]
-        energy = torch.zeros(
-            atype.shape[0], dtype=torch.float64, device=edge_vec.device
-        )
-        g = torch.zeros_like(edge_vec)
-        if n_edge == 0:
-            return energy, g
-        is32 = edge_vec.dtype == torch.float32
-        vec_t = wp.vec3f if is32 else wp.vec3d
-        kernel = _edge_terms_f32 if is32 else _edge_terms_f64
-        # Bound to names, so no contiguous copy is freed before the launch.
-        index = edge_index.to(torch.int64).contiguous()
-        mask = edge_mask.to(torch.bool).contiguous()
-        vec = edge_vec.detach().contiguous()
-        types = atype.to(torch.int64).contiguous()
-        own = owned.contiguous()
-
-        def arr(t, dtype):
-            return wp.from_torch(t, dtype=dtype, requires_grad=False)
-
-        with _torch_stream_scope(edge_vec.device):
-            wp.launch(
-                kernel,
-                dim=n_edge,
-                inputs=[
-                    arr(index, wp.int64),
-                    arr(mask, wp.bool),
-                    arr(vec, vec_t),
-                    arr(types, wp.int64),
-                    arr(own, wp.bool),
-                    arr(self.numbers, wp.float64),
-                    arr(self.r_lo, wp.float64),
-                    arr(self.r_hi, wp.float64),
-                    wp.float64(self.max_outer**2),
-                    arr(energy, wp.float64),
-                    arr(g, vec_t),
-                ],
-                device=str(edge_vec.device),
-            )
-        return energy, g
-
-    def _use_warp(self, edge_vec: torch.Tensor) -> bool:
-        return wp is not None and edge_vec.is_cuda and not _tracing(edge_vec)
-
     def edge_terms(
         self,
         atype: torch.Tensor,
@@ -465,8 +409,6 @@ class ZBL(torch.nn.Module):
         n_node = atype.shape[0]
         if owned is None:
             owned = torch.ones(n_node, dtype=torch.bool, device=atype.device)
-        if self._use_warp(edge_vec):
-            return self._edge_terms_warp(atype, edge_index, edge_vec, edge_mask, owned)
         src, dst = edge_index[0].long(), edge_index[1].long()
         real = (atype >= 0) & (atype < self.numbers.numel())
         valid = edge_mask.bool() & real[src] & real[dst] & owned[dst]
@@ -528,70 +470,22 @@ class ZBL(torch.nn.Module):
         edge into an owned node, so an owned node's product is complete; a
         ghost's is not, and is not used.
         """
-        if not self.training and self._use_warp(edge_vec):
-            return _EnvelopeFunction.apply(edge_vec, self, atype, edge_index, edge_mask)
         src, dst = edge_index[0].long(), edge_index[1].long()
         real = (atype >= 0) & (atype < self.numbers.numel())
         valid = edge_mask.bool() & real[src] & real[dst]
         return self._envelope_torch(atype, src, dst, edge_vec, valid)
-
-    def _envelope_warp(
-        self,
-        atype: torch.Tensor,
-        edge_index: torch.Tensor,
-        edge_vec: torch.Tensor,
-        edge_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """One pass over the edges: the factor per node, (N,), and per edge
-        ``d log s / d edge_vec``, (E, 3), both in ``edge_vec``'s dtype. The
-        factor's gradient along an edge into node ``i`` is ``w_i`` times that
-        edge's entry."""
-        from deepmd_lr.nvalchemi.nlist import _torch_stream_scope
-
-        n_node, n_edge = atype.shape[0], edge_vec.shape[0]
-        device = edge_vec.device
-        log_sum = torch.zeros(n_node, dtype=torch.float64, device=device)
-        closed = torch.zeros(n_node, dtype=torch.int32, device=device)
-        dlog = torch.zeros_like(edge_vec)
-        if n_edge:
-            is32 = edge_vec.dtype == torch.float32
-            vec_t = wp.vec3f if is32 else wp.vec3d
-            # Bound to names, so no contiguous copy is freed before the launch.
-            index = edge_index.to(torch.int64).contiguous()
-            mask = edge_mask.to(torch.bool).contiguous()
-            vec = edge_vec.detach().contiguous()
-            types = atype.to(torch.int64).contiguous()
-
-            def arr(t, dtype):
-                return wp.from_torch(t, dtype=dtype, requires_grad=False)
-
-            with _torch_stream_scope(device):
-                wp.launch(
-                    _envelope_f32 if is32 else _envelope_f64,
-                    dim=n_edge,
-                    inputs=[
-                        arr(index, wp.int64),
-                        arr(mask, wp.bool),
-                        arr(vec, vec_t),
-                        arr(types, wp.int64),
-                        arr(self.r_lo, wp.float64),
-                        arr(self.r_hi, wp.float64),
-                        wp.float64(self.max_outer**2),
-                        arr(log_sum, wp.float64),
-                        arr(closed, wp.int32),
-                        arr(dlog, vec_t),
-                    ],
-                    device=str(device),
-                )
-        factor = torch.where(closed > 0, torch.zeros_like(log_sum), torch.exp(log_sum))
-        return factor.to(edge_vec.dtype), dlog
 
     # ------------------------------------------------------------ contacts
 
     def explicit(self, edge_vec: torch.Tensor) -> bool:
         """Whether this graph is evaluated through :meth:`contacts`: an
         evaluation, on a CUDA device, computed rather than traced."""
-        return not self.training and self._use_warp(edge_vec)
+        return (
+            not self.training
+            and wp is not None
+            and edge_vec.is_cuda
+            and not _tracing(edge_vec)
+        )
 
     def contacts(
         self,
@@ -747,34 +641,8 @@ class ZBL(torch.nn.Module):
         return out
 
 
-class _EnvelopeFunction(torch.autograd.Function):
-    """The envelope from the Warp kernel, with its gradient.
-
-    The kernel leaves ``d log s / d edge_vec`` per edge, so the backward is
-    one gather and one product, ``(grad_w w)[dst] dlog``: zero wherever the
-    factor is flat, the closed contacts included. First derivatives only --
-    a second backward is refused rather than returned wrong; training, which
-    needs one, takes the torch arithmetic.
-    """
-
-    @staticmethod
-    def forward(ctx, edge_vec, zbl, atype, edge_index, edge_mask):
-        factor, dlog = zbl._envelope_warp(atype, edge_index, edge_vec, edge_mask)
-        ctx.dlog = dlog
-        ctx.dst = edge_index[1].long()
-        ctx.save_for_backward(factor)
-        return factor
-
-    @staticmethod
-    @torch.autograd.function.once_differentiable
-    def backward(ctx, grad_factor):
-        (factor,) = ctx.saved_tensors
-        weight = (grad_factor * factor).index_select(0, ctx.dst)
-        return weight.unsqueeze(-1) * ctx.dlog, None, None, None, None
-
-
 # ----------------------------------------------------------------------------
-# The Warp kernels: one pass over the edges
+# The Warp kernel: one pass over the edges of an inference graph
 # ----------------------------------------------------------------------------
 
 if wp is not None:
@@ -840,79 +708,6 @@ if wp is not None:
             return False
         return True
 
-    @wp.kernel(enable_backward=False)
-    def _edge_terms_f32(
-        edge_index: wp.array2d(dtype=wp.int64),
-        edge_mask: wp.array(dtype=wp.bool),
-        vec: wp.array(dtype=wp.vec3f),
-        atype: wp.array(dtype=wp.int64),
-        owned: wp.array(dtype=wp.bool),
-        numbers: wp.array(dtype=wp.float64),
-        r_lo: wp.array2d(dtype=wp.float64),
-        r_hi: wp.array2d(dtype=wp.float64),
-        r_max2: wp.float64,
-        energy: wp.array(dtype=wp.float64),
-        g: wp.array(dtype=wp.vec3f),
-    ):
-        e = wp.tid()
-        v = wp.vec3d(
-            wp.float64(vec[e][0]), wp.float64(vec[e][1]), wp.float64(vec[e][2])
-        )
-        # The distance first: almost every edge leaves here, having read
-        # nothing but its own vector.
-        r2 = wp.dot(v, v)
-        if r2 >= r_max2:
-            return
-        if not _edge_valid(e, edge_index, edge_mask, atype, numbers.shape[0]):
-            return
-        if not owned[edge_index[1, e]]:
-            return
-        i = atype[edge_index[0, e]]
-        j = atype[edge_index[1, e]]
-        ro = r_hi[i, j]
-        r = wp.sqrt(r2)
-        if r >= ro:
-            return
-        out = _zbl_pair(r, numbers[i], numbers[j], r_lo[i, j], ro)
-        wp.atomic_add(energy, edge_index[1, e], out[0])
-        s = out[1] / r
-        g[e] = wp.vec3f(
-            wp.float32(s * v[0]), wp.float32(s * v[1]), wp.float32(s * v[2])
-        )
-
-    @wp.kernel(enable_backward=False)
-    def _edge_terms_f64(
-        edge_index: wp.array2d(dtype=wp.int64),
-        edge_mask: wp.array(dtype=wp.bool),
-        vec: wp.array(dtype=wp.vec3d),
-        atype: wp.array(dtype=wp.int64),
-        owned: wp.array(dtype=wp.bool),
-        numbers: wp.array(dtype=wp.float64),
-        r_lo: wp.array2d(dtype=wp.float64),
-        r_hi: wp.array2d(dtype=wp.float64),
-        r_max2: wp.float64,
-        energy: wp.array(dtype=wp.float64),
-        g: wp.array(dtype=wp.vec3d),
-    ):
-        e = wp.tid()
-        v = vec[e]
-        r2 = wp.dot(v, v)
-        if r2 >= r_max2:
-            return
-        if not _edge_valid(e, edge_index, edge_mask, atype, numbers.shape[0]):
-            return
-        if not owned[edge_index[1, e]]:
-            return
-        i = atype[edge_index[0, e]]
-        j = atype[edge_index[1, e]]
-        ro = r_hi[i, j]
-        r = wp.sqrt(r2)
-        if r >= ro:
-            return
-        out = _zbl_pair(r, numbers[i], numbers[j], r_lo[i, j], ro)
-        wp.atomic_add(energy, edge_index[1, e], out[0])
-        g[e] = (out[1] / r) * v
-
     @wp.func
     def _log_step(r: wp.float64, ri: wp.float64, ro: wp.float64) -> wp.vec2d:
         """Inside the window, ``log s`` and ``d log s / dr``; the first is
@@ -931,77 +726,6 @@ if wp is not None:
         one = wp.float64(1.0) - t
         ds = wp.float64(30.0) * t * t * one * one / (ro - ri)
         return wp.vec2d(wp.log(s), ds / s)
-
-    @wp.kernel(enable_backward=False)
-    def _envelope_f32(
-        edge_index: wp.array2d(dtype=wp.int64),
-        edge_mask: wp.array(dtype=wp.bool),
-        vec: wp.array(dtype=wp.vec3f),
-        atype: wp.array(dtype=wp.int64),
-        r_lo: wp.array2d(dtype=wp.float64),
-        r_hi: wp.array2d(dtype=wp.float64),
-        r_max2: wp.float64,
-        log_sum: wp.array(dtype=wp.float64),
-        closed: wp.array(dtype=wp.int32),
-        dlog: wp.array(dtype=wp.vec3f),
-    ):
-        e = wp.tid()
-        v = wp.vec3d(
-            wp.float64(vec[e][0]), wp.float64(vec[e][1]), wp.float64(vec[e][2])
-        )
-        r2 = wp.dot(v, v)
-        if r2 >= r_max2:
-            return
-        if not _edge_valid(e, edge_index, edge_mask, atype, r_lo.shape[0]):
-            return
-        i = atype[edge_index[0, e]]
-        j = atype[edge_index[1, e]]
-        ro = r_hi[i, j]
-        r = wp.sqrt(r2)
-        if r >= ro:
-            return
-        out = _log_step(r, r_lo[i, j], ro)
-        if out[0] > wp.float64(0.0):
-            wp.atomic_add(closed, edge_index[1, e], 1)
-            return
-        wp.atomic_add(log_sum, edge_index[1, e], out[0])
-        c = out[1] / r
-        dlog[e] = wp.vec3f(
-            wp.float32(c * v[0]), wp.float32(c * v[1]), wp.float32(c * v[2])
-        )
-
-    @wp.kernel(enable_backward=False)
-    def _envelope_f64(
-        edge_index: wp.array2d(dtype=wp.int64),
-        edge_mask: wp.array(dtype=wp.bool),
-        vec: wp.array(dtype=wp.vec3d),
-        atype: wp.array(dtype=wp.int64),
-        r_lo: wp.array2d(dtype=wp.float64),
-        r_hi: wp.array2d(dtype=wp.float64),
-        r_max2: wp.float64,
-        log_sum: wp.array(dtype=wp.float64),
-        closed: wp.array(dtype=wp.int32),
-        dlog: wp.array(dtype=wp.vec3d),
-    ):
-        e = wp.tid()
-        v = vec[e]
-        r2 = wp.dot(v, v)
-        if r2 >= r_max2:
-            return
-        if not _edge_valid(e, edge_index, edge_mask, atype, r_lo.shape[0]):
-            return
-        i = atype[edge_index[0, e]]
-        j = atype[edge_index[1, e]]
-        ro = r_hi[i, j]
-        r = wp.sqrt(r2)
-        if r >= ro:
-            return
-        out = _log_step(r, r_lo[i, j], ro)
-        if out[0] > wp.float64(0.0):
-            wp.atomic_add(closed, edge_index[1, e], 1)
-            return
-        wp.atomic_add(log_sum, edge_index[1, e], out[0])
-        dlog[e] = (out[1] / r) * v
 
     @wp.func
     def _contact(
