@@ -20,13 +20,16 @@ A window is ``[x_lo, x_hi]`` in units of the pair's covalent-radius sum,
 to [0, 1], is exactly 0 below it and exactly 1 above. Below ``x_lo`` a pair is
 ZBL alone; with every neighbour beyond ``x_hi`` an atom's factor is exactly 1.
 
-Each pair of elements has its own window, because what the network has seen
-differs from pair to pair: a bond stops near 0.9 radius sums, but two oxygens
-of liquid water never come closer than 1.8 and two hydrogens than 2.0, and the
-network falls right below each of those. Choose ``x_hi`` at or below the
-pair's shortest contact in the data, so that nothing fitted changes, and
-``x_lo`` above where the network starts to fall. A pair without a window has
-no term.
+By default every pair of elements has the same window in these units,
+:data:`DEFAULT_WINDOW`, so the covalent radii place it and nothing has to be
+assigned: a bond sits near one radius sum and its window just below it.
+``pairs`` gives single pairs a window of their own, because what the network
+has seen differs from pair to pair: two oxygens of liquid water never come
+closer than 1.8 radius sums and two hydrogens than 2.0, and the network falls
+right below each of those, far above a window placed for a bond. A window's
+``x_hi`` belongs at or below the pair's shortest contact in the data, so that
+nothing fitted changes, and its ``x_lo`` above where the network starts to
+fall.
 
 ZBL has no parameters and sees the edge vectors through no network, so its
 force and virial are assembled analytically from the per-edge derivative. The
@@ -72,7 +75,14 @@ try:
 except ImportError:  # pragma: no cover - the MD extra is optional
     wp = None
 
-__all__ = ["ZBL", "ZBL_KEY", "Contacts", "add_envelope_gradient", "contact_output"]
+__all__ = [
+    "DEFAULT_WINDOW",
+    "ZBL",
+    "ZBL_KEY",
+    "Contacts",
+    "add_envelope_gradient",
+    "contact_output",
+]
 
 #: Key of the optional block in the model config.
 ZBL_KEY = "zbl"
@@ -85,7 +95,15 @@ _A_EXPONENT = 0.23
 _PHI_A = (0.18175, 0.50986, 0.28022, 0.02817)
 _PHI_B = (3.19980, 0.94229, 0.40290, 0.20162)
 
-_KEYS = ("window",)
+#: The window of every pair of elements that ``pairs`` does not name, in
+#: covalent-radius sums. Measured on a DPA4C water model, whose O-H bonds stop
+#: at 0.90 and whose fitted energy falls below 0.70: a window that closes at
+#: 0.5 (mace-lr's, for the charges of a MACE model) is too late and leaves a
+#: hole of -75 eV, one that opens at 0.9 touches the data, and this one gives
+#: a wall that rises all the way in.
+DEFAULT_WINDOW = (0.6, 0.85)
+
+_KEYS = ("window", "pairs")
 #: Keys of the first implementation (October 2026), named in the refusal so a
 #: checkpoint or input that still carries them explains itself.
 _RETIRED = (
@@ -116,55 +134,66 @@ def _tracing(t: torch.Tensor) -> bool:
     return isinstance(t, (FakeTensor, FunctionalTensor)) or get_proxy_mode() is not None
 
 
-#: How a window must be written; quoted by every refusal.
-_WINDOW_FORM = (
-    "zbl.window maps pairs of elements to [x_lo, x_hi] in covalent-radius "
-    'sums, e.g. {"O-H": [0.7, 0.9], "O-O": [1.5, 1.75]}'
-)
-
-
 def pair_key(a: str, b: str) -> str:
     """The one name of a pair of elements, whichever way round it was written."""
     return "-".join(sorted((a, b)))
 
 
-def check_windows(windows: Any) -> dict[str, tuple[float, float]]:
-    """Validate ``window = {"A-B": [x_lo, x_hi], ...}``: at least one pair of
-    elements, each written once, finite ``0 <= x_lo < x_hi``. Returns the
-    windows under their :func:`pair_key`."""
-    if isinstance(windows, dict):
-        # DeePMD-kit's `_comment` annotations, as everywhere in a config.
-        windows = {
-            k: v
-            for k, v in windows.items()
-            if not (isinstance(k, str) and k.startswith("_"))
-        }
-    if not isinstance(windows, dict) or not windows:
-        raise ValueError(f"{_WINDOW_FORM}; got {windows!r}")
+def check_window(window: Any, name: str = "window") -> tuple[float, float]:
+    """Validate one window ``[x_lo, x_hi]`` in covalent-radius sums: finite,
+    ``0 <= x_lo < x_hi``."""
+    try:
+        x_lo, x_hi = window
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"zbl.{name} must be [x_lo, x_hi] in covalent-radius sums, got {window!r}"
+        ) from None
+    for x in (x_lo, x_hi):
+        if isinstance(x, bool) or not isinstance(x, Real) or not math.isfinite(x):
+            raise ValueError(f"zbl.{name} must hold two finite real numbers")
+    if not 0.0 <= x_lo < x_hi:
+        raise ValueError(
+            f"zbl.{name} needs 0 <= x_lo < x_hi, got [{x_lo}, {x_hi}]: ZBL is "
+            "full below x_lo and gone above x_hi"
+        )
+    return float(x_lo), float(x_hi)
+
+
+def check_pairs(pairs: Any) -> dict[str, tuple[float, float]]:
+    """Validate ``pairs = {"A-B": [x_lo, x_hi], ...}``: pairs of elements,
+    each written once, each a window. Returns them under their
+    :func:`pair_key`; an empty or missing map is no pair."""
+    if pairs is None:
+        return {}
+    if not isinstance(pairs, dict):
+        raise ValueError(
+            "zbl.pairs maps pairs of elements to their own window, e.g. "
+            f'{{"O-O": [1.5, 1.75]}}; got {pairs!r}'
+        )
     checked: dict[str, tuple[float, float]] = {}
-    for name, window in windows.items():
+    for name, window in pairs.items():
+        if isinstance(name, str) and name.startswith("_"):
+            continue  # DeePMD-kit's `_comment` annotations, as in any block
         symbols = name.split("-") if isinstance(name, str) else []
         if len(symbols) != 2 or not all(atomic_numbers.get(s, 0) > 0 for s in symbols):
-            raise ValueError(f"{_WINDOW_FORM}; {name!r} is not a pair of elements")
+            raise ValueError(f"zbl.pairs: {name!r} is not a pair of elements")
         key = pair_key(*symbols)
         if key in checked:
-            raise ValueError(f"zbl.window names the pair {key} twice")
-        try:
-            x_lo, x_hi = window
-        except (TypeError, ValueError):
-            raise ValueError(f"{_WINDOW_FORM}; {name!r} has {window!r}") from None
-        for x in (x_lo, x_hi):
-            if isinstance(x, bool) or not isinstance(x, Real) or not math.isfinite(x):
-                raise ValueError(
-                    f"zbl.window {name!r} must hold two finite real numbers"
-                )
-        if not 0.0 <= x_lo < x_hi:
-            raise ValueError(
-                f"zbl.window {name!r} needs 0 <= x_lo < x_hi, got [{x_lo}, {x_hi}]: "
-                "ZBL is full below x_lo and gone above x_hi"
-            )
-        checked[key] = (float(x_lo), float(x_hi))
+            raise ValueError(f"zbl.pairs names the pair {key} twice")
+        checked[key] = check_window(window, f"pairs[{name!r}]")
     return dict(sorted(checked.items()))
+
+
+def normalized_settings(settings: dict[str, Any]) -> dict[str, Any]:
+    """A ``zbl`` block as the model reads it: the default window written
+    out, each pair under one name, numbers as floats. Two blocks that build
+    the same term compare equal."""
+    settings = {k: v for k, v in settings.items() if not k.startswith("_")}
+    window = settings.get("window", DEFAULT_WINDOW)
+    return {
+        "window": None if window is None else list(check_window(window)),
+        "pairs": {k: list(v) for k, v in check_pairs(settings.get("pairs")).items()},
+    }
 
 
 class Contacts(NamedTuple):
@@ -269,12 +298,15 @@ class ZBL(torch.nn.Module):
     """Screened nuclear repulsion inside a short-contact window, and the
     envelope that switches the network off there; no parameters.
 
-    ``settings`` is the ``zbl`` block of the model config: ``{"window":
-    {"A-B": [x_lo, x_hi], ...}}``, one window per pair of elements in units
-    of that pair's covalent-radius sum. There is no default: a window belongs
-    just below the pair's shortest contact in the data the model was fitted
-    to, which differs from pair to pair and from system to system. A pair
-    that is not listed has no term.
+    ``settings`` is the ``zbl`` block of the model config, and may be empty:
+
+    ``window``
+        ``[x_lo, x_hi]`` in units of a pair's covalent-radius sum, for every
+        pair of elements; :data:`DEFAULT_WINDOW` when left out. ``None``
+        gives no pair a window but those in ``pairs``.
+    ``pairs``
+        ``{"A-B": [x_lo, x_hi], ...}``, a window of their own for single
+        pairs, in the same units.
     """
 
     def __init__(self, type_map: list[str], settings: dict[str, Any], device=None):
@@ -289,39 +321,53 @@ class ZBL(torch.nn.Module):
                 f"zbl accepts only {list(_KEYS)}, got {sorted(unknown)}"
                 + (
                     f". {retired} belonged to the first implementation; the "
-                    "switch is now a window per pair of elements"
+                    "switch is now a window in covalent-radius sums"
                     if retired
                     else ""
                 )
             )
-        if "window" not in settings:
+        window = settings.get("window", DEFAULT_WINDOW)
+        #: The window of every pair ``pairs`` does not name, in covalent-radius
+        #: sums, or None: then only those pairs have one.
+        self.window = None if window is None else check_window(window)
+        #: ``{"A-B": (x_lo, x_hi)}``, the pairs with a window of their own.
+        self.pairs = check_pairs(settings.get("pairs"))
+        if self.window is None and not self.pairs:
             raise ValueError(
-                f"zbl.window is required. {_WINDOW_FORM}, with x_hi at or below "
-                "the pair's shortest contact in the data"
+                "zbl has no window: `window` is null and `pairs` names no pair"
             )
-        #: ``{"A-B": (x_lo, x_hi)}`` in covalent-radius sums, as configured.
-        self.windows = check_windows(settings["window"])
         # A type that is not an element -- ASE's dummy "X" heads this
         # repository's periodic-table type maps -- has no nucleus: Z = 0, and
         # can be in no window.
         numbers = [atomic_numbers.get(s, 0) for s in type_map]
+        elements = [i for i, z in enumerate(numbers) if z > 0]
+        if not elements:
+            raise ValueError("zbl requires at least one element symbol in type_map")
+        radius = torch.tensor(
+            [float(covalent_radii[z]) for z in numbers], dtype=torch.float64
+        )
+        total = radius[:, None] + radius[None, :]
         n_type = len(type_map)
         r_lo = torch.zeros((n_type, n_type), dtype=torch.float64)
         r_hi = torch.zeros((n_type, n_type), dtype=torch.float64)
-        for name, (x_lo, x_hi) in self.windows.items():
+        if self.window is not None:
+            real = torch.zeros(n_type, dtype=torch.bool)
+            real[elements] = True
+            both = real[:, None] & real[None, :]
+            r_lo[both] = self.window[0] * total[both]
+            r_hi[both] = self.window[1] * total[both]
+        for name, (x_lo, x_hi) in self.pairs.items():
             a, b = name.split("-")
             if a not in type_map or b not in type_map:
                 raise ValueError(
-                    f"zbl.window names the pair {name}, but the type_map has no "
+                    f"zbl.pairs names the pair {name}, but the type_map has no "
                     f"{a if a not in type_map else b}"
                 )
             i, j = type_map.index(a), type_map.index(b)
-            total = float(covalent_radii[numbers[i]] + covalent_radii[numbers[j]])
-            r_lo[i, j] = r_lo[j, i] = x_lo * total
-            r_hi[i, j] = r_hi[j, i] = x_hi * total
-        #: The largest distance at which any pair is still inside its window.
-        #: A plain float, fixed here: the kernels take it every step, and
-        #: reading it off a device buffer would be a host synchronisation.
+            r_lo[i, j] = r_lo[j, i] = x_lo * total[i, j]
+            r_hi[i, j] = r_hi[j, i] = x_hi * total[i, j]
+        #: The largest distance at which any pair of this type_map is still
+        #: inside its window: what the descriptor's cutoff has to cover.
         self.max_outer = float(r_hi.max())
         # Derived entirely from the serialized type_map and windows: not
         # optimizer state, and no state_dict entry.
@@ -337,7 +383,31 @@ class ZBL(torch.nn.Module):
         self.register_buffer("r_hi", r_hi.to(device), persistent=False)
 
     def serialize(self) -> dict[str, Any]:
-        return {"window": {name: list(w) for name, w in self.windows.items()}}
+        data: dict[str, Any] = {
+            "window": None if self.window is None else list(self.window)
+        }
+        if self.pairs:
+            data["pairs"] = {name: list(w) for name, w in self.pairs.items()}
+        return data
+
+    def window_of(self, a: str, b: str, type_map: list[str]) -> tuple[float, float]:
+        """The window of one pair of elements, in angstrom."""
+        i, j = type_map.index(a), type_map.index(b)
+        return float(self.r_lo[i, j]), float(self.r_hi[i, j])
+
+    def reach(self, atype: torch.Tensor) -> torch.Tensor:
+        """The largest distance at which a pair of the types in ``atype`` is
+        still inside its window, squared: a ``(1,)`` tensor on the device,
+        computed there. A type_map that lists the whole periodic table has
+        windows out to 4 A between its largest atoms; a pass over the edges
+        of a water box should not look that far."""
+        n_type = self.numbers.numel()
+        # `index_fill_` takes its value as a scalar; an indexed assignment
+        # would upload it, which a step of MD must not do.
+        present = torch.zeros(n_type, dtype=torch.bool, device=atype.device)
+        present.index_fill_(0, atype.clamp(0, n_type - 1).long(), True)
+        reach = (self.r_hi * (present[:, None] & present[None, :])).max()
+        return (reach * reach).reshape(1)
 
     # ------------------------------------------------------------ per edge
 
@@ -475,6 +545,36 @@ class ZBL(torch.nn.Module):
         valid = edge_mask.bool() & real[src] & real[dst]
         return self._envelope_torch(atype, src, dst, edge_vec, valid)
 
+    def inside(
+        self,
+        atype: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_vec: torch.Tensor,
+        edge_mask: torch.Tensor,
+    ) -> tuple[float, dict[tuple[int, int], float]]:
+        """What the windows meet on one graph: the smallest envelope of any
+        node, and for every pair of types with an edge inside its window the
+        shortest such edge, in units of the pair's window end (below 1 is
+        inside). For checking windows against data, not for a hot path."""
+        src, dst = edge_index[0].long(), edge_index[1].long()
+        factor = self.envelope(atype, edge_index, edge_vec, edge_mask)
+        smallest = float(factor.min()) if factor.numel() else 1.0
+        real = (atype >= 0) & (atype < self.numbers.numel())
+        ti = atype.clamp(0, self.numbers.numel() - 1).long()
+        hi = self.r_hi[ti[src], ti[dst]]
+        r = edge_vec.to(torch.float64).norm(dim=1)
+        found = edge_mask.bool() & real[src] & real[dst] & (r < hi)
+        pairs: dict[tuple[int, int], float] = {}
+        for i, j, x in zip(
+            ti[src][found].tolist(),
+            ti[dst][found].tolist(),
+            (r[found] / hi[found]).tolist(),
+            strict=True,
+        ):
+            key = (min(i, j), max(i, j))
+            pairs[key] = min(pairs.get(key, 1.0), x)
+        return smallest, pairs
+
     # ------------------------------------------------------------ contacts
 
     def explicit(self, edge_vec: torch.Tensor) -> bool:
@@ -528,6 +628,7 @@ class ZBL(torch.nn.Module):
             vec = edge_vec.detach().contiguous()
             types = atype.to(torch.int64).contiguous()
             own = owned.to(torch.bool).contiguous()
+            reach = self.reach(types)
 
             def view(t, dtype):
                 # A read-only launch argument; `t` is bound above, so it
@@ -552,7 +653,7 @@ class ZBL(torch.nn.Module):
                         view(self.numbers, wp.float64),
                         view(self.r_lo, wp.float64),
                         view(self.r_hi, wp.float64),
-                        wp.float64(self.max_outer**2),
+                        view(reach, wp.float64),
                         capacity,
                         arr(energy, wp.float64),
                         arr(log_sum, wp.float64),
@@ -792,7 +893,7 @@ if wp is not None:
         numbers: wp.array(dtype=wp.float64),
         r_lo: wp.array2d(dtype=wp.float64),
         r_hi: wp.array2d(dtype=wp.float64),
-        r_max2: wp.float64,
+        r_max2: wp.array(dtype=wp.float64),
         capacity: int,
         energy: wp.array(dtype=wp.float64),
         log_sum: wp.array(dtype=wp.float64),
@@ -808,7 +909,7 @@ if wp is not None:
         # The distance first: almost every edge leaves here, having read
         # nothing but its own vector.
         r2 = wp.dot(v, v)
-        if r2 >= r_max2:
+        if r2 >= r_max2[0]:
             return
         if not _edge_valid(e, edge_index, edge_mask, atype, numbers.shape[0]):
             return
@@ -827,7 +928,7 @@ if wp is not None:
         numbers: wp.array(dtype=wp.float64),
         r_lo: wp.array2d(dtype=wp.float64),
         r_hi: wp.array2d(dtype=wp.float64),
-        r_max2: wp.float64,
+        r_max2: wp.array(dtype=wp.float64),
         capacity: int,
         energy: wp.array(dtype=wp.float64),
         log_sum: wp.array(dtype=wp.float64),
@@ -839,7 +940,7 @@ if wp is not None:
         e = wp.tid()
         v = vec[e]
         r2 = wp.dot(v, v)
-        if r2 >= r_max2:
+        if r2 >= r_max2[0]:
             return
         if not _edge_valid(e, edge_index, edge_mask, atype, numbers.shape[0]):
             return

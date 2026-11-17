@@ -41,6 +41,9 @@ from typing import (
 
 import numpy as np
 import torch
+from ase.data import (
+    covalent_radii,
+)
 from deepmd.dpmodel.model.edge_transform_output import (
     node_ownership_mask,
 )
@@ -97,6 +100,7 @@ from deepmd_lr.zbl import (
     Contacts,
     add_envelope_gradient,
     contact_output,
+    pair_key,
 )
 
 #: The ``model.type`` that selects this class, and the tag written into
@@ -130,6 +134,11 @@ _NO_KERNEL = (
     "tables are built and then silently ignored -- `DescrptDPA4C.call_graph` "
     "falls back to the uncompressed math, so nothing gets faster."
 )
+
+#: The smallest envelope a short-contact window may leave any atom of the
+#: training data with (:meth:`LongRangeEnergyModel._check_zbl_against`). A
+#: contact that only grazes a window's upper edge leaves more than this.
+_ZBL_ON_DATA = 0.99
 
 #: Raised when the fused inference level meets a model with a ``zbl`` term.
 _NO_FUSED_WITH_ZBL = (
@@ -568,14 +577,19 @@ class LongRangeEnergyModel(EnergyModel):
         """Give the model the short-contact term of ``settings``, the
         config's ``zbl`` block; None removes it.
 
-        Inside the window ZBL repulsion comes in and the network goes out:
-        the fitted energy and the raw charge of every atom are multiplied by
-        the envelope, the product over its neighbours of the window's step
+        ``{}`` is a complete block: every pair of elements then has the
+        default window, placed below a bond by the covalent radii. Inside a
+        window ZBL repulsion comes in and the network goes out: the fitted
+        energy of every atom is multiplied by the envelope, the product over
+        its neighbours of the window's step, and its charge is weighted by it
         (:mod:`deepmd_lr.zbl`). The term holds no weights and adds no
-        ``state_dict`` entry, so a trained model can be given one: with the
+        ``state_dict`` entry, so a trained model can be given one: with every
         window's upper edge at or below the shortest contact of its data,
-        nothing it was fitted to changes. The recorded config follows, so a
-        model saved afterwards describes the term it has.
+        nothing it was fitted to changes. Training checks that against its
+        own data (:meth:`compute_or_load_stat`); for a trained model it is
+        the caller's to check (``examples/10-zbl/scan.py --data``). The
+        recorded config follows, so a model saved afterwards describes the
+        term it has.
         """
         if settings is None:
             self.zbl = None
@@ -596,9 +610,11 @@ class LongRangeEnergyModel(EnergyModel):
             rcut = float(descriptor.get_rcut())
             if zbl.max_outer > rcut:
                 raise ValueError(
-                    f"a zbl.window ends at {zbl.max_outer:g} A, beyond "
-                    f"descriptor.rcut {rcut:g} A: a pair entering the neighbour "
-                    "list would arrive inside the switch. Lower its x_hi."
+                    f"a zbl window ends at {zbl.max_outer:g} A for the largest "
+                    f"pair of this type_map, beyond descriptor.rcut {rcut:g} A: "
+                    "a pair entering the neighbour list would arrive inside "
+                    "the switch. Lower `window`, or set it to null and give "
+                    "`pairs` for the elements in use."
                 )
             # A module made after `.eval()` would still be in training mode,
             # where the envelope takes the slower torch arithmetic.
@@ -1525,15 +1541,79 @@ class LongRangeEnergyModel(EnergyModel):
         is never a legitimate cell, so this cannot mask a real problem.
         """
 
+        checked: list = []
+
         def sanitized() -> Any:
             sampled = sampled_func()
             for frame in sampled:
                 box = frame.get("box") if hasattr(frame, "get") else None
                 if box is not None and not np.asarray(box).any():
                     frame["box"] = None
+            if not checked:
+                # Once: upstream may ask for the samples several times.
+                checked.append(True)
+                self._check_zbl_against(sampled)
             return sampled
 
         return super().compute_or_load_stat(sanitized, *args, **kwargs)
+
+    def _check_zbl_against(self, sampled: Any) -> None:
+        """Refuse a short-contact window that reaches into the training data.
+
+        Inside a window the network is switched off, so a window that covers
+        fitted geometries has the model trained with part of itself turned
+        down on its own data, against several eV of ZBL: a fit that goes
+        wrong without saying why. The default window sits below a bond in
+        units of the covalent radii, and bonds differ (O-H in water stops at
+        0.90 radius sums, Nb-O in a perovskite at 0.75), so the frames
+        sampled for the statistics are checked and the pairs that need a
+        window of their own are named, with one that fits.
+        """
+        if self.zbl is None:
+            return
+        zbl = self.zbl
+        device = next(self.parameters()).device
+        smallest, reached = 1.0, {}
+        for system in sampled:
+            nf = np.asarray(system["coord"]).shape[0]
+            coord = torch.as_tensor(
+                np.asarray(system["coord"]), dtype=torch.float64, device=device
+            ).reshape(nf, -1, 3)
+            atype = torch.as_tensor(
+                np.asarray(system["atype"]), dtype=torch.int64, device=device
+            ).reshape(nf, -1)
+            box = system.get("box")
+            if box is not None:
+                box = torch.as_tensor(
+                    np.asarray(box), dtype=torch.float64, device=device
+                ).reshape(nf, 3, 3)
+            graph = build_neighbor_graph_fast(coord, atype, box, zbl.max_outer)
+            factor, pairs = zbl.inside(
+                atype.reshape(-1), graph.edge_index, graph.edge_vec, graph.edge_mask
+            )
+            smallest = min(smallest, factor)
+            for key, x in pairs.items():
+                reached[key] = min(reached.get(key, 1.0), x)
+        if smallest >= _ZBL_ON_DATA:
+            return
+        type_map = list(self.get_type_map())
+        found, fits = [], {}
+        for (i, j), x in sorted(reached.items(), key=lambda item: item[1]):
+            total = float(covalent_radii[int(zbl.numbers[i])]) + float(
+                covalent_radii[int(zbl.numbers[j])]
+            )
+            x_lo, x_hi = float(zbl.r_lo[i, j]) / total, float(zbl.r_hi[i, j]) / total
+            contact = math.floor(100 * x * x_hi) / 100
+            name = pair_key(type_map[i], type_map[j])
+            found.append(f"{name} {x * x_hi:.2f} (window {x_lo:.2f}-{x_hi:.2f})")
+            fits[name] = [round(max(contact - (x_hi - x_lo), 0.0), 2), contact]
+        raise ValueError(
+            "a zbl window reaches into the training data: the network would be "
+            f"switched down to {smallest:.2f} of its output on a fitted "
+            "geometry. Shortest contacts inside a window, in covalent-radius "
+            f"sums: {', '.join(found)}. Give these pairs a window below their "
+            f'data: "pairs": {json.dumps(fits)}'
+        )
 
     def enable_hessian(self) -> None:
         """Refuse the Hessian with ZBL: DeePMD-kit's Hessian wrapper calls

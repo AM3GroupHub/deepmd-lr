@@ -16,14 +16,13 @@ inside a 192-atom frame:
 
 The whole fall sits on the two atoms in contact (every other atom together:
 +0.16 eV). A pair repulsion added on top does not help: ZBL is 21 eV at 0.60 Å.
-The `zbl` block therefore does two things across a window per pair of elements:
+The `zbl` block therefore does two things across a window, and needs nothing
+assigned:
 
 ```json
 "model": {
   "type": "dp_lr",
-  "zbl": {
-    "window": {"O-H": [0.70, 0.90], "H-H": [1.45, 2.00], "O-O": [1.50, 1.75]}
-  }
+  "zbl": {}
 }
 ```
 
@@ -42,30 +41,56 @@ Below `x_lo` a pair is its energy offsets plus ZBL and carries no charge. With
 every neighbour beyond its window an atom's envelope is exactly 1, and the model
 is the one that was trained.
 
-## Choosing the windows
+## The windows
 
-What the network has seen differs from pair to pair, so each pair has its own
-window, and a pair that is not listed has no term:
+| key | default | |
+|---|---|---|
+| `window` | `[0.6, 0.85]` | every pair's window, in covalent-radius sums; `null` for none |
+| `pairs` | `{}` | a window of their own for single pairs, `{"O-O": [1.5, 1.75]}`, same units |
 
-- **`x_hi` at or below the pair's shortest contact in the data**, so that
-  nothing fitted changes. `scan.py --data train.xyz` prints these in radius
-  sums.
-- **`x_lo` above where the network starts to fall.** Scan the pair with the
-  trained model first; the fall is abrupt.
-- Each window must end inside `descriptor.rcut`.
+**The default is placed by the covalent radii**, just below a bond: 0.58–0.82 Å
+for O–H. It was chosen on the water model, whose O–H bonds stop at 0.90 radius
+sums and whose fitted energy falls below 0.70:
 
-For the water model:
+| every pair's window | the O–H bond pushed to 0.57 Å |
+|---|---|
+| `[0.5, 0.8]` (mace-lr's, for the charges of a MACE model) | −75 eV: closes too late |
+| `[0.6, 0.85]` | +24.7 eV, rising all the way in |
+| `[0.7, 0.9]` | +24.7 eV, but opens at the shortest bond in the data |
 
-| pair | shortest in the data | the trained model falls below | window |
-|---|---|---|---|
-| O–H | 0.873 Å = 0.90 | 0.68 Å = 0.70 (the bond compressed) | `[0.70, 0.90]` |
-| O–O | 2.350 Å = 1.78 | 1.95 Å = 1.48 (two molecules pushed together) | `[1.50, 1.75]` |
-| H–H | 1.272 Å = 2.05 | not separable: an O–H contact closes first | `[1.45, 2.00]` |
+**A pair needs a window of its own when its data stop far from a bond
+length.** Two oxygens of liquid water never come closer than 1.78 radius sums
+and two hydrogens than 2.05, and the network falls right below each of those,
+far above a window placed for a bond. With the default alone the O–H bond is
+covered and paths that close an H–H or an O–O contact keep holes of −115 and
+−19 eV; with
 
-A window has to sit against its own pair's data. One covalent window for every
-pair, `[0.7, 0.9]`, covered the O–H bond and nothing else: paths that close an
-H–H or an O–O contact kept holes of −190 and −51 eV between that window and
-those pairs' floors.
+```json
+"zbl": {"pairs": {"H-H": [1.45, 2.00], "O-O": [1.50, 1.75]}}
+```
+
+all three hold. `scan.py --data train.xyz` prints every pair's shortest contact
+in radius sums; a window's `x_hi` belongs at or below it, and its `x_lo` above
+where the trained model starts to fall (1.95 Å for two water molecules pushed
+together along O–O).
+
+**Training checks the windows against its data.** A window that covers fitted
+geometries would have the network switched off on them, so when the statistics
+are taken the sampled frames are checked, and a window that reaches into them
+is refused with the pair and a window that fits:
+
+```
+a zbl window reaches into the training data: the network would be switched down
+to 0.94 of its output on a fitted geometry. Shortest contacts inside a window,
+in covalent-radius sums: H-O 0.90 (window 0.70-0.95). Give these pairs a window
+below their data: "pairs": {"H-O": [0.64, 0.89]}
+```
+
+Bond lengths differ between materials (0.75 radius sums for Nb–O in PMN, 0.77
+for C–C in SiC, both inside the default), so this is where a pair shorter than
+the default allows shows up. Each window must also end inside
+`descriptor.rcut`; with a type_map that lists the whole periodic table the
+default reaches 4.4 Å between its largest atoms.
 
 ## A trained model
 
@@ -77,7 +102,8 @@ from deepmd_lr.ase import LongRangeCalculator, load_model
 from deepmd_lr.nvalchemi import build_evaluator
 
 model = load_model("model.ckpt.pt")
-model.set_zbl({"window": {"O-H": [0.70, 0.90], "H-H": [1.45, 2.00], "O-O": [1.50, 1.75]}})
+model.set_zbl({})                                  # the default for every pair
+model.set_zbl({"pairs": {"H-H": [1.45, 2.00], "O-O": [1.50, 1.75]}})  # water
 atoms.calc = LongRangeCalculator(model)            # ASE
 ev = build_evaluator(model, atoms, compress=True)  # GPU MD
 ```
@@ -85,22 +111,25 @@ ev = build_evaluator(model, atoms, compress=True)  # GPU MD
 With every window below its pair's data this changes nothing fitted: on the
 water test set the energy moved by 5e-6 eV, forces by 2e-6 eV/Å and charges by
 4e-7 e, which is float32 noise. For the same reason training with the block
-gives the same model on the data; `set_zbl(None)` removes the term.
+gives the same model on the data; `set_zbl(None)` removes the term. Nothing
+checks a trained model against data it no longer has: run the scan with
+`--data` first.
 
 ## What it does, measured
 
 [`scan.py`](../examples/10-zbl/scan.py) pushes one pair of each kind together
 inside a validation frame: the O–H bond by moving the hydrogen along it, the
 other two by moving the neighbour's whole molecule, rigid. The reference is a
-MACE-LR model trained on the same data, evaluated on the same geometries:
+MACE-LR model trained on the same data, evaluated on the same geometries; the
+block is the default with the two pairs above:
 
 | energy change | trained model | with `zbl` | MACE-LR |
 |---|---|---|---|
-| O–H at 0.62 Å | −124 eV | +20.2 eV | +7.1 eV |
+| O–H at 0.62 Å | −124 eV | +15.9 eV | +7.1 eV |
 | O–H at 0.29 Å | −1.5e6 eV | +112 eV | +50 eV |
-| H–H at 0.97 Å | −149 eV | +25.7 eV | +9.0 eV |
-| O–O at 1.56 Å | −130 eV | +26.2 eV | +10.8 eV |
-| largest charge of a pair on the three paths | 1.3e4 e | 0.25 e | |
+| H–H at 0.97 Å | −149 eV | +22.8 eV | +9.0 eV |
+| O–O at 1.56 Å | −130 eV | +24.9 eV | +10.8 eV |
+| largest charge of a pair on the three paths | 1.3e4 e | 0.27 e | |
 
 With the term the energy rises all the way in on each path and has the
 reference's shape. Where a path passes a third atom its energy falls again
@@ -115,17 +144,18 @@ rms without the term, 0.031 with it), since no pair enters a window.
 
 - **It is a guard for a pair contact in otherwise normal surroundings.** A
   badly packed box still collapses: FIRE from a 64-water box with O–O contacts
-  at 1.56 Å slides to −13,900 eV in 600 steps (the trained model reaches −1.2e9
-  in 25). Once two oxygens are switched off, their hydrogens are still
-  described by the network, which has never seen such surroundings. Pre-relax
-  with a classical force field ([MD](md.md#relaxing-a-packed-box-first)).
+  at 1.56 Å slides to −14,100 eV in 600 steps with the two pairs above
+  (−640,000 eV with the default alone; the trained model reaches −1.2e9 in
+  25). Once two oxygens are switched off, their hydrogens are still described
+  by the network, which has never seen such surroundings. Pre-relax with a
+  classical force field ([MD](md.md#relaxing-a-packed-box-first)).
 - **Inside a window the wall is stiffer than the reference.** Standard ZBL is
-  2–4 times MACE-LR there (O–H at 0.71 Å: 13.4 eV against 3.2 eV). The term
+  2–3 times MACE-LR there (O–H at 0.62 Å: 15.9 eV against 7.1 eV). The term
   keeps a run alive through a collision; it does not make the energy of that
   collision right.
-- **A window above a pair's data changes the model on the data.** Bond floors
-  differ between materials (0.75 radius sums for Nb–O in PMN, 0.77 for C–C in
-  SiC), which is why there is no default window.
+- **The default covers bonds, not every pair.** Pairs that never bond in the
+  data need a window of their own, as above; the default alone leaves them to
+  the network between their data and a bond length.
 
 ## Refused
 
@@ -158,9 +188,9 @@ Measured on the GB10 with the compressed water model, per evaluation:
 
 | atoms | without | with `zbl` |
 |---|---|---|
-| 192 | 13.0 ms | 14.2 ms |
-| 12,288 | 15.3 ms | 16.3 ms |
-| 98,304 | 62.3 ms | 64.5 ms |
-| 98,304, with Born tensors | 71.6 ms | 75.2 ms |
+| 192 | 10.8 ms | 11.6 ms |
+| 12,288 | 13.8 ms | 14.6 ms |
+| 98,304 | 62.3 ms | 64.3 ms |
+| 98,304, with Born tensors | 71.5 ms | 74.9 ms |
 
 That is about a millisecond per evaluation, and another per 100,000 atoms.

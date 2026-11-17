@@ -3,27 +3,40 @@
 A model fitted to condensed-phase data falls apart when two atoms are pushed
 closer than anything in that data. The `zbl` block hands such a pair over to
 the ZBL nuclear repulsion and switches the network off for the atoms in
-contact ([short contacts](../../docs/zbl.md)):
+contact ([short contacts](../../docs/zbl.md)). Nothing has to be assigned: the
+covalent radii place a window below every bond.
 
 ```json
-"zbl": {"window": {"O-H": [0.70, 0.90], "H-H": [1.45, 2.00], "O-O": [1.50, 1.75]}}
+"zbl": {}
 ```
 
 It holds no weights, so a trained model can be given one:
 
 ```python
 model = load_model("model.ckpt.pt")
-model.set_zbl({"window": {"O-H": [0.70, 0.90], "H-H": [1.45, 2.00], "O-O": [1.50, 1.75]}})
+model.set_zbl({})
 ```
 
-[`scan.py`](scan.py) is how to choose the windows and check them. It prints the
-shortest contact of every pair in the training data, in covalent-radius sums
-(a window's upper edge belongs at or below it), then pushes one pair of each
-kind together inside a frame, with the trained model and with the term:
+[`scan.py`](scan.py) checks it on your model, and shows which pairs need a
+window of their own. It prints the shortest contact of every pair in the
+training data, in covalent-radius sums, then pushes one pair of each kind
+together inside a frame, with the trained model and with the term:
+
+```bash
+python scan.py model.ckpt.pt frame.xyz --data train.xyz --png scan.png
+```
+
+On water the default covers the O–H bond; two oxygens and two hydrogens never
+come anywhere near a bond length in the data (1.78 and 2.05 radius sums), and
+the model falls right below those, so they get a window there:
 
 ```bash
 python scan.py model.ckpt.pt frame.xyz --data train.xyz \
-    --window O-H:0.7:0.9 H-H:1.45:2.0 O-O:1.5:1.75 --png scan.png
+    --pairs H-H:1.45:2.0 O-O:1.5:1.75 --png scan.png
+```
+
+```json
+"zbl": {"pairs": {"H-H": [1.45, 2.00], "O-O": [1.50, 1.75]}}
 ```
 
 A bonded pair is compressed by moving one atom along the bond; for any other
@@ -40,7 +53,7 @@ To see what a path should look like, evaluate the same geometries with
 something you trust, DFT or another model, and hand them back:
 
 ```bash
-python scan.py model.ckpt.pt frame.xyz --window ... --frames scan_frames.xyz
+python scan.py model.ckpt.pt frame.xyz --frames scan_frames.xyz
 ```
 
 ```python
@@ -52,7 +65,7 @@ ase.io.write("scan_reference.xyz", frames)
 ```
 
 ```bash
-python scan.py model.ckpt.pt frame.xyz --window ... \
+python scan.py model.ckpt.pt frame.xyz \
     --reference scan_reference.xyz --reference-label "DFT" --png scan.png
 ```
 

@@ -1,7 +1,8 @@
 """Push one pair together inside a real frame, with and without ``zbl``.
 
+    python scan.py model.ckpt.pt frame.xyz --data train.xyz
     python scan.py model.ckpt.pt frame.xyz --data train.xyz \\
-        --window O-H:0.7:0.9 H-H:1.45:2.0 O-O:1.5:1.75
+        --pairs H-H:1.45:2.0 O-O:1.5:1.75
 
 For every pair of elements in the frame, the first atom of one and a
 neighbour of the other are brought from their own distance down to 0.3
@@ -9,15 +10,17 @@ covalent-radius sums. A bonded pair is compressed by moving the one atom
 along the bond; for any other pair the nearest neighbour in another molecule
 is taken and its whole molecule moves, rigid, so that nothing inside either
 molecule is distorted on the way. The trained model and the same weights with
-``model.set_zbl({"window": ...})`` are compared, and below the pair's shortest
+``model.set_zbl(...)`` are compared, and below the pair's shortest
 fitted contact (``--data``; the frame's own distance without it) the curve
 with the term is judged: the energy must never fall back below where it stood
 at that contact, must end at no less than half the pair's ZBL energy, and
 must keep the long-range part and the two charges bounded.
 
-A window is ``pair:x_lo:x_hi`` in units of the pair's covalent-radius sum.
-``--data`` prints every pair's shortest contact in those units, which is where
-a window's upper edge belongs.
+Without options every pair has the default window, placed below a bond by the
+covalent radii. ``--window X_LO X_HI`` changes it for every pair and
+``--pairs PAIR:X_LO:X_HI ...`` gives single pairs their own, all in units of
+the pair's covalent-radius sum. ``--data`` prints every pair's shortest
+contact in those units, which is where a window's upper edge belongs.
 
 What moves can meet a third atom before the pair itself closes: the table
 names the closest other contact, and that contact is then what the row shows.
@@ -280,10 +283,17 @@ def main() -> None:
     parser.add_argument("--index", type=int, default=0)
     parser.add_argument(
         "--window",
+        type=float,
+        nargs=2,
+        metavar=("X_LO", "X_HI"),
+        help="every pair's window, in covalent-radius sums (default: the model's)",
+    )
+    parser.add_argument(
+        "--pairs",
         nargs="+",
-        required=True,
+        default=[],
         metavar="PAIR:X_LO:X_HI",
-        help="one window per pair of elements, in covalent-radius sums",
+        help="a window of their own for single pairs, in the same units",
     )
     parser.add_argument("--data", help="training set, for the pair floors")
     parser.add_argument("--points", type=int, default=29)
@@ -297,12 +307,15 @@ def main() -> None:
     frame = read(args.frame, index=args.index)
     plain = load_model(args.model)
     model = load_model(args.model)
-    windows = {}
-    for spec in args.window:
+    settings: dict = {"pairs": {}}
+    if args.window:
+        settings["window"] = args.window
+    for spec in args.pairs:
         pair, x_lo, x_hi = spec.split(":")
-        windows[pair] = [float(x_lo), float(x_hi)]
-    model.set_zbl({"window": windows})
-    windows = model.zbl.windows  # each pair under the one name the model keeps
+        settings["pairs"][pair] = [float(x_lo), float(x_hi)]
+    model.set_zbl(settings)
+    type_map = list(model.get_type_map())
+    print(f"zbl: {model.zbl.serialize()}")
     calcs = {"plain": LongRangeCalculator(plain), "zbl": LongRangeCalculator(model)}
     floors = pair_floors(read(args.data, index=":")) if args.data else {}
     for name, floor in floors.items():
@@ -313,7 +326,7 @@ def main() -> None:
 
     report = {
         "model": args.model,
-        "window": {name: list(window) for name, window in windows.items()},
+        "zbl": model.zbl.serialize(),
         "long_range": bool(getattr(model, "has_long_range", False)),
         "reference_label": args.reference_label,
         "pairs": {},
@@ -339,7 +352,7 @@ def main() -> None:
                 raise SystemExit(f"--reference holds another scan of {name}")
             result["reference"] = trusted[name]
         result["zbl_pair"] = zbl_pair(model, a, b, result["r"]).tolist()
-        result["window"] = [x * radius_sum(a, b) for x in windows.get(name, (0, 0))]
+        result["window"] = list(model.zbl.window_of(a, b, type_map))
         result["floor"] = floors.get(name, result["r"][0])
         result["judgement"] = judge(
             result, result["floor"], np.array(result["zbl_pair"])

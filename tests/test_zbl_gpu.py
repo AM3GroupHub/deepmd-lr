@@ -15,7 +15,7 @@ from deepmd_lr.nvalchemi import DistributedEvaluator
 from deepmd_lr.zbl import ZBL, add_envelope_gradient
 
 from .test_joint_model import LONG_RANGE
-from .test_zbl import WINDOWS, config
+from .test_zbl import BLOCK, config
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -42,7 +42,7 @@ def random_graph(dtype, n_node: int = 12, n_edge: int = 600, seed: int = 0):
 def test_the_contact_list_is_the_torch_arithmetic(dtype):
     """What inference runs on: one kernel pass, the per-node ZBL energy and
     envelope, and per edge in contact the two derivatives."""
-    zbl = ZBL(["O", "H"], {"window": WINDOWS}, device=DEVICE).eval()
+    zbl = ZBL(["O", "H"], BLOCK, device=DEVICE).eval()
     atype, edges, vec, mask, owned = random_graph(dtype, n_node=40, n_edge=120, seed=1)
     assert zbl.explicit(vec) and not zbl.train().explicit(vec)
     zbl.eval()
@@ -176,7 +176,7 @@ def test_the_md_step_reads_the_host_no_more_often(compress, long_range):
         pytest.skip("compiled DPA4C compression operator required")
     coord, atype, cell = system()
     model = build32(long_range=long_range)
-    model.set_zbl({"window": WINDOWS})
+    model.set_zbl(BLOCK)
     evaluator = DistributedEvaluator(
         model, atype, cell, devices=[DEVICE], memory_headroom=None, compress=compress
     )
