@@ -41,7 +41,7 @@ from deepmd.pt_expt.model.model import BaseModel
 from deepmd.pt_expt.utils.env import DEVICE
 from deepmd.utils.argcheck import normalize
 
-from deepmd_lr.zbl import DEFAULT_WINDOW, ZBL
+from deepmd_lr.zbl import DEFAULT_WINDOW, ZBL, normalized_settings
 
 from .test_joint_model import DESCRIPTOR, DT, FITTING, LONG_RANGE, frame
 
@@ -217,10 +217,12 @@ class TestSettings:
             ZBL(["X", "O", "H"], {"pairs": pairs})
 
     def test_retired_keys_are_named(self):
-        with pytest.raises(ValueError, match="first implementation"):
-            ZBL(["O", "H"], {"clamp": True})
-        with pytest.raises(ValueError, match="accepts only"):
-            ZBL(["O", "H"], {"trainable": True})
+        # Shared-head comparison must validate the same block the model builds.
+        for read in (normalized_settings, lambda block: ZBL(["O", "H"], block)):
+            with pytest.raises(ValueError, match="first implementation"):
+                read({"clamp": True})
+            with pytest.raises(ValueError, match="accepts only"):
+                read({"trainable": True})
 
     def test_a_type_map_without_an_element_is_refused(self):
         with pytest.raises(ValueError, match="at least one element"):
@@ -500,7 +502,7 @@ class TestContactList:
         e_edge, g = zbl._edge_terms_torch(atype, src, dst, vec, valid & owned[dst])
         energy = torch.zeros(atype.shape[0], dtype=DT).index_add(0, dst, e_edge)
         leaf = vec.clone().requires_grad_(True)
-        envelope = zbl._envelope_torch(atype, src, dst, leaf, valid)
+        envelope = zbl.envelope(atype, edges, leaf, mask)
         (dw,) = torch.autograd.grad((envelope * cotangent).sum(), leaf)
         return energy, envelope.detach(), g, dw
 
@@ -799,6 +801,56 @@ class TestModel:
         # Half way through the window the two keep a share, smoothly.
         half = model(*contact_frame(0.78)[:2], box=cell)["charge"][0]
         assert (half[:2].abs() > 0).all() and half.sum().abs().item() < 1e-12
+
+    @pytest.mark.parametrize("training", [False, True])
+    @pytest.mark.parametrize("filtered", [False, True])
+    def test_a_fully_closed_charged_frame_is_invalid(self, training, filtered):
+        cfg = config(lr=True)
+        if filtered:
+            cfg["long_range"]["charge_filter"] = [100.0, 1.0]
+        model = get_model(cfg).train(training)
+        coord, atype = dimer(0.6)
+        for total in (0.0, 1.0, -1.0):
+            state = torch.tensor([[total, 0.0]], dtype=DT, device=DEVICE)
+            out = model(coord, atype, charge_spin=state)
+            if total == 0:
+                assert out["charge"].eq(0).all()
+                assert torch.isfinite(out["energy"]).all()
+                assert torch.isfinite(out["force"]).all()
+            else:
+                assert torch.isnan(out["charge"]).all()
+                assert not torch.isfinite(out["energy"]).all()
+
+    @pytest.mark.parametrize("training", [False, True])
+    @pytest.mark.parametrize("r", [0.78, 0.6])
+    def test_filter_fallback_follows_the_envelope(self, training, r):
+        cfg = config(lr=True)
+        cfg["long_range"]["charge_filter"] = [100.0, 1.0]
+        model = get_model(cfg).train(training)
+        coord, atype, cell = contact_frame(r)
+        state = torch.tensor([[1.0, 0.0]], dtype=DT, device=DEVICE)
+        out = model(coord, atype, box=cell, charge_spin=state)
+        weight = torch.ones_like(out["charge"])
+        weight[:, :2] = step(r, "O", "H")
+        torch.testing.assert_close(out["charge"], weight / weight.sum(-1, keepdim=True))
+        # The fallback's envelope derivative belongs in the force as well.
+        h = 1e-5
+        plus, minus = coord.clone(), coord.clone()
+        plus[0, 1, 0] += h
+        minus[0, 1, 0] -= h
+        ep = model(plus, atype, box=cell, charge_spin=state)["energy"]
+        em = model(minus, atype, box=cell, charge_spin=state)["energy"]
+        fd = -(ep - em).reshape(()) / (2 * h)
+        torch.testing.assert_close(out["force"][0, 1, 0], fd, atol=2e-6, rtol=1e-6)
+        # Omitting a neutral condition skips the fallback-weight work, with
+        # the same outputs as an explicit zero target through the general path.
+        neutral = model(coord, atype, box=cell)
+        explicit = model(coord, atype, box=cell, charge_spin=torch.zeros_like(state))
+        assert neutral["charge"].eq(0).all()
+        for key in ("charge", "energy", "force", "virial"):
+            torch.testing.assert_close(
+                neutral[key], explicit[key], rtol=1e-10, atol=1e-10
+            )
 
     @pytest.mark.parametrize("r", [0.78, 0.6])
     def test_born_tensors_carry_the_envelopes_derivative(self, r):

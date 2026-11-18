@@ -1,35 +1,25 @@
 # SPDX-License-Identifier: MIT
 """Short contacts on the DPA4C neighbour graph: ZBL takes over from the network.
 
-A network fitted to condensed-phase data has seen no pair closer than its
-shortest bond, and below that it extrapolates freely. On a water model an O-H
-pair pushed from 0.70 to 0.60 A drops the fitted energy by 230 eV, all of it
-on the two atoms in contact, and a little further in their predicted charges
-reach tens of e. A few eV of pair repulsion added on top change nothing
-there, so this module does two things across a window per pair of elements:
+Across a window per pair of elements, this module combines:
 
 - **ZBL in**: the screened nuclear repulsion of Ziegler, Biersack and
   Littmark, ``V_ZBL(r) (1 - s)``;
-- **the network out**: each atom's fitted energy and raw charge are
-  multiplied by the envelope ``w_i = prod_j s(r_ij)``, the product over its
-  neighbours (mace-lr's ``charge_net.envelope``, here on the energy too).
+- **the network out**: each atom's fitted energy is multiplied by the
+  envelope ``w_i = prod_j s(r_ij)``, the product over its neighbours; its
+  per-type energy offset is retained. Charges use this envelope as the
+  projection's weight, ``q_i = w_i (raw_i + shift)``, so a closed atom takes
+  no share of the charge deficit.
 
 A window is ``[x_lo, x_hi]`` in units of the pair's covalent-radius sum,
 ``x = r / (R_i + R_j)`` with ASE's radii, and one C2 step
 ``s(x) = t^3 (10 - 15 t + 6 t^2)``, ``t = (x - x_lo) / (x_hi - x_lo)`` clamped
-to [0, 1], is exactly 0 below it and exactly 1 above. Below ``x_lo`` a pair is
-ZBL alone; with every neighbour beyond ``x_hi`` an atom's factor is exactly 1.
+to [0, 1], is exactly 0 below it and exactly 1 above. A contact below ``x_lo``
+closes both atoms' envelopes; with every neighbour beyond ``x_hi`` an atom's
+factor is exactly 1.
 
-By default every pair of elements has the same window in these units,
-:data:`DEFAULT_WINDOW`, so the covalent radii place it and nothing has to be
-assigned: a bond sits near one radius sum and its window just below it.
-``pairs`` gives single pairs a window of their own, because what the network
-has seen differs from pair to pair: two oxygens of liquid water never come
-closer than 1.8 radius sums and two hydrogens than 2.0, and the network falls
-right below each of those, far above a window placed for a bond. A window's
-``x_hi`` belongs at or below the pair's shortest contact in the data, so that
-nothing fitted changes, and its ``x_lo`` above where the network starts to
-fall.
+Every pair uses :data:`DEFAULT_WINDOW` unless overridden by ``pairs``.
+See ``docs/zbl.md`` for window selection and validation against training data.
 
 ZBL has no parameters and sees the edge vectors through no network, so its
 force and virial are assembled analytically from the per-edge derivative. The
@@ -105,12 +95,7 @@ _A_EXPONENT = 0.23
 _PHI_A = (0.18175, 0.50986, 0.28022, 0.02817)
 _PHI_B = (3.19980, 0.94229, 0.40290, 0.20162)
 
-#: The window of every pair of elements that ``pairs`` does not name, in
-#: covalent-radius sums. Measured on a DPA4C water model, whose O-H bonds stop
-#: at 0.90 and whose fitted energy falls below 0.70: a window that closes at
-#: 0.5 (mace-lr's, for the charges of a MACE model) is too late and leaves a
-#: hole of -75 eV, one that opens at 0.9 touches the data, and this one gives
-#: a wall that rises all the way in.
+#: Default window in covalent-radius sums; validation is in ``docs/zbl.md``.
 DEFAULT_WINDOW = (0.6, 0.85)
 
 _KEYS = ("window", "pairs")
@@ -198,12 +183,29 @@ def normalized_settings(settings: dict[str, Any]) -> dict[str, Any]:
     """A ``zbl`` block as the model reads it: the default window written
     out, each pair under one name, numbers as floats. Two blocks that build
     the same term compare equal."""
+    if not isinstance(settings, dict):
+        raise ValueError("zbl must be a configuration dictionary")
     settings = {k: v for k, v in settings.items() if not k.startswith("_")}
+    unknown = set(settings) - set(_KEYS)
+    if unknown:
+        retired = sorted(unknown & set(_RETIRED))
+        raise ValueError(
+            f"zbl accepts only {list(_KEYS)}, got {sorted(unknown)}"
+            + (
+                f". {retired} belonged to the first implementation; the "
+                "switch is now a window in covalent-radius sums"
+                if retired
+                else ""
+            )
+        )
     window = settings.get("window", DEFAULT_WINDOW)
-    return {
-        "window": None if window is None else list(check_window(window)),
-        "pairs": {k: list(v) for k, v in check_pairs(settings.get("pairs")).items()},
-    }
+    window = None if window is None else list(check_window(window))
+    pairs = {k: list(v) for k, v in check_pairs(settings.get("pairs")).items()}
+    if window is None and not pairs:
+        raise ValueError(
+            "zbl has no window: `window` is null and `pairs` names no pair"
+        )
+    return {"window": window, "pairs": pairs}
 
 
 class Contacts(NamedTuple):
@@ -329,31 +331,13 @@ class ZBL(torch.nn.Module):
 
     def __init__(self, type_map: list[str], settings: dict[str, Any], device=None):
         super().__init__()
-        if not isinstance(settings, dict):
-            raise ValueError("zbl must be a configuration dictionary")
-        settings = {k: v for k, v in settings.items() if not k.startswith("_")}
-        unknown = set(settings) - set(_KEYS)
-        if unknown:
-            retired = sorted(unknown & set(_RETIRED))
-            raise ValueError(
-                f"zbl accepts only {list(_KEYS)}, got {sorted(unknown)}"
-                + (
-                    f". {retired} belonged to the first implementation; the "
-                    "switch is now a window in covalent-radius sums"
-                    if retired
-                    else ""
-                )
-            )
-        window = settings.get("window", DEFAULT_WINDOW)
+        settings = normalized_settings(settings)
+        window = settings["window"]
         #: The window of every pair ``pairs`` does not name, in covalent-radius
         #: sums, or None: then only those pairs have one.
-        self.window = None if window is None else check_window(window)
+        self.window = None if window is None else tuple(window)
         #: ``{"A-B": (x_lo, x_hi)}``, the pairs with a window of their own.
-        self.pairs = check_pairs(settings.get("pairs"))
-        if self.window is None and not self.pairs:
-            raise ValueError(
-                "zbl has no window: `window` is null and `pairs` names no pair"
-            )
+        self.pairs = {k: tuple(v) for k, v in settings["pairs"].items()}
         # A type that is not an element -- ASE's dummy "X" heads this
         # repository's periodic-table type maps -- has no nucleus: Z = 0, and
         # can be in no window.
@@ -511,36 +495,6 @@ class ZBL(torch.nn.Module):
 
     # ------------------------------------------------------------ envelope
 
-    def _envelope_torch(
-        self,
-        atype: torch.Tensor,
-        src: torch.Tensor,
-        dst: torch.Tensor,
-        edge_vec: torch.Tensor,
-        valid: torch.Tensor,
-    ) -> torch.Tensor:
-        """The envelope as torch arithmetic, differentiable to any order."""
-        r2 = edge_vec.square().sum(-1)
-        # Padded edges carry a zero vector: give them a harmless distance.
-        r = torch.sqrt(torch.where(valid, r2, torch.ones_like(r2)))
-        ri, ro, _ti = self._pair_window(atype, src, dst)
-        ri, ro = ri.to(r.dtype), ro.to(r.dtype)
-        width = torch.where(ro > ri, ro - ri, torch.ones_like(ro))
-        t = ((r - ri) / width).clamp(0.0, 1.0)
-        s = t * t * t * (t * (6.0 * t - 15.0) + 10.0)
-        inside = valid & (r < ro)
-        # A product of exact zeros and ones, summed as logarithms: an edge
-        # outside its window adds log 1 = 0, and one at or below the lower
-        # edge the constant -inf, which makes the product and its derivatives
-        # exactly zero without differentiating log(0).
-        closed = inside & (s <= 0)
-        log_s = torch.where(inside & ~closed, s, torch.ones_like(s)).log()
-        log_s = torch.where(closed, torch.full_like(s, -torch.inf), log_s)
-        log_w = torch.zeros(atype.shape[0], dtype=r.dtype, device=r.device).index_add(
-            0, dst, log_s
-        )
-        return torch.exp(log_w)
-
     def envelope(
         self,
         atype: torch.Tensor,
@@ -561,7 +515,11 @@ class ZBL(torch.nn.Module):
         src, dst = edge_index[0].long(), edge_index[1].long()
         real = (atype >= 0) & (atype < self.numbers.numel())
         valid = edge_mask.bool() & real[src] & real[dst]
-        return self._envelope_torch(atype, src, dst, edge_vec, valid)
+        log_s, _ = self._step_terms_torch(atype, src, dst, edge_vec, valid)
+        log_w = torch.zeros(
+            atype.shape[0], dtype=log_s.dtype, device=log_s.device
+        ).index_add(0, dst, log_s)
+        return torch.exp(log_w)
 
     def _step_terms_torch(
         self,
@@ -570,15 +528,17 @@ class ZBL(torch.nn.Module):
         dst: torch.Tensor,
         vec: torch.Tensor,
         valid: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Per edge, what its step does to its destination's envelope:
-        ``log s`` (0 unless the edge is inside its window), whether it closes
-        the destination (at or below the lower edge), and ``d log s / d
-        edge_vec`` (0 where the step is flat). The kernel's ``_log_step``,
-        for float64 vectors of any number of edges."""
+        *,
+        derivative: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Per-edge ``log s`` in the vector's dtype, and optionally its
+        analytic gradient for the contact list. Training differentiates the
+        log step itself and needs no explicit gradient."""
         r2 = vec.square().sum(-1)
+        # Padded edges carry a zero vector: give them a harmless distance.
         r = torch.sqrt(torch.where(valid, r2, torch.ones_like(r2)))
         ri, ro, _ti = self._pair_window(atype, src, dst)
+        ri, ro = ri.to(r.dtype), ro.to(r.dtype)
         width = torch.where(ro > ri, ro - ri, torch.ones_like(ro))
         t = ((r - ri) / width).clamp(0.0, 1.0)
         s = t * t * t * (t * (6.0 * t - 15.0) + 10.0)
@@ -586,13 +546,18 @@ class ZBL(torch.nn.Module):
         closed = inside & (s <= 0)
         partial = inside & ~closed
         s = torch.where(partial, s, torch.ones_like(s))
+        # A closed edge contributes the constant -inf: exp(sum(log s)) and
+        # its derivatives are exactly zero, without differentiating log(0).
+        log_s = torch.where(closed, torch.full_like(s, -torch.inf), s.log())
+        if not derivative:
+            return log_s, None
         # d s / d r = 30 t^2 (1 - t)^2 / width, over s for the logarithm.
         dlog = torch.where(
             partial,
             30.0 * t * t * (1.0 - t) * (1.0 - t) / (width * s),
             torch.zeros_like(s),
         )
-        return s.log(), closed, (dlog / r).unsqueeze(-1) * vec
+        return log_s, (dlog / r).unsqueeze(-1) * vec
 
     def inside(
         self,
@@ -818,12 +783,13 @@ class ZBL(torch.nn.Module):
         edge, src, dst, vec = edge[kept], src[kept], dst[kept], vec[kept]
         valid = torch.ones_like(edge, dtype=torch.bool)
         e_edge, g = self._edge_terms_torch(atype, src, dst, vec, owned[dst])
-        log_s, closed, dlog = self._step_terms_torch(atype, src, dst, vec, valid)
+        log_s, dlog = self._step_terms_torch(
+            atype, src, dst, vec, valid, derivative=True
+        )
         zero = torch.zeros(n_node, dtype=torch.float64, device=device)
         energy = zero.index_add(0, dst, e_edge)
         log_w = zero.index_add(0, dst, log_s)
-        n_closed = zero.index_add(0, dst, closed.to(torch.float64))
-        envelope = torch.where(n_closed > 0, zero, torch.exp(log_w))
+        envelope = torch.exp(log_w)
         return Contacts(energy, envelope, edge, src, dst, vec, g, dlog)
 
     # -------------------------------------------------------- graph output

@@ -72,6 +72,37 @@ class TestFilter:
             out, torch.full((1, 4), 0.25e-3, dtype=torch.float64)
         )
 
+    @pytest.mark.parametrize("total", [0.0, 1.0])
+    def test_weighted_fallback_is_masked_normalized_and_differentiable(self, total):
+        from deepmd_lr.fitting.charge import project_to_total_charge
+
+        raw = torch.tensor([[0.2, -0.1, 0.3, 5.0]], dtype=torch.float64)
+        mask = torch.tensor([[True, True, True, False]])
+        w = torch.tensor(
+            [[0.0, 0.1, 0.2, 1.0]], dtype=torch.float64, requires_grad=True
+        )
+
+        def filtered(w):
+            weight = w * mask
+            charge = project_to_total_charge(raw, total, mask=weight)
+            return filter_charges(
+                charge, total, (10.0, 1.0), mask, fallback_weight=weight
+            )
+
+        torch.testing.assert_close(
+            filtered(w), total * torch.tensor([[0.0, 1 / 3, 2 / 3, 0.0]], dtype=w.dtype)
+        )
+        # Sum below one must still be normalized; padding takes no share.
+        assert torch.autograd.gradcheck(filtered, (w,))
+        assert torch.autograd.gradgradcheck(filtered, (w,))
+
+    def test_fallback_weight_does_not_reweight_surviving_charges(self):
+        charge = torch.tensor([[0.0, 0.3, 0.7]], dtype=torch.float64)
+        weight = torch.tensor([[0.0, 0.2, 1.0]], dtype=charge.dtype)
+        plain = filter_charges(charge, 1.0, (0.2, 0.1))
+        weighted = filter_charges(charge, 1.0, (0.2, 0.1), fallback_weight=weight)
+        torch.testing.assert_close(weighted, plain, rtol=0, atol=0)
+
     def test_the_weight_is_c3(self):
         """Value and first three derivatives continuous at both ends of the
         transition: zero at the lower end, (1, 0, 0, 0) at the upper."""

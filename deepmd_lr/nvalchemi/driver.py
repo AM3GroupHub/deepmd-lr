@@ -216,9 +216,7 @@ def _owned(values, n_owned: int):
 
 def _on_nodes(owned_values: torch.Tensor, part: Partition) -> torch.Tensor:
     """Per-owned-atom values on the partition's node axis, zero on ghosts."""
-    out = torch.zeros(
-        part.n_node, dtype=owned_values.dtype, device=owned_values.device
-    )
+    out = torch.zeros(part.n_node, dtype=owned_values.dtype, device=owned_values.device)
     out[: part.n_owned] = owned_values.detach()
     return out
 
@@ -848,9 +846,7 @@ def _born_charges_partitioned(
                 local = item.envelope * shifted
             (g,) = torch.autograd.grad(local.sum(), leaf, retain_graph=True)
             reusable = None
-            if cap is not None and (
-                item.envelope is None or item.contacts is not None
-            ):
+            if cap is not None and (item.envelope is None or item.contacts is not None):
                 reusable = g
             if item.contacts is not None:
                 # The envelope was a plain factor: d local / d w = raw + shift.
@@ -1058,7 +1054,13 @@ def _long_range_global(
     if charge_filter is not None:
         # Inside this graph, so dE/dq below already carries the filter to the
         # charge-response force.
-        charge = filter_charges(charge, total_charge, charge_filter, mask=mask)
+        charge = filter_charges(
+            charge,
+            total_charge,
+            charge_filter,
+            mask=mask,
+            fallback_weight=weight if envelope_t is not None else None,
+        )
     if term is None:
         term = model.long_range_energy
     atom_energy = term(coord_in, charge, cell_in)

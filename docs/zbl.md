@@ -41,6 +41,17 @@ Below `x_lo` a pair is its energy offsets plus ZBL and carries no charge. With
 every neighbour beyond its window an atom's envelope is exactly 1, and the model
 is the one that was trained.
 
+A charged frame needs at least one eligible atom with a nonzero envelope to
+carry its total charge. If every envelope closes, a nonzero requested total
+produces NaN charges and energy: the constraints cannot both be satisfied.
+The MD engine rejects this through its non-finite-energy check, without an
+extra GPU-to-host check during evaluation. A fully closed neutral frame remains
+valid and carries zero charge.
+
+If `charge_filter` removes every charge, its fallback distributes the total
+according to the envelope weights. Closed atoms remain uncharged, and partially
+open atoms take a proportional share; the force includes this dependence.
+
 ## The windows
 
 | key | default | |

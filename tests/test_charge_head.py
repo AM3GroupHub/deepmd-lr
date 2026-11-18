@@ -104,14 +104,10 @@ class TestProjection:
     def test_mask_excludes_padding(self):
         """Padding atoms take no share of the deficit and come back as zero."""
         raw = torch.randn(2, 6, dtype=torch.float64)
-        mask = torch.tensor(
-            [[1, 1, 1, 1, 0, 0], [1, 1, 1, 0, 0, 0]], dtype=torch.bool
-        )
+        mask = torch.tensor([[1, 1, 1, 1, 0, 0], [1, 1, 1, 0, 0, 0]], dtype=torch.bool)
         q = project_to_total_charge(raw, 1.0, mask=mask)
         assert torch.allclose(q[~mask], torch.zeros(5, dtype=torch.float64))
-        assert torch.allclose(
-            q.sum(-1), torch.ones(2, dtype=torch.float64), atol=1e-12
-        )
+        assert torch.allclose(q.sum(-1), torch.ones(2, dtype=torch.float64), atol=1e-12)
 
     def test_shift_is_uniform(self):
         """The correction is a constant shift, so charge *differences* survive."""
@@ -162,6 +158,30 @@ class TestProjection:
         assert torch.isfinite(q).all()
         q.sum().backward()
         assert torch.isfinite(raw.grad).all()
+
+    @pytest.mark.parametrize("backend", ["numpy", "torch"])
+    @pytest.mark.parametrize("per_frame", [False, True])
+    def test_closed_weights_cannot_silently_drop_a_nonzero_total(
+        self, backend, per_frame
+    ):
+        raw = np.array([[-0.6, -0.3, 0.2]] * 3)
+        weight = np.array([[0.0, 0.0, 0.0], [0.0, 0.1, 0.2], [1.0, 1.0, 1.0]])
+        total = np.array([1.0, -1.0, 0.0]) if per_frame else 1.0
+        if backend == "torch":
+            raw, weight = (torch.as_tensor(x, device=DEVICE) for x in (raw, weight))
+            if per_frame:
+                total = torch.as_tensor(total, device=DEVICE)
+        charge = project_to_total_charge(raw, total, mask=weight)
+        if backend == "torch":
+            charge = charge.cpu().numpy()
+        assert np.isnan(charge[0]).all()
+        np.testing.assert_allclose(
+            charge[1:].sum(-1), [-1.0, 0.0] if per_frame else 1.0
+        )
+        neutral = project_to_total_charge(raw, 0.0, mask=weight)
+        if backend == "torch":
+            neutral = neutral.cpu().numpy()
+        assert np.isfinite(neutral).all() and (neutral[0] == 0).all()
 
 
 class TestRegistration:

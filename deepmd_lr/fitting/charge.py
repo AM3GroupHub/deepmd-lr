@@ -140,6 +140,8 @@ def filter_charges(
     total_charge: Any,
     charge_filter: tuple[float, float],
     mask: torch.Tensor | None = None,
+    *,
+    fallback_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     r"""Switch small charges off, smoothly, and restore the total on the rest.
 
@@ -160,11 +162,14 @@ def filter_charges(
     .. math:: q'_i = y_i q_i + y_i (Q - \sum_j y_j q_j) / \sum_j y_j ,
 
     so an atom switched off stays exactly at zero. A frame with no atom left
-    above the threshold spreads ``Q`` uniformly, as the plain projection does.
+    above the threshold spreads ``Q`` uniformly, as the plain projection does,
+    or according to ``fallback_weight`` when the projection was weighted.
 
     ``charge`` is ``(nf, nloc)`` and already satisfies the total; ``mask``
     marks the real atoms. Differentiable, so autograd carries the filter into
-    the charge-response force.
+    the charge-response force. ``fallback_weight`` is the full weight passed
+    to the projection, including zeros for padding and excluded atoms. It
+    affects only the fallback, so the surviving charges are not reweighted.
     """
     dtype = charge.dtype
     weight = torch.ones_like(charge) if mask is None else mask.to(dtype)
@@ -179,7 +184,16 @@ def filter_charges(
         total = total.reshape(-1).expand(charge.shape[0])
     deficit = total - kept.sum(dim=-1)
     y_sum = y.sum(dim=-1)
-    n_real = torch.clamp(weight.sum(dim=-1), min=1.0)
+    # A known neutral total makes every empty-filter fallback exactly zero.
+    # Keep that common path independent of the envelope's autograd graph.
+    if fallback_weight is None or (
+        not hasattr(total_charge, "shape") and total_charge == 0
+    ):
+        n_real = torch.clamp(weight.sum(dim=-1), min=1.0)
+    else:
+        weight = fallback_weight.to(dtype)
+        n_real = weight.sum(dim=-1)
+        n_real = torch.where(n_real > 0, n_real, torch.ones_like(n_real))
     any_kept = y_sum > 0
     share = torch.where(
         any_kept[:, None],
@@ -239,7 +253,10 @@ def project_to_total_charge(
     -------
     Array
         Constrained charges, shape ``(nf, nloc)``. Summing over ``nloc``
-        reproduces ``total_charge`` for every frame.
+        reproduces ``total_charge`` for frames with nonzero total weight.
+        Floating weights that are all zero cannot carry a nonzero total:
+        that frame returns NaN charges. Neutral frames and all-padding
+        boolean masks still return zeros. No device-to-host check is needed.
     """
     xp = array_api_compat.array_namespace(raw_charge)
     dtype = raw_charge.dtype
@@ -260,10 +277,18 @@ def project_to_total_charge(
     else:
         target = xp.astype(xp.reshape(target, (-1,)), dtype)
 
-    # A frame with no real atoms has nothing to correct; guard the divide so it
-    # yields 0 rather than a NaN that would poison the whole batch's gradients.
+    # Keep empty neutral/padding frames differentiable with a safe denominator.
     safe_n = xp.where(n_real > 0, n_real, xp.ones_like(n_real))
-    shift = xp.where(n_real > 0, (target - current) / safe_n, xp.zeros_like(n_real))
+    empty = xp.zeros_like(n_real)
+    if mask is not None and xp.isdtype(mask.dtype, "real floating"):
+        # A closed envelope cannot carry Q != 0. Fail through non-finite
+        # outputs (as ZBL contact overflow does), without synchronizing CUDA.
+        # A scalar neutral target needs no additional device operations.
+        if hasattr(total_charge, "shape"):
+            empty = xp.where(target == 0, empty, xp.full_like(empty, float("nan")))
+        elif total_charge != 0:
+            empty = xp.full_like(empty, float("nan"))
+    shift = xp.where(n_real > 0, (target - current) / safe_n, empty)
 
     return (raw_charge + shift[..., None]) * weight
 

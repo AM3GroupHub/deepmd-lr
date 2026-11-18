@@ -22,7 +22,7 @@ from deepmd_lr.nvalchemi import DistributedEvaluator
 from deepmd_lr.zbl import ZBL, add_envelope_gradient
 
 from .test_joint_model import LONG_RANGE
-from .test_zbl import BLOCK, config
+from .test_zbl import BLOCK, config, contact_frame, dimer, twins
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -71,7 +71,7 @@ def test_the_contact_list_is_the_torch_arithmetic(dtype):
     e_edge, g_ref = zbl._edge_terms_torch(atype, src, dst, vec, valid & owned[dst])
     e_ref = torch.zeros_like(found.energy).index_add(0, dst, e_edge)
     leaf = vec.clone().requires_grad_(True)
-    w_ref = zbl._envelope_torch(atype, src, dst, leaf, valid).double()
+    w_ref = zbl.envelope(atype, edges, leaf, mask).double()
     cotangent = torch.randn(
         40, generator=torch.Generator().manual_seed(2), dtype=torch.float64
     ).to(DEVICE)
@@ -364,9 +364,66 @@ def test_the_compiled_exports_keep_the_term(tmp_path, monkeypatch):
     check(compressed, "dpa4c_canonical")
 
 
+@pytest.mark.parametrize("partitions", [1, 2])
+@pytest.mark.parametrize("r", [0.78, 0.6])
+def test_charged_filter_fallback_agrees_across_partitions(partitions, r):
+    model, _ = twins(lr=True)
+    model.charge_filter = (100.0, 1.0)
+    coord, atype, cell = contact_frame(r)
+    state = torch.tensor([[1.0, 0.0]], dtype=coord.dtype, device=DEVICE)
+    reference = model(coord, atype, box=cell, charge_spin=state)
+    xyz, types, box = (x[0].cpu().numpy() for x in (coord, atype, cell))
+    evaluator = DistributedEvaluator(
+        model,
+        types,
+        box,
+        devices=[DEVICE] * partitions,
+        charge_spin=[1.0, 0.0],
+        charge_filter=model.charge_filter,
+        compute_virial=True,
+        memory_headroom=None,
+    )
+    evaluator(xyz)
+    for key in ("energy", "force", "virial", "charge"):
+        np.testing.assert_allclose(
+            np.asarray(evaluator.results[key]).reshape(-1),
+            reference[key].detach().cpu().numpy().reshape(-1),
+            atol=1e-8,
+            rtol=1e-8,
+        )
+    assert np.asarray(evaluator.results["charge"]).sum() == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("filtered", [False, True])
+def test_md_rejects_a_fully_closed_charged_frame(filtered):
+    from ase import Atoms
+
+    from deepmd_lr.nvalchemi import MDInstabilityError, VelocityVerlet
+
+    model, _ = twins(lr=True)
+    coord, atype = dimer(0.6)
+    xyz, types = (x[0].cpu().numpy() for x in (coord, atype))
+    atoms = Atoms("OH", positions=xyz, cell=np.eye(3) * 14, pbc=True)
+    evaluator = DistributedEvaluator(
+        model,
+        types,
+        atoms.cell.array,
+        devices=[DEVICE, DEVICE],
+        charge_spin=[1.0, 0.0],
+        charge_filter=(100.0, 1.0) if filtered else None,
+        memory_headroom=None,
+    )
+    md = VelocityVerlet(evaluator, atoms, timestep=0.1, logfile=None)
+    with pytest.raises(MDInstabilityError, match="non-finite energy"):
+        md.run(1)
+    assert md.nsteps == 0
+
+
 @pytest.mark.parametrize("compress", [False, True])
-@pytest.mark.parametrize("long_range", [False, True])
-def test_the_md_step_reads_the_host_no_more_often(compress, long_range):
+@pytest.mark.parametrize(
+    ("long_range", "filtered"), [(False, False), (True, False), (True, True)]
+)
+def test_the_md_step_reads_the_host_no_more_often(compress, long_range, filtered):
     """The kernels read nothing back: a step with the term makes the same
     number of downloads as one without (`tests/test_sync.py`)."""
     from .test_compress import build32
@@ -378,6 +435,13 @@ def test_the_md_step_reads_the_host_no_more_often(compress, long_range):
     model = build32(long_range=long_range)
     model.set_zbl(BLOCK)
     evaluator = DistributedEvaluator(
-        model, atype, cell, devices=[DEVICE], memory_headroom=None, compress=compress
+        model,
+        atype,
+        cell,
+        devices=[DEVICE],
+        memory_headroom=None,
+        compress=compress,
+        charge_spin=[1.0, 0.0] if filtered else None,
+        charge_filter=(100.0, 1.0) if filtered else None,
     )
     assert_downloads(count_syncs(evaluator, coord), 1 if compress else 2)

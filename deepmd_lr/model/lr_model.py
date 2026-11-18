@@ -215,9 +215,7 @@ def _run_backbone(model, graph, atype_flat, charge_spin):
     """
     descriptor = model.atomic_model.descriptor
     kwargs = (
-        {"charge_spin": charge_spin}
-        if model.atomic_model.supports_charge_spin
-        else {}
+        {"charge_spin": charge_spin} if model.atomic_model.supports_charge_spin else {}
     )
     return descriptor.call_graph(
         graph,
@@ -432,9 +430,7 @@ class LongRangeEnergyModel(EnergyModel):
     def has_long_range(self) -> bool:
         """Whether a long-range term is configured. Without one this model is
         exactly the standard energy model."""
-        return (
-            self.charge_fitting is not None and self.long_range_energy is not None
-        )
+        return self.charge_fitting is not None and self.long_range_energy is not None
 
     def long_range_energy_for(
         self, cell: Any, pbc: Any, settings: dict[str, Any] | None = None
@@ -982,11 +978,7 @@ class LongRangeEnergyModel(EnergyModel):
         nf, nloc = atype.shape[0], atype.shape[1]
         atype_flat = atype.reshape(-1)
         raw = self.raw_charges(features, rot_mat, atype_flat).reshape(nf, nloc)
-        total = (
-            charge_spin[:, 0].to(raw.dtype)
-            if charge_spin is not None
-            else torch.zeros(nf, dtype=raw.dtype, device=raw.device)
-        )
+        total = charge_spin[:, 0].to(raw.dtype) if charge_spin is not None else 0.0
         if contacts is not None:
             envelope = contacts.envelope.to(raw.dtype).reshape(nf, nloc)
             envelope = envelope.clone().requires_grad_(True)
@@ -1046,7 +1038,7 @@ class LongRangeEnergyModel(EnergyModel):
             else isolated_term_for(self.long_range_energy)
         )
         mask = charge_mask(self, atype)
-        filtered = self._charge_filter_for(charge_spin, nf, coord, mask)
+        filtered = self._charge_filter_for(charge_spin, mask)
         args = (term, geometry, atype, charge_spin, mask, filtered)
         if shared is not None:
             result = self._shared_long_range(shared, *args)
@@ -1071,12 +1063,10 @@ class LongRangeEnergyModel(EnergyModel):
     def _charge_filter_for(
         self,
         charge_spin: torch.Tensor | None,
-        nf: int,
-        coord: torch.Tensor,
         mask: torch.Tensor,
-    ) -> Callable[[torch.Tensor], torch.Tensor]:
-        """The charge filter this evaluation applies, as ``projected ->
-        charge`` (the identity without one)."""
+    ) -> Callable[[_Charges], torch.Tensor]:
+        """Filter the projected charges, retaining their envelope for the
+        fallback; return them unchanged without a filter."""
         if self.training and self.charge_filter is not None:
             raise RuntimeError(
                 "a simulation-time charge_filter override is set; clear it "
@@ -1085,19 +1075,23 @@ class LongRangeEnergyModel(EnergyModel):
             )
         charge_filter = self.effective_charge_filter
         if charge_filter is None:
-            return lambda projected: projected
+            return lambda charges: charges.projected
         if self.compute_born:
             raise NotImplementedError(
                 "charge_filter cannot be combined with Born charges yet: "
                 "the Born tensor is built from the unfiltered charges"
             )
-        total = (
-            charge_spin[:, 0].to(coord.dtype)
-            if charge_spin is not None
-            else torch.zeros(nf, dtype=coord.dtype, device=coord.device)
-        )
-        return lambda projected: filter_charges(
-            projected, total, charge_filter, mask=mask
+        total = charge_spin[:, 0] if charge_spin is not None else 0.0
+        return lambda charges: filter_charges(
+            charges.projected,
+            total,
+            charge_filter,
+            mask=mask,
+            fallback_weight=(
+                None
+                if charges.envelope is None or charge_spin is None
+                else charges.envelope * mask
+            ),
         )
 
     def _shared_long_range(
@@ -1108,7 +1102,7 @@ class LongRangeEnergyModel(EnergyModel):
         atype: torch.Tensor,
         charge_spin: torch.Tensor | None,
         mask: torch.Tensor,
-        filtered: Callable[[torch.Tensor], torch.Tensor],
+        filtered: Callable[[_Charges], torch.Tensor],
     ) -> dict[str, torch.Tensor | None]:
         """The long-range energy and its derivatives on the captured backbone.
 
@@ -1134,7 +1128,7 @@ class LongRangeEnergyModel(EnergyModel):
             return_raw=True,
         )
         contacts = shared.get("contacts")
-        charge = filtered(charges.projected)
+        charge = filtered(charges)
         atom_energy = term(geometry.coord, charge, geometry.box, mask=mask)
         edge_vec = shared["edge_vec"]
         leaves = [geometry.leaf, geometry.eps, edge_vec]
@@ -1195,7 +1189,7 @@ class LongRangeEnergyModel(EnergyModel):
         atype: torch.Tensor,
         charge_spin: torch.Tensor | None,
         mask: torch.Tensor,
-        filtered: Callable[[torch.Tensor], torch.Tensor],
+        filtered: Callable[[_Charges], torch.Tensor],
     ) -> dict[str, torch.Tensor | None]:
         """The long-range energy and its derivatives from a second backbone
         pass on a graph strained with ``geometry``, for when the energy path
@@ -1221,7 +1215,7 @@ class LongRangeEnergyModel(EnergyModel):
             strain=geometry.strain,
             return_raw=True,
         )
-        charge = filtered(charges.projected)
+        charge = filtered(charges)
         atom_energy = term(geometry.coord, charge, geometry.box, mask=mask)
         grad_coord, grad_eps = torch.autograd.grad(
             atom_energy.sum(),

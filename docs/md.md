@@ -58,7 +58,8 @@ attacks the cause in training; the filter removes what is left.
 The filter weights projected charges by a C³ polynomial: zero for
 `|q| <= c_t - delta`, one for `|q| >= c_t + delta`. It then restores the
 total charge in proportion to those weights. If every weight is zero,
-the total charge is distributed uniformly over real atoms.
+the total charge is distributed uniformly over real atoms, or in proportion to
+their [ZBL envelopes](zbl.md) when enabled. A closed envelope receives no charge.
 
 **Train with it**, so the model learns its interface with the charges it will
 run with:
