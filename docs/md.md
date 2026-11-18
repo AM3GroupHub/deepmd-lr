@@ -58,7 +58,8 @@ attacks the cause in training; the filter removes what is left.
 The filter weights projected charges by a C³ polynomial: zero for
 `|q| <= c_t - delta`, one for `|q| >= c_t + delta`. It then restores the
 total charge in proportion to those weights. If every weight is zero,
-the total charge is distributed uniformly over real atoms.
+the total charge is distributed uniformly over real atoms, or in proportion to
+their [ZBL envelopes](zbl.md) when enabled. A closed envelope receives no charge.
 
 **Train with it**, so the model learns its interface with the charges it will
 run with:
@@ -120,7 +121,9 @@ Measured on that C/Si model (`ener_lr`, `pref_qn` 100) with (3.5e-3, 1.5e-3):
   stop the run. A failed evaluation, including one during frame
   restoration, leaves `atoms` and the evaluator in the start's orientation
   with their cached results invalidated. Pre-relax with a classical force
-  field ([below](#relaxing-a-packed-box-first)).
+  field ([below](#relaxing-a-packed-box-first)). A [`zbl`](zbl.md) block
+  guards a pair contact in otherwise normal surroundings; it does not rescue
+  a packed box.
 - **Check conservation with NVE first**
   ([above](#check-energy-conservation-before-trusting-a-trajectory)).
   Langevin conserves nothing, and under a field nothing is conserved at all.

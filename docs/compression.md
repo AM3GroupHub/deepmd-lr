@@ -18,6 +18,25 @@ Compress once per process, after loading; it is inference-only. A failed
 compression leaves the descriptor and `DP_CUDA_INFER` as they were, so the
 inputs can be corrected and retried.
 
+A compressed model runs in evaluation mode only. It may be compressed in
+either mode, but a forward in training mode, where the descriptor would skip
+its kernel without saying so, is refused, and so is `.train()` afterwards.
+
+**For LAMMPS**, a short-range model goes through DeePMD-kit's own commands,
+which write the compact compressed `.pt2` that `pair_style deepmd` runs
+(Kokkos included); a [`zbl`](zbl.md) block stays with it. A model with
+`long_range` has no export ([MD](md.md)).
+
+```bash
+dp --pt-expt freeze -c model.ckpt.pt -o model.pt2
+dp --pt-expt compress -i model.pt2 -o model_c.pt2
+```
+
+The compact lower needs a fitting net DeePMD-kit's fused operators serve:
+`float32` and `"resnet_dt": false`. With the default `resnet_dt` (a per-layer
+timestep, which those operators do not implement) `dp compress` still writes
+a correct file, on the graph lower instead of the compact one.
+
 **Requirements**
 
 - A deepmd-kit **built from source with the CUDA operators** (below). The PyPI
@@ -27,8 +46,10 @@ inputs can be corrected and retried.
   torch.ops.deepmd.dpa4c_graph_compress ...`.
 - `DP_CUDA_INFER=1`, set for you if unset. Level 2 is refused for a model with
   `long_range`: its fused energy/force path bypasses the shared backbone, the
-  charge response and the Born charges. A model without `long_range` may set
-  `DP_CUDA_INFER=2` (force as a value, no autograd).
+  charge response and the Born charges. A short-range model may set
+  `DP_CUDA_INFER=2` (force as a value, no autograd), with or without a
+  [`zbl`](zbl.md) block: the fused operators take its envelope as a weight
+  per atom.
 - A `float32` descriptor with no `exclude_types` (upstream's rule).
 
 **What it changes**

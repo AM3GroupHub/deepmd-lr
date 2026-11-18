@@ -151,6 +151,7 @@ def born_charges(
     *,
     create_graph: bool = False,
     eps_inf: float = 1.0,
+    finish_gradient: Any = None,
 ) -> torch.Tensor:
     """Per-atom Born effective charge tensors, shape ``(nf, nloc, 3, 3)``.
 
@@ -180,6 +181,11 @@ def born_charges(
         multiplied by :math:`\\sqrt{\\varepsilon_\\infty}`, the factor that
         turns the model's Coulomb charges into screened ones; see
         :func:`screening_factor`. ``1.0`` (vacuum) changes nothing.
+    finish_gradient
+        Called on ``d raw / d edge_vec`` before it is reduced, for a caller
+        whose ``raw`` holds a factor it keeps out of the autograd graph: the
+        short-contact envelope in inference, whose share is added from its
+        list of contacts (:func:`deepmd_lr.zbl.add_envelope_gradient`).
 
     Returns
     -------
@@ -205,6 +211,8 @@ def born_charges(
     (g,) = torch.autograd.grad(
         raw.sum(), edge_vec, create_graph=create_graph, retain_graph=True
     )
+    if finish_gradient is not None:
+        g = finish_gradient(g)
     # Defensive, not load-bearing: DPA4C multiplies its cutoff envelope by the
     # mask, so a guard edge already contributes an identically zero gradient.
     # `edge_force_virial` masks anyway, and so do we -- a future builder that

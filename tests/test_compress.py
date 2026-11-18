@@ -382,11 +382,25 @@ class TestKernel:
         with pytest.raises(RuntimeError, match="DP_CUDA_INFER"):
             model(coord, atype, box=cell)
 
-    def test_training_mode_is_refused(self):
-        model = build32()
-        model.train()
-        with pytest.raises(RuntimeError, match="eval"):
-            model.enable_compression()
+    def test_compressed_in_training_mode_it_runs_only_after_eval(self):
+        """``dp compress`` compresses the model it has just deserialized,
+        which is in training mode, and serializes it: accepted. A forward in
+        that state, where the descriptor would skip its kernel without
+        saying so, is not, and DeePMD-kit refuses a later ``.train()``."""
+        plain, packed = twins()
+        packed.train()
+        packed.enable_compression()
+        assert packed.atomic_model.descriptor.compress
+        coord, atype, cell = frame()
+        with pytest.raises(RuntimeError, match="called in training mode"):
+            packed(coord, atype, box=cell)
+        packed.eval()
+        a = plain(coord, atype, box=cell)
+        b = packed(coord, atype, box=cell)
+        assert float((a["energy"] - b["energy"]).abs().max()) <= 1e-3
+        assert float((a["force"] - b["force"]).abs().max()) <= 2e-3
+        with pytest.raises(RuntimeError, match="cannot re-enter training"):
+            packed.train()
 
     @pytest.mark.parametrize("stride", [0.01, 0.002])
     def test_compressed_matches_uncompressed(self, stride):

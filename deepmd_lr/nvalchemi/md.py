@@ -346,6 +346,10 @@ def _fingerprint(evaluator: Any, masses: np.ndarray, fixed: Any = ()) -> dict:
         fingerprint["fixed_sha1"] = hashlib.sha1(
             np.asarray(fixed, dtype=np.int64).tobytes()
         ).hexdigest()
+    zbl = getattr(evaluator.model, "zbl", None)
+    if zbl is not None:
+        # And only with the term: it changes the energy surface at a contact.
+        fingerprint["zbl"] = zbl.serialize()
     return fingerprint
 
 

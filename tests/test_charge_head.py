@@ -104,14 +104,10 @@ class TestProjection:
     def test_mask_excludes_padding(self):
         """Padding atoms take no share of the deficit and come back as zero."""
         raw = torch.randn(2, 6, dtype=torch.float64)
-        mask = torch.tensor(
-            [[1, 1, 1, 1, 0, 0], [1, 1, 1, 0, 0, 0]], dtype=torch.bool
-        )
+        mask = torch.tensor([[1, 1, 1, 1, 0, 0], [1, 1, 1, 0, 0, 0]], dtype=torch.bool)
         q = project_to_total_charge(raw, 1.0, mask=mask)
         assert torch.allclose(q[~mask], torch.zeros(5, dtype=torch.float64))
-        assert torch.allclose(
-            q.sum(-1), torch.ones(2, dtype=torch.float64), atol=1e-12
-        )
+        assert torch.allclose(q.sum(-1), torch.ones(2, dtype=torch.float64), atol=1e-12)
 
     def test_shift_is_uniform(self):
         """The correction is a constant shift, so charge *differences* survive."""
@@ -134,6 +130,26 @@ class TestProjection:
             lambda x: project_to_total_charge(x, 1.0), (raw,)
         )
 
+    def test_a_weight_switches_a_charge_off_smoothly(self):
+        """A mask in [0, 1] is a weight, ``q = w (raw + shift)``: the atom
+        with weight 0 carries nothing whatever offset the raw charges have,
+        the total is kept, and weight 1 everywhere is the plain projection."""
+        from deepmd_lr.fitting.charge import projection_shift
+
+        kind = {"dtype": torch.float64, "device": DEVICE}
+        raw = torch.tensor([[-0.6, -0.3, -0.3, -0.7]], **kind)
+        for first in (0.0, 0.25, 1.0):
+            weight = torch.tensor([[first, 1.0, 1.0, 1.0]], **kind)
+            charge = project_to_total_charge(raw, 0.5, mask=weight)
+            shift = projection_shift(charge, raw, weight)
+            assert charge.sum().item() == pytest.approx(0.5, abs=1e-14)
+            torch.testing.assert_close(charge, weight * (raw + shift[:, None]))
+            if first == 0.0:
+                assert charge[0, 0].item() == 0.0
+                assert shift.item() == pytest.approx((0.5 + 1.3) / 3)
+            if first == 1.0:
+                torch.testing.assert_close(charge, project_to_total_charge(raw, 0.5))
+
     def test_no_nan_for_fully_masked_frame(self):
         """An all-padding frame must not poison the batch's gradients."""
         raw = torch.randn(2, 4, dtype=torch.float64, requires_grad=True)
@@ -142,6 +158,30 @@ class TestProjection:
         assert torch.isfinite(q).all()
         q.sum().backward()
         assert torch.isfinite(raw.grad).all()
+
+    @pytest.mark.parametrize("backend", ["numpy", "torch"])
+    @pytest.mark.parametrize("per_frame", [False, True])
+    def test_closed_weights_cannot_silently_drop_a_nonzero_total(
+        self, backend, per_frame
+    ):
+        raw = np.array([[-0.6, -0.3, 0.2]] * 3)
+        weight = np.array([[0.0, 0.0, 0.0], [0.0, 0.1, 0.2], [1.0, 1.0, 1.0]])
+        total = np.array([1.0, -1.0, 0.0]) if per_frame else 1.0
+        if backend == "torch":
+            raw, weight = (torch.as_tensor(x, device=DEVICE) for x in (raw, weight))
+            if per_frame:
+                total = torch.as_tensor(total, device=DEVICE)
+        charge = project_to_total_charge(raw, total, mask=weight)
+        if backend == "torch":
+            charge = charge.cpu().numpy()
+        assert np.isnan(charge[0]).all()
+        np.testing.assert_allclose(
+            charge[1:].sum(-1), [-1.0, 0.0] if per_frame else 1.0
+        )
+        neutral = project_to_total_charge(raw, 0.0, mask=weight)
+        if backend == "torch":
+            neutral = neutral.cpu().numpy()
+        assert np.isfinite(neutral).all() and (neutral[0] == 0).all()
 
 
 class TestRegistration:

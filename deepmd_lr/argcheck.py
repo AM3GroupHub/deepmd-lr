@@ -45,6 +45,12 @@ from deepmd_lr.same_as import (
     CHARGE_SAME_AS_KEY,
     SAME_AS_KEY,
 )
+from deepmd_lr.zbl import (
+    DEFAULT_WINDOW as DEFAULT_ZBL_WINDOW,
+)
+from deepmd_lr.zbl import (
+    ZBL_KEY,
+)
 
 
 @model_args_plugin.register(MODEL_TYPE)
@@ -133,6 +139,7 @@ def dp_lr_model_args() -> Argument:
                     "same alpha; `same_as` links of either branch follow it."
                 ),
             ),
+            _zbl_args(),
             _long_range_args(),
         ],
         doc=(
@@ -140,6 +147,51 @@ def dp_lr_model_args() -> Argument:
             "(PME or Ewald via nvalchemi-toolkit-ops, or the isolated term for "
             "systems without a cell). Without a `long_range` block it is "
             "exactly the standard energy model."
+        ),
+    )
+
+
+def _zbl_args() -> Argument:
+    """The optional ``zbl`` block: short contacts handed over to ZBL."""
+    window = Argument(
+        "window",
+        [list[float], None],
+        optional=True,
+        default=list(DEFAULT_ZBL_WINDOW),
+        doc=(
+            "`[x_lo, x_hi]` in units of a pair's covalent-radius sum (ASE "
+            "radii), for every pair of elements: the full ZBL repulsion "
+            "below `x_lo`, none above `x_hi`, a C2 switch between, and the "
+            "network switched off across the same range. The default sits "
+            "below a bond; `x_hi` must stay at or below the shortest contact "
+            "in the training data, which is checked when training starts. "
+            "`null` gives no pair a window but those in `pairs`."
+        ),
+    )
+    pairs = Argument(
+        "pairs",
+        dict,
+        optional=True,
+        default={},
+        doc=(
+            'A window of their own for single pairs, `{"O-O": [1.5, 1.75]}`, '
+            "in the same units: for a pair whose shortest contact in the "
+            "data is far from a bond length (two oxygens of water), or "
+            "shorter than the default allows."
+        ),
+    )
+    return Argument(
+        ZBL_KEY,
+        dict,
+        [window, pairs],
+        optional=True,
+        default=None,
+        doc=(
+            "Screened nuclear (ZBL) repulsion for pairs closer than the data "
+            "the model was fitted to, with the network switched off there. "
+            "Absent, the model has none; `{}` places a window below every "
+            "bond from the covalent radii. It holds no weights, so a trained "
+            "model can be given one afterwards (`model.set_zbl`). DPA4C only."
         ),
     )
 
