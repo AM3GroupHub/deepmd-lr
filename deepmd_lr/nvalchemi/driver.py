@@ -216,7 +216,9 @@ def _owned(values, n_owned: int):
 
 def _on_nodes(owned_values: torch.Tensor, part: Partition) -> torch.Tensor:
     """Per-owned-atom values on the partition's node axis, zero on ghosts."""
-    out = torch.zeros(part.n_node, dtype=owned_values.dtype, device=owned_values.device)
+    out = torch.zeros(
+        part.n_node, dtype=owned_values.dtype, device=owned_values.device
+    )
     out[: part.n_owned] = owned_values.detach()
     return out
 
@@ -846,7 +848,9 @@ def _born_charges_partitioned(
                 local = item.envelope * shifted
             (g,) = torch.autograd.grad(local.sum(), leaf, retain_graph=True)
             reusable = None
-            if cap is not None and (item.envelope is None or item.contacts is not None):
+            if cap is not None and (
+                item.envelope is None or item.contacts is not None
+            ):
                 reusable = g
             if item.contacts is not None:
                 # The envelope was a plain factor: d local / d w = raw + shift.
@@ -967,8 +971,7 @@ def _charge_response_force(
                             weights / item.envelope.to(weights.dtype),
                             torch.zeros_like(weights),
                         )
-                    w_node = torch.zeros(part.n_node, dtype=g1.dtype, device=g1.device)
-                    w_node[: part.n_owned] = per_node.to(g1.dtype)
+                    w_node = _on_nodes(per_node.to(g1.dtype), part)
                     g_e = g1 * w_node[graph.edge_index[1]][:, None]
                 else:
                     (g_e,) = torch.autograd.grad(response, cap, retain_graph=True)

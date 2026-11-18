@@ -151,8 +151,9 @@ _NO_HESSIAN = (
 )
 
 
-def _check_ownership(mask: Any) -> None:
-    """Refuse to weigh something that is not DeePMD-kit's ownership mask.
+def _weighted_ownership(mask: Any, envelope: torch.Tensor) -> torch.Tensor:
+    """DeePMD-kit's per-node ownership mask times the envelope, float64;
+    refused for anything that is not that mask.
 
     The short-contact envelope reaches the fused operators on the per-node
     boolean mask DeePMD-kit hands them (``DescrptDPA4C.fused_energy_force_graph``
@@ -170,6 +171,27 @@ def _check_ownership(mask: Any) -> None:
             + "): the interface has changed. Evaluate at DP_CUDA_INFER=1, "
             "whose autograd lower does not depend on it."
         )
+    return mask.to(torch.float64) * envelope
+
+
+@contextlib.contextmanager
+def _hooked(obj: Any, name: str, replacement: Any) -> Iterator[None]:
+    """Replace the method ``obj.name`` by ``replacement`` for one pass.
+
+    Undone by deleting, unless the object carried its own attribute:
+    assigning the original back would leave a bound method in the instance
+    dict, shadowing the class attribute and holding the instance.
+    """
+    had_own = name in obj.__dict__
+    original = getattr(obj, name)
+    setattr(obj, name, replacement)
+    try:
+        yield
+    finally:
+        if had_own:
+            setattr(obj, name, original)
+        else:
+            delattr(obj, name)
 
 
 def _kernel_available() -> bool:
@@ -215,7 +237,9 @@ def _run_backbone(model, graph, atype_flat, charge_spin):
     """
     descriptor = model.atomic_model.descriptor
     kwargs = (
-        {"charge_spin": charge_spin} if model.atomic_model.supports_charge_spin else {}
+        {"charge_spin": charge_spin}
+        if model.atomic_model.supports_charge_spin
+        else {}
     )
     return descriptor.call_graph(
         graph,
@@ -430,7 +454,9 @@ class LongRangeEnergyModel(EnergyModel):
     def has_long_range(self) -> bool:
         """Whether a long-range term is configured. Without one this model is
         exactly the standard energy model."""
-        return self.charge_fitting is not None and self.long_range_energy is not None
+        return (
+            self.charge_fitting is not None and self.long_range_energy is not None
+        )
 
     def long_range_energy_for(
         self, cell: Any, pbc: Any, settings: dict[str, Any] | None = None
@@ -777,20 +803,12 @@ class LongRangeEnergyModel(EnergyModel):
                 )
             return out
 
-        # Undo by deleting unless the descriptor carried its own `call_graph`:
-        # assigning `unhooked` back would leave a bound method in the instance
-        # dict, shadowing the class attribute and holding the instance.
-        had_own = "call_graph" in descriptor.__dict__
-        descriptor.call_graph = capture
         self._capture_depth += 1
         try:
-            yield captured
+            with _hooked(descriptor, "call_graph", capture):
+                yield captured
         finally:
             self._capture_depth -= 1
-            if had_own:
-                descriptor.call_graph = unhooked
-            else:
-                del descriptor.call_graph
 
     @contextlib.contextmanager
     def _enveloping_energy(
@@ -869,45 +887,55 @@ class LongRangeEnergyModel(EnergyModel):
         ) -> Any:
             if factor is None:
                 return None  # no plain weight to hand over: the autograd lower
-            _check_ownership(ownership)
-            owned = ownership.to(torch.float64)
-            weight = owned * factor
             out = unfused(
-                fitting, graph, atype_clamped, weight, atom_bias, *args, **kwargs
+                fitting,
+                graph,
+                atype_clamped,
+                _weighted_ownership(ownership, factor),
+                atom_bias,
+                *args,
+                **kwargs,
             )
             if out is None:
                 return None  # not served: DeePMD-kit takes the autograd lower
             energy, atom_energy, *rest = out
-            # The operators weighed the offsets along with the network. Give
-            # an atom back the part of its offset the envelope took.
-            offset = self._energy_offsets().to(torch.float64)[atype_clamped]
-            state["enveloped"] = atom_energy - (weight * offset).unsqueeze(-1)
-            kept = ((owned - weight) * offset).unsqueeze(-1)
+            state["enveloped"], kept = self._offsets_kept(
+                atom_energy, atype_clamped, ownership, factor
+            )
             energy = energy + frame_scalar_sum(kept, graph.n_node).to(energy.dtype)
             return (energy, atom_energy + kept.to(atom_energy.dtype), *rest)
 
-        had_own = "forward_atomic_graph" in atomic_model.__dict__
-        had_fused = "fused_energy_force_graph" in descriptor.__dict__
-        atomic_model.forward_atomic_graph = enveloped
-        if unfused is not None:
-            descriptor.fused_energy_force_graph = fused
-        try:
-            yield state
-        finally:
-            if had_own:
-                atomic_model.forward_atomic_graph = unhooked
-            else:
-                del atomic_model.forward_atomic_graph
+        with contextlib.ExitStack() as hooks:
+            hooks.enter_context(
+                _hooked(atomic_model, "forward_atomic_graph", enveloped)
+            )
             if unfused is not None:
-                if had_fused:
-                    descriptor.fused_energy_force_graph = unfused
-                else:
-                    del descriptor.fused_energy_force_graph
+                hooks.enter_context(
+                    _hooked(descriptor, "fused_energy_force_graph", fused)
+                )
+            yield state
 
-    def _energy_offsets(self) -> torch.Tensor:
-        """The per-type energy offsets DeePMD-kit adds after the fitting net,
-        ``(ntypes,)``: its output statistics for the energy."""
-        return self.atomic_model.out_bias[0, :, 0]
+    def _offsets_kept(
+        self,
+        atom_energy: torch.Tensor,
+        atype_clamped: torch.Tensor,
+        ownership: torch.Tensor,
+        envelope: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """What a fused operator's atomic energies hold once it was handed
+        the envelope on its ownership mask, ``(N, 1)`` float64 each: the
+        weighted fitted energies ``w f``, and the part of each atom's offset
+        to give back.
+
+        The operators multiply the per-type offsets (DeePMD-kit's output
+        statistics for the energy, added after the fitting net) along with
+        the network; an atom in contact keeps its offset whole.
+        """
+        owned = ownership.to(torch.float64)
+        weight = owned * envelope
+        offset = self.atomic_model.out_bias[0, :, 0].to(torch.float64)[atype_clamped]
+        enveloped = atom_energy - (weight * offset).unsqueeze(-1)
+        return enveloped, ((owned - weight) * offset).unsqueeze(-1)
 
     @staticmethod
     def _usable(captured: dict) -> dict | None:
@@ -1117,6 +1145,7 @@ class LongRangeEnergyModel(EnergyModel):
         """
         nf, nloc = atype.shape[0], atype.shape[1]
         create_graph = self.training
+        contacts = shared.get("contacts")
         charges = self._charges_from_features(
             shared["features"],
             shared["rot_mat"],
@@ -1124,10 +1153,9 @@ class LongRangeEnergyModel(EnergyModel):
             charge_spin,
             mask,
             (shared["edge_index"], shared["edge_vec"], shared["edge_mask"]),
-            contacts=shared.get("contacts"),
+            contacts=contacts,
             return_raw=True,
         )
-        contacts = shared.get("contacts")
         charge = filtered(charges)
         atom_energy = term(geometry.coord, charge, geometry.box, mask=mask)
         edge_vec = shared["edge_vec"]
@@ -1408,28 +1436,19 @@ class LongRangeEnergyModel(EnergyModel):
 
         def weighted(*args: Any, **kwargs: Any) -> Any:
             atype_clamped, mask = unhooked(*args, **kwargs)
-            _check_ownership(mask)
             seen.update(atype=atype_clamped, mask=mask)
-            return atype_clamped, mask.to(torch.float64) * contacts.envelope
+            return atype_clamped, _weighted_ownership(mask, contacts.envelope)
 
-        had_own = "_prepare_graph_nodes" in atomic_model.__dict__
-        atomic_model._prepare_graph_nodes = weighted
-        try:
+        with _hooked(atomic_model, "_prepare_graph_nodes", weighted):
             result = lower()
-        finally:
-            if had_own:
-                atomic_model._prepare_graph_nodes = unhooked
-            else:
-                del atomic_model._prepare_graph_nodes
-        mask = seen["mask"].to(torch.float64)
-        weight = mask * contacts.envelope
         # As on the graph lower: the operator weighed the offsets with the
         # network, an atom keeps its own, and the list of contacts adds ZBL
         # and the envelope's own force and virial.
-        offset = self._energy_offsets().to(torch.float64)[seen["atype"]]
-        enveloped = result["atom_energy"] - (weight * offset).unsqueeze(-1)
+        enveloped, kept = self._offsets_kept(
+            result["atom_energy"], seen["atype"], seen["mask"], contacts.envelope
+        )
         extra = contact_output(contacts, enveloped, n_node, n_local, do_atomic_virial)
-        added = extra["energy"] + ((mask - weight) * offset).unsqueeze(-1)
+        added = extra["energy"] + kept
         nf = n_node.shape[0]
         result["atom_energy"] = result["atom_energy"] + added
         result["energy"] = result["energy"] + frame_scalar_sum(added, n_node)

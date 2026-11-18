@@ -926,12 +926,14 @@ class TestModel:
 def test_the_weight_goes_onto_an_ownership_mask_only():
     """The envelope rides into DeePMD-kit's fused operators on their boolean
     ownership mask; anything else in its place is a changed interface."""
-    from deepmd_lr.model.lr_model import _check_ownership
+    from deepmd_lr.model.lr_model import _weighted_ownership
 
-    _check_ownership(torch.ones(3, dtype=torch.bool))
+    envelope = torch.tensor([1.0, 0.5, 0.0], dtype=torch.float64)
+    owned = torch.tensor([True, True, False])
+    assert _weighted_ownership(owned, envelope).tolist() == [1.0, 0.5, 0.0]
     for other in (torch.ones(3), torch.ones(3, dtype=torch.int64), None):
         with pytest.raises(RuntimeError, match="interface has changed"):
-            _check_ownership(other)
+            _weighted_ownership(other, envelope)
 
 
 class TestRefusals:

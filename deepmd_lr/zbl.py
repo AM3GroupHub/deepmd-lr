@@ -208,6 +208,35 @@ def normalized_settings(settings: dict[str, Any]) -> dict[str, Any]:
     return {"window": window, "pairs": pairs}
 
 
+def _distance(vec: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+    """Edge lengths; a padded edge carries a zero vector and is given a
+    harmless distance instead."""
+    r2 = vec.square().sum(-1)
+    return torch.sqrt(torch.where(valid, r2, torch.ones_like(r2)))
+
+
+def _lower_output(
+    energy: torch.Tensor,
+    energy_redu: torch.Tensor,
+    force: torch.Tensor,
+    virial: torch.Tensor,
+    atom_virial: torch.Tensor | None,
+) -> dict[str, torch.Tensor]:
+    """The keys ``fit_output_to_model_output_graph`` writes for ``energy``,
+    from per-node energies ``(N,)``, per-frame ones ``(nf,)``, forces, frame
+    virials and, if asked for, per-atom virials."""
+    n_cap, nf = energy.shape[0], energy_redu.shape[0]
+    out = {
+        "energy": energy.unsqueeze(-1),
+        "energy_redu": energy_redu.unsqueeze(-1),
+        "energy_derv_r": force.reshape(n_cap, 1, 3),
+        "energy_derv_c_redu": virial.reshape(nf, 1, 9),
+    }
+    if atom_virial is not None:
+        out["energy_derv_c"] = atom_virial.reshape(n_cap, 1, 9)
+    return out
+
+
 class Contacts(NamedTuple):
     """What one pass over an inference graph found (:meth:`ZBL.contacts`).
 
@@ -300,18 +329,11 @@ def contact_output(
         virial = torch.zeros((nf, 3, 3), dtype=torch.float64, device=g.device)
         virial.index_add_(0, frame_id[contacts.dst], outer)
         energy_redu = segment_sum(contacts.energy, frame_id, nf)
-    out = {
-        "energy": contacts.energy.unsqueeze(-1),
-        "energy_redu": energy_redu.unsqueeze(-1),
-        "energy_derv_r": force.reshape(n_cap, 1, 3),
-        "energy_derv_c_redu": virial.reshape(nf, 1, 9),
-    }
+    atom_virial = None
     if do_atomic_virial:
         atom_virial = torch.zeros((n_cap, 3, 3), dtype=torch.float64, device=g.device)
-        out["energy_derv_c"] = atom_virial.index_add_(0, contacts.src, outer).reshape(
-            n_cap, 1, 9
-        )
-    return out
+        atom_virial.index_add_(0, contacts.src, outer)
+    return _lower_output(contacts.energy, energy_redu, force, virial, atom_virial)
 
 
 class ZBL(torch.nn.Module):
@@ -407,20 +429,40 @@ class ZBL(torch.nn.Module):
         # `index_fill_` takes its value as a scalar; an indexed assignment
         # would upload it, which a step of MD must not do.
         present = torch.zeros(n_type, dtype=torch.bool, device=atype.device)
-        present.index_fill_(0, atype.clamp(0, n_type - 1).long(), True)
+        present.index_fill_(0, self._types(atype)[1], True)
         reach = (self.r_hi * (present[:, None] & present[None, :])).max()
         return (reach * reach).reshape(1)
 
     # ------------------------------------------------------------ per edge
 
-    def _pair_window(
-        self, atype: torch.Tensor, src: torch.Tensor, dst: torch.Tensor
+    def _types(self, atype: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Whether each node is a real atom, and its type clamped into the
+        tables so a padded node (type -1) indexes somewhere harmless."""
+        n_type = self.numbers.numel()
+        return (atype >= 0) & (atype < n_type), atype.clamp(0, n_type - 1).long()
+
+    def _valid(
+        self,
+        atype: torch.Tensor,
+        src: torch.Tensor,
+        dst: torch.Tensor,
+        edge_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """The edges that count: unmasked, between two real atoms."""
+        real, _ = self._types(atype)
+        return edge_mask.bool() & real[src] & real[dst]
+
+    def _window(
+        self, ti: torch.Tensor, src: torch.Tensor, dst: torch.Tensor, r: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Each edge's ``(r_lo, r_hi)`` and its two types, clamped into the
-        table so a padded node (type -1) indexes somewhere harmless."""
-        ti = atype.clamp(0, self.numbers.numel() - 1).long()
+        """Where each edge of length ``r`` is in its pair's window: ``t`` in
+        [0, 1] across it, the window's width and its upper end, in ``r``'s
+        dtype."""
         ts, td = ti[src], ti[dst]
-        return self.r_lo[ts, td], self.r_hi[ts, td], ti
+        ri, ro = self.r_lo[ts, td].to(r.dtype), self.r_hi[ts, td].to(r.dtype)
+        # An empty window (a pair with no nucleus) has no width to divide by.
+        width = torch.where(ro > ri, ro - ri, torch.ones_like(ro))
+        return ((r - ri) / width).clamp(0.0, 1.0), width, ro
 
     def _edge_terms_torch(
         self,
@@ -433,10 +475,10 @@ class ZBL(torch.nn.Module):
         """Half pair energy per edge, (E,) float64, and ``dE_edge/d edge_vec``,
         (E, 3) in ``edge_vec``'s dtype, over every edge; the Warp kernel
         below is the same formulas for the edges in contact."""
-        r2 = edge_vec.to(torch.float64).square().sum(-1)
-        # Padded edges carry a zero vector: give them a harmless distance.
-        r = torch.sqrt(torch.where(valid, r2, torch.ones_like(r2)))
-        ri, ro, ti = self._pair_window(atype, src, dst)
+        vec = edge_vec.to(torch.float64)
+        r = _distance(vec, valid)
+        ti = self._types(atype)[1]
+        t, width, ro = self._window(ti, src, dst, r)
         z = self.numbers[ti]
         zi, zj = z[src], z[dst]
         a = _A_PREFACTOR / (zi.pow(_A_EXPONENT) + zj.pow(_A_EXPONENT))
@@ -450,17 +492,13 @@ class ZBL(torch.nn.Module):
         coulomb = _KE * zi * zj / r
         pair = coulomb * phi
         dpair = coulomb * (dphi / a - phi / r)
-        # An empty window (a pair with no nucleus) has no width to divide by.
-        width = torch.where(ro > ri, ro - ri, torch.ones_like(ro))
-        t = ((r - ri) / width).clamp(0.0, 1.0)
         switch = 1 - 10 * t.pow(3) + 15 * t.pow(4) - 6 * t.pow(5)
         dswitch = (-30 * t.pow(2) + 60 * t.pow(3) - 30 * t.pow(4)) / width
         on = valid & (r < ro)
         zero = torch.zeros_like(r)
         energy = torch.where(on, 0.5 * pair * switch, zero)
         dedr = torch.where(on, 0.5 * (dpair * switch + pair * dswitch), zero)
-        g = (dedr / r).unsqueeze(-1) * edge_vec.to(torch.float64)
-        return energy, g.to(edge_vec.dtype)
+        return energy, ((dedr / r).unsqueeze(-1) * vec).to(edge_vec.dtype)
 
     def edge_terms(
         self,
@@ -482,8 +520,7 @@ class ZBL(torch.nn.Module):
         if owned is None:
             owned = torch.ones(n_node, dtype=torch.bool, device=atype.device)
         src, dst = edge_index[0].long(), edge_index[1].long()
-        real = (atype >= 0) & (atype < self.numbers.numel())
-        valid = edge_mask.bool() & real[src] & real[dst] & owned[dst]
+        valid = self._valid(atype, src, dst, edge_mask) & owned[dst]
         e_edge, g = self._edge_terms_torch(atype, src, dst, edge_vec, valid)
         energy = torch.zeros(n_node, dtype=torch.float64, device=edge_vec.device)
         return energy.index_add(0, dst, e_edge), g
@@ -513,8 +550,7 @@ class ZBL(torch.nn.Module):
         ghost's is not, and is not used.
         """
         src, dst = edge_index[0].long(), edge_index[1].long()
-        real = (atype >= 0) & (atype < self.numbers.numel())
-        valid = edge_mask.bool() & real[src] & real[dst]
+        valid = self._valid(atype, src, dst, edge_mask)
         log_s, _ = self._step_terms_torch(atype, src, dst, edge_vec, valid)
         log_w = torch.zeros(
             atype.shape[0], dtype=log_s.dtype, device=log_s.device
@@ -534,13 +570,8 @@ class ZBL(torch.nn.Module):
         """Per-edge ``log s`` in the vector's dtype, and optionally its
         analytic gradient for the contact list. Training differentiates the
         log step itself and needs no explicit gradient."""
-        r2 = vec.square().sum(-1)
-        # Padded edges carry a zero vector: give them a harmless distance.
-        r = torch.sqrt(torch.where(valid, r2, torch.ones_like(r2)))
-        ri, ro, _ti = self._pair_window(atype, src, dst)
-        ri, ro = ri.to(r.dtype), ro.to(r.dtype)
-        width = torch.where(ro > ri, ro - ri, torch.ones_like(ro))
-        t = ((r - ri) / width).clamp(0.0, 1.0)
+        r = _distance(vec, valid)
+        t, width, ro = self._window(self._types(atype)[1], src, dst, r)
         s = t * t * t * (t * (6.0 * t - 15.0) + 10.0)
         inside = valid & (r < ro)
         closed = inside & (s <= 0)
@@ -573,11 +604,10 @@ class ZBL(torch.nn.Module):
         src, dst = edge_index[0].long(), edge_index[1].long()
         factor = self.envelope(atype, edge_index, edge_vec, edge_mask)
         smallest = float(factor.min()) if factor.numel() else 1.0
-        real = (atype >= 0) & (atype < self.numbers.numel())
-        ti = atype.clamp(0, self.numbers.numel() - 1).long()
+        ti = self._types(atype)[1]
         hi = self.r_hi[ti[src], ti[dst]]
         r = edge_vec.to(torch.float64).norm(dim=1)
-        found = edge_mask.bool() & real[src] & real[dst] & (r < hi)
+        found = self._valid(atype, src, dst, edge_mask) & (r < hi)
         # The shortest edge of every pair of types, one bucket per pair.
         n_type = self.numbers.numel()
         low, high = torch.minimum(ti[src], ti[dst]), torch.maximum(ti[src], ti[dst])
@@ -772,9 +802,7 @@ class ZBL(torch.nn.Module):
             dst = dst.clamp(max=n_node - 1)
             stored = edge < destination_row_ptr[-1]
         vec = edge_vec.detach()[edge].to(torch.float64)
-        n_type = self.numbers.numel()
-        real = (atype >= 0) & (atype < n_type)
-        ti = atype.clamp(0, n_type - 1).long()
+        real, ti = self._types(atype)
         longest = self.r_hi[ti[src], ti[dst]]
         contact = (
             stored & real[src] & real[dst] & (vec.square().sum(-1) < longest * longest)
@@ -788,8 +816,7 @@ class ZBL(torch.nn.Module):
         )
         zero = torch.zeros(n_node, dtype=torch.float64, device=device)
         energy = zero.index_add(0, dst, e_edge)
-        log_w = zero.index_add(0, dst, log_s)
-        envelope = torch.exp(log_w)
+        envelope = torch.exp(zero.index_add(0, dst, log_s))
         return Contacts(energy, envelope, edge, src, dst, vec, g, dlog)
 
     # -------------------------------------------------------- graph output
@@ -852,15 +879,13 @@ class ZBL(torch.nn.Module):
             force, atom_virial, virial = edge_force_virial(
                 g_e, edge_vec, edge_index, edge_mask, n_node, node_capacity=n_cap
             )
-        out = {
-            "energy": energy.unsqueeze(-1),
-            "energy_redu": energy_redu.unsqueeze(-1),
-            "energy_derv_r": force.reshape(n_cap, 1, 3),
-            "energy_derv_c_redu": virial.reshape(nf, 1, 9),
-        }
-        if do_atomic_virial:
-            out["energy_derv_c"] = atom_virial.reshape(n_cap, 1, 9)
-        return out
+        return _lower_output(
+            energy,
+            energy_redu,
+            force,
+            virial,
+            atom_virial if do_atomic_virial else None,
+        )
 
 
 # ----------------------------------------------------------------------------
@@ -912,25 +937,6 @@ if wp is not None:
         )
 
     @wp.func
-    def _edge_valid(
-        e: int,
-        edge_index: wp.array2d(dtype=wp.int64),
-        edge_mask: wp.array(dtype=wp.bool),
-        atype: wp.array(dtype=wp.int64),
-        n_type: int,
-    ) -> bool:
-        """A real edge between two real atoms (a padded node has type -1)."""
-        if not edge_mask[e]:
-            return False
-        i = atype[edge_index[0, e]]
-        j = atype[edge_index[1, e]]
-        if i < wp.int64(0) or i >= wp.int64(n_type):
-            return False
-        if j < wp.int64(0) or j >= wp.int64(n_type):
-            return False
-        return True
-
-    @wp.func
     def _log_step(r: wp.float64, ri: wp.float64, ro: wp.float64) -> wp.vec2d:
         """Inside the window, ``log s`` and ``d log s / dr``; the first is
         positive (never a logarithm of a step) at or below the lower edge."""
@@ -949,17 +955,17 @@ if wp is not None:
         ds = wp.float64(30.0) * t * t * one * one / (ro - ri)
         return wp.vec2d(wp.log(s), ds / s)
 
-    @wp.func
-    def _contact(
-        e: int,
-        v: wp.vec3d,
-        r2: wp.float64,
+    @wp.kernel(enable_backward=False)
+    def _contacts(
         edge_index: wp.array2d(dtype=wp.int64),
+        edge_mask: wp.array(dtype=wp.bool),
+        vec: wp.array(dtype=Any),
         atype: wp.array(dtype=wp.int64),
         owned: wp.array(dtype=wp.bool),
         numbers: wp.array(dtype=wp.float64),
         r_lo: wp.array2d(dtype=wp.float64),
         r_hi: wp.array2d(dtype=wp.float64),
+        r_max2: wp.array(dtype=wp.float64),
         capacity: int,
         energy: wp.array(dtype=wp.float64),
         log_sum: wp.array(dtype=wp.float64),
@@ -968,12 +974,25 @@ if wp is not None:
         ends: wp.array2d(dtype=wp.int64),
         values: wp.array2d(dtype=wp.vec3d),
     ):
-        """One valid edge shorter than the longest window: its ZBL half
-        energy and its step onto the destination, and a slot in the list."""
+        """One edge: if it is a contact, its ZBL half energy and its step
+        onto the destination, and a slot in the list."""
+        e = wp.tid()
+        v = wp.vec3d(
+            wp.float64(vec[e][0]), wp.float64(vec[e][1]), wp.float64(vec[e][2])
+        )
+        # The distance first: almost every edge leaves here, having read
+        # nothing but its own vector.
+        r2 = wp.dot(v, v)
+        if r2 >= r_max2[0] or not edge_mask[e]:
+            return
         src = edge_index[0, e]
         dst = edge_index[1, e]
         i = atype[src]
         j = atype[dst]
+        # A padded node has type -1: no real atom, no contact.
+        n_type = wp.int64(numbers.shape[0])
+        if i < wp.int64(0) or i >= n_type or j < wp.int64(0) or j >= n_type:
+            return
         ro = r_hi[i, j]
         r = wp.sqrt(r2)
         if r >= ro:
@@ -1004,68 +1023,6 @@ if wp is not None:
         values[1, slot] = g
         values[2, slot] = dlog
 
-    @wp.kernel(enable_backward=False)
-    def _contacts_f32(
-        edge_index: wp.array2d(dtype=wp.int64),
-        edge_mask: wp.array(dtype=wp.bool),
-        vec: wp.array(dtype=wp.vec3f),
-        atype: wp.array(dtype=wp.int64),
-        owned: wp.array(dtype=wp.bool),
-        numbers: wp.array(dtype=wp.float64),
-        r_lo: wp.array2d(dtype=wp.float64),
-        r_hi: wp.array2d(dtype=wp.float64),
-        r_max2: wp.array(dtype=wp.float64),
-        capacity: int,
-        energy: wp.array(dtype=wp.float64),
-        log_sum: wp.array(dtype=wp.float64),
-        closed: wp.array(dtype=wp.int32),
-        count: wp.array(dtype=wp.int32),
-        ends: wp.array2d(dtype=wp.int64),
-        values: wp.array2d(dtype=wp.vec3d),
-    ):
-        e = wp.tid()
-        v = wp.vec3d(
-            wp.float64(vec[e][0]), wp.float64(vec[e][1]), wp.float64(vec[e][2])
-        )
-        # The distance first: almost every edge leaves here, having read
-        # nothing but its own vector.
-        r2 = wp.dot(v, v)
-        if r2 >= r_max2[0]:
-            return
-        if not _edge_valid(e, edge_index, edge_mask, atype, numbers.shape[0]):
-            return
-        _contact(
-            e, v, r2, edge_index, atype, owned, numbers, r_lo, r_hi, capacity,
-            energy, log_sum, closed, count, ends, values,
-        )  # fmt: skip
-
-    @wp.kernel(enable_backward=False)
-    def _contacts_f64(
-        edge_index: wp.array2d(dtype=wp.int64),
-        edge_mask: wp.array(dtype=wp.bool),
-        vec: wp.array(dtype=wp.vec3d),
-        atype: wp.array(dtype=wp.int64),
-        owned: wp.array(dtype=wp.bool),
-        numbers: wp.array(dtype=wp.float64),
-        r_lo: wp.array2d(dtype=wp.float64),
-        r_hi: wp.array2d(dtype=wp.float64),
-        r_max2: wp.array(dtype=wp.float64),
-        capacity: int,
-        energy: wp.array(dtype=wp.float64),
-        log_sum: wp.array(dtype=wp.float64),
-        closed: wp.array(dtype=wp.int32),
-        count: wp.array(dtype=wp.int32),
-        ends: wp.array2d(dtype=wp.int64),
-        values: wp.array2d(dtype=wp.vec3d),
-    ):
-        e = wp.tid()
-        v = vec[e]
-        r2 = wp.dot(v, v)
-        if r2 >= r_max2[0]:
-            return
-        if not _edge_valid(e, edge_index, edge_mask, atype, numbers.shape[0]):
-            return
-        _contact(
-            e, v, r2, edge_index, atype, owned, numbers, r_lo, r_hi, capacity,
-            energy, log_sum, closed, count, ends, values,
-        )  # fmt: skip
+    # The graph's own precision in, float64 out.
+    _contacts_f32 = wp.overload(_contacts, {"vec": wp.array(dtype=wp.vec3f)})
+    _contacts_f64 = wp.overload(_contacts, {"vec": wp.array(dtype=wp.vec3d)})

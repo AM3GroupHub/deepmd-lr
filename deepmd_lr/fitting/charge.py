@@ -107,6 +107,12 @@ def projection_shift(
     )
 
 
+def _known_neutral(total_charge: Any) -> bool:
+    """Whether the total charge is the plain number zero, known without
+    asking a device: a tensor's value is not looked at."""
+    return not hasattr(total_charge, "shape") and total_charge == 0
+
+
 def check_charge_filter(charge_filter: Any) -> tuple[float, float] | None:
     """Validate ``charge_filter = (c_t, delta)``: finite, ``0 < delta <= c_t``.
 
@@ -186,9 +192,7 @@ def filter_charges(
     y_sum = y.sum(dim=-1)
     # A known neutral total makes every empty-filter fallback exactly zero.
     # Keep that common path independent of the envelope's autograd graph.
-    if fallback_weight is None or (
-        not hasattr(total_charge, "shape") and total_charge == 0
-    ):
+    if fallback_weight is None or _known_neutral(total_charge):
         n_real = torch.clamp(weight.sum(dim=-1), min=1.0)
     else:
         weight = fallback_weight.to(dtype)
@@ -280,14 +284,14 @@ def project_to_total_charge(
     # Keep empty neutral/padding frames differentiable with a safe denominator.
     safe_n = xp.where(n_real > 0, n_real, xp.ones_like(n_real))
     empty = xp.zeros_like(n_real)
-    if mask is not None and xp.isdtype(mask.dtype, "real floating"):
+    if (
+        mask is not None
+        and xp.isdtype(mask.dtype, "real floating")
+        and not _known_neutral(total_charge)
+    ):
         # A closed envelope cannot carry Q != 0. Fail through non-finite
         # outputs (as ZBL contact overflow does), without synchronizing CUDA.
-        # A scalar neutral target needs no additional device operations.
-        if hasattr(total_charge, "shape"):
-            empty = xp.where(target == 0, empty, xp.full_like(empty, float("nan")))
-        elif total_charge != 0:
-            empty = xp.full_like(empty, float("nan"))
+        empty = xp.where(target == 0, empty, xp.full_like(empty, float("nan")))
     shift = xp.where(n_real > 0, (target - current) / safe_n, empty)
 
     return (raw_charge + shift[..., None]) * weight
