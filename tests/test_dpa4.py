@@ -371,6 +371,96 @@ def test_cli_training_checkpoint_and_restart(tmp_path, bridging):
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
+def born_tensors(model, coord, atype, cell) -> np.ndarray:
+    model.compute_born = True
+    try:
+        out = evaluate(model, coord, atype, cell)
+    finally:
+        model.compute_born = False
+    return out["born_charge"][0].detach().cpu().numpy()
+
+
+class TestBornTensor:
+    """The pair formula on a descriptor that passes messages: each pair
+    vector's effect on every charge within reach, shared by its two atoms."""
+
+    @pytest.mark.parametrize("n_blocks", [1, 2])
+    def test_it_is_the_pair_assembly_of_finite_differences(self, n_blocks):
+        """An oracle that shares nothing with the implementation but the
+        graph: every edge vector is moved on its own, the raw charges are
+        recomputed, and the tensor is summed edge by edge."""
+        from deepmd_lr.model.lr_model import _run_backbone
+
+        model = build_dpa4(n_blocks=n_blocks)
+        coord, atype, cell = frame(n_mol=2, box=6.5)
+        flat = atype.reshape(-1)
+        graph = build_neighbor_graph_fast(coord, atype, cell, RCUT)
+        vectors = graph.edge_vec.detach().clone()
+
+        def total_raw(edge_vec):
+            moved = copy.copy(graph)
+            moved.edge_vec = edge_vec
+            features, rot_mat = _run_backbone(model, moved, flat, None)
+            return float(model.raw_charges(features, rot_mat, flat).sum())
+
+        h = 1e-4
+        mask = graph.edge_mask.bool()
+        gradient = torch.zeros_like(vectors)
+        for edge in torch.nonzero(mask).reshape(-1).tolist():
+            for axis in range(3):
+                plus, minus = vectors.clone(), vectors.clone()
+                plus[edge, axis] += h
+                minus[edge, axis] -= h
+                gradient[edge, axis] = (total_raw(plus) - total_raw(minus)) / (2 * h)
+
+        charge = evaluate(model, coord, atype, cell)["charge"][0].detach()
+        expected = charge[:, None, None] * torch.eye(3, dtype=DT, device=DEVICE)
+        src, dst = graph.edge_index[0].long(), graph.edge_index[1].long()
+        for edge in torch.nonzero(mask).reshape(-1).tolist():
+            half = 0.5 * torch.outer(vectors[edge], gradient[edge])
+            expected[dst[edge]] += half
+            expected[src[edge]] -= half
+        tensors = born_tensors(model, coord, atype, cell)
+        assert np.abs(tensors).max() > 0.1
+        assert np.abs(tensors - expected.cpu().numpy()).max() < 1e-6
+
+    def test_one_block_without_a_seed_is_the_one_hop_formula(self):
+        """A DPA4 that reaches one shell is a one-hop descriptor, and the
+        tensor is DPA4C's: the pair's own two charges, from finite
+        differences of each charge against each atom."""
+        model = build_dpa4(n_blocks=1, use_env_seed=False)
+        assert receptive_hops(model) == 1
+        coord, atype, cell = frame(n_mol=2, box=20.0)
+        n = coord.shape[1]
+        h = 1e-5
+
+        def raw(positions):
+            graph = build_neighbor_graph_fast(positions, atype, cell, RCUT)
+            from deepmd_lr.model.lr_model import _run_backbone
+
+            flat = atype.reshape(-1)
+            return model.raw_charges(*_run_backbone(model, graph, flat, None), flat)
+
+        jacobian = torch.zeros((n, n, 3), dtype=DT, device=DEVICE)
+        for atom in range(n):
+            for axis in range(3):
+                plus, minus = coord.clone(), coord.clone()
+                plus[0, atom, axis] += h
+                minus[0, atom, axis] -= h
+                jacobian[:, atom, axis] = (raw(plus) - raw(minus)).detach() / (2 * h)
+        charge = evaluate(model, coord, atype, cell)["charge"][0].detach()
+        expected = charge[:, None, None] * torch.eye(3, dtype=DT, device=DEVICE)
+        for i in range(n):
+            for j in range(n):
+                if i != j:
+                    r_ji = coord[0, j] - coord[0, i]
+                    expected[i] += 0.5 * torch.outer(
+                        r_ji, jacobian[i, j] + jacobian[j, i]
+                    )
+        tensors = born_tensors(model, coord, atype, cell)
+        assert np.abs(tensors - expected.cpu().numpy()).max() < 1e-6
+
+
 def squeezed(r: float):
     """A water box with the first O-H bond set to ``r``."""
     coord, atype, cell = frame(n_mol=6, box=10.0)
@@ -507,14 +597,7 @@ class TestRefusals:
     def test_the_helper_names_the_descriptor_and_its_reach(self):
         require_one_hop(build(), "anything")
         with pytest.raises(NotImplementedError, match="DescrptDPA4.*3 neighbour"):
-            require_one_hop(build_dpa4(), "The Born tensor")
-
-    def test_born_charges_from_the_model(self):
-        model = build_dpa4()
-        model.compute_born = True
-        coord, atype, cell = frame(n_mol=6, box=10.0)
-        with pytest.raises(NotImplementedError, match="Born tensor"):
-            evaluate(model, coord, atype, cell)
+            require_one_hop(build_dpa4(), "A halo of one cutoff")
 
     def test_compression(self):
         with pytest.raises(NotImplementedError, match="no compressed form"):
@@ -664,16 +747,46 @@ class TestEngine:
         assert energy == pytest.approx(float(serial["energy"]), abs=1e-8)
         assert (force - serial["force"][0].detach()).abs().max() < 1e-8
 
-    def test_born_charges_are_refused_at_construction(self, system):
-        from deepmd_lr.nvalchemi import DistributedEvaluator
+    @pytest.mark.parametrize(
+        "options",
+        [{}, {"bridging": True}, {"n_blocks": 3}],
+        ids=["long-range", "bridged", "three-blocks"],
+    )
+    def test_born_tensors_agree_on_every_route(self, options):
+        from deepmd_lr.nvalchemi import (
+            DistributedEvaluator,
+            evaluate_partitioned,
+            to_numpy,
+        )
 
-        _coord, atype, cell = self.host(system)
-        with pytest.raises(NotImplementedError, match="Born tensor"):
-            DistributedEvaluator(
-                build_dpa4(),
-                atype,
-                cell,
-                devices=[DEVICE],
-                memory_headroom=None,
-                compute_born=True,
+        model = build_dpa4(**options)
+        system = frame(n_mol=40, box=16.0)
+        coord, atype, cell = self.host(system)
+        reference = born_tensors(model, *system)
+        assert np.abs(reference).max() > 0.1
+        # A neutral frame: the tensors sum to zero whatever the derivative.
+        assert np.abs(reference.sum(axis=0)).max() < 1e-10
+        for n in (1, 2, 4):
+            out = to_numpy(
+                evaluate_partitioned(
+                    model,
+                    coord,
+                    atype,
+                    cell,
+                    n_partitions=n,
+                    devices=[DEVICE] * n,
+                    compute_born=True,
+                )
             )
+            assert np.abs(out["born_charge"] - reference).max() < 1e-8, n
+        evaluator = DistributedEvaluator(
+            model,
+            atype,
+            cell,
+            devices=[DEVICE],
+            memory_headroom=None,
+            compute_born=True,
+        )
+        evaluator(coord)
+        one_device = torch.as_tensor(evaluator.results["born_charge"]).cpu().numpy()
+        assert np.abs(one_device - reference).max() < 1e-8

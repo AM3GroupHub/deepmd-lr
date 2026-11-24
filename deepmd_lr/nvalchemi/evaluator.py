@@ -54,7 +54,6 @@ from deepmd_lr.compress import (
     compress_model,
 )
 from deepmd_lr.fitting.charge import check_charge_filter
-from deepmd_lr.model.lr_model import require_one_hop
 from deepmd_lr.nvalchemi.driver import (
     _halo_hops,
     _to_host,
@@ -495,8 +494,6 @@ class DistributedEvaluator:
                 raise ValueError(_VIRIAL_UNDER_FIELD)
             # The field force is built from Z, so Z has to be assembled.
             self.compute_born = True
-        if self.compute_born:
-            require_one_hop(self.model, "The Born tensor (compute_born or an efield)")
         self.charge_spin = charge_spin
         #: ``(c_t, delta)`` or None; see the class docstring. Absent, the
         #: model's own (``long_range.charge_filter``); ``False``, none.

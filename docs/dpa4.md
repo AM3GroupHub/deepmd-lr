@@ -33,7 +33,7 @@ features, as it does with DPA4C, and the same backbone pass serves both heads.
 | MD and relaxation on one GPU (`DistributedEvaluator` with one device) | yes |
 | `same_as` links | yes |
 | Several GPUs (`DistributedEvaluator`, `evaluate_partitioned`) | yes, with a [deeper halo](#several-gpus) |
-| Born effective charges, an external field | refused for now |
+| Born effective charges, an external field | yes, [in the pair form](#the-born-tensor) |
 | Short contacts: `bridging_method` with a shield on the charges | yes, [below](#short-contacts) |
 | The `zbl` block | refused: DPA4C only |
 | Compression | not available: DeePMD-kit has no compressed DPA4 |
@@ -100,12 +100,20 @@ twice its own atoms as ghosts. Several GPUs pay off only when the partitions
 are much thicker than the halo; fewer blocks or a shorter cutoff shrink it in
 proportion. On one device there is no halo at all.
 
-## The Born tensor is refused for now
+## The Born tensor
 
-Its pair formula assigns each edge's charge derivative to the two atoms of
-that edge, which holds only when a charge depends on the edges into its own
-atom. On DPA4 it would return wrong numbers without an error, so
-`compute_born` and an external field raise `NotImplementedError`.
+The tensor keeps the pair form it has on DPA4C,
+`Z_i = q_i 1 + ½ Σ_j r_ji ⊗ (∂q/∂r_ji)`, summed with opposite sign at the
+pair's other atom, from one backward pass of the charges through the edge
+vectors. On DPA4C only the pair's own charges depend on `r_ji`. On DPA4 every
+charge within reach does, and the derivative is the sum over all of them:
+each pair vector's whole effect on the charges is shared by the pair's two
+atoms. A third atom's response therefore enters with the pair's lever arm,
+not with its own position. The sum of the tensors over the atoms is the total
+charge exactly, as before, and the cost stays one backward pass.
+
+Serial, partitioned and one-device evaluation return the same tensors; an
+external field uses them as with DPA4C ([Born charges](born-charges.md)).
 
 ## Checks
 
@@ -119,6 +127,10 @@ atom. On DPA4 it would return wrong numbers without an error, so
 - the one-device evaluator equals the model to 1e-8 eV and 1e-8 eV/Å;
 - partitions with a deep halo (1, 2 and 4, one to three blocks) equal the
   serial model to 1e-8, and a halo is reused while atoms move within the skin;
+- the Born tensor equals the pair formula assembled from finite differences
+  of the charges against every edge vector (1e-6), reduces to the one-hop
+  formula for one block without a seed, and is the same on 1, 2 and 4
+  partitions and on one device (1e-8);
 - with bridging: the model without a long-range term equals DeePMD-kit's
   bridged model, both atoms of a contact below the window carry exactly zero
   charge with the total conserved, and the force is the energy gradient

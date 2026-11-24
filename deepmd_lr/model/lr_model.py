@@ -1231,8 +1231,6 @@ class LongRangeEnergyModel(EnergyModel):
             if geometry.base_box is not None
             else isolated_term_for(self.long_range_energy)
         )
-        if self.compute_born:
-            require_one_hop(self, "The Born tensor")
         mask = charge_mask(self, atype)
         filtered = self._charge_filter_for(charge_spin, mask)
         args = (term, geometry, atype, charge_spin, mask, filtered)

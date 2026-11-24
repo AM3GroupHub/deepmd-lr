@@ -130,6 +130,8 @@ class _Run:
     #: The short-contact envelope of every atom, gathered beside the raw
     #: charges; None for a model without a ``zbl`` term.
     envelope: torch.Tensor | None = None
+    #: How many neighbour shells an atom's output reaches (1 for DPA4C).
+    hops: int = 1
 
     @property
     def n_atoms(self) -> int:
@@ -533,8 +535,6 @@ def _validated(model, pbc, long_range_energy, charge_filter, compute_born):
     """The checked charge filter; a term whose boundary is not the system's,
     and a filter with Born charges, are refused."""
     check_long_range_boundary(model, pbc, long_range_energy)
-    if compute_born:
-        require_one_hop(model, "The Born tensor")
     charge_filter = check_charge_filter(charge_filter)
     if charge_filter is not None and compute_born:
         # The Born tensor differentiates the raw charges; the filter would
@@ -637,6 +637,7 @@ def _prepared(
         raw_charge=raw_charge,
         virial=virial,
         envelope=envelope,
+        hops=receptive_hops(model) or 1,
     )
 
 
@@ -867,9 +868,14 @@ def _born_charges_partitioned(
                 shifted = raw + shift.to(device=raw.device, dtype=raw.dtype)
                 local = item.envelope * shifted
             (g,) = torch.autograd.grad(local.sum(), leaf, retain_graph=True)
+            # The charge response may reuse this cotangent only where it is
+            # `d raw_dst / d edge_vec`, each edge reaching its own
+            # destination's charge alone: a one-hop descriptor.
             reusable = None
-            if cap is not None and (
-                item.envelope is None or item.contacts is not None
+            if (
+                cap is not None
+                and run.hops == 1
+                and (item.envelope is None or item.contacts is not None)
             ):
                 reusable = g
             if item.contacts is not None:

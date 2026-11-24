@@ -102,6 +102,9 @@ discarded term. So:
 **One extra backward pass, not one per atom.** DPA4C has no message passing,
 so an atom's charge depends only on edges where it is the centre, and a single
 VJP yields every per-edge derivative at once.
+On DPA4, which does pass messages, the same pass gives each pair vector's
+effect on every charge within reach, and the tensor keeps its pair form with
+that sum ([DPA4](dpa4.md#the-born-tensor)).
 
 **The derivative uses the raw charges, the `q_i d_ab` term the constrained
 ones.** `project_to_total_charge` subtracts a global mean, so every projected
@@ -118,10 +121,10 @@ tensor to 5e-16 at 1, 2 and 4 partitions, with the net field force `Q·E` to
 
 **On the GPU-direct list the Born pass is one kernel, and its backward is
 shared with the charge response.** Both start from the same VJP of the raw
-charges onto the edge vectors; because the descriptor is one-hop, the weighted
+charges onto the edge vectors; because DPA4C is one-hop, the weighted
 cotangent the charge-response force needs is that gradient times each edge's
 destination weight, so `_charge_response_force` reuses it instead of a second
-backward through the descriptor. The edge half, `1/2 (sum_in − sum_out) r ⊗ g`,
+backward through the descriptor (on DPA4 it runs that second backward). The edge half, `1/2 (sum_in − sum_out) r ⊗ g`,
 is summed along the destination and source CSR rows by a Warp kernel
 (`deepmd_lr/nvalchemi/born_csr.py`): one thread per node, float64
 accumulation, no `(E, 3, 3)` temporary, no atomics, deterministic. The
