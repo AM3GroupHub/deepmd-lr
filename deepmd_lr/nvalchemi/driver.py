@@ -60,6 +60,7 @@ from deepmd_lr.model.lr_model import (
     _is_compressed,
     _run_backbone,
     _symmetric_strain,
+    require_one_hop,
 )
 from deepmd_lr.nvalchemi.born_csr import (
     edge_born_response_csr,
@@ -529,6 +530,8 @@ def _validated(model, pbc, long_range_energy, charge_filter, compute_born):
     """The checked charge filter; a term whose boundary is not the system's,
     and a filter with Born charges, are refused."""
     check_long_range_boundary(model, pbc, long_range_energy)
+    if compute_born:
+        require_one_hop(model, "The Born tensor")
     charge_filter = check_charge_filter(charge_filter)
     if charge_filter is not None and compute_born:
         # The Born tensor differentiates the raw charges; the filter would
@@ -563,6 +566,9 @@ def _prepared(
     if parts is None:
         host = coord.detach().cpu().numpy() if coord_np is None else coord_np
         parts = partition_system(host, cell, rcut, n_partitions, pbc)
+    if any(len(part.ghost) for part in parts):
+        # A halo of one cutoff, with edges into owned atoms only.
+        require_one_hop(model, "A partition with a halo of ghost atoms")
     if devices is None:
         devices = [next(model.parameters()).device] * len(parts)
     if len(devices) != len(parts):

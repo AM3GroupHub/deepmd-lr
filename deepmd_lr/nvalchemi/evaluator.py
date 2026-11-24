@@ -54,6 +54,7 @@ from deepmd_lr.compress import (
     compress_model,
 )
 from deepmd_lr.fitting.charge import check_charge_filter
+from deepmd_lr.model.lr_model import require_one_hop
 from deepmd_lr.nvalchemi.driver import (
     _to_host,
     check_long_range_boundary,
@@ -441,6 +442,8 @@ class DistributedEvaluator:
         #: partitioned, probed or rebuilt
         #: (:func:`~deepmd_lr.nvalchemi.partition.whole_system`).
         self._whole_system = len(self.devices) == 1
+        if not self._whole_system:
+            require_one_hop(self.model, "Evaluation on several devices")
         if self.isolated and not self._whole_system:
             raise ValueError(
                 "a cluster (pbc all False) runs on one device: its long-range "
@@ -493,6 +496,8 @@ class DistributedEvaluator:
                 raise ValueError(_VIRIAL_UNDER_FIELD)
             # The field force is built from Z, so Z has to be assembled.
             self.compute_born = True
+        if self.compute_born:
+            require_one_hop(self.model, "The Born tensor (compute_born or an efield)")
         self.charge_spin = charge_spin
         #: ``(c_t, delta)`` or None; see the class docstring. Absent, the
         #: model's own (``long_range.charge_filter``); ``False``, none.

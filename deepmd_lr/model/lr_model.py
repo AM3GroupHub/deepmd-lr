@@ -194,6 +194,51 @@ def _hooked(obj: Any, name: str, replacement: Any) -> Iterator[None]:
             delattr(obj, name)
 
 
+#: The energy fitting nets a ``dp_lr`` model accepts: DeePMD-kit's standard
+#: one, and the one it pairs with the DPA4 descriptor. Both are invariant
+#: per-atom energy heads.
+_ENERGY_FITTINGS = ("ener", "dpa4_ener", "sezm_ener")
+
+
+def receptive_hops(model: Any) -> int | None:
+    """How many neighbour shells an atom's descriptor output reaches, in
+    units of the cutoff; None for a descriptor this module cannot tell.
+
+    DPA4C scans the edges into an atom once: one hop, and everything an atom
+    carries (energy, raw charge) depends on its own neighbours only. DPA4
+    passes messages: each interaction block reads its neighbours' states, and
+    the environment seed has already folded one shell into the state the
+    first block reads.
+    """
+    descriptor = model.atomic_model.descriptor
+    if not descriptor.has_message_passing():
+        return 1
+    if type(descriptor).__name__ == "DescrptDPA4":
+        return len(descriptor.l_schedule) + int(bool(descriptor.use_env_seed))
+    return None
+
+
+def require_one_hop(model: Any, what: str) -> None:
+    """Refuse ``what`` on a message-passing descriptor.
+
+    Some of this package assumes that an atom's output depends on the edges
+    into that atom alone: the Born tensor's pair formula, and partitions with
+    a halo of one cutoff. On a descriptor that passes messages they would
+    return wrong numbers without an error anywhere.
+    """
+    hops = receptive_hops(model)
+    if hops == 1:
+        return
+    name = type(model.atomic_model.descriptor).__name__
+    reach = "an unknown number of" if hops is None else str(hops)
+    raise NotImplementedError(
+        f"{what} is not available on {name} yet: it passes messages, so an "
+        f"atom's energy and charge reach {reach} neighbour shells, and this "
+        "path assumes one (DPA4C). Energies, forces, virials and charges on "
+        "one device are exact for any depth."
+    )
+
+
 def _kernel_available() -> bool:
     """Whether ``deepmd::dpa4c_graph_compress`` is registered in this process."""
     from deepmd.kernels.cuda.dpa4c.graph_compress import (
@@ -586,11 +631,12 @@ class LongRangeEnergyModel(EnergyModel):
             fitting_base=BaseFitting,
             backend_name="pt_expt",
         )
-        if fitting_type != "ener":
+        if fitting_type not in _ENERGY_FITTINGS:
             raise ValueError(
                 f"The '{MODEL_TYPE}' model is an energy model and requires "
-                f"fitting_net.type 'ener', got '{fitting_type}'. A long-range "
-                "electrostatic term is only defined as an energy contribution."
+                f"fitting_net.type 'ener' (or 'dpa4_ener'), got "
+                f"'{fitting_type}'. A long-range electrostatic term is only "
+                "defined as an energy contribution."
             )
 
         charge_fitting, long_range_energy, trained_filter = cls._build_long_range(
@@ -1065,6 +1111,8 @@ class LongRangeEnergyModel(EnergyModel):
             if geometry.base_box is not None
             else isolated_term_for(self.long_range_energy)
         )
+        if self.compute_born:
+            require_one_hop(self, "The Born tensor")
         mask = charge_mask(self, atype)
         filtered = self._charge_filter_for(charge_spin, mask)
         args = (term, geometry, atype, charge_spin, mask, filtered)
@@ -1676,6 +1724,13 @@ class LongRangeEnergyModel(EnergyModel):
             raise TypeError("table_stride_1 must be a positive finite number")
         if not math.isfinite(table_stride_1) or table_stride_1 <= 0:
             raise ValueError("table_stride_1 must be positive and finite")
+        descriptor = self.atomic_model.descriptor
+        if not hasattr(descriptor, "compress"):
+            raise NotImplementedError(
+                f"{type(descriptor).__name__} has no compressed form: "
+                "compression is DeePMD-kit's tabulated kernel for DPA4C. Run "
+                "this model uncompressed."
+            )
         if not _kernel_available():
             raise RuntimeError(_NO_KERNEL)
         level = cuda_infer_level()

@@ -37,6 +37,7 @@ The first runs 25 ps without wrapping and checks forces every 500 steps
 | [charge_filter](../tests/test_charge_filter.py) | exact zeros, total charge, C³ weights, force gradients and agreement across interfaces |
 | [neutrality_loss](../tests/test_neutrality_loss.py) | `ener_lr` penalty, schedule, gradients, schema and serialization |
 | [zbl](../tests/test_zbl.py), [zbl_gpu](../tests/test_zbl_gpu.py) | a window per pair, the ZBL pair term and the envelope (exact ends, C²), offsets plus ZBL and no charge below a window, finite-difference forces, virial and Born tensors, the list of contacts against the arithmetic over every edge, refusals; the kernel against torch, agreement of compressed, partitioned, level-2 and canonical evaluation, compiled `.pt2` exports read back, download counts |
+| [dpa4](../tests/test_dpa4.py) | the model on DPA4: building and serialization, the reach of the message passing, finite-difference forces and virial, a training step, the frame condition, the one-device evaluator, and the refusals (Born tensors, halo partitions, compression) |
 | [multi_task](../tests/test_multi_task.py), [same_as](../tests/test_same_as.py), [charge_same_as](../tests/test_charge_same_as.py) | branch expansion and parameter sharing |
 
 ## Inference and MD coverage
