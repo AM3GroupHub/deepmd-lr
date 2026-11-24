@@ -57,3 +57,7 @@ experiments/
 # exact fragment the rule above exists to prevent. Step 1 of each example's
 # README regenerates the whole directory in seconds.
 examples/*/data/
+
+# Output of the cluster build script, kept beside it (scripts/cluster/)
+scripts/cluster/*.out
+scripts/cluster/*.log
