@@ -80,6 +80,12 @@ cd /path/to/deepmd-lr
 pip install --no-deps -e .
 ```
 
+On the NUS clusters the same recipe is one script, with the cluster's CUDA
+module, CMake from a module and the system gcc pinned as host compiler:
+`bash scripts/cluster/build_deepmd_cuda_cluster.sh vanda` (A40, sm_86) or
+`hopper` (H200, sm_90). `scripts/cluster/fix_prefix.py` renames the resulting
+environment without a rebuild.
+
 `--no-build-isolation` uses the selected CUDA torch. The architecture flags
 keep torch's CMake and DeePMD-kit's compiler targets consistent; disabling
 MPI avoids linking the pip `mpich` library in this setup. `--no-deps` keeps
