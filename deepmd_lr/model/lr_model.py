@@ -276,6 +276,10 @@ def require_one_hop(model: Any, what: str) -> None:
 #: an atom's charge is switched off at a short contact.
 CHARGE_SHIELD_KEY = "charge_shield"
 
+#: Key in ``long_range``: true freezes the short-range model, so that only the
+#: charge head trains.
+CHARGE_HEAD_ONLY_KEY = "train_charge_head_only"
+
 #: The model-level keys of DeePMD-kit's ZBL bridging.
 _BRIDGING_KEYS = ("bridging_method", "bridging_r_inner", "bridging_r_outer")
 
@@ -745,6 +749,11 @@ class LongRangeEnergyModel(EnergyModel):
             # config writes the key as null.
             shield = (data.get(LONG_RANGE_KEY) or {}).get(CHARGE_SHIELD_KEY)
             model.set_charge_shield(bridging if shield is None else shield)
+        if (data.get(LONG_RANGE_KEY) or {}).get(CHARGE_HEAD_ONLY_KEY):
+            # Every weight of the short-range model, whatever its descriptor
+            # and fitting net make of their own `trainable` key (DeePMD-kit's
+            # `dpa4_ener` net trains with it false).
+            model.atomic_model.requires_grad_(False)
         # Before the config is recorded, which already holds the block.
         model.set_zbl(data.get(ZBL_KEY))
         model.model_def_script = json.dumps(model_params)

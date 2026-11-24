@@ -450,10 +450,23 @@ def _long_range_args() -> Argument:
         "`bridging_r_outer`; give this key to choose others, or to shield the "
         "charges of a model without bridging.",
     )
+    charge_head_only = Argument(
+        "train_charge_head_only",
+        bool,
+        optional=True,
+        default=False,
+        doc="Freeze the short-range model -- descriptor, energy fitting net "
+        "and, with `bridging_method`, the bridged composition -- so that only "
+        "the charge head trains. The middle stage of the SR -> LR -> FT "
+        "curriculum: on a converged short-range model the charges are fitted "
+        "to what it left unexplained, before everything is trained together. "
+        "A training switch only; it changes nothing in a model that is "
+        "evaluated.",
+    )
     return Argument(
         LONG_RANGE_KEY,
         dict,
-        [charge_net, reciprocal, charge_filter, charge_shield],
+        [charge_net, reciprocal, charge_filter, charge_shield, charge_head_only],
         optional=True,
         default=None,
         doc="The long-range electrostatic term. Omit for a pure short-range "

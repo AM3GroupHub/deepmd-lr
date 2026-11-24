@@ -62,4 +62,5 @@ The first runs 25 ps without wrapping and checks forces every 500 steps
 | [plugin_registration](../tests/test_plugin_registration.py), [import_order](../tests/test_import_order.py) | entry point, schema and independent module imports |
 | [xyz_to_deepmd](../tests/test_xyz_to_deepmd.py) | dataset conversion |
 | [graft_short_range](../tests/test_graft_short_range.py) | checkpoint grafting |
+| [curriculum](../tests/test_curriculum.py) | SR → LR → FT through `dp train` on DPA4C, DPA4 and bridged DPA4: `train_charge_head_only` leaves only the charge head trainable, the LR stage moves no other weight, the FT stage moves all three parts |
 | [calibrate_born](../tests/test_calibrate_born.py) | signed scale fitting and calibration CLI |

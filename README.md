@@ -72,6 +72,7 @@ include `input.json`, and simulation examples include runnable scripts.
 | [08](examples/08-nemd) | thermal conductance by NEMD | a region thermostat with an exact heat account, fixed layers, a slab on the GPU path |
 | [09](examples/09-fire-swap) | B-site order in PMN by FIRE-Swap | relaxed-swap Metropolis on one evaluator, rollback and resume |
 | [10](examples/10-zbl) | short contacts | `zbl`: ZBL repulsion and the network switched off below the data; choosing the windows with a scan |
+| [11](examples/11-sr-lr-ft) | staged training | SR → LR → FT: the charge head on a frozen short-range model (`train_charge_head_only`), then everything |
 
 ## Run MD
 

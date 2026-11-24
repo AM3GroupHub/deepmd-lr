@@ -28,6 +28,7 @@ features, as it does with DPA4C, and the same backbone pass serves both heads.
 | | DPA4 |
 |---|---|
 | Training with `dp --pt-expt train`, restart, the `ener_lr` loss | yes |
+| Staged training, SR → LR → FT ([training](training.md#plan-b-sr--lr--ft-staged)); freeze with `long_range.train_charge_head_only`, since `dpa4_ener` ignores `trainable: false` | yes |
 | Energy, force, virial, charges; the charge filter; `charge_spin` | yes |
 | ASE calculator | yes |
 | MD and relaxation on one GPU (`DistributedEvaluator` with one device) | yes |
