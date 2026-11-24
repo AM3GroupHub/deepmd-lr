@@ -4,15 +4,21 @@
 Follows DistMLIP's design -- one process, several devices, an owned/halo split
 per partition -- but not its code, whose C-extension partitioner serves
 multi-layer message passing. DPA4C is strictly one-hop: one halo of width
-``rcut`` is all it needs, with no per-layer exchange.
+``rcut`` is all it needs, with no per-layer exchange. A descriptor that
+passes messages (DPA4) gets a halo as many cutoffs deep as it reaches
+instead, and still no exchange.
 
 Two invariants make the assembled result exact rather than approximate.
 
-**Every edge belongs to exactly one partition.** A subgraph keeps only the
-edges whose *destination* is an owned atom. An edge appears in exactly one
-partition -- the one owning its destination -- so summing over partitions
-counts it once. Keeping ghost-to-ghost edges would double-count them, because
-the partition owning those atoms holds the same edge.
+**Every energy belongs to exactly one partition.** For a one-hop descriptor a
+subgraph keeps only the edges whose *destination* is an owned atom, so an
+edge appears in exactly one partition -- the one owning its destination --
+and summing over partitions counts it once. With message passing a subgraph
+also holds the edges into the ghosts its owned atoms read, and such an edge
+is in several partitions; what is counted once is the energy and the raw
+charge, which every partition takes from its owned atoms only. Each
+partition's force and virial are the derivatives of its own owned energies
+over its own edges, and those sum to the whole.
 
 **Ghost forces belong to their owner.** Edge ``(src, dst)`` pushes on both
 ends, so a partition computes force contributions for its ghosts too. Those
@@ -83,6 +89,12 @@ class Partition:
     owned_shift: np.ndarray | None = None
     ghost_image: np.ndarray | None = None
     owned_image: np.ndarray | None = None
+    #: How many nodes, from the front, a neighbour list searches from. None is
+    #: the owned atoms alone, all a one-hop descriptor needs. One that passes
+    #: messages also needs the edges into the ghosts whose state an owned
+    #: atom's output reads, and those ghosts are ordered first (see
+    #: :func:`partition_system`).
+    n_centre: int | None = None
     #: Set for the whole system on one device (:func:`whole_system`): its
     #: per-axis periodicity, which the GPU list applies through image shifts.
     #: ``None`` for a halo partition, whose node set carries its images
@@ -108,6 +120,11 @@ class Partition:
     @property
     def n_node(self) -> int:
         return len(self.owned) + len(self.ghost)
+
+    @property
+    def n_search(self) -> int:
+        """The number of leading nodes that are neighbour-list centres."""
+        return self.n_owned if self.n_centre is None else self.n_centre
 
     @property
     def is_whole_system(self) -> bool:
@@ -501,8 +518,10 @@ def partition_system(
     n_partitions: int,
     pbc=(True, True, True),
     skin: float = 0.0,
+    hops: int = 1,
 ) -> list[Partition]:
-    """Split atoms into ``n_partitions`` blocks, each with an ``rcut`` halo.
+    """Split atoms into ``n_partitions`` blocks, each with a halo of ghosts
+    ``hops * rcut`` deep.
 
     The blocks form a grid, :func:`decomposition_grid` pieces per cell axis,
     chosen to make each block's halo as small as the count allows -- slabs for
@@ -525,6 +544,17 @@ def partition_system(
         partition stays valid while atoms move, which is what lets an MD run
         reuse it across steps. Edges are still built at ``rcut``, so a skin
         changes cost but never the answer.
+    hops
+        How many neighbour shells an atom's output reaches
+        (:func:`~deepmd_lr.model.lr_model.receptive_hops`): 1 for DPA4C, more
+        for a descriptor that passes messages. The halo is that many cutoffs
+        deep, so that an owned atom sees in its partition exactly the
+        neighbourhood it sees in the whole system, with no exchange between
+        partitions. Its output reads the state of every node within
+        ``hops - 1`` cutoffs, and those states need their own incoming edges:
+        such ghosts are placed first and counted in ``Partition.n_centre``,
+        the nodes a neighbour list searches from. Ghosts beyond them only
+        send messages.
     n_partitions
         Number of partitions. ``1`` yields a single partition with no ghosts.
     pbc
@@ -544,12 +574,18 @@ def partition_system(
     inverse = np.linalg.inv(cell)
     coord, image = _fold_into_cell(coord, cell, inverse, pbc)
     frac = coord @ inverse
-    owner = _assign_owners(frac, cell, rcut, n_partitions, pbc)
-    halo = _HaloImages(coord, cell, inverse, pbc, rcut + skin)
+    hops = int(hops)
+    if hops < 1:
+        raise ValueError(f"hops must be >= 1, got {hops}")
+    reach = hops * rcut
+    owner = _assign_owners(frac, cell, reach, n_partitions, pbc)
+    halo = _HaloImages(coord, cell, inverse, pbc, reach + skin)
     partitions = []
     for p in range(n_partitions):
         owned = np.flatnonzero(owner == p)
-        ghosts = halo.ghosts_of(owned, frac[owned])
+        ghosts, n_inner = halo.ghosts_of(
+            owned, frac[owned], inner=None if hops == 1 else reach - rcut + skin
+        )
         # Relative to the coordinates handed in, not the folded ones, and as
         # integer lattice vectors, so a deformed cell can re-express them.
         ghost_image = halo.shifts[ghosts // n_atoms] - image[halo.atom[ghosts]]
@@ -562,6 +598,7 @@ def partition_system(
                 owned_shift=owned_image @ cell,
                 ghost_image=ghost_image,
                 owned_image=owned_image,
+                n_centre=None if hops == 1 else len(owned) + n_inner,
             )
         )
     return partitions
@@ -662,9 +699,13 @@ class _HaloImages:
         # `halo` is a ghost.
         self.bound = np.nextafter(halo, np.inf)
 
-    def ghosts_of(self, owned: np.ndarray, owned_frac: np.ndarray) -> np.ndarray:
+    def ghosts_of(
+        self, owned: np.ndarray, owned_frac: np.ndarray, inner: float | None = None
+    ) -> tuple[np.ndarray, int]:
         """Image indices within ``halo`` of an owned atom, the owned atoms'
-        own unshifted copies excluded.
+        own unshifted copies excluded; with ``inner``, those within that
+        smaller distance come first, and their number is returned too (0
+        without it).
 
         Two passes with no Python-level neighbour lists (millions of list
         objects at 98,304 atoms made that the slowest part of a rebuild):
@@ -679,12 +720,17 @@ class _HaloImages:
             nearest, _ = cKDTree(self.coord[owned]).query(
                 self.images[boxed], k=1, distance_upper_bound=self.bound, workers=-1
             )
-            candidates = boxed[np.isfinite(nearest)]
+            found = np.isfinite(nearest)
+            candidates, nearest = boxed[found], nearest[found]
         else:
-            candidates = np.empty(0, dtype=int)
+            candidates, nearest = np.empty(0, dtype=int), np.empty(0)
         # A shifted copy of an owned atom is a legitimate ghost when the cell
         # is small; only the unshifted copy is the atom itself.
         is_self = np.isin(self.atom[candidates], owned) & np.all(
             self.shifts[candidates // self.n_atoms] == 0, axis=1
         )
-        return candidates[~is_self]
+        candidates, nearest = candidates[~is_self], nearest[~is_self]
+        if inner is None:
+            return candidates, 0
+        close = nearest <= inner
+        return np.concatenate([candidates[close], candidates[~close]]), int(close.sum())

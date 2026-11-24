@@ -56,6 +56,7 @@ from deepmd_lr.compress import (
 from deepmd_lr.fitting.charge import check_charge_filter
 from deepmd_lr.model.lr_model import require_one_hop
 from deepmd_lr.nvalchemi.driver import (
+    _halo_hops,
     _to_host,
     check_long_range_boundary,
     device_replicas,
@@ -442,8 +443,6 @@ class DistributedEvaluator:
         #: partitioned, probed or rebuilt
         #: (:func:`~deepmd_lr.nvalchemi.partition.whole_system`).
         self._whole_system = len(self.devices) == 1
-        if not self._whole_system:
-            require_one_hop(self.model, "Evaluation on several devices")
         if self.isolated and not self._whole_system:
             raise ValueError(
                 "a cluster (pbc all False) runs on one device: its long-range "
@@ -558,6 +557,10 @@ class DistributedEvaluator:
         #: to buy the rebuild reduction it was chosen for.
         self._skin_is_auto = isinstance(skin, str)
         self._rcut = float(self.model.get_rcut())
+        #: How many cutoffs an atom's output reaches, and so how deep a
+        #: partition's halo is: 1 for DPA4C, more for message passing.
+        self._hops = 1 if self._whole_system else _halo_hops(self.model)
+        self._halo_depth = self._hops * self._rcut
         #: A ceiling the geometry rule may not exceed, lowered every time a
         #: device runs out of memory. Infinite until that happens, so a run
         #: that fits pays nothing for this.
@@ -679,7 +682,7 @@ class DistributedEvaluator:
             # One device, the list searched afresh every step: no halo.
             return 0.0
         return min(
-            default_skin(self.cell, self._rcut, len(self.devices)), self._skin_cap
+            default_skin(self.cell, self._halo_depth, len(self.devices)), self._skin_cap
         )
 
     def _cell_inverse(self) -> np.ndarray:
@@ -873,6 +876,7 @@ class DistributedEvaluator:
             len(self.devices),
             pbc=self.pbc,
             skin=self.skin,
+            hops=self._hops,
         )
         self._reference_positions = tracked.clone()
         self._reference_cell_dev = self._cell_dev.clone()
@@ -940,12 +944,12 @@ class DistributedEvaluator:
             return
         affordable = skin_for_node_ratio(
             self.cell,
-            self._rcut,
+            self._halo_depth,
             len(self.devices),
             min(ratios),
             skin_from=self.skin,
         )
-        wanted = default_skin(self.cell, self._rcut, len(self.devices))
+        wanted = default_skin(self.cell, self._halo_depth, len(self.devices))
         if affordable < wanted:
             warnings.warn(
                 f"the halo the geometry rule asks for ({wanted:.2f} A) does not "

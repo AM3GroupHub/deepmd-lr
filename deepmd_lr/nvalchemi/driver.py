@@ -60,6 +60,7 @@ from deepmd_lr.model.lr_model import (
     _is_compressed,
     _run_backbone,
     _symmetric_strain,
+    receptive_hops,
     require_one_hop,
 )
 from deepmd_lr.nvalchemi.born_csr import (
@@ -280,7 +281,9 @@ def partition_graph(
     strain: torch.Tensor | None = None,
     with_csr: bool = False,
 ):
-    """Build one partition's neighbour graph: every edge into an owned atom.
+    """Build one partition's neighbour graph: every edge into an owned atom,
+    and for a descriptor that passes messages into the ghosts it reads
+    (``Partition.n_centre``).
 
     The search is a :class:`~deepmd_lr.nvalchemi.nlist.GpuNeighborList`,
     cached on the partition and run at every call, with only the owned atoms
@@ -356,7 +359,7 @@ def partition_graph(
                 device,
                 cell=None,
                 targets=torch.arange(
-                    part.n_owned, dtype=torch.int32, device=torch.device(device)
+                    part.n_search, dtype=torch.int32, device=torch.device(device)
                 ),
                 float64_vectors=keep64,
             )
@@ -543,6 +546,14 @@ def _validated(model, pbc, long_range_energy, charge_filter, compute_born):
     return charge_filter
 
 
+def _halo_hops(model) -> int:
+    """How many cutoffs deep a partition's halo has to be for ``model``."""
+    hops = receptive_hops(model)
+    if hops is None:
+        require_one_hop(model, "A partition with a halo of ghost atoms")
+    return hops
+
+
 def _prepared(
     model,
     coord,
@@ -565,10 +576,13 @@ def _prepared(
     parts = partitions
     if parts is None:
         host = coord.detach().cpu().numpy() if coord_np is None else coord_np
-        parts = partition_system(host, cell, rcut, n_partitions, pbc)
-    if any(len(part.ghost) for part in parts):
-        # A halo of one cutoff, with edges into owned atoms only.
-        require_one_hop(model, "A partition with a halo of ghost atoms")
+        parts = partition_system(
+            host, cell, rcut, n_partitions, pbc, hops=_halo_hops(model)
+        )
+    elif any(len(part.ghost) and part.n_centre is None for part in parts):
+        # Partitions built with a halo of one cutoff and edges into owned
+        # atoms only: wrong, without an error, for a deeper descriptor.
+        require_one_hop(model, "A partition with a halo of one cutoff")
     if devices is None:
         devices = [next(model.parameters()).device] * len(parts)
     if len(devices) != len(parts):

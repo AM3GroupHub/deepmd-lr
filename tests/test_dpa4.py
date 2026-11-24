@@ -572,27 +572,105 @@ class TestEngine:
             torch.as_tensor(charge, device=DEVICE), serial["charge"][0], atol=1e-10
         )
 
-    def test_a_halo_partition_is_refused(self, system):
-        from deepmd_lr.nvalchemi import evaluate_partitioned
+    @pytest.mark.parametrize(
+        "options",
+        [
+            {"long_range": False},
+            {},
+            {"bridging": True},
+            {"n_blocks": 3},
+            {"n_blocks": 1, "use_env_seed": False},
+        ],
+        ids=["short-range", "long-range", "bridged", "three-blocks", "one-hop"],
+    )
+    def test_partitions_with_a_deep_halo_are_the_serial_model(self, options):
+        """The halo is as many cutoffs deep as the descriptor reaches, with
+        the edges into the ghosts an owned atom reads: no exchange between
+        partitions, and the same numbers as the undivided system."""
+        from deepmd_lr.nvalchemi import evaluate_partitioned, to_numpy
 
+        model = build_dpa4(**options)
+        system = frame(n_mol=40, box=16.0)
         coord, atype, cell = self.host(system)
-        with pytest.raises(NotImplementedError, match="halo of ghost atoms"):
+        serial = evaluate(model, *system)
+        for n in (1, 2, 4):
+            out = to_numpy(
+                evaluate_partitioned(
+                    model,
+                    coord,
+                    atype,
+                    cell,
+                    n_partitions=n,
+                    devices=[DEVICE] * n,
+                    compute_virial=True,
+                )
+            )
+            assert out["energy"] == pytest.approx(float(serial["energy"]), abs=1e-8)
+            for key in ("force", "virial") + (("charge",) if "charge" in out else ()):
+                reference = serial[key].detach().cpu().numpy().reshape(out[key].shape)
+                assert np.abs(out[key] - reference).max() < 1e-8, (n, key)
+
+    def test_the_halo_is_as_deep_as_the_reach(self):
+        from deepmd_lr.nvalchemi import partition_system
+
+        coord, _atype, cell = self.host(frame(n_mol=40, box=16.0))
+        shallow = partition_system(coord, cell, RCUT, 2)
+        deep = partition_system(coord, cell, RCUT, 2, hops=3)
+        for one, three in zip(shallow, deep, strict=True):
+            assert one.n_centre is None and one.n_search == one.n_owned
+            assert three.n_owned == one.n_owned
+            assert three.n_owned < three.n_search < three.n_node
+            assert three.n_node > one.n_node
+            # The centres are the owned atoms and every ghost within two
+            # cutoffs of one; the ghosts after them are farther than that.
+            nodes = three.coordinates(coord)
+            distance = np.linalg.norm(
+                nodes[three.n_owned :, None] - nodes[None, : three.n_owned], axis=-1
+            ).min(axis=1)
+            inner = three.n_search - three.n_owned
+            assert distance[:inner].max() <= 2 * RCUT < distance[inner:].min()
+            assert distance.max() <= 3 * RCUT
+
+    def test_partitions_built_for_one_hop_are_refused(self):
+        from deepmd_lr.nvalchemi import evaluate_partitioned, partition_system
+
+        coord, atype, cell = self.host(frame(n_mol=40, box=16.0))
+        with pytest.raises(NotImplementedError, match="halo of one cutoff"):
             evaluate_partitioned(
-                build_dpa4(), coord, atype, cell, n_partitions=2, devices=[DEVICE] * 2
+                build_dpa4(),
+                coord,
+                atype,
+                cell,
+                partitions=partition_system(coord, cell, RCUT, 2),
+                devices=[DEVICE] * 2,
             )
 
-    def test_several_devices_and_born_charges_are_refused_at_construction(self, system):
+    def test_several_devices_reuse_a_halo_while_atoms_move(self):
         from deepmd_lr.nvalchemi import DistributedEvaluator
 
         model = build_dpa4()
+        system = frame(n_mol=40, box=16.0)
+        coord, atype, cell = self.host(system)
+        evaluator = DistributedEvaluator(
+            model, atype, cell, devices=[DEVICE] * 2, memory_headroom=None, skin=1.0
+        )
+        evaluator(coord)
+        rebuilds = evaluator.rebuild_count
+        moved = coord + np.random.default_rng(3).uniform(-0.2, 0.2, coord.shape)
+        energy, force = evaluator(moved)
+        assert evaluator.rebuild_count == rebuilds
+        moved_t = torch.as_tensor(moved, dtype=DT, device=DEVICE).unsqueeze(0)
+        serial = evaluate(model, moved_t, system[1], system[2])
+        assert energy == pytest.approx(float(serial["energy"]), abs=1e-8)
+        assert (force - serial["force"][0].detach()).abs().max() < 1e-8
+
+    def test_born_charges_are_refused_at_construction(self, system):
+        from deepmd_lr.nvalchemi import DistributedEvaluator
+
         _coord, atype, cell = self.host(system)
-        with pytest.raises(NotImplementedError, match="several devices"):
-            DistributedEvaluator(
-                model, atype, cell, devices=[DEVICE] * 2, memory_headroom=None
-            )
         with pytest.raises(NotImplementedError, match="Born tensor"):
             DistributedEvaluator(
-                model,
+                build_dpa4(),
                 atype,
                 cell,
                 devices=[DEVICE],
