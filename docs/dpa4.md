@@ -32,7 +32,7 @@ features, as it does with DPA4C, and the same backbone pass serves both heads.
 | ASE calculator | yes |
 | MD and relaxation on one GPU (`DistributedEvaluator` with one device) | yes |
 | `same_as` links | yes |
-| Several GPUs (`DistributedEvaluator`, `evaluate_partitioned`) | yes, with a [deeper halo](#several-gpus) |
+| Several GPUs (`DistributedEvaluator`, `evaluate_partitioned`) | for `n_blocks: 1` only, with a [deeper halo](#several-gpus) |
 | Born effective charges, an external field | yes, [in the pair form](#the-born-tensor) |
 | Short contacts: `bridging_method` with a shield on the charges | yes, [below](#short-contacts) |
 | The `zbl` block | refused: DPA4C only |
@@ -83,22 +83,29 @@ charge reach `n_blocks` neighbour shells, and one more with `use_env_seed`
 (the default), which is 24 Å at the default three blocks and 6 Å cutoff.
 `deepmd_lr.model.lr_model.receptive_hops(model)` returns that number of
 shells; a test moves one atom of a chain and checks that the reach is exactly
-that and no further.
+that and no further. With `bridging_method` a neighbour's message is also
+gated by that neighbour's own short contacts, which adds `bridging_r_outer`
+(0.8 Å by default) to the reach, not another shell
+(`deepmd_lr.model.lr_model.gate_margin`).
 
 ## Several GPUs
 
-A partition's halo is as many cutoffs deep as the descriptor reaches, and its
-graph also holds the edges into the ghosts whose state an owned atom reads
-(those within one cutoff less). An owned atom then sees in its partition
-exactly what it sees in the whole system, with no exchange between partitions
-during a step; energies, forces, the virial and charges equal the undivided
-model's to rounding.
+Several devices are supported for a DPA4 of **one interaction block**. With
+more blocks the evaluator and `evaluate_partitioned` raise
+`NotImplementedError`; run such a model on one device.
 
-The price is the halo. With three blocks and a 6 Å cutoff it is 24 Å on each
-face, against 6 Å for DPA4C: a slab-shaped partition 50 Å thick holds about
-twice its own atoms as ghosts. Several GPUs pay off only when the partitions
-are much thicker than the halo; fewer blocks or a shorter cutoff shrink it in
-proportion. On one device there is no halo at all.
+A partition's halo is as many cutoffs deep as the descriptor reaches (plus
+`bridging_r_outer` with bridging), and its graph also holds the edges into
+the ghosts whose state or gate an owned atom reads. An owned atom then sees in its partition
+exactly what it sees in the whole system, with no exchange between partitions
+during a step; energies, forces, the virial, charges and Born tensors equal
+the undivided model's to rounding.
+
+The halo is the reason for the limit. One block reaches two cutoffs with
+`use_env_seed` (the default) and one without: a 12 Å or 6 Å halo at a 6 Å
+cutoff. Three blocks would need 24 Å on every face, where a slab-shaped
+partition 50 Å thick holds about twice its own atoms as ghosts. On one device
+there is no halo at all, whatever the depth.
 
 ## The Born tensor
 
@@ -125,12 +132,13 @@ external field uses them as with DPA4C ([Born charges](born-charges.md)).
 - a training step with a force loss reaches the descriptor, both fitting nets
   and the charge head;
 - the one-device evaluator equals the model to 1e-8 eV and 1e-8 eV/Å;
-- partitions with a deep halo (1, 2 and 4, one to three blocks) equal the
-  serial model to 1e-8, and a halo is reused while atoms move within the skin;
+- for one block, partitions with a deep halo (1, 2 and 4) equal the serial
+  model to 1e-8, and a halo is reused while atoms move within the skin; two
+  and three blocks are refused on several devices and run on one;
 - the Born tensor equals the pair formula assembled from finite differences
   of the charges against every edge vector (1e-6), reduces to the one-hop
-  formula for one block without a seed, and is the same on 1, 2 and 4
-  partitions and on one device (1e-8);
+  formula for one block without a seed, and is the same on one device and,
+  for one block, on 1, 2 and 4 partitions (1e-8);
 - with bridging: the model without a long-range term equals DeePMD-kit's
   bridged model, both atoms of a contact below the window carry exactly zero
   charge with the total conserved, and the force is the energy gradient

@@ -60,6 +60,8 @@ from deepmd_lr.model.lr_model import (
     _is_compressed,
     _run_backbone,
     _symmetric_strain,
+    backbone,
+    gate_margin,
     receptive_hops,
     require_one_hop,
 )
@@ -547,10 +549,26 @@ def _validated(model, pbc, long_range_energy, charge_filter, compute_born):
 
 
 def _halo_hops(model) -> int:
-    """How many cutoffs deep a partition's halo has to be for ``model``."""
+    """How many cutoffs deep a partition's halo has to be for ``model``;
+    refused for a DPA4 of more than one interaction block.
+
+    The halo is one cutoff per neighbour shell the descriptor reaches, and a
+    partition holds every atom inside it: at three blocks and a 6 A cutoff
+    that is 24 A on each face. Partitions are therefore offered for one block
+    only (two cutoffs with the environment seed, one without); a deeper model
+    runs on one device, which has no halo.
+    """
     hops = receptive_hops(model)
     if hops is None:
         require_one_hop(model, "A partition with a halo of ghost atoms")
+    blocks = len(getattr(backbone(model).descriptor, "l_schedule", [])) or 1
+    if blocks > 1:
+        raise NotImplementedError(
+            f"this DPA4 has n_blocks = {blocks}: several devices (partitions "
+            "with a halo) are supported for n_blocks = 1 only, since the halo "
+            f"would be {hops} cutoffs deep on every face. Run it on one "
+            "device, which needs no halo."
+        )
     return hops
 
 
@@ -577,12 +595,20 @@ def _prepared(
     if parts is None:
         host = coord.detach().cpu().numpy() if coord_np is None else coord_np
         parts = partition_system(
-            host, cell, rcut, n_partitions, pbc, hops=_halo_hops(model)
+            host,
+            cell,
+            rcut,
+            n_partitions,
+            pbc,
+            hops=_halo_hops(model),
+            margin=gate_margin(model),
         )
-    elif any(len(part.ghost) and part.n_centre is None for part in parts):
-        # Partitions built with a halo of one cutoff and edges into owned
-        # atoms only: wrong, without an error, for a deeper descriptor.
-        require_one_hop(model, "A partition with a halo of one cutoff")
+    elif any(len(part.ghost) for part in parts):
+        _halo_hops(model)
+        if any(len(part.ghost) and part.n_centre is None for part in parts):
+            # Partitions built with a halo of one cutoff and edges into owned
+            # atoms only: wrong, without an error, for a deeper descriptor.
+            require_one_hop(model, "A partition with a halo of one cutoff")
     if devices is None:
         devices = [next(model.parameters()).device] * len(parts)
     if len(devices) != len(parts):

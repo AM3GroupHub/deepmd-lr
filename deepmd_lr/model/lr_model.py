@@ -224,7 +224,8 @@ def receptive_hops(model: Any) -> int | None:
     carries (energy, raw charge) depends on its own neighbours only. DPA4
     passes messages: each interaction block reads its neighbours' states, and
     the environment seed has already folded one shell into the state the
-    first block reads.
+    first block reads. (DeePMD-kit's bridging adds a margin to this, not a
+    shell: :func:`gate_margin`.)
     """
     descriptor = backbone(model).descriptor
     if not descriptor.has_message_passing():
@@ -232,6 +233,22 @@ def receptive_hops(model: Any) -> int | None:
     if type(descriptor).__name__ == "DescrptDPA4":
         return len(descriptor.l_schedule) + int(bool(descriptor.use_env_seed))
     return None
+
+
+def gate_margin(model: Any) -> float:
+    """How far beyond ``receptive_hops`` cutoffs an atom's output reaches, in
+    angstrom: ``bridging_r_outer`` for a DPA4 with DeePMD-kit's bridging,
+    else 0.
+
+    With bridging a neighbour's message is gated by that neighbour's own
+    short contacts, the pairs closer than ``bridging_r_outer``. The outermost
+    atom an output reads can thus have a contact partner just beyond the last
+    cutoff, and that partner's position matters.
+    """
+    descriptor = backbone(model).descriptor
+    if getattr(descriptor, "bridging_switch", None) is None:
+        return 0.0
+    return float(descriptor.inner_clamp_r_outer)
 
 
 def require_one_hop(model: Any, what: str) -> None:

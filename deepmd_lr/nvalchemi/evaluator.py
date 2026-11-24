@@ -54,6 +54,7 @@ from deepmd_lr.compress import (
     compress_model,
 )
 from deepmd_lr.fitting.charge import check_charge_filter
+from deepmd_lr.model.lr_model import gate_margin
 from deepmd_lr.nvalchemi.driver import (
     _halo_hops,
     _to_host,
@@ -557,7 +558,8 @@ class DistributedEvaluator:
         #: How many cutoffs an atom's output reaches, and so how deep a
         #: partition's halo is: 1 for DPA4C, more for message passing.
         self._hops = 1 if self._whole_system else _halo_hops(self.model)
-        self._halo_depth = self._hops * self._rcut
+        self._margin = 0.0 if self._whole_system else gate_margin(self.model)
+        self._halo_depth = self._hops * self._rcut + self._margin
         #: A ceiling the geometry rule may not exceed, lowered every time a
         #: device runs out of memory. Infinite until that happens, so a run
         #: that fits pays nothing for this.
@@ -874,6 +876,7 @@ class DistributedEvaluator:
             pbc=self.pbc,
             skin=self.skin,
             hops=self._hops,
+            margin=self._margin,
         )
         self._reference_positions = tracked.clone()
         self._reference_cell_dev = self._cell_dev.clone()

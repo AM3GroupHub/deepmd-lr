@@ -519,6 +519,7 @@ def partition_system(
     pbc=(True, True, True),
     skin: float = 0.0,
     hops: int = 1,
+    margin: float = 0.0,
 ) -> list[Partition]:
     """Split atoms into ``n_partitions`` blocks, each with a halo of ghosts
     ``hops * rcut`` deep.
@@ -555,6 +556,13 @@ def partition_system(
         such ghosts are placed first and counted in ``Partition.n_centre``,
         the nodes a neighbour list searches from. Ghosts beyond them only
         send messages.
+    margin
+        Extra halo depth in angstrom
+        (:func:`~deepmd_lr.model.lr_model.gate_margin`), for a descriptor
+        whose messages are gated by the sender's short contacts: the halo
+        also holds the contact partners of its outermost senders, and every
+        sender (every node within ``hops`` cutoffs) is then a centre, since
+        its gate reads the edges into it.
     n_partitions
         Number of partitions. ``1`` yields a single partition with no ghosts.
     pbc
@@ -577,15 +585,20 @@ def partition_system(
     hops = int(hops)
     if hops < 1:
         raise ValueError(f"hops must be >= 1, got {hops}")
-    reach = hops * rcut
+    margin = float(margin)
+    if margin < 0.0:
+        raise ValueError(f"margin must be >= 0, got {margin}")
+    reach = hops * rcut + margin
     owner = _assign_owners(frac, cell, reach, n_partitions, pbc)
     halo = _HaloImages(coord, cell, inverse, pbc, reach + skin)
+    # The ghosts that need their own incoming edges: those whose state is
+    # read (one cutoff less than the reach), or with a gate every sender.
+    one_hop = hops == 1 and margin == 0.0
+    inner = None if one_hop else (hops if margin else hops - 1) * rcut + skin
     partitions = []
     for p in range(n_partitions):
         owned = np.flatnonzero(owner == p)
-        ghosts, n_inner = halo.ghosts_of(
-            owned, frac[owned], inner=None if hops == 1 else reach - rcut + skin
-        )
+        ghosts, n_inner = halo.ghosts_of(owned, frac[owned], inner=inner)
         # Relative to the coordinates handed in, not the folded ones, and as
         # integer lattice vectors, so a deformed cell can re-express them.
         ghost_image = halo.shifts[ghosts // n_atoms] - image[halo.atom[ghosts]]
@@ -598,7 +611,7 @@ def partition_system(
                 owned_shift=owned_image @ cell,
                 ghost_image=ghost_image,
                 owned_image=owned_image,
-                n_centre=None if hops == 1 else len(owned) + n_inner,
+                n_centre=None if one_hop else len(owned) + n_inner,
             )
         )
     return partitions

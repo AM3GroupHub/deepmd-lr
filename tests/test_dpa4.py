@@ -23,7 +23,12 @@ from deepmd.pt_expt.model.get_model import get_model
 from deepmd.pt_expt.model.model import BaseModel
 from deepmd.pt_expt.utils.env import DEVICE
 
-from deepmd_lr.model.lr_model import backbone, receptive_hops, require_one_hop
+from deepmd_lr.model.lr_model import (
+    backbone,
+    gate_margin,
+    receptive_hops,
+    require_one_hop,
+)
 from deepmd_lr.neighbors import build_neighbor_graph_fast
 
 from .test_joint_model import DT, FITTING, LONG_RANGE, build, frame
@@ -161,6 +166,48 @@ class TestLocality:
             # fades by orders of magnitude per hop, so no threshold.
             changed.append(bool((features(moved) != reference).any()))
         assert changed == [k <= hops for k in range(1, n)]
+
+    @pytest.mark.parametrize(
+        ("n_blocks", "use_env_seed"), [(1, True), (1, False), (2, True)]
+    )
+    def test_bridging_adds_the_gate_margin_and_no_shell(self, n_blocks, use_env_seed):
+        """A neighbour's message is gated by that neighbour's own short
+        contacts. A chain ends ``k`` links away in an atom with a partner
+        inside the bridging window on its far side: the partner is beyond
+        every cutoff of the path, and is felt at the chain's start only with
+        bridging, and only when its atom is the outermost one read."""
+        options = {
+            "long_range": False,
+            "fitting": "dpa4_ener",
+            "n_blocks": n_blocks,
+            "use_env_seed": use_env_seed,
+        }
+        for bridging in (False, True):
+            model = build_dpa4(bridging=bridging, **options)
+            hops = receptive_hops(model)
+            assert hops == n_blocks + int(use_env_seed)
+            assert gate_margin(model) == (0.8 if bridging else 0.0)
+
+            def felt(k, model=model):
+                atype = torch.zeros((1, k + 2), dtype=torch.int64, device=DEVICE)
+                descriptor = backbone(model).descriptor
+
+                def features(length):
+                    coord = torch.zeros((1, k + 2, 3), dtype=DT, device=DEVICE)
+                    coord[0, : k + 1, 0] = (
+                        0.9 * RCUT * torch.arange(k + 1, dtype=DT, device=DEVICE)
+                    )
+                    coord[0, k + 1, 0] = coord[0, k, 0] + length  # the partner
+                    graph = build_neighbor_graph_fast(coord, atype, None, RCUT)
+                    return descriptor.call_graph(graph, atype.reshape(-1))[0][
+                        0
+                    ].detach()
+
+                return bool((features(0.65) != features(0.67)).any())
+
+            assert felt(hops - 1), bridging  # within the cutoffs either way
+            assert felt(hops) == bridging
+            assert not felt(hops + 1), bridging
 
 
 class TestSerial:
@@ -461,6 +508,15 @@ class TestBornTensor:
         assert np.abs(tensors - expected.cpu().numpy()).max() < 1e-6
 
 
+def crowded():
+    """A box big enough to partition, with one O-H pair inside the bridging
+    window so that the gate and the charge shield are at work."""
+    coord, atype, cell = frame(n_mol=40, box=16.0)
+    coord = coord.clone()
+    coord[0, 1] = coord[0, 0] + torch.tensor([0.62, 0.0, 0.0], dtype=DT, device=DEVICE)
+    return coord, atype, cell
+
+
 def squeezed(r: float):
     """A water box with the first O-H bond set to ``r``."""
     coord, atype, cell = frame(n_mol=6, box=10.0)
@@ -661,10 +717,10 @@ class TestEngine:
             {"long_range": False},
             {},
             {"bridging": True},
-            {"n_blocks": 3},
-            {"n_blocks": 1, "use_env_seed": False},
+            {"use_env_seed": False},
+            {"bridging": True, "use_env_seed": False},
         ],
-        ids=["short-range", "long-range", "bridged", "three-blocks", "one-hop"],
+        ids=["short-range", "long-range", "bridged", "one-hop", "bridged-one-hop"],
     )
     def test_partitions_with_a_deep_halo_are_the_serial_model(self, options):
         """The halo is as many cutoffs deep as the descriptor reaches, with
@@ -672,8 +728,8 @@ class TestEngine:
         partitions, and the same numbers as the undivided system."""
         from deepmd_lr.nvalchemi import evaluate_partitioned, to_numpy
 
-        model = build_dpa4(**options)
-        system = frame(n_mol=40, box=16.0)
+        model = build_dpa4(n_blocks=1, **options)
+        system = crowded()
         coord, atype, cell = self.host(system)
         serial = evaluate(model, *system)
         for n in (1, 2, 4):
@@ -720,7 +776,7 @@ class TestEngine:
         coord, atype, cell = self.host(frame(n_mol=40, box=16.0))
         with pytest.raises(NotImplementedError, match="halo of one cutoff"):
             evaluate_partitioned(
-                build_dpa4(),
+                build_dpa4(n_blocks=1),
                 coord,
                 atype,
                 cell,
@@ -731,7 +787,7 @@ class TestEngine:
     def test_several_devices_reuse_a_halo_while_atoms_move(self):
         from deepmd_lr.nvalchemi import DistributedEvaluator
 
-        model = build_dpa4()
+        model = build_dpa4(n_blocks=1)
         system = frame(n_mol=40, box=16.0)
         coord, atype, cell = self.host(system)
         evaluator = DistributedEvaluator(
@@ -747,10 +803,50 @@ class TestEngine:
         assert energy == pytest.approx(float(serial["energy"]), abs=1e-8)
         assert (force - serial["force"][0].detach()).abs().max() < 1e-8
 
+    @pytest.mark.parametrize("n_blocks", [2, 3])
+    def test_more_than_one_block_runs_on_one_device_only(self, n_blocks):
+        """A halo of three or four cutoffs on every face is not offered."""
+        from deepmd_lr.nvalchemi import (
+            DistributedEvaluator,
+            evaluate_partitioned,
+            partition_system,
+        )
+
+        model = build_dpa4(n_blocks=n_blocks)
+        system = frame(n_mol=40, box=16.0)
+        coord, atype, cell = self.host(system)
+        with pytest.raises(NotImplementedError, match="n_blocks = 1 only"):
+            DistributedEvaluator(
+                model, atype, cell, devices=[DEVICE] * 2, memory_headroom=None
+            )
+        for options in (
+            {"n_partitions": 2},
+            {"partitions": partition_system(coord, cell, RCUT, 2, hops=n_blocks + 1)},
+        ):
+            with pytest.raises(NotImplementedError, match="n_blocks = 1 only"):
+                evaluate_partitioned(
+                    model, coord, atype, cell, devices=[DEVICE] * 2, **options
+                )
+        # One device: no halo, and the serial numbers with the Born tensors.
+        evaluator = DistributedEvaluator(
+            model,
+            atype,
+            cell,
+            devices=[DEVICE],
+            memory_headroom=None,
+            compute_born=True,
+        )
+        energy, force = evaluator(coord)
+        serial = evaluate(model, *system)
+        assert energy == pytest.approx(float(serial["energy"]), abs=1e-8)
+        assert (force - serial["force"][0].detach()).abs().max() < 1e-8
+        tensors = torch.as_tensor(evaluator.results["born_charge"]).cpu().numpy()
+        assert np.abs(tensors - born_tensors(model, *system)).max() < 1e-8
+
     @pytest.mark.parametrize(
         "options",
-        [{}, {"bridging": True}, {"n_blocks": 3}],
-        ids=["long-range", "bridged", "three-blocks"],
+        [{}, {"bridging": True}, {"use_env_seed": False}],
+        ids=["long-range", "bridged", "one-hop"],
     )
     def test_born_tensors_agree_on_every_route(self, options):
         from deepmd_lr.nvalchemi import (
@@ -759,8 +855,8 @@ class TestEngine:
             to_numpy,
         )
 
-        model = build_dpa4(**options)
-        system = frame(n_mol=40, box=16.0)
+        model = build_dpa4(n_blocks=1, **options)
+        system = crowded()
         coord, atype, cell = self.host(system)
         reference = born_tensors(model, *system)
         assert np.abs(reference).max() > 0.1
