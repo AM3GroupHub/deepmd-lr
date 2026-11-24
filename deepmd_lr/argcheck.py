@@ -12,6 +12,7 @@ from dargs import (
     Argument,
 )
 from deepmd.utils.argcheck import (
+    _bridging_method_args,
     descrpt_variant_type_args,
     fitting_args_plugin,
     fitting_variant_type_args,
@@ -140,6 +141,9 @@ def dp_lr_model_args() -> Argument:
                 ),
             ),
             _zbl_args(),
+            # DeePMD-kit's own short-contact keys, for a DPA4 descriptor:
+            # `bridging_method`, `bridging_r_inner`, `bridging_r_outer`.
+            *_bridging_method_args(),
             _long_range_args(),
         ],
         doc=(
@@ -433,10 +437,23 @@ def _long_range_args() -> Argument:
         "little charge each carries none. Born charges and fields are refused "
         "with it. See deepmd_lr.fitting.charge.filter_charges.",
     )
+    charge_shield = Argument(
+        "charge_shield",
+        [list[float], None],
+        optional=True,
+        default=None,
+        doc="[r_lo, r_hi] in angstrom, or null. With `bridging_method` (DPA4) "
+        "an atom's charge is switched off at a short contact: weighted by the "
+        "product over its neighbours of a C2 step from 0 at r_lo to 1 at r_hi, "
+        "inside the total-charge projection, so the other atoms carry the "
+        "total. By default the radii are `bridging_r_inner` and "
+        "`bridging_r_outer`; give this key to choose others, or to shield the "
+        "charges of a model without bridging.",
+    )
     return Argument(
         LONG_RANGE_KEY,
         dict,
-        [charge_net, reciprocal, charge_filter],
+        [charge_net, reciprocal, charge_filter, charge_shield],
         optional=True,
         default=None,
         doc="The long-range electrostatic term. Omit for a pure short-range "

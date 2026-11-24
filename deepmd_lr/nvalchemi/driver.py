@@ -592,7 +592,7 @@ def _prepared(
     raw_charge = torch.zeros(n_atoms, dtype=dtype, device=home) if long_range else None
     envelope = (
         torch.ones(n_atoms, dtype=dtype, device=home)
-        if long_range and getattr(model, "zbl", None) is not None
+        if long_range and getattr(model, "has_charge_envelope", False)
         else None
     )
     virial = torch.zeros((3, 3), dtype=dtype, device=home) if compute_virial else None

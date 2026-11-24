@@ -23,7 +23,7 @@ from deepmd.pt_expt.model.get_model import get_model
 from deepmd.pt_expt.model.model import BaseModel
 from deepmd.pt_expt.utils.env import DEVICE
 
-from deepmd_lr.model.lr_model import receptive_hops, require_one_hop
+from deepmd_lr.model.lr_model import backbone, receptive_hops, require_one_hop
 from deepmd_lr.neighbors import build_neighbor_graph_fast
 
 from .test_joint_model import DT, FITTING, LONG_RANGE, build, frame
@@ -43,22 +43,44 @@ DESCRIPTOR = {
 }
 
 
-def build_dpa4(long_range: bool = True, fitting: str = "ener", **descriptor):
+BRIDGING = {
+    "bridging_method": "ZBL",
+    "bridging_r_inner": 0.5,
+    "bridging_r_outer": 0.8,
+}
+
+
+def build_dpa4(
+    long_range: bool = True,
+    fitting: str = "ener",
+    bridging: bool = False,
+    model_type: str = "dp_lr",
+    **descriptor,
+):
     """A small DPA4 model whose weights have all been moved off their
     initial values: DPA4 starts with a readout that returns zero, and a zero
     energy would pass every force test."""
     cfg = {
-        "type": "dp_lr",
+        "type": model_type,
         "type_map": ["O", "H"],
         "descriptor": {**copy.deepcopy(DESCRIPTOR), **descriptor},
         "fitting_net": {**copy.deepcopy(FITTING), "type": fitting},
     }
     if long_range:
         cfg["long_range"] = copy.deepcopy(LONG_RANGE)
-    model = get_model(cfg)
+    if bridging:
+        # DeePMD-kit bridges a DPA4 descriptor with its own energy net only.
+        cfg.update(BRIDGING)
+        cfg["fitting_net"]["type"] = "dpa4_ener"
+    return roughened(get_model(cfg))
+
+
+def roughened(model):
     generator = torch.Generator(device="cpu").manual_seed(11)
     with torch.no_grad():
         for parameter in model.parameters():
+            if not parameter.is_floating_point():
+                continue
             noise = torch.randn(parameter.shape, generator=generator, dtype=DT)
             parameter.add_(0.05 * noise.to(parameter))
     return model.eval()
@@ -261,7 +283,8 @@ class TestInterfaces:
         assert models["slab"].charge_fitting is models["bulk"].charge_fitting
 
 
-def test_cli_training_checkpoint_and_restart(tmp_path):
+@pytest.mark.parametrize("bridging", [False, True])
+def test_cli_training_checkpoint_and_restart(tmp_path, bridging):
     """``dp train`` with the long-range loss on a DPA4 model, the fitting net
     DeePMD-kit pairs with it at its automatic width, and a restart."""
     from deepmd_lr.ase import load_model
@@ -311,6 +334,8 @@ def test_cli_training_checkpoint_and_restart(tmp_path):
             "seed": 1,
         },
     }
+    if bridging:
+        cfg["model"].update(BRIDGING)
     inp = tmp_path / "input.json"
     inp.write_text(json.dumps(cfg))
     env = {
@@ -327,9 +352,12 @@ def test_cli_training_checkpoint_and_restart(tmp_path):
     checkpoint = tmp_path / "model.ckpt.pt"
     model = load_model(str(checkpoint), device="cpu")
     assert type(model).__name__ == "LongRangeEnergyModel"
-    assert type(model.atomic_model.descriptor).__name__ == "DescrptDPA4"
+    assert type(backbone(model).descriptor).__name__ == "DescrptDPA4"
     out = model(coord.cpu(), atype.cpu(), box=torch.eye(3, dtype=DT).unsqueeze(0) * 8.0)
     assert torch.isfinite(out["force"]).all() and "charge" in out
+    assert (model.charge_shield is not None) == bridging
+    if bridging:
+        assert type(model.atomic_model).__name__ == "LinearEnergyAtomicModel"
     cfg["training"]["numb_steps"] = 3
     inp.write_text(json.dumps(cfg))
     proc = subprocess.run(
@@ -341,6 +369,136 @@ def test_cli_training_checkpoint_and_restart(tmp_path):
         timeout=600,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def squeezed(r: float):
+    """A water box with the first O-H bond set to ``r``."""
+    coord, atype, cell = frame(n_mol=6, box=10.0)
+    coord = coord.clone()
+    coord[0, 1] = coord[0, 0] + torch.tensor([r, 0.0, 0.0], dtype=DT, device=DEVICE)
+    return coord, atype, cell
+
+
+class TestBridging:
+    """Short contacts on DPA4: DeePMD-kit's own ZBL bridging for the energy,
+    and a shield on the charges from here."""
+
+    def test_without_a_long_range_term_it_is_deepmd_kits_bridged_model(self):
+        ours = build_dpa4(long_range=False, bridging=True, fitting="dpa4_ener")
+        theirs = build_dpa4(
+            long_range=False, bridging=True, fitting="dpa4_ener", model_type="standard"
+        )
+        assert type(ours).__name__ == "LongRangeEnergyModel"
+        assert type(theirs).__name__ != "LongRangeEnergyModel"
+        assert ours.charge_shield is None
+        for r in (1.0, 0.65, 0.4):
+            a, b = evaluate(ours, *squeezed(r)), evaluate(theirs, *squeezed(r))
+            for key in ("energy", "force", "virial"):
+                assert torch.allclose(a[key], b[key], atol=1e-10), (r, key)
+
+    def test_the_shield_takes_the_bridging_radii(self):
+        model = build_dpa4(bridging=True)
+        assert model.charge_shield.radii == (0.5, 0.8)
+        assert model.has_charge_envelope and model.zbl is None
+        assert not list(model.charge_shield.state_dict())
+
+    @pytest.mark.parametrize("r", [0.499, 0.4])
+    def test_atoms_in_contact_carry_no_charge(self, r):
+        model = build_dpa4(bridging=True)
+        charge = evaluate(model, *squeezed(r))["charge"][0]
+        assert charge[:2].eq(0).all()
+        assert float(charge[2:].abs().max()) > 1e-4
+        assert float(charge.sum()) == pytest.approx(0.0, abs=1e-10)
+
+    def test_beyond_the_window_the_shield_changes_nothing(self):
+        model = build_dpa4(bridging=True)
+        shielded = evaluate(model, *squeezed(0.9))
+        model.set_charge_shield(None)
+        plain = evaluate(model, *squeezed(0.9))
+        for key in ("energy", "force", "charge"):
+            assert torch.allclose(shielded[key], plain[key], atol=1e-10), key
+
+    @pytest.mark.parametrize("r", [1.0, 0.7, 0.6, 0.45])
+    def test_the_force_is_the_gradient_through_the_window(self, r):
+        model = build_dpa4(bridging=True)
+        coord, atype, cell = squeezed(r)
+        force = evaluate(model, coord, atype, cell)["force"][0, 1, 0]
+
+        def displaced(step):
+            moved = coord.clone()
+            moved[0, 1, 0] += step
+            return float(evaluate(model, moved, atype, cell)["energy"].sum())
+
+        assert -derivative(displaced, 2e-4) == pytest.approx(float(force), abs=2e-6)
+
+    def test_the_shield_has_its_own_key(self):
+        cfg_radii = [0.6, 1.0]
+        model = build_dpa4(bridging=True)
+        model.set_charge_shield(cfg_radii)
+        assert evaluate(model, *squeezed(0.6))["charge"][0, :2].eq(0).all()
+        again = BaseModel.deserialize(model.serialize()).to(DEVICE).eval()
+        assert again.charge_shield.radii == (0.6, 1.0)
+        assert type(again.atomic_model).__name__ == "LinearEnergyAtomicModel"
+        a, b = evaluate(model, *squeezed(0.7)), evaluate(again, *squeezed(0.7))
+        for key in ("energy", "force", "charge"):
+            assert torch.allclose(a[key], b[key], atol=1e-10), key
+
+    def test_the_config_key_overrides_the_bridging_radii(self):
+        cfg = {
+            "type": "dp_lr",
+            "type_map": ["O", "H"],
+            "descriptor": copy.deepcopy(DESCRIPTOR),
+            "fitting_net": {**copy.deepcopy(FITTING), "type": "dpa4_ener"},
+            "long_range": {**copy.deepcopy(LONG_RANGE), "charge_shield": [0.7, 0.9]},
+            **BRIDGING,
+        }
+        assert get_model(cfg).charge_shield.radii == (0.7, 0.9)
+        del cfg["bridging_method"]  # a shield without bridging
+        assert get_model(cfg).charge_shield.radii == (0.7, 0.9)
+
+    @pytest.mark.parametrize(
+        ("radii", "message"),
+        [([0.8, 0.5], "r_lo < r_hi"), ([0.5, 9.0], "beyond the cutoff"), (0.5, "r_lo")],
+    )
+    def test_bad_radii_are_refused(self, radii, message):
+        with pytest.raises(ValueError, match=message):
+            build_dpa4().set_charge_shield(radii)
+
+    def test_the_zbl_block_and_bridging_do_not_mix(self):
+        with pytest.raises(ValueError, match="both handle short contacts"):
+            get_model(
+                {
+                    "type": "dp_lr",
+                    "type_map": ["O", "H"],
+                    "descriptor": copy.deepcopy(DESCRIPTOR),
+                    "fitting_net": copy.deepcopy(FITTING),
+                    "zbl": {},
+                    **BRIDGING,
+                }
+            )
+
+    def test_the_schema_takes_the_keys(self):
+        from deepmd.utils.argcheck import normalize
+
+        cfg = {
+            "model": {
+                "type": "dp_lr",
+                "type_map": ["O", "H"],
+                "descriptor": {"type": "dpa4", "rcut": 4.0},
+                "fitting_net": {"type": "dpa4_ener"},
+                "long_range": {
+                    **copy.deepcopy(LONG_RANGE),
+                    "charge_shield": [0.5, 0.8],
+                },
+                **BRIDGING,
+            },
+            "learning_rate": {"start_lr": 1e-3},
+            "loss": {"type": "ener_lr"},
+            "training": {"training_data": {"systems": ["./data"]}, "numb_steps": 1},
+        }
+        model = normalize(cfg)["model"]
+        assert model["bridging_method"] == "ZBL"
+        assert model["long_range"]["charge_shield"] == [0.5, 0.8]
 
 
 class TestRefusals:
@@ -391,6 +549,27 @@ class TestEngine:
                 force.cpu().numpy() - serial["force"][0].detach().cpu().numpy()
             ).max()
             < 1e-8
+        )
+
+    def test_one_device_carries_the_charge_shield(self):
+        from deepmd_lr.nvalchemi import DistributedEvaluator
+
+        model = build_dpa4(bridging=True)
+        coord, atype, cell = squeezed(0.65)
+        serial = evaluate(model, coord, atype, cell)
+        evaluator = DistributedEvaluator(
+            model,
+            atype[0].cpu().numpy(),
+            cell[0].cpu().numpy(),
+            devices=[DEVICE],
+            memory_headroom=None,
+        )
+        energy, force = evaluator(coord[0].cpu().numpy())
+        assert energy == pytest.approx(float(serial["energy"]), abs=1e-8)
+        assert (force - serial["force"][0].detach()).abs().max() < 1e-8
+        charge = evaluator.results["charge"]
+        assert torch.allclose(
+            torch.as_tensor(charge, device=DEVICE), serial["charge"][0], atol=1e-10
         )
 
     def test_a_halo_partition_is_refused(self, system):

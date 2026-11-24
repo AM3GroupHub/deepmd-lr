@@ -34,10 +34,46 @@ features, as it does with DPA4C, and the same backbone pass serves both heads.
 | `same_as` links | yes |
 | Several GPUs, or `evaluate_partitioned` with a halo | refused for now |
 | Born effective charges, an external field | refused for now |
+| Short contacts: `bridging_method` with a shield on the charges | yes, [below](#short-contacts) |
 | The `zbl` block | refused: DPA4C only |
 | Compression | not available: DeePMD-kit has no compressed DPA4 |
 | A shared backbone across heads (`shared_dict`, `charge_same_as`) | not available: DeePMD-kit's DPA4 does not share parameters yet |
 | Export of a long-range model | refused, as with DPA4C |
+
+## Short contacts
+
+DPA4 has DeePMD-kit's own short-contact treatment, and `dp_lr` takes its keys
+as a `standard` model does:
+
+```json
+{
+  "model": {
+    "type": "dp_lr",
+    "descriptor": { "type": "dpa4", "rcut": 6.0 },
+    "fitting_net": { "type": "dpa4_ener" },
+    "bridging_method": "ZBL",
+    "bridging_r_inner": 0.5,
+    "bridging_r_outer": 0.8,
+    "long_range": { "charge_net": {}, "reciprocal": { "alpha": 0.4 } }
+  }
+}
+```
+
+- **The energy is DeePMD-kit's.** It adds the ZBL pair repulsion over every
+  pair inside the cutoff and freezes the distances the descriptor sees below
+  `bridging_r_inner` (in Å), so the network is fitted to what ZBL leaves.
+  The model is built by DeePMD-kit's own builder and, without a `long_range`
+  block, returns its numbers exactly. It needs `fitting_net.type: dpa4_ener`.
+- **The charges are shielded here.** An atom's charge is weighted by the
+  product over its neighbours of a C2 step that is 0 at `bridging_r_inner` and
+  1 at `bridging_r_outer`. The weight enters the total-charge projection, so
+  two atoms pushed together carry no charge and the others carry the total.
+  Beyond `bridging_r_outer` nothing changes.
+- `long_range.charge_shield: [r_lo, r_hi]` chooses other radii for the shield,
+  and works without `bridging_method` too.
+
+DeePMD-kit recommends setting `training.training_data.min_pair_dist` to
+`bridging_r_inner`, so frames with closer pairs are skipped in training.
 
 ## Why some paths are refused
 
@@ -72,4 +108,8 @@ any depth.
 - the virial against a volume change;
 - a training step with a force loss reaches the descriptor, both fitting nets
   and the charge head;
-- the one-device evaluator equals the model to 1e-8 eV and 1e-8 eV/Å.
+- the one-device evaluator equals the model to 1e-8 eV and 1e-8 eV/Å;
+- with bridging: the model without a long-range term equals DeePMD-kit's
+  bridged model, both atoms of a contact below the window carry exactly zero
+  charge with the total conserved, and the force is the energy gradient
+  through the window.

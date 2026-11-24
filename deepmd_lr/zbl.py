@@ -406,6 +406,24 @@ class ZBL(torch.nn.Module):
         self.register_buffer("r_lo", r_lo.to(device), persistent=False)
         self.register_buffer("r_hi", r_hi.to(device), persistent=False)
 
+    @classmethod
+    def from_radii(
+        cls, type_map: list[str], r_lo: float, r_hi: float, device=None
+    ) -> "ZBL":
+        """The envelope alone, with one window in angstrom for every pair of
+        elements: what shields the charges of a model whose short-contact
+        energy is handled elsewhere (:meth:`envelope` is all that is used)."""
+        shield = cls(type_map, {}, device=device)
+        real = shield.numbers > 0
+        both = (real[:, None] & real[None, :]).to(shield.r_lo.dtype)
+        shield.r_lo = both * float(r_lo)
+        shield.r_hi = both * float(r_hi)
+        shield.window, shield.pairs = None, {}
+        shield.max_outer = float(r_hi)
+        #: ``(r_lo, r_hi)`` in angstrom.
+        shield.radii = (float(r_lo), float(r_hi))
+        return shield
+
     def serialize(self) -> dict[str, Any]:
         data: dict[str, Any] = {
             "window": None if self.window is None else list(self.window)
