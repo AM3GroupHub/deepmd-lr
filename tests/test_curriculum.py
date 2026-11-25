@@ -43,7 +43,8 @@ DPA4 = {
     "descriptor": {
         "type": "dpa4",
         "rcut": 4.0,
-        "sel": 40,
+        # No `sel`: training takes it from the neighbour statistics, and the
+        # graft has to build the same model from an input without it.
         "channels": 16,
         "lmax": 2,
         "n_blocks": 1,
@@ -88,12 +89,18 @@ def long_range(kind: str, charge_head_only: bool) -> dict:
 
 @pytest.mark.parametrize("kind", list(SHORT_RANGE))
 def test_only_the_charge_head_is_left_trainable(kind):
-    model = get_model(long_range(kind, charge_head_only=True))
+    def built(charge_head_only: bool):
+        cfg = long_range(kind, charge_head_only)
+        if cfg["descriptor"]["type"] == "dpa4":
+            cfg["descriptor"]["sel"] = 40  # `dp train` would fill it in
+        return get_model(cfg)
+
+    model = built(charge_head_only=True)
     trainable = [n for n, p in model.named_parameters() if p.requires_grad]
     assert trainable and all(name.startswith(CHARGE) for name in trainable)
     assert not any(p.requires_grad for p in model.atomic_model.parameters())
     # Without the key the learned model trains.
-    free = get_model(long_range(kind, charge_head_only=False))
+    free = built(charge_head_only=False)
     assert all(p.requires_grad for p in backbone(free).parameters())
 
 
