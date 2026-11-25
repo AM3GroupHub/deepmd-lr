@@ -50,8 +50,9 @@ tables.
 
 ### Calibrating the scale and sign against DFPT labels
 
-Training does not supervise Born tensors. Fit a signed scalar to DFPT labels
-after training, then assess the remaining error on held-out data:
+By default training does not supervise Born tensors (the `ener_lr` loss can,
+with `pref_bec`: [training](training.md#supervising-the-charges-with-born-tensors-pref_bec)).
+Without that, fit a signed scalar to DFPT labels after training, then assess the remaining error on held-out data:
 `s = sum(Z_raw * Z_dft) / sum(Z_raw * Z_raw)`.
 
 ```bash

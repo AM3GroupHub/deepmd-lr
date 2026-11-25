@@ -138,6 +138,48 @@ multi-task run set it in each branch's `loss_dict` entry.
   `ener_spin`; a penalty-only loss (every `ener` prefactor zero) fails inside
   DeePMD-kit's own loss, so keep an energy term.
 
+### Supervising the charges with Born tensors: `pref_bec`
+
+Energies and forces see the charges only through an energy quadratic in them.
+That fixes neither their sign nor much of their response to a displacement,
+and what a run lands on varies: on water, joint DPA4 training gave rigid
+charges of 0.50 e on oxygen and the staged run 0.05 e, both needing an
+after-the-fact scale. Where DFT Born effective charges exist for some frames,
+the `ener_lr` loss can use them:
+
+```json
+"loss": {
+  "type": "ener_lr",
+  "start_pref_bec": 100, "limit_pref_bec": 10,
+  "bec_scale": 1.355
+}
+```
+
+- **The label** is `set.*/born_charge.npy`, `(nframes, natoms * 9)` in e, per
+  atom the 3×3 tensor row by row with `[polarization, displacement]` indices,
+  the layout of the calculator's `results["born_charge"]`. A system without
+  the file contributes nothing to the term, so a few labelled systems can
+  sit beside the unlabelled training set; raise their share of the batches
+  with `training_data.sys_probs`.
+- **`bec_scale`** is the factor from the model's tensors to the labels',
+  `sqrt(eps_inf)`: the model's Coulomb energy is between bare charges, the
+  labels are screened ones ([Born charges](born-charges.md)). It is a
+  setting, not fitted: with it fixed the term decides the sign and the size
+  of the charges, not only the shape of their response.
+- **The term** is the mean over atoms and components of
+  `(bec_scale * Z_model - Z_label)^2`, absolute under `loss_func: mae`, on
+  the prefactor schedule of the others; `lcurve.out` gains `rmse_bec` (and
+  `mae_bec`).
+- **Where in the curriculum:** in the LR and FT stages. With
+  `train_charge_head_only` the term trains the charge head alone on a frozen
+  short-range model.
+- **What it costs:** the Born tensor is computed on every training batch and
+  differentiated once more, as the forces are.
+- **What it changes:** Born tensors are then fitted, not predicted. Keep
+  labelled frames out of the fit to judge them, and say so when comparing
+  with DFPT.
+- Not with `long_range.charge_filter` (the Born tensor is refused with it).
+
 ## What to watch
 
 ```python

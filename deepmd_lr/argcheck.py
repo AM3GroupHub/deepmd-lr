@@ -487,10 +487,26 @@ def ener_lr_loss_args() -> list[Argument]:
         "block. Scheduled as the other prefactors: limit + (start - limit) * "
         "lr / start_lr."
     )
+    bec = (
+        "Prefactor of the Born term: the mean over atoms and components of "
+        "the squared difference (absolute under `loss_func: mae`) between "
+        "bec_scale times the model's Born effective charge tensors and the "
+        "`born_charge` label (born_charge.npy, nine numbers per atom, in e). "
+        "Systems without the label contribute nothing. Needs a `dp_lr` model "
+        "with a `long_range` block. Scheduled as the other prefactors."
+    )
     return [
         *loss_ener(),
         Argument("start_pref_qn", [float, int], optional=True, default=0.0,
                  doc=f"{doc} This is the value at the start of training."),
         Argument("limit_pref_qn", [float, int], optional=True, default=0.0,
                  doc=f"{doc} This is the value at the end of training."),
+        Argument("start_pref_bec", [float, int], optional=True, default=0.0,
+                 doc=f"{bec} This is the value at the start of training."),
+        Argument("limit_pref_bec", [float, int], optional=True, default=0.0,
+                 doc=f"{bec} This is the value at the end of training."),
+        Argument("bec_scale", [float, int], optional=True, default=1.0,
+                 doc="The factor from the model's Born tensors to the labels', "
+                 "sqrt(eps_inf): the Born term compares bec_scale * Z_model "
+                 "with the label. A setting, not fitted."),
     ]
