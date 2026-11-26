@@ -360,6 +360,11 @@ class DistributedEvaluator:
         self._set_physics(
             compute_virial, compute_born, efield, charge_spin, charge_filter, eps_inf
         )
+        #: One backward per partition for the short-range and the
+        #: charge-response force together, where the model allows it
+        #: (:func:`~deepmd_lr.nvalchemi.driver.evaluate_partitioned`); False
+        #: reports the two apart, for one descriptor backward more.
+        self.merge_backward = True
         #: The model's device: where results are assembled and forces live.
         self.home = next(model.parameters()).device
         self.atype = np.asarray(atype, dtype=np.int64).reshape(-1)
@@ -1009,6 +1014,7 @@ class DistributedEvaluator:
                     long_range_energy=self.long_range_energy,
                     charge_filter=self.charge_filter,
                     atype_device=self._atype_dev,
+                    merge_backward=self.merge_backward,
                 )
             except Exception as exc:
                 if (

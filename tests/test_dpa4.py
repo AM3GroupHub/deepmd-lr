@@ -11,10 +11,6 @@ return wrong numbers.
 
 import copy
 import json
-import os
-import subprocess
-import sys
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -31,6 +27,7 @@ from deepmd_lr.model.lr_model import (
 )
 from deepmd_lr.neighbors import build_neighbor_graph_fast
 
+from .test_curriculum import BRIDGING, dp_train, write_dataset
 from .test_joint_model import DT, FITTING, LONG_RANGE, build, frame
 
 RCUT = 4.0
@@ -45,13 +42,6 @@ DESCRIPTOR = {
     "precision": "float64",
     "use_amp": False,
     "seed": 1,
-}
-
-
-BRIDGING = {
-    "bridging_method": "ZBL",
-    "bridging_r_inner": 0.5,
-    "bridging_r_outer": 0.8,
 }
 
 
@@ -336,20 +326,8 @@ def test_cli_training_checkpoint_and_restart(tmp_path, bridging):
     DeePMD-kit pairs with it at its automatic width, and a restart."""
     from deepmd_lr.ase import load_model
 
-    rng = np.random.default_rng(0)
-    data = tmp_path / "data"
-    (data / "set.000").mkdir(parents=True)
-    coord, atype, cell = frame(n_mol=2, box=8.0)
-    n_frame, n_atom = 4, atype.shape[1]
-    (data / "type.raw").write_text("\n".join(map(str, atype[0].tolist())) + "\n")
-    (data / "type_map.raw").write_text("O\nH\n")
-    coordinates = coord[0].cpu().numpy()[None] + 0.05 * rng.normal(
-        size=(n_frame, n_atom, 3)
-    )
-    np.save(data / "set.000/coord.npy", coordinates.reshape(n_frame, -1))
-    np.save(data / "set.000/box.npy", np.tile((np.eye(3) * 8.0).reshape(1, 9), (4, 1)))
-    np.save(data / "set.000/energy.npy", rng.normal(size=n_frame))
-    np.save(data / "set.000/force.npy", rng.normal(size=(n_frame, n_atom * 3)))
+    data = write_dataset(tmp_path)
+    coord, atype, _ = frame(n_mol=2, box=8.0)
     descriptor = {**DESCRIPTOR, "precision": "float32"}
     del descriptor["use_amp"]  # DeePMD-kit's default
     cfg = {
@@ -385,17 +363,7 @@ def test_cli_training_checkpoint_and_restart(tmp_path, bridging):
         cfg["model"].update(BRIDGING)
     inp = tmp_path / "input.json"
     inp.write_text(json.dumps(cfg))
-    env = {
-        **os.environ,
-        "CUDA_VISIBLE_DEVICES": "",
-        "OMP_NUM_THREADS": "1",
-        "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
-    }
-    command = [sys.executable, "-m", "deepmd", "--pt-expt", "train", str(inp)]
-    proc = subprocess.run(
-        command, cwd=tmp_path, env=env, capture_output=True, text=True, timeout=600
-    )
-    assert proc.returncode == 0, proc.stdout + proc.stderr
+    dp_train(str(inp), cwd=tmp_path)
     checkpoint = tmp_path / "model.ckpt.pt"
     model = load_model(str(checkpoint), device="cpu")
     assert type(model).__name__ == "LongRangeEnergyModel"
@@ -407,15 +375,7 @@ def test_cli_training_checkpoint_and_restart(tmp_path, bridging):
         assert type(model.atomic_model).__name__ == "LinearEnergyAtomicModel"
     cfg["training"]["numb_steps"] = 3
     inp.write_text(json.dumps(cfg))
-    proc = subprocess.run(
-        [*command, "--restart", str(checkpoint)],
-        cwd=tmp_path,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=600,
-    )
-    assert proc.returncode == 0, proc.stdout + proc.stderr
+    dp_train(str(inp), "--restart", str(checkpoint), cwd=tmp_path)
 
 
 def born_tensors(model, coord, atype, cell) -> np.ndarray:
@@ -748,6 +708,81 @@ class TestEngine:
             for key in ("force", "virial") + (("charge",) if "charge" in out else ()):
                 reference = serial[key].detach().cpu().numpy().reshape(out[key].shape)
                 assert np.abs(out[key] - reference).max() < 1e-8, (n, key)
+
+    @pytest.mark.parametrize(
+        "make",
+        [
+            lambda: build_dpa4(n_blocks=1),
+            lambda: build_dpa4(n_blocks=1, bridging=True),
+            build,
+        ],
+        ids=["dpa4", "bridged", "dpa4c"],
+    )
+    def test_one_merged_backward_is_the_two_separate_ones(self, make):
+        """The short-range and the charge-response force from one backward
+        per partition: the totals of the two-pass evaluation, with the
+        response no longer reported apart."""
+        from deepmd_lr.nvalchemi import evaluate_partitioned, to_numpy
+
+        model = make()
+        coord, atype, cell = self.host(crowded())
+        for n in (1, 2, 4):
+            out = {
+                merged: to_numpy(
+                    evaluate_partitioned(
+                        model,
+                        coord,
+                        atype,
+                        cell,
+                        n_partitions=n,
+                        devices=[DEVICE] * n,
+                        compute_virial=True,
+                        merge_backward=merged,
+                    )
+                )
+                for merged in (False, True)
+            }
+            assert "force_charge_response" in out[False]
+            assert "force_charge_response" not in out[True]
+            assert "virial_charge_response" not in out[True]
+            for key in ("energy", "force", "virial", "charge"):
+                difference = np.abs(out[True][key] - out[False][key]).max()
+                assert difference < 1e-9, (n, key)
+
+    def test_the_evaluator_merges_the_backwards_at_any_depth(self, system):
+        """One device has no halo, so two blocks run there, merged or not."""
+        from deepmd_lr.nvalchemi import DistributedEvaluator
+
+        model = build_dpa4(n_blocks=2)
+        coord, atype, cell = self.host(system)
+        evaluator = DistributedEvaluator(
+            model, atype, cell, devices=[DEVICE], memory_headroom=None
+        )
+        assert evaluator.merge_backward
+        energy, force = evaluator(coord)
+        force = force.clone()
+        assert "force_charge_response" not in evaluator.results
+        evaluator.merge_backward = False
+        energy_apart, force_apart = evaluator(coord)
+        assert "force_charge_response" in evaluator.results
+        assert energy == pytest.approx(energy_apart, abs=1e-9)
+        assert (force - force_apart).abs().max() < 1e-9
+
+    def test_the_born_tensor_keeps_the_separate_backwards(self):
+        from deepmd_lr.nvalchemi import evaluate_partitioned
+
+        model = build_dpa4(n_blocks=1)
+        coord, atype, cell = self.host(crowded())
+        out = evaluate_partitioned(
+            model,
+            coord,
+            atype,
+            cell,
+            devices=[DEVICE],
+            compute_born=True,
+            merge_backward=True,
+        )
+        assert "force_charge_response" in out and "born_charge" in out
 
     def test_the_halo_is_as_deep_as_the_reach(self):
         from deepmd_lr.nvalchemi import partition_system

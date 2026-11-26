@@ -123,6 +123,51 @@ charge exactly, as before, and the cost stays one backward pass.
 Serial, partitioned and one-device evaluation return the same tensors; an
 external field uses them as with DPA4C ([Born charges](born-charges.md)).
 
+## Speed at inference
+
+DPA4 has no compression, but DeePMD-kit ships Triton kernels for its SO(2)
+blocks, switched on by an environment variable read when the model is built:
+
+```bash
+DP_TRITON_INFER=2 python run_md.py ...
+```
+
+They pass through the plugin unchanged. Measured on 1,536 atoms of water (one
+block, 64 channels, `lmax` 3, GB10, GPU shared with other jobs):
+
+| `DP_TRITON_INFER` | step | peak memory | forces against level 0 |
+|---|---|---|---|
+| 0 | 2.6–2.9 s | 10.1 GB | – |
+| 1 | 1.9 s | 6.9 GB | 5e-6 eV/Å at most |
+| 2 | 0.85–0.94 s | 6.4 GB | 5e-6 eV/Å at most |
+
+The first call compiles the kernels (some 10 s more, once per shape).
+
+Those steps took two backward passes through the descriptor: DeePMD-kit's
+graph lower differentiates the short-range energy itself, and the
+charge-response force needs the descriptor's derivative again once the
+long-range term has given `dE/dq`. The MD evaluator now takes both in one
+pass: each partition keeps its atomic energies attached and differentiates
+`sum_i E_i + sum_j dE/dq_j raw_j` once (`evaluator.merge_backward`, on by
+default). Same system, same shared GPU:
+
+| `DP_TRITON_INFER` | two backwards | one |
+|---|---|---|
+| 0 | 2.84 s | 1.70 s |
+| 2 | 0.89–0.99 s | 0.59–0.62 s |
+
+The total force and virial are those of the two passes to round-off; the
+charge response is no longer reported on its own
+(`results["force_charge_response"]`), so set `evaluator.merge_backward =
+False` to see it. Two passes remain where DeePMD-kit's lower is not the plain
+autograd one (a compressed DPA4C, `DP_CUDA_INFER >= 2`, a `zbl` block) and
+when Born tensors are computed.
+
+`DP_AMP_INFER=1` (bf16 in the blocks) is not recommended: it moved the forces
+of that model by 0.0017 eV/Å on average and 0.008 at most, a quarter of the
+model's own error, for a smaller gain, and together with `DP_TRITON_INFER` it
+fails inside DeePMD-kit's kernels (3.2.0).
+
 ## Checks
 
 `tests/test_dpa4.py`, with random weights in float64:
