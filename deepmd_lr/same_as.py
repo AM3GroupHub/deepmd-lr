@@ -172,6 +172,13 @@ def _validated_charge_owner(
                 f"branch {name!r}: `{CHARGE_SAME_AS_KEY}` needs a `dp_lr` branch "
                 "with a `long_range.charge_net` block on both sides."
             )
+    for name, block in ((owner, base), (key, branch)):
+        if block["long_range"].get("multipole_net") is not None:
+            raise NotImplementedError(
+                f"branch {name!r}: `{CHARGE_SAME_AS_KEY}` shares the charge "
+                "head, and a `long_range.multipole_net` beside it is not "
+                "shared yet"
+            )
     own = _normalized_charge_net(branch["long_range"]["charge_net"])
     theirs = _normalized_charge_net(base["long_range"]["charge_net"])
     if own != theirs:

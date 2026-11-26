@@ -13,6 +13,7 @@ What is pinned:
 """
 
 import copy
+import json
 
 import numpy as np
 import pytest
@@ -24,6 +25,14 @@ from deepmd.utils.argcheck import normalize
 
 from deepmd_lr.lr.multipole import MultipoleLongRangeEnergy
 
+from .test_curriculum import (
+    DPA4,
+    REPO,
+    changed,
+    dp_train,
+    run_python,
+    write_dataset,
+)
 from .test_dpa4 import DESCRIPTOR, derivative, evaluate, roughened
 from .test_joint_model import DT, FITTING, frame
 
@@ -163,6 +172,21 @@ class TestDerivatives:
         trace = out["virial"].reshape(3, 3).diagonal().sum()
         assert -derivative(strained) == pytest.approx(float(trace), abs=1e-6)
 
+        # A shear, which a virial with an antisymmetric part would get wrong:
+        # the moments turn with the frame, so the true one is symmetric.
+        virial = out["virial"].reshape(3, 3)
+        torch.testing.assert_close(virial, virial.T, atol=1e-9, rtol=0)
+
+        def sheared(step):
+            strain = torch.eye(3, dtype=DT, device=DEVICE)
+            strain[0, 1] = strain[1, 0] = step
+            energy = evaluate(model, coord @ strain, atype, cell @ strain)["energy"]
+            return float(energy.sum())
+
+        assert -derivative(sheared) == pytest.approx(
+            float(virial[0, 1] + virial[1, 0]), abs=1e-6
+        )
+
     def test_a_training_step_reaches_the_head(self):
         model = build(2).train()
         coord, atype, cell = frame(n_mol=6, box=10.0)
@@ -242,6 +266,89 @@ class TestBornTensor:
         assert any(float(g.abs().max()) > 0 for g in grads)
 
 
+class TestEngine:
+    """Partitions and the MD evaluator: the moments cross a partition beside
+    the charges, and come back as ``dE/dmu`` and ``dE/dQ``."""
+
+    @staticmethod
+    def host(system):
+        coord, atype, cell = system
+        return (t[0].cpu().numpy() for t in (coord, atype, cell))
+
+    @pytest.mark.parametrize("lmax", [1, 2])
+    def test_partitions_are_the_serial_model(self, lmax):
+        from deepmd_lr.nvalchemi import evaluate_partitioned, to_numpy
+
+        model = build(lmax, n_blocks=1)
+        system = frame(n_mol=16, box=14.0)
+        coord, atype, cell = self.host(system)
+        serial = evaluate(model, *system)
+        keys = ["force", "virial", "charge", "dipole"] + ["quadrupole"] * (lmax == 2)
+        for n in (1, 2, 4):
+            for merged in (False, True):
+                out = to_numpy(
+                    evaluate_partitioned(
+                        model, coord, atype, cell, n_partitions=n,
+                        devices=[DEVICE] * n, compute_virial=True,
+                        merge_backward=merged,
+                    )
+                )  # fmt: skip
+                assert out["energy"] == pytest.approx(float(serial["energy"]), abs=1e-8)
+                for key in keys:
+                    reference = (
+                        serial[key].detach().cpu().numpy().reshape(out[key].shape)
+                    )
+                    assert np.abs(out[key] - reference).max() < 1e-8, (n, merged, key)
+
+    def test_born_tensors_agree_on_every_route(self):
+        from deepmd_lr.nvalchemi import evaluate_partitioned, to_numpy
+
+        model = build(2, n_blocks=1)
+        system = frame(n_mol=16, box=14.0)
+        coord, atype, cell = self.host(system)
+        serial = TestBornTensor.born(model, *system).cpu().numpy()
+        for n in (1, 2, 4):
+            out = to_numpy(
+                evaluate_partitioned(
+                    model, coord, atype, cell, n_partitions=n,
+                    devices=[DEVICE] * n, compute_born=True,
+                )
+            )  # fmt: skip
+            assert np.abs(out["born_charge"] - serial).max() < 1e-8, n
+
+    def test_the_evaluator_and_the_calculator_report_the_moments(self):
+        from ase import Atoms
+
+        from deepmd_lr.ase import LongRangeCalculator
+        from deepmd_lr.nvalchemi import DistributedEvaluator
+
+        model = build(2)
+        system = frame(n_mol=6, box=10.0)
+        coord, atype, cell = self.host(system)
+        serial = evaluate(model, *system)
+        evaluator = DistributedEvaluator(
+            model, atype, cell, devices=[DEVICE], memory_headroom=None
+        )
+        energy, force = evaluator(coord)
+        assert energy == pytest.approx(float(serial["energy"]), abs=1e-8)
+        assert (force - serial["force"][0].detach()).abs().max() < 1e-8
+        dipole = torch.as_tensor(evaluator.results["dipole"], device=DEVICE)
+        assert torch.allclose(dipole, serial["dipole"][0], atol=1e-10)
+        atoms = Atoms(
+            symbols=["O" if t == 0 else "H" for t in atype],
+            positions=coord, cell=cell, pbc=True,
+        )  # fmt: skip
+        atoms.calc = LongRangeCalculator(model)
+        assert atoms.get_potential_energy() == pytest.approx(
+            float(serial["energy"]), abs=1e-8
+        )
+        for key, name in (("dipole", "dipoles"), ("quadrupole", "quadrupoles")):
+            assert np.allclose(
+                atoms.calc.results[name], serial[key][0].detach().cpu().numpy(),
+                atol=1e-10,
+            )  # fmt: skip
+
+
 class TestPlumbing:
     def test_it_round_trips_through_serialization(self):
         model = build(2)
@@ -297,3 +404,59 @@ class TestRefusals:
         cfg["long_range"]["reciprocal"] = {"method": "pme", "alpha": 0.4}
         with pytest.raises(ValueError, match="ewald"):
             get_model(cfg)
+
+
+def test_the_curriculum_through_the_cli(tmp_path):
+    """SR, then the charge and multipole heads alone on it, then everything:
+    `dp train`, the graft and a restart on a model with a multipole head."""
+    data = write_dataset(tmp_path)
+    short_range = {"type": "standard", "type_map": ["O", "H"], **copy.deepcopy(DPA4)}
+    long_range = {
+        **copy.deepcopy(short_range),
+        "type": "dp_lr",
+        "long_range": {
+            "charge_net": {"neuron": [16, 16], "seed": 2},
+            "multipole_net": {"neuron": [16, 16], "seed": 3, "lmax": 2},
+            "reciprocal": {"method": "ewald", "alpha": 0.4, "k_cutoff": 4.0},
+        },
+    }
+
+    def weights(path) -> dict:
+        return torch.load(path, map_location="cpu", weights_only=False)["model"]
+
+    def stage(name: str, model: dict, *flags: str) -> dict:
+        folder = tmp_path / name
+        folder.mkdir()
+        cfg = {
+            "model": model,
+            "learning_rate": {"start_lr": 1e-3, "stop_lr": 1e-4, "decay_steps": 1},
+            "loss": {"type": "ener", "start_pref_e": 1.0, "limit_pref_e": 1.0,
+                     "start_pref_f": 1.0, "limit_pref_f": 1.0},
+            "training": {
+                "training_data": {"systems": [str(data)], "batch_size": 1},
+                "numb_steps": 3, "disp_freq": 1, "save_freq": 3, "seed": 1,
+            },
+        }  # fmt: skip
+        (folder / "input.json").write_text(json.dumps(cfg))
+        if name == "lr":
+            run_python(
+                str(REPO / "scripts" / "graft_short_range.py"),
+                "--short-range", str(tmp_path / "sr" / "model.ckpt.pt"),
+                "--input", "input.json", "--out", "init.ckpt.pt",
+                cwd=folder,
+            )  # fmt: skip
+        dp_train("input.json", *flags, cwd=folder)
+        return weights(folder / "model.ckpt.pt")
+
+    stage("sr", short_range)
+    head_only = copy.deepcopy(long_range)
+    head_only["long_range"]["train_charge_head_only"] = True
+    lr = stage("lr", head_only, "--init-model", "init.ckpt")
+    moved = changed(weights(tmp_path / "lr" / "init.ckpt.pt"), lr)
+    assert any("multipole_fitting." in key for key in moved)
+    assert any("charge_fitting." in key for key in moved)
+    assert all("_fitting." in key and ".fitting_net." not in key for key in moved)
+    ft = stage("ft", long_range, "--init-model", str(tmp_path / "lr" / "model.ckpt"))
+    moved = changed(lr, ft)
+    assert any("multipole_fitting." in key for key in moved)
+    assert any(".descriptor." in key for key in moved)

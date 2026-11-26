@@ -143,6 +143,7 @@ inference and fixes the run's `charge_spin` in the tables. See
 | [cost.md](docs/cost.md) | step time and memory, compressed and not |
 | [md.md](docs/md.md) | ASE workflow, energy conservation, charge filtering and initial relaxation |
 | [compression.md](docs/compression.md) | compressed backbone: requirements, what changes, building the CUDA operators |
+| [multipoles.md](docs/multipoles.md) | atomic dipoles and quadrupoles in the long-range term: the head, the energy, what they add to the Born tensor, what is refused |
 | [born-charges.md](docs/born-charges.md) | Born effective charges, MD in an external field, calibrating against DFPT |
 | [zbl.md](docs/zbl.md) | short contacts: ZBL repulsion and the envelope, a window per pair, what it guards and what it does not |
 | [partitioned-md.md](docs/partitioned-md.md) | GPU MD and its units, cell updates, skin and halos, custom integrators and scaling |

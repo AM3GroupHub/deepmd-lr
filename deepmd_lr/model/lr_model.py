@@ -1311,11 +1311,7 @@ class LongRangeEnergyModel(EnergyModel):
                 "state, which only the shared backbone capture carries; this "
                 "evaluation took a path without it"
             )
-        coefficient = head.call_graph(features, atype.reshape(-1))[head.var_name]
-        vectors, tensors = cartesian_features(
-            backbone(self).descriptor, equivariant, head.lmax
-        )
-        dipole, quadrupole = contract(coefficient, vectors, tensors)
+        dipole, quadrupole = self.raw_moments(features, equivariant, atype.reshape(-1))
         nf = atype.shape[0]
         dipole = dipole.reshape(nf, -1, 3)
         if weight is not None:
@@ -1325,6 +1321,22 @@ class LongRangeEnergyModel(EnergyModel):
             if weight is not None:
                 quadrupole = quadrupole * weight.to(quadrupole.dtype)[..., None, None]
         return dipole, quadrupole
+
+    def raw_moments(
+        self,
+        features: torch.Tensor,
+        equivariant: torch.Tensor,
+        atype_flat: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """The multipole head's dipoles ``(N, 3)`` and quadrupoles ``(N, 3,
+        3)`` (None below ``lmax`` 2) on the flat node axis, before the mask
+        and the envelope weigh them."""
+        head = self.multipole_fitting
+        coefficient = head.call_graph(features, atype_flat)[head.var_name]
+        vectors, tensors = cartesian_features(
+            backbone(self).descriptor, equivariant, head.lmax
+        )
+        return contract(coefficient, vectors, tensors)
 
     def _term_energy(
         self,
@@ -1527,12 +1539,21 @@ class LongRangeEnergyModel(EnergyModel):
                     None if charges.dipole is None else charges.dipole.reshape(-1, 3)
                 ),
             )
+        virial = (-grad_eps).reshape(nf, 3, 3) + response_virial.reshape(nf, 3, 3)
+        if self.has_multipoles:
+            # With moments that are tensors, neither half is invariant under
+            # a rotation on its own: turning the atoms at fixed dipoles
+            # changes the energy, and so does turning the dipoles. The strain
+            # is symmetric and drops the first half's antisymmetric part, the
+            # edge sum keeps the second's; they cancel in the true virial,
+            # which is the symmetric part of what is here.
+            virial = 0.5 * (virial + virial.transpose(-1, -2))
         return {
             "atom_energy": atom_energy,
             "charge": charge,
             "shift": charges.shift,
             "force": -grad_coord + response_force.reshape(nf, nloc, 3),
-            "virial": (-grad_eps).reshape(nf, 9) + response_virial.reshape(nf, 9),
+            "virial": virial.reshape(nf, 9),
             "born": born,
             "dipole": charges.dipole,
             "quadrupole": charges.quadrupole,
