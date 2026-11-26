@@ -36,7 +36,9 @@ The first runs 25 ps without wrapping and checks forces every 500 steps
 | [born](../tests/test_born.py), [eps_inf](../tests/test_eps_inf.py) | tensor derivatives, sum rules, field forces and screening on each path |
 | [charge_filter](../tests/test_charge_filter.py) | exact zeros, total charge, C³ weights, force gradients and agreement across interfaces |
 | [neutrality_loss](../tests/test_neutrality_loss.py) | `ener_lr` penalty, schedule, gradients, schema and serialization |
+| [born_loss](../tests/test_born_loss.py) | the Born term of `ener_lr`: value and schedule, no contribution without the label, the label requirement, the factory switching the model's Born tensors on, a student's tensors brought to a teacher's by the term alone (DPA4C and DPA4), `dp train` with labelled and unlabelled systems, also charge-head-only |
 | [zbl](../tests/test_zbl.py), [zbl_gpu](../tests/test_zbl_gpu.py) | a window per pair, the ZBL pair term and the envelope (exact ends, C²), offsets plus ZBL and no charge below a window, finite-difference forces, virial and Born tensors, the list of contacts against the arithmetic over every edge, refusals; the kernel against torch, agreement of compressed, partitioned, level-2 and canonical evaluation, compiled `.pt2` exports read back, download counts |
+| [dpa4](../tests/test_dpa4.py) | the model on DPA4: building and serialization, the reach of the message passing, finite-difference forces and virial, a training step, the frame condition, the one-device evaluator, DeePMD-kit's ZBL bridging with the charge shield, partitions with a halo as deep as the reach, the Born tensor against finite differences over the edge vectors and across partitions, and the refusals (one-hop partitions, compression) |
 | [multi_task](../tests/test_multi_task.py), [same_as](../tests/test_same_as.py), [charge_same_as](../tests/test_charge_same_as.py) | branch expansion and parameter sharing |
 
 ## Inference and MD coverage
@@ -61,4 +63,5 @@ The first runs 25 ps without wrapping and checks forces every 500 steps
 | [plugin_registration](../tests/test_plugin_registration.py), [import_order](../tests/test_import_order.py) | entry point, schema and independent module imports |
 | [xyz_to_deepmd](../tests/test_xyz_to_deepmd.py) | dataset conversion |
 | [graft_short_range](../tests/test_graft_short_range.py) | checkpoint grafting |
+| [curriculum](../tests/test_curriculum.py) | SR → LR → FT through `dp train` on DPA4C, DPA4 and bridged DPA4: `train_charge_head_only` leaves only the charge head trainable, the LR stage moves no other weight, the FT stage moves all three parts |
 | [calibrate_born](../tests/test_calibrate_born.py) | signed scale fitting and calibration CLI |

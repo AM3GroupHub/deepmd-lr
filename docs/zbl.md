@@ -260,7 +260,7 @@ Each of these would silently leave the term out, or meet it half way:
 |---|---|
 | the dense (neighbour-list) lower, `forward_lower` | the term is evaluated on the graph lowers, which are what `dp freeze` and a compressed export trace for this model |
 | a Hessian | DeePMD-kit's Hessian wrapper evaluates the atomic model directly |
-| `use_srtab`, atom or pair exclusions, a descriptor other than DPA4C | not supported with the term |
+| `use_srtab`, atom or pair exclusions, a descriptor other than DPA4C | not supported with the term; DPA4 has [its own](dpa4.md#short-contacts) |
 | `charge_same_as` branches with different `zbl` blocks | one charge head has one envelope |
 
 An MD checkpoint records the block, and restores only onto an evaluator whose

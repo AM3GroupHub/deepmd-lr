@@ -46,6 +46,9 @@ This is a **model fragment**, not a complete training input:
 dp --pt-expt train input.json
 ```
 
+For systems DPA4C does not describe well enough, the same model runs on
+DPA4 (`"descriptor": {"type": "dpa4"}`); see [what works there](docs/dpa4.md).
+
 Use [example 01](examples/01-bulk) for data preparation and a complete
 `input.json`. Train a baseline with `"type": "dp_lr"` and `long_range` removed
 to measure the improvement. Choose [alpha and the mesh](docs/alpha-and-mesh.md)
@@ -69,6 +72,7 @@ include `input.json`, and simulation examples include runnable scripts.
 | [08](examples/08-nemd) | thermal conductance by NEMD | a region thermostat with an exact heat account, fixed layers, a slab on the GPU path |
 | [09](examples/09-fire-swap) | B-site order in PMN by FIRE-Swap | relaxed-swap Metropolis on one evaluator, rollback and resume |
 | [10](examples/10-zbl) | short contacts | `zbl`: ZBL repulsion and the network switched off below the data; choosing the windows with a scan |
+| [11](examples/11-sr-lr-ft) | staged training | SR → LR → FT: the charge head on a frozen short-range model (`train_charge_head_only`), then everything |
 
 ## Run MD
 
@@ -130,6 +134,7 @@ inference and fixes the run's `charge_spin` in the tables. See
 |---|---|
 | [install.md](docs/install.md) | dependencies, environment setup and import check |
 | [alpha-and-mesh.md](docs/alpha-and-mesh.md) | does the term apply to your data; choosing `alpha` and the mesh; `pme` vs `ewald` |
+| [dpa4.md](docs/dpa4.md) | DPA4 as the backbone: configuration, what works, what is refused and why |
 | [non-periodic.md](docs/non-periodic.md) | molecules and clusters: the isolated sum, its two kernels, MD on the GPU |
 | [multi-head.md](docs/multi-head.md) | several levels of theory: sharing, clipping and branch configuration |
 | [same-as.md](docs/same-as.md) | one theory, bulk + slab: `same_as`; setting the long-range type at load |

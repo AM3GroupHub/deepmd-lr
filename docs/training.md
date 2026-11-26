@@ -7,27 +7,51 @@ used it and converged without trouble: 4.9× better forces than the baseline,
 charges settling near ±1 within a few thousand steps. Use it unless you hit a
 symptom in [Troubleshooting](#troubleshooting).
 
-### Plan B: staged (when Plan A is unstable)
+### Plan B: SR → LR → FT (staged)
 
-| stage | steps | LR | what trains |
-|-------|------:|----|-------------|
-| 1. warm-up | 10–20% of budget | 1e-3 → 1e-4 | descriptor + energy head (no `long_range` block) |
-| 2. graft   | — | — | copy weights across, scale down the charge head |
-| 3. joint   | remainder | 5e-4 → 1e-5 | everything |
+Three runs, each started from the one before
+([example 11](../examples/11-sr-lr-ft) has the three inputs and a script):
 
-Stage 2 needs a helper, because `dp train --init-model` loads the state dict
-strictly and refuses a checkpoint missing the charge head's weights:
+| stage | what trains | learning rate | started from |
+|-------|-------------|---------------|--------------|
+| SR | descriptor + energy head; no `long_range` block | 1e-3 → 1e-5 | scratch |
+| LR | the charge head alone, on the SR model frozen (`long_range.train_charge_head_only: true`) | 1e-3 → 1e-5 | the SR checkpoint, grafted |
+| FT | everything | a tenth: 1e-4 → 1e-6 | the LR checkpoint |
 
 ```bash
-dp --pt-expt train input_stage1.json          # long_range block removed
+dp --pt-expt train sr.json                    # long_range block removed
 
 python scripts/graft_short_range.py \
-    --short-range run_stage1/model.ckpt.pt \
-    --input       input_joint.json \
-    --out         init_joint.ckpt.pt
+    --short-range sr/model.ckpt.pt --input lr.json --out init.ckpt.pt
+dp --pt-expt train lr.json --init-model init.ckpt
 
-dp --pt-expt train input_joint.json --init-model init_joint.ckpt
+dp --pt-expt train ft.json --init-model lr/model.ckpt
 ```
+
+Why stage it. Trained jointly from scratch, the charges are fitted while the
+short-range model is still wrong, so they absorb error that is not
+electrostatic. In the LR stage they are fitted to what a converged
+short-range model left unexplained, and in the FT stage both adapt together
+from there. The curriculum comes from mace-lr, where on water the joint run
+gave nearly rigid charges and too little Born anisotropy; there it did not
+give a Born-charge improvement that held across seeds, so compare against
+Plan A on your own system before adopting it.
+
+- **`train_charge_head_only` freezes the whole short-range model**: every
+  weight of the descriptor and the energy fitting net, with bridging the
+  bridged composition too. Use it rather than the two `trainable: false`
+  keys: DeePMD-kit's `dpa4_ener` fitting net trains on with its key false.
+  The FT input is the LR input without the key.
+- **The same `long_range` block in LR and FT**: α belongs to the trained
+  charges and cannot change between them.
+- **Continue from `model.ckpt.pt`**, the live weights; each stage starts its
+  own average ([EMA](#ema-is-always-on)) and the model to deploy is the FT
+  stage's `model_ema.ckpt.pt`.
+- **The graft is needed once**, between SR and LR, because
+  `dp train --init-model` loads the state dict strictly and refuses a
+  checkpoint missing the charge head's weights. LR to FT needs none.
+- The LR stage can be left out (SR, graft, joint): the earlier form of this
+  plan, which the table below was measured with.
 
 The script scales the charge head's output layer by 0.01, and the scale has to
 be small but not zero. Too large (a fresh head) predicts random charges whose
@@ -113,6 +137,48 @@ multi-task run set it in each branch's `loss_dict` entry.
 - **Limits.** `validating.full_validation` accepts only `ener` and
   `ener_spin`; a penalty-only loss (every `ener` prefactor zero) fails inside
   DeePMD-kit's own loss, so keep an energy term.
+
+### Supervising the charges with Born tensors: `pref_bec`
+
+Energies and forces see the charges only through an energy quadratic in them.
+That fixes neither their sign nor much of their response to a displacement,
+and what a run lands on varies: on water, joint DPA4 training gave rigid
+charges of 0.50 e on oxygen and the staged run 0.05 e, both needing an
+after-the-fact scale. Where DFT Born effective charges exist for some frames,
+the `ener_lr` loss can use them:
+
+```json
+"loss": {
+  "type": "ener_lr",
+  "start_pref_bec": 100, "limit_pref_bec": 10,
+  "bec_scale": 1.355
+}
+```
+
+- **The label** is `set.*/born_charge.npy`, `(nframes, natoms * 9)` in e, per
+  atom the 3×3 tensor row by row with `[polarization, displacement]` indices,
+  the layout of the calculator's `results["born_charge"]`. A system without
+  the file contributes nothing to the term, so a few labelled systems can
+  sit beside the unlabelled training set; raise their share of the batches
+  with `training_data.sys_probs`.
+- **`bec_scale`** is the factor from the model's tensors to the labels',
+  `sqrt(eps_inf)`: the model's Coulomb energy is between bare charges, the
+  labels are screened ones ([Born charges](born-charges.md)). It is a
+  setting, not fitted: with it fixed the term decides the sign and the size
+  of the charges, not only the shape of their response.
+- **The term** is the mean over atoms and components of
+  `(bec_scale * Z_model - Z_label)^2`, absolute under `loss_func: mae`, on
+  the prefactor schedule of the others; `lcurve.out` gains `rmse_bec` (and
+  `mae_bec`).
+- **Where in the curriculum:** in the LR and FT stages. With
+  `train_charge_head_only` the term trains the charge head alone on a frozen
+  short-range model.
+- **What it costs:** the Born tensor is computed on every training batch and
+  differentiated once more, as the forces are.
+- **What it changes:** Born tensors are then fitted, not predicted. Keep
+  labelled frames out of the fit to judge them, and say so when comparing
+  with DFPT.
+- Not with `long_range.charge_filter` (the Born tensor is refused with it).
 
 ## What to watch
 

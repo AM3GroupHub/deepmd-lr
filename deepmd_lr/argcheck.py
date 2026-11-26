@@ -12,6 +12,7 @@ from dargs import (
     Argument,
 )
 from deepmd.utils.argcheck import (
+    _bridging_method_args,
     descrpt_variant_type_args,
     fitting_args_plugin,
     fitting_variant_type_args,
@@ -140,6 +141,9 @@ def dp_lr_model_args() -> Argument:
                 ),
             ),
             _zbl_args(),
+            # DeePMD-kit's own short-contact keys, for a DPA4 descriptor:
+            # `bridging_method`, `bridging_r_inner`, `bridging_r_outer`.
+            *_bridging_method_args(),
             _long_range_args(),
         ],
         doc=(
@@ -433,10 +437,36 @@ def _long_range_args() -> Argument:
         "little charge each carries none. Born charges and fields are refused "
         "with it. See deepmd_lr.fitting.charge.filter_charges.",
     )
+    charge_shield = Argument(
+        "charge_shield",
+        [list[float], None],
+        optional=True,
+        default=None,
+        doc="[r_lo, r_hi] in angstrom, or null. With `bridging_method` (DPA4) "
+        "an atom's charge is switched off at a short contact: weighted by the "
+        "product over its neighbours of a C2 step from 0 at r_lo to 1 at r_hi, "
+        "inside the total-charge projection, so the other atoms carry the "
+        "total. By default the radii are `bridging_r_inner` and "
+        "`bridging_r_outer`; give this key to choose others, or to shield the "
+        "charges of a model without bridging.",
+    )
+    charge_head_only = Argument(
+        "train_charge_head_only",
+        bool,
+        optional=True,
+        default=False,
+        doc="Freeze the short-range model -- descriptor, energy fitting net "
+        "and, with `bridging_method`, the bridged composition -- so that only "
+        "the charge head trains. The middle stage of the SR -> LR -> FT "
+        "curriculum: on a converged short-range model the charges are fitted "
+        "to what it left unexplained, before everything is trained together. "
+        "A training switch only; it changes nothing in a model that is "
+        "evaluated.",
+    )
     return Argument(
         LONG_RANGE_KEY,
         dict,
-        [charge_net, reciprocal, charge_filter],
+        [charge_net, reciprocal, charge_filter, charge_shield, charge_head_only],
         optional=True,
         default=None,
         doc="The long-range electrostatic term. Omit for a pure short-range "
@@ -457,10 +487,26 @@ def ener_lr_loss_args() -> list[Argument]:
         "block. Scheduled as the other prefactors: limit + (start - limit) * "
         "lr / start_lr."
     )
+    bec = (
+        "Prefactor of the Born term: the mean over atoms and components of "
+        "the squared difference (absolute under `loss_func: mae`) between "
+        "bec_scale times the model's Born effective charge tensors and the "
+        "`born_charge` label (born_charge.npy, nine numbers per atom, in e). "
+        "Systems without the label contribute nothing. Needs a `dp_lr` model "
+        "with a `long_range` block. Scheduled as the other prefactors."
+    )
     return [
         *loss_ener(),
         Argument("start_pref_qn", [float, int], optional=True, default=0.0,
                  doc=f"{doc} This is the value at the start of training."),
         Argument("limit_pref_qn", [float, int], optional=True, default=0.0,
                  doc=f"{doc} This is the value at the end of training."),
+        Argument("start_pref_bec", [float, int], optional=True, default=0.0,
+                 doc=f"{bec} This is the value at the start of training."),
+        Argument("limit_pref_bec", [float, int], optional=True, default=0.0,
+                 doc=f"{bec} This is the value at the end of training."),
+        Argument("bec_scale", [float, int], optional=True, default=1.0,
+                 doc="The factor from the model's Born tensors to the labels', "
+                 "sqrt(eps_inf): the Born term compares bec_scale * Z_model "
+                 "with the label. A setting, not fitted."),
     ]

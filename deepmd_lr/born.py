@@ -50,6 +50,19 @@ feature depends only on edges where its atom is the *centre*:
 per-edge derivative in a single pass -- not one pass per atom, which is what a
 naive Jacobian would cost.
 
+With message passing
+--------------------
+On a descriptor that passes messages (DPA4) a charge also depends on edges
+elsewhere within its reach, and the same single pass gives, for every edge,
+the response of *all* charges to that pair vector, ``sum_k d raw_k / d
+edge_vec_e``. The tensor keeps its pair form with that derivative in place of
+the pair's own: each pair vector's whole effect on the charges is assigned,
+half and half, to the pair's two atoms. Where only the pair's own charges
+respond this is the formula above unchanged; a third atom's response enters
+with the pair's lever arm rather than its own position. The sum rule holds as
+before, and nothing but edge vectors is used, so periodic images need no
+bookkeeping.
+
 Raw or constrained charges
 --------------------------
 The derivative uses the **raw**, pre-projection charges; the :math:`\delta`
@@ -205,9 +218,10 @@ def born_charges(
             "be mapped back onto the frame layout."
         )
 
-    # One backward pass for every edge. Summing over j is legitimate only
-    # because the descriptor is one-hop: each edge feeds exactly one atom's
-    # charge, its centre, so the summed cotangent carries no cross terms.
+    # One backward pass for every edge. For a one-hop descriptor each edge
+    # feeds exactly one atom's charge, its centre, so the summed cotangent
+    # carries no cross terms; with message passing it is the pair form of
+    # the module docstring.
     (g,) = torch.autograd.grad(
         raw.sum(), edge_vec, create_graph=create_graph, retain_graph=True
     )

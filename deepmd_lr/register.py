@@ -20,6 +20,7 @@ brings us here.
 
 from deepmd_lr import (  # schema args; `same_as`, EMA, compression, loss hooks
     argcheck,
+    bridging,
     compress,
     ema_default,
     loss,
@@ -45,6 +46,10 @@ ema_default.install()
 # A compressed DPA4C must ask for the CSR views its kernel needs; upstream's
 # `get_geo_compress` never does for DPA4C. One boolean, see `compress.py`.
 compress.install()
+
+# `bridging_method` on a `dp_lr` model: upstream expands the key before it
+# dispatches on the model type, and would refuse ours.
+bridging.install()
 
 # `ener_lr`: upstream's loss factory is a fixed if/elif over its own types.
 loss.install()

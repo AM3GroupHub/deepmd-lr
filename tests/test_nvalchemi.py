@@ -1109,10 +1109,16 @@ class TestDistributedEvaluator:
         """Short-range, reciprocal and charge-response, and they must add up.
 
         The charge-response piece is the one that could plausibly be dropped
-        without anything looking wrong, so its presence is asserted.
+        without anything looking wrong, so its presence is asserted. The
+        split needs the two backward passes: merged, only the total exists.
         """
         driver = self._driver(model, system, compute_virial=True)
         driver(system[0])
+        total = driver.virial.copy()
+        assert "virial_charge_response" not in driver.results
+        driver.merge_backward = False
+        driver(system[0])
+        assert np.abs(driver.virial - total).max() < 1e-10
         parts = [
             driver.results[key]
             for key in (

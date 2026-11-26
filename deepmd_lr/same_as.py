@@ -442,8 +442,10 @@ def _require_shared_descriptor(wrapper: Any, owner: str, key: str) -> None:
     reads each branch's type indices as the owner's, and the same oxygen got
     opposite-sign charges under the two theories.
     """
-    ours = list(wrapper.model[key].atomic_model.descriptor.parameters())
-    theirs = list(wrapper.model[owner].atomic_model.descriptor.parameters())
+    from deepmd_lr.model.lr_model import backbone
+
+    ours = list(backbone(wrapper.model[key]).descriptor.parameters())
+    theirs = list(backbone(wrapper.model[owner]).descriptor.parameters())
     if len(ours) != len(theirs) or any(
         p.data_ptr() != q.data_ptr() for p, q in zip(ours, theirs, strict=True)
     ):

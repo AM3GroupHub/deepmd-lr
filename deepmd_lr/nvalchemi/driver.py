@@ -42,6 +42,9 @@ from typing import (
 
 import numpy as np
 import torch
+from deepmd.kernels.utils import (
+    cuda_infer_level,
+)
 
 from deepmd_lr.born import (
     edge_born_response,
@@ -60,6 +63,10 @@ from deepmd_lr.model.lr_model import (
     _is_compressed,
     _run_backbone,
     _symmetric_strain,
+    gate_margin,
+    message_blocks,
+    receptive_hops,
+    require_one_hop,
 )
 from deepmd_lr.nvalchemi.born_csr import (
     edge_born_response_csr,
@@ -126,8 +133,13 @@ class _Run:
     raw_charge: torch.Tensor | None
     virial: torch.Tensor | None
     #: The short-contact envelope of every atom, gathered beside the raw
-    #: charges; None for a model without a ``zbl`` term.
+    #: charges; None for a model without one (``zbl`` or a charge shield).
     envelope: torch.Tensor | None = None
+    #: How many neighbour shells an atom's output reaches (1 for DPA4C).
+    hops: int = 1
+    #: One backward per partition for the short-range and the charge-response
+    #: force together (:func:`_merges_backward`).
+    merged: bool = False
 
     @property
     def n_atoms(self) -> int:
@@ -279,7 +291,9 @@ def partition_graph(
     strain: torch.Tensor | None = None,
     with_csr: bool = False,
 ):
-    """Build one partition's neighbour graph: every edge into an owned atom.
+    """Build one partition's neighbour graph: every edge into an owned atom,
+    and for a descriptor that passes messages into the ghosts it reads
+    (``Partition.n_centre``).
 
     The search is a :class:`~deepmd_lr.nvalchemi.nlist.GpuNeighborList`,
     cached on the partition and run at every call, with only the owned atoms
@@ -355,7 +369,7 @@ def partition_graph(
                 device,
                 cell=None,
                 targets=torch.arange(
-                    part.n_owned, dtype=torch.int32, device=torch.device(device)
+                    part.n_search, dtype=torch.int32, device=torch.device(device)
                 ),
                 float64_vectors=keep64,
             )
@@ -419,6 +433,7 @@ def evaluate_partitioned(
     long_range_energy: Any = None,
     charge_filter: tuple[float, float] | None = None,
     atype_device: torch.Tensor | None = None,
+    merge_backward: bool = False,
 ) -> dict[str, Any]:
     """Run ``model`` over spatial partitions and assemble the global result.
 
@@ -457,6 +472,13 @@ def evaluate_partitioned(
         ``atype`` already on the gather device, for the long-range term. A
         caller that evaluates every step keeps one copy rather than paying a
         pageable upload per call; ``cell`` may likewise be a device tensor.
+    merge_backward
+        Take the short-range and the charge-response force in one backward
+        pass per partition where the model allows it
+        (:func:`_merges_backward`): the same total force and virial for one
+        descriptor backward fewer. The two are then not told apart:
+        ``force_charge_response`` and ``virial_charge_response`` are absent
+        from the result, and ``force`` and ``virial`` are the totals.
 
     Returns
     -------
@@ -483,6 +505,7 @@ def evaluate_partitioned(
         partitions,
         replicas,
         compute_virial,
+        merge_backward and not compute_born,
     )
     launched = _launch(run, charge_spin)
     _gather(run, launched)
@@ -522,7 +545,7 @@ def evaluate_partitioned(
     response = _charge_response_force(
         run, launched, result["dE_dq"], born_grads, result.get("dE_dw")
     )
-    return _assembled(result, response, compute_virial, eps_inf)
+    return _assembled(result, response, compute_virial, eps_inf, run.merged)
 
 
 def _validated(model, pbc, long_range_energy, charge_filter, compute_born):
@@ -540,6 +563,30 @@ def _validated(model, pbc, long_range_energy, charge_filter, compute_born):
     return charge_filter
 
 
+def _halo_hops(model) -> int:
+    """How many cutoffs deep a partition's halo has to be for ``model``;
+    refused for a DPA4 of more than one interaction block.
+
+    The halo is one cutoff per neighbour shell the descriptor reaches, and a
+    partition holds every atom inside it: at three blocks and a 6 A cutoff
+    that is 24 A on each face. Partitions are therefore offered for one block
+    only (two cutoffs with the environment seed, one without); a deeper model
+    runs on one device, which has no halo.
+    """
+    hops = receptive_hops(model)
+    if hops is None:
+        require_one_hop(model, "A partition with a halo of ghost atoms")
+    blocks = message_blocks(model)
+    if blocks > 1:
+        raise NotImplementedError(
+            f"this DPA4 has n_blocks = {blocks}: several devices (partitions "
+            "with a halo) are supported for n_blocks = 1 only, since the halo "
+            f"would be {hops} cutoffs deep on every face. Run it on one "
+            "device, which needs no halo."
+        )
+    return hops
+
+
 def _prepared(
     model,
     coord,
@@ -552,6 +599,7 @@ def _prepared(
     partitions,
     replicas,
     compute_virial: bool,
+    merge_backward: bool = False,
 ) -> _Run:
     """The partitions (those given, or a decomposition of ``coord``) on their
     devices and replicas, the coordinates on every device, the zeroed sums."""
@@ -562,7 +610,21 @@ def _prepared(
     parts = partitions
     if parts is None:
         host = coord.detach().cpu().numpy() if coord_np is None else coord_np
-        parts = partition_system(host, cell, rcut, n_partitions, pbc)
+        parts = partition_system(
+            host,
+            cell,
+            rcut,
+            n_partitions,
+            pbc,
+            hops=_halo_hops(model),
+            margin=gate_margin(model),
+        )
+    elif any(len(part.ghost) for part in parts):
+        _halo_hops(model)
+        if any(len(part.ghost) and part.n_centre is None for part in parts):
+            # Partitions built with a halo of one cutoff and edges into owned
+            # atoms only: wrong, without an error, for a deeper descriptor.
+            require_one_hop(model, "A partition with a halo of one cutoff")
     if devices is None:
         devices = [next(model.parameters()).device] * len(parts)
     if len(devices) != len(parts):
@@ -586,7 +648,7 @@ def _prepared(
     raw_charge = torch.zeros(n_atoms, dtype=dtype, device=home) if long_range else None
     envelope = (
         torch.ones(n_atoms, dtype=dtype, device=home)
-        if long_range and getattr(model, "zbl", None) is not None
+        if long_range and getattr(model, "has_charge_envelope", False)
         else None
     )
     virial = torch.zeros((3, 3), dtype=dtype, device=home) if compute_virial else None
@@ -617,6 +679,30 @@ def _prepared(
         raw_charge=raw_charge,
         virial=virial,
         envelope=envelope,
+        hops=receptive_hops(model) or 1,
+        merged=merge_backward and _merges_backward(model),
+    )
+
+
+def _merges_backward(model) -> bool:
+    """Whether one backward can serve both forces of ``model``.
+
+    DeePMD-kit's graph lower differentiates the short-range energy itself,
+    before the long-range term exists; the charge-response force then needs a
+    second backward through the same descriptor. Where the lower is the plain
+    autograd one, the partition can keep the atomic energies attached instead
+    and differentiate ``sum_i E_i + sum_j dE/dq_j raw_j`` once.
+
+    Not where the lower is something else: a compressed descriptor and
+    ``DP_CUDA_INFER >= 2`` emit the force from fused operators, and a ``zbl``
+    block adds its own terms around the lower.
+    """
+    return (
+        model.has_long_range
+        and not model.training
+        and not _is_compressed(model)
+        and model.zbl is None
+        and cuda_infer_level() < 2
     )
 
 
@@ -670,20 +756,27 @@ def _launch_one(run: _Run, part: Partition, device, charge_spin) -> _Launched:
             else contextlib.nullcontext({})
         )
         with capture as captured:
-            out = local.forward_common_lower_graph(
-                node_type,
-                n_node,
-                n_local,
-                graph.edge_index,
-                graph.edge_vec,
-                graph.edge_mask,
-                destination_order=graph.destination_order,
-                destination_row_ptr=graph.destination_row_ptr,
-                source_order=graph.source_order,
-                source_row_ptr=graph.source_row_ptr,
-                destination_sorted=graph.destination_sorted,
-                charge_spin=condition,
-            )
+            if run.merged:
+                # The atomic energies alone, attached to this partition's
+                # coordinates: their backward waits for the charge response.
+                out = local.atomic_model.forward_common_atomic_graph(
+                    graph, node_type, charge_spin=condition
+                )
+            else:
+                out = local.forward_common_lower_graph(
+                    node_type,
+                    n_node,
+                    n_local,
+                    graph.edge_index,
+                    graph.edge_vec,
+                    graph.edge_mask,
+                    destination_order=graph.destination_order,
+                    destination_row_ptr=graph.destination_row_ptr,
+                    source_order=graph.source_order,
+                    source_row_ptr=graph.source_row_ptr,
+                    destination_sorted=graph.destination_sorted,
+                    charge_spin=condition,
+                )
         # Charges from the same descriptor pass the energy head just ran, kept
         # attached for the charge-response backward; a second pass only when
         # the capture cannot carry the gradient.
@@ -717,26 +810,32 @@ def _gather(run: _Run, launched: list[_Launched]) -> None:
     for item in launched:
         part, out, raw, envelope = item.part, item.out, item.raw, item.envelope
         v = part.views(home, dtype)
-        if run.compute_virial:
-            run.virial += (
-                out["energy_derv_c_redu"].reshape(3, 3).detach().to(home, dtype)
-            )
         per_atom = out["energy"].reshape(-1).detach().to(home, dtype)
-        # `energy_derv_r` is already the force, not the energy gradient.
-        node_force = (
-            out["energy_derv_r"].reshape(part.n_node, 3).detach().to(home, dtype)
-        )
+        # With one merged backward the force and virial come later, from
+        # `_charge_response_force`.
+        node_force = None
+        if not run.merged:
+            if run.compute_virial:
+                run.virial += (
+                    out["energy_derv_c_redu"].reshape(3, 3).detach().to(home, dtype)
+                )
+            # `energy_derv_r` is already the force, not the energy gradient.
+            node_force = (
+                out["energy_derv_r"].reshape(part.n_node, 3).detach().to(home, dtype)
+            )
         if part.is_whole_system:
             # Nodes are the atoms in order: the sums have one term each.
             run.atom_energy.copy_(per_atom)
-            run.force.copy_(node_force)
+            if node_force is not None:
+                run.force.copy_(node_force)
             if run.long_range:
                 run.raw_charge.copy_(raw.detach().to(home, dtype))
             if envelope is not None:
                 run.envelope.copy_(envelope.detach().to(home, dtype))
             continue
         run.atom_energy.index_add_(0, v["owned"], per_atom[: part.n_owned])
-        run.force.index_add_(0, v["ids"], node_force)
+        if node_force is not None:
+            run.force.index_add_(0, v["ids"], node_force)
         if run.long_range:
             run.raw_charge.index_copy_(0, v["owned"], raw.detach().to(home, dtype))
         if envelope is not None:
@@ -744,22 +843,31 @@ def _gather(run: _Run, launched: list[_Launched]) -> None:
 
 
 def _assembled(
-    result: dict, response: tuple, compute_virial: bool, eps_inf: float
+    result: dict,
+    response: tuple,
+    compute_virial: bool,
+    eps_inf: float,
+    merged: bool = False,
 ) -> dict:
     """``result`` with the short-range, long-range and charge-response terms
-    added up, and the reported charges screened."""
+    added up, and the reported charges screened. With one merged backward
+    ``response`` already holds the short-range force and virial, and the
+    charge response is not reported on its own."""
     response_force, response_virial = response
     result["energy"] = result["energy_short_range"] + result["energy_long_range"]
     result["atom_energy_short_range"] = result["atom_energy"]
     result["atom_energy"] = result["atom_energy"] + result["atom_energy_long_range"]
-    result["force"] = result["force"] + result["force_long_range"]
-    result["force_charge_response"] = response_force
-    result["force"] = result["force"] + response_force
+    result["force"] = result["force"] + result["force_long_range"] + response_force
+    if not merged:
+        result["force_charge_response"] = response_force
     if compute_virial:
         result["virial"] = (
             result["virial"] + result["virial_long_range"] + response_virial
         )
-        result["virial_charge_response"] = response_virial
+        if merged:
+            del result["virial_short_range"]
+        else:
+            result["virial_charge_response"] = response_virial
     # The energy used the model's own charges; only the report is screened,
     # after the Born tensor took the unscaled ones for its delta term.
     factor = screening_factor(eps_inf)
@@ -801,9 +909,9 @@ def _born_charges_partitioned(
 
     The global projection touches only the :math:`q_i\delta_{\alpha\beta}`
     term, which arrives already projected (``charge``). The derivative half
-    uses the **raw** charges, which are strictly local -- DPA4C is one-hop, so
-    an atom's raw charge sees only edges where it is the centre -- and
-    therefore partition exactly. With a short-contact envelope the local
+    uses the **raw** charges of the atoms a partition owns, which its halo
+    covers in full (one cutoff for DPA4C, one per shell for DPA4), and
+    therefore partitions exactly. With a short-contact envelope the local
     charge is ``w (raw + shift)`` at the fixed ``shift`` the projection
     found, as local as the raw one. Each partition contributes both halves of
     the pair sum for every edge it owns::
@@ -847,9 +955,14 @@ def _born_charges_partitioned(
                 shifted = raw + shift.to(device=raw.device, dtype=raw.dtype)
                 local = item.envelope * shifted
             (g,) = torch.autograd.grad(local.sum(), leaf, retain_graph=True)
+            # The charge response may reuse this cotangent only where it is
+            # `d raw_dst / d edge_vec`, each edge reaching its own
+            # destination's charge alone: a one-hop descriptor.
             reusable = None
-            if cap is not None and (
-                item.envelope is None or item.contacts is not None
+            if (
+                cap is not None
+                and run.hops == 1
+                and (item.envelope is None or item.contacts is not None)
             ):
                 reusable = g
             if item.contacts is not None:
@@ -926,9 +1039,9 @@ def _charge_response_force(
     partition backpropagates ``sum_j (dE/dq_j raw_j + dE/dw_j w_j)``.
 
     ``born_grads``, when the Born tensors were just computed, holds each
-    partition's unweighted cotangent ``d raw / d edge_vec``. The descriptor
-    is one-hop, so ``d (sum_j w_j raw_j) / d edge_vec_e`` is that gradient
-    times ``w_{dst(e)}``, and the backward through the descriptor is not
+    partition's unweighted cotangent ``d raw / d edge_vec``, kept for a
+    one-hop descriptor only: there ``d (sum_j w_j raw_j) / d edge_vec_e`` is
+    that gradient times ``w_{dst(e)}``, and the backward through the descriptor is not
     repeated. With a list of contacts the cotangent already holds the
     envelope, and the weight is divided by it: ``dE/dq_j`` is proportional
     to the envelope, so the ratio is finite and an atom in contact has none.
@@ -953,7 +1066,15 @@ def _charge_response_force(
                 if item.contacts is None:
                     response = response + (item.envelope * through).sum()
             targets = [node_coord] if eps is None else [node_coord, eps]
-            if cap is None:
+            if run.merged:
+                # The owned atoms' energies with it, as DeePMD-kit's lower
+                # reduces them (ghost rows left out, in its energy precision):
+                # the short-range force rides the same backward. The capture
+                # hangs off this partition's own `edge_vec`, so one stage.
+                energy = item.out["energy"].reshape(-1)[: part.n_owned]
+                total = energy.sum(dtype=torch.float64) + response
+                grads = torch.autograd.grad(total, targets)
+            elif cap is None:
                 grads = torch.autograd.grad(response, targets)
             else:
                 # Two stages: the captured features hang off the detached leaf

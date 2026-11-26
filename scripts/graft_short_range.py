@@ -100,6 +100,13 @@ def main() -> None:
     warm_state = warm["model"]
 
     model_params = copy.deepcopy(json.load(open(args.input))["model"])
+    # What `dp train` fills in before it builds a model -- a DPA4 `sel` from
+    # the neighbour statistics, every default -- the warm-up run recorded;
+    # an input file leaves it out. The input's own keys win.
+    recorded = warm_state.get("_extra_state", {}).get("model_params", {})
+    for part in ("descriptor", "fitting_net"):
+        if isinstance(recorded.get(part), dict) and part in model_params:
+            model_params[part] = {**recorded[part], **model_params[part]}
     joint = get_model(copy.deepcopy(model_params))
     fresh = {PREFIX + k: v for k, v in joint.state_dict().items()}
 

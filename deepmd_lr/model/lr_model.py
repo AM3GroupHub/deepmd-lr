@@ -115,6 +115,8 @@ MODEL_TYPE = "dp_lr"
 #: emits ``type: "standard"`` and its ``deserialize`` pops that key without a
 #: default, so the round-trip has to put it back (see :meth:`deserialize`).
 _ATOMIC_MODEL_TYPE = "standard"
+#: Wire key for the atomic model's own type when it is not that one.
+_WRAPPED_TYPE_KEY = "atomic_model_type"
 
 #: Key of the optional long-range block in the model config.
 LONG_RANGE_KEY = "long_range"
@@ -194,6 +196,130 @@ def _hooked(obj: Any, name: str, replacement: Any) -> Iterator[None]:
             delattr(obj, name)
 
 
+#: The energy fitting nets a ``dp_lr`` model accepts: DeePMD-kit's standard
+#: one, and the one it pairs with the DPA4 descriptor. Both are invariant
+#: per-atom energy heads.
+_ENERGY_FITTINGS = ("ener", "dpa4_ener", "sezm_ener")
+
+
+def _learned(atomic_model: Any) -> Any:
+    """``atomic_model`` itself, or the learned child (the one with the
+    descriptor) of DeePMD-kit's bridged composition
+    ``[learned, inner_potential]``."""
+    children = getattr(atomic_model, "models", None)
+    if children is None:
+        return atomic_model
+    return next(child for child in children if hasattr(child, "descriptor"))
+
+
+def backbone(model: Any) -> Any:
+    """The learned atomic model of ``model``: the one with the descriptor,
+    also under DeePMD-kit's ZBL bridging (``bridging_method``)."""
+    return _learned(model.atomic_model)
+
+
+def message_blocks(model: Any) -> int | None:
+    """The number of message-passing blocks of a DPA4 descriptor; 0 for a
+    descriptor without message passing, None for one this module cannot
+    tell."""
+    descriptor = backbone(model).descriptor
+    if not descriptor.has_message_passing():
+        return 0
+    if type(descriptor).__name__ == "DescrptDPA4":
+        return len(descriptor.l_schedule)
+    return None
+
+
+def receptive_hops(model: Any) -> int | None:
+    """How many neighbour shells an atom's descriptor output reaches, in
+    units of the cutoff; None for a descriptor this module cannot tell.
+
+    DPA4C scans the edges into an atom once: one hop, and everything an atom
+    carries (energy, raw charge) depends on its own neighbours only. DPA4
+    passes messages: each interaction block reads its neighbours' states, and
+    the environment seed has already folded one shell into the state the
+    first block reads. (DeePMD-kit's bridging adds a margin to this, not a
+    shell: :func:`gate_margin`.)
+    """
+    blocks = message_blocks(model)
+    if not blocks:  # no message passing (one hop), or unknown
+        return 1 if blocks == 0 else None
+    return blocks + int(bool(backbone(model).descriptor.use_env_seed))
+
+
+def gate_margin(model: Any) -> float:
+    """How far beyond ``receptive_hops`` cutoffs an atom's output reaches, in
+    angstrom: ``bridging_r_outer`` for a DPA4 with DeePMD-kit's bridging,
+    else 0.
+
+    With bridging a neighbour's message is gated by that neighbour's own
+    short contacts, the pairs closer than ``bridging_r_outer``. The outermost
+    atom an output reads can thus have a contact partner just beyond the last
+    cutoff, and that partner's position matters.
+    """
+    descriptor = backbone(model).descriptor
+    if getattr(descriptor, "bridging_switch", None) is None:
+        return 0.0
+    return float(descriptor.inner_clamp_r_outer)
+
+
+def require_one_hop(model: Any, what: str) -> None:
+    """Refuse ``what`` on a message-passing descriptor.
+
+    Partitions with a halo of one cutoff assume that an atom's output depends
+    on the edges into that atom alone. On a descriptor that passes messages
+    they would return wrong numbers without an error anywhere.
+    """
+    hops = receptive_hops(model)
+    if hops == 1:
+        return
+    name = type(backbone(model).descriptor).__name__
+    reach = "an unknown number of" if hops is None else str(hops)
+    raise NotImplementedError(
+        f"{what} is not available on {name}: it passes messages, so an "
+        f"atom's energy and charge reach {reach} neighbour shells, and this "
+        "path assumes one. Energies, forces, virials and charges on one "
+        "device are exact for any depth."
+    )
+
+
+#: Key in ``long_range``: the radii ``[r_lo, r_hi]`` in angstrom across which
+#: an atom's charge is switched off at a short contact.
+CHARGE_SHIELD_KEY = "charge_shield"
+
+#: Key in ``long_range``: true freezes the short-range model, so that only the
+#: charge head trains.
+CHARGE_HEAD_ONLY_KEY = "train_charge_head_only"
+
+
+def _bridging_radii(data: dict) -> tuple[float, float] | None:
+    """``(r_inner, r_outer)`` of an active ``bridging_method``, else None."""
+    if str(data.get("bridging_method", "none")).lower() in ("none", ""):
+        return None
+    return (
+        float(data.get("bridging_r_inner", 0.5)),
+        float(data.get("bridging_r_outer", 0.8)),
+    )
+
+
+def _bridged_atomic_model(data: dict) -> Any:
+    """DeePMD-kit's bridged composition ``[learned, inner_potential]`` for a
+    ``dp_lr`` config with ``bridging_method``, built by DeePMD-kit itself.
+
+    Its own expansion and linear-model builder do the work, on the config a
+    ``standard`` model would have: the ZBL pair sum, the inner clamp in the
+    descriptor, the composition's statistics and exclusions are all theirs.
+    """
+    from deepmd.pt_expt.model.get_model import get_linear_model
+    from deepmd.utils.bridging import expand_bridging_method
+
+    ours = (LONG_RANGE_KEY, ZBL_KEY, "type")
+    plain = {key: value for key, value in data.items() if key not in ours}
+    return get_linear_model(
+        expand_bridging_method({**plain, "type": "standard"})
+    ).atomic_model
+
+
 def _kernel_available() -> bool:
     """Whether ``deepmd::dpa4c_graph_compress`` is registered in this process."""
     from deepmd.kernels.cuda.dpa4c.graph_compress import (
@@ -235,10 +361,10 @@ def _run_backbone(model, graph, atype_flat, charge_spin):
     ``DPAtomicModel.forward_atomic_graph`` gates it -- only the DPA4 family
     accepts the keyword, and ``dp_lr`` allows any descriptor.
     """
-    descriptor = model.atomic_model.descriptor
+    descriptor = backbone(model).descriptor
     kwargs = (
         {"charge_spin": charge_spin}
-        if model.atomic_model.supports_charge_spin
+        if backbone(model).supports_charge_spin
         else {}
     )
     return descriptor.call_graph(
@@ -251,7 +377,7 @@ def _run_backbone(model, graph, atype_flat, charge_spin):
 
 def _is_compressed(model) -> bool:
     """Whether ``model``'s descriptor is running from compressed tables."""
-    return bool(getattr(model.atomic_model.descriptor, "compress", False))
+    return bool(getattr(backbone(model).descriptor, "compress", False))
 
 
 class _Charges(NamedTuple):
@@ -403,6 +529,10 @@ class LongRangeEnergyModel(EnergyModel):
         #: fitted energy and the raw charge of an atom in contact off there.
         #: It holds no weights; see :meth:`set_zbl`.
         self.zbl: ZBL | None = None
+        #: The envelope that switches charges off at a short contact when
+        #: DeePMD-kit's own bridging handles the energy there, or None; see
+        #: :meth:`set_charge_shield`.
+        self.charge_shield: ZBL | None = None
         #: The contacts of the graph lower now running, for the capture it
         #: runs inside to take along; None outside one and on the torch path.
         self._contacts: Contacts | None = None
@@ -425,11 +555,11 @@ class LongRangeEnergyModel(EnergyModel):
         this class's `enable_compression`, upstream's, or a later
         `apply_charge_state` (see `deepmd_lr.compress`).
         """
-        return folded_charge_spin(self.atomic_model.descriptor)
+        return folded_charge_spin(backbone(self).descriptor)
 
     @_compressed_charge_spin.setter
     def _compressed_charge_spin(self, value: tuple[float, float] | None) -> None:
-        setattr(self.atomic_model.descriptor, FOLDED_ATTR, value)
+        setattr(backbone(self).descriptor, FOLDED_ATTR, value)
 
     def change_out_bias(
         self, merged: Any, bias_adjust_mode: str = "change-by-statistic"
@@ -580,32 +710,56 @@ class LongRangeEnergyModel(EnergyModel):
                 "network; choose one"
             )
 
-        descriptor, fitting, fitting_type = get_model_components(
-            data,
-            descriptor_base=BaseDescriptor,
-            fitting_base=BaseFitting,
-            backend_name="pt_expt",
-        )
-        if fitting_type != "ener":
+        fitting_type = str((data.get("fitting_net") or {}).get("type", "ener"))
+        if fitting_type not in _ENERGY_FITTINGS:
             raise ValueError(
                 f"The '{MODEL_TYPE}' model is an energy model and requires "
-                f"fitting_net.type 'ener', got '{fitting_type}'. A long-range "
-                "electrostatic term is only defined as an energy contribution."
+                f"fitting_net.type {' or '.join(map(repr, _ENERGY_FITTINGS))}, "
+                f"got '{fitting_type}'. A long-range electrostatic term is only "
+                "defined as an energy contribution."
             )
+        bridging = _bridging_radii(data)
+        if bridging is None:
+            descriptor, fitting, _ = get_model_components(
+                data,
+                descriptor_base=BaseDescriptor,
+                fitting_base=BaseFitting,
+                backend_name="pt_expt",
+            )
+            base = {
+                "descriptor": descriptor,
+                "fitting": fitting,
+                "type_map": data["type_map"],
+                "atom_exclude_types": data.get("atom_exclude_types", []),
+                "pair_exclude_types": data.get("pair_exclude_types", []),
+            }
+        else:
+            if data.get(ZBL_KEY) is not None:
+                raise ValueError(
+                    "`zbl` and `bridging_method` both handle short contacts; "
+                    "`zbl` is for DPA4C, `bridging_method` for DPA4"
+                )
+            base = {"atomic_model_": _bridged_atomic_model(data)}
+            descriptor = _learned(base["atomic_model_"]).descriptor
 
         charge_fitting, long_range_energy, trained_filter = cls._build_long_range(
             data, descriptor
         )
         model = cls(
-            descriptor=descriptor,
-            fitting=fitting,
-            type_map=data["type_map"],
-            atom_exclude_types=data.get("atom_exclude_types", []),
-            pair_exclude_types=data.get("pair_exclude_types", []),
-            charge_fitting=charge_fitting,
-            long_range_energy=long_range_energy,
+            **base, charge_fitting=charge_fitting, long_range_energy=long_range_energy
         )
         model.trained_charge_filter = trained_filter
+        block = data.get(LONG_RANGE_KEY) or {}
+        if charge_fitting is not None:
+            # The key's own value, or with bridging its radii: a normalized
+            # config writes the key as null.
+            shield = block.get(CHARGE_SHIELD_KEY)
+            model.set_charge_shield(bridging if shield is None else shield)
+        if block.get(CHARGE_HEAD_ONLY_KEY):
+            # Every weight of the short-range model, whatever its descriptor
+            # and fitting net make of their own `trainable` key (DeePMD-kit's
+            # `dpa4_ener` net trains with it false).
+            model.atomic_model.requires_grad_(False)
         # Before the config is recorded, which already holds the block.
         model.set_zbl(data.get(ZBL_KEY))
         model.model_def_script = json.dumps(model_params)
@@ -634,7 +788,7 @@ class LongRangeEnergyModel(EnergyModel):
         else:
             if getattr(self, "_hessian_enabled", False):
                 raise NotImplementedError(_NO_HESSIAN)
-            descriptor = self.atomic_model.descriptor
+            descriptor = backbone(self).descriptor
             if type(descriptor).__name__ != "DescrptDPA4C":
                 raise ValueError("zbl supports the dpa4c descriptor only")
             if (
@@ -642,6 +796,8 @@ class LongRangeEnergyModel(EnergyModel):
                 or self.atomic_model.pair_exclude_types
             ):
                 raise ValueError("zbl with atom or pair exclusions is not supported")
+            if self.charge_shield is not None:
+                raise ValueError("a charge shield already weighs the charges")
             zbl = ZBL(
                 self.get_type_map(), settings, device=next(self.parameters()).device
             )
@@ -711,7 +867,7 @@ class LongRangeEnergyModel(EnergyModel):
         ``strain`` is a per-frame ``(nf, 3, 3)`` matrix, ``I + sym(eps)``,
         applied to the edge vectors AFTER the graph is built.
         """
-        descriptor = self.atomic_model.descriptor
+        descriptor = backbone(self).descriptor
         self._refuse_compressed_fallback()
         graph = build_neighbor_graph_fast(coord, atype, box, descriptor.get_rcut())
         if strain is not None:
@@ -782,7 +938,7 @@ class LongRangeEnergyModel(EnergyModel):
             yield captured
             return
 
-        descriptor = self.atomic_model.descriptor
+        descriptor = backbone(self).descriptor
         unhooked = descriptor.call_graph
 
         def capture(graph: Any, atype_flat: Any, *args: Any, **kwargs: Any) -> Any:
@@ -976,9 +1132,54 @@ class LongRangeEnergyModel(EnergyModel):
         the raw charges, so the charge-response force and the Born tensor
         differentiate it per node and per partition the same way.
         """
-        if self.zbl is None:
+        envelope = self.zbl if self.zbl is not None else self.charge_shield
+        if envelope is None:
             return None
-        return self.zbl.envelope(atype_flat, edge_index, edge_vec, edge_mask)
+        return envelope.envelope(atype_flat, edge_index, edge_vec, edge_mask)
+
+    @property
+    def has_charge_envelope(self) -> bool:
+        """Whether the charges are weighted by a short-contact envelope: a
+        ``zbl`` block's, or the charge shield's (never both)."""
+        return self.zbl is not None or self.charge_shield is not None
+
+    def set_charge_shield(self, radii: Any) -> None:
+        """Switch an atom's charge off at a short contact, between the radii
+        ``[r_lo, r_hi]`` in angstrom; None removes the shield.
+
+        For a model whose short contacts DeePMD-kit's ZBL bridging handles
+        (DPA4): the energy needs nothing from here, and the charges of two
+        atoms pushed together should not be the network's. The weight is the
+        envelope of :mod:`deepmd_lr.zbl`, the product over an atom's
+        neighbours of a C2 step from 0 at ``r_lo`` to 1 at ``r_hi``, and it
+        enters the total-charge projection as with a ``zbl`` block. By
+        default the radii are the bridging's own; ``long_range.charge_shield``
+        overrides them. No weights, no ``state_dict`` entry.
+        """
+        if radii is None:
+            self.charge_shield = None
+            return
+        if self.zbl is not None:
+            raise ValueError("a `zbl` block already weighs the charges")
+        try:
+            r_lo, r_hi = (float(r) for r in radii)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"charge_shield must be [r_lo, r_hi] in angstrom, got {radii!r}"
+            ) from None
+        if not (math.isfinite(r_lo) and math.isfinite(r_hi) and 0.0 <= r_lo < r_hi):
+            raise ValueError(
+                f"charge_shield needs 0 <= r_lo < r_hi, got [{r_lo}, {r_hi}]"
+            )
+        rcut = float(self.get_rcut())
+        if r_hi > rcut:
+            raise ValueError(
+                f"charge_shield ends at {r_hi:g} A, beyond the cutoff {rcut:g} A"
+            )
+        shield = ZBL.from_radii(
+            self.get_type_map(), r_lo, r_hi, device=next(self.parameters()).device
+        )
+        self.charge_shield = shield.train(self.training)
 
     def _charges_from_features(
         self,
@@ -1182,8 +1383,7 @@ class LongRangeEnergyModel(EnergyModel):
         born = None
         if self.compute_born:
             # A second, cheaper VJP over the tape the gradient above left
-            # alive; one pass covers every edge because the descriptor is
-            # one-hop.
+            # alive; one pass covers every edge (`deepmd_lr.born`).
             finish = None
             if contacts is not None:
                 # d local / d w = raw + shift, per node.
@@ -1658,7 +1858,7 @@ class LongRangeEnergyModel(EnergyModel):
         """
         level = self._check_compression_request(table_stride_1)
         state = self._charge_state_to_fold(charge_spin)
-        descriptor = self.atomic_model.descriptor
+        descriptor = backbone(self).descriptor
         with _restored_on_failure(descriptor):
             super().enable_compression(
                 table_extrapolate, table_stride_1, table_stride_2, check_frequency
@@ -1676,6 +1876,13 @@ class LongRangeEnergyModel(EnergyModel):
             raise TypeError("table_stride_1 must be a positive finite number")
         if not math.isfinite(table_stride_1) or table_stride_1 <= 0:
             raise ValueError("table_stride_1 must be positive and finite")
+        descriptor = backbone(self).descriptor
+        if not hasattr(descriptor, "compress"):
+            raise NotImplementedError(
+                f"{type(descriptor).__name__} has no compressed form: "
+                "compression is DeePMD-kit's tabulated kernel for DPA4C. Run "
+                "this model uncompressed."
+            )
         if not _kernel_available():
             raise RuntimeError(_NO_KERNEL)
         level = cuda_infer_level()
@@ -1692,7 +1899,7 @@ class LongRangeEnergyModel(EnergyModel):
     def _charge_state_to_fold(self, charge_spin: Any) -> list | None:
         """The validated ``[charge, multiplicity]`` to fold into the tables,
         or None for a descriptor without the frame-condition embedding."""
-        if not self.atomic_model.add_chg_spin_ebd:
+        if not backbone(self).add_chg_spin_ebd:
             return None
         from deepmd.utils.charge_state import validate_charge_state
 
@@ -1837,6 +2044,9 @@ class LongRangeEnergyModel(EnergyModel):
         route that to ``EnergyModel``.
         """
         data = super().serialize()
+        if data.get("type") != _ATOMIC_MODEL_TYPE:
+            # A bridged composition: remember what to rebuild it as.
+            data[_WRAPPED_TYPE_KEY] = data["type"]
         data["type"] = MODEL_TYPE
         if self.has_long_range:
             data[LONG_RANGE_KEY] = {
@@ -1845,6 +2055,8 @@ class LongRangeEnergyModel(EnergyModel):
             }
             if self.trained_charge_filter is not None:
                 data[LONG_RANGE_KEY]["charge_filter"] = list(self.trained_charge_filter)
+            if self.charge_shield is not None:
+                data[LONG_RANGE_KEY][CHARGE_SHIELD_KEY] = list(self.charge_shield.radii)
         if self.zbl is not None:
             data[ZBL_KEY] = self.zbl.serialize()
         return data
@@ -1853,10 +2065,15 @@ class LongRangeEnergyModel(EnergyModel):
     def deserialize(cls, data: dict[str, Any]) -> "LongRangeEnergyModel":
         """Restore the atomic model's own wire tag, then defer to the base."""
         data = data.copy()
-        data["type"] = _ATOMIC_MODEL_TYPE
+        data["type"] = data.pop(_WRAPPED_TYPE_KEY, _ATOMIC_MODEL_TYPE)
         block = data.pop(LONG_RANGE_KEY, None)
         zbl = data.pop(ZBL_KEY, None)
-        model = super().deserialize(data)
+        if data["type"] == _ATOMIC_MODEL_TYPE:
+            model = super().deserialize(data)
+        else:
+            from deepmd.pt_expt.model.dp_linear_model import LinearEnergyModel
+
+            model = cls(atomic_model_=LinearEnergyModel.deserialize(data).atomic_model)
         model.set_zbl(zbl)
         if block is not None:
             model.charge_fitting = BaseFitting.deserialize(block["charge_net"])
@@ -1865,4 +2082,5 @@ class LongRangeEnergyModel(EnergyModel):
             model.trained_charge_filter = check_charge_filter(
                 block.get("charge_filter")
             )
+            model.set_charge_shield(block.get(CHARGE_SHIELD_KEY))
         return model

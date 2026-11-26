@@ -350,6 +350,9 @@ def _fingerprint(evaluator: Any, masses: np.ndarray, fixed: Any = ()) -> dict:
     if zbl is not None:
         # And only with the term: it changes the energy surface at a contact.
         fingerprint["zbl"] = zbl.serialize()
+    shield = getattr(evaluator.model, "charge_shield", None)
+    if shield is not None:
+        fingerprint["charge_shield"] = list(shield.radii)
     return fingerprint
 
 
