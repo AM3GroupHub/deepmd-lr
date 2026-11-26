@@ -123,6 +123,29 @@ def write_dataset(root: Path) -> Path:
     return data
 
 
+def run_python(*command: str, cwd: Path) -> None:
+    """``python <command>`` on the CPU with this checkout importable."""
+    env = {
+        **os.environ,
+        "CUDA_VISIBLE_DEVICES": "",
+        "OMP_NUM_THREADS": "1",
+        "PYTHONPATH": str(REPO),
+    }
+    proc = subprocess.run(
+        [sys.executable, *command],
+        cwd=cwd,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def dp_train(*args: str, cwd: Path) -> None:
+    run_python("-m", "deepmd", "--pt-expt", "train", *args, cwd=cwd)
+
+
 def changed(before: dict, after: dict) -> set[str]:
     assert before.keys() == after.keys()
     return {
@@ -135,23 +158,6 @@ def changed(before: dict, after: dict) -> set[str]:
 @pytest.mark.parametrize("kind", list(SHORT_RANGE))
 def test_three_stages_through_the_cli(tmp_path, kind):
     data = write_dataset(tmp_path)
-    env = {
-        **os.environ,
-        "CUDA_VISIBLE_DEVICES": "",
-        "OMP_NUM_THREADS": "1",
-        "PYTHONPATH": str(REPO),
-    }
-
-    def run(*command, cwd):
-        proc = subprocess.run(
-            [sys.executable, *command],
-            cwd=cwd,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=900,
-        )
-        assert proc.returncode == 0, proc.stdout + proc.stderr
 
     def weights(path: Path) -> dict:
         return torch.load(path, map_location="cpu", weights_only=False)["model"]
@@ -179,9 +185,9 @@ def test_three_stages_through_the_cli(tmp_path, kind):
         }
         (folder / "input.json").write_text(json.dumps(cfg))
         if name != "lr":
-            run("-m", "deepmd", "--pt-expt", "train", "input.json", *flags, cwd=folder)
+            dp_train("input.json", *flags, cwd=folder)
             return weights(folder / "model.ckpt.pt")
-        run(
+        run_python(
             str(REPO / "scripts" / "graft_short_range.py"),
             "--short-range",
             str(tmp_path / "sr" / "model.ckpt.pt"),
@@ -191,11 +197,7 @@ def test_three_stages_through_the_cli(tmp_path, kind):
             "init.ckpt.pt",
             cwd=folder,
         )
-        run(
-            "-m", "deepmd", "--pt-expt", "train", "input.json",
-            "--init-model", "init.ckpt",
-            cwd=folder,
-        )  # fmt: skip
+        dp_train("input.json", "--init-model", "init.ckpt", cwd=folder)
         return weights(folder / "model.ckpt.pt")
 
     sr = stage("sr", short_range(kind))

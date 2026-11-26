@@ -202,18 +202,32 @@ def _hooked(obj: Any, name: str, replacement: Any) -> Iterator[None]:
 _ENERGY_FITTINGS = ("ener", "dpa4_ener", "sezm_ener")
 
 
-def backbone(model: Any) -> Any:
-    """The learned atomic model of ``model``: the one with the descriptor.
-
-    That is the atomic model itself, or with DeePMD-kit's ZBL bridging
-    (``bridging_method``) the learned child of its composition
-    ``[learned, inner_potential]``.
-    """
-    atomic_model = model.atomic_model
+def _learned(atomic_model: Any) -> Any:
+    """``atomic_model`` itself, or the learned child (the one with the
+    descriptor) of DeePMD-kit's bridged composition
+    ``[learned, inner_potential]``."""
     children = getattr(atomic_model, "models", None)
     if children is None:
         return atomic_model
     return next(child for child in children if hasattr(child, "descriptor"))
+
+
+def backbone(model: Any) -> Any:
+    """The learned atomic model of ``model``: the one with the descriptor,
+    also under DeePMD-kit's ZBL bridging (``bridging_method``)."""
+    return _learned(model.atomic_model)
+
+
+def message_blocks(model: Any) -> int | None:
+    """The number of message-passing blocks of a DPA4 descriptor; 0 for a
+    descriptor without message passing, None for one this module cannot
+    tell."""
+    descriptor = backbone(model).descriptor
+    if not descriptor.has_message_passing():
+        return 0
+    if type(descriptor).__name__ == "DescrptDPA4":
+        return len(descriptor.l_schedule)
+    return None
 
 
 def receptive_hops(model: Any) -> int | None:
@@ -227,12 +241,10 @@ def receptive_hops(model: Any) -> int | None:
     first block reads. (DeePMD-kit's bridging adds a margin to this, not a
     shell: :func:`gate_margin`.)
     """
-    descriptor = backbone(model).descriptor
-    if not descriptor.has_message_passing():
-        return 1
-    if type(descriptor).__name__ == "DescrptDPA4":
-        return len(descriptor.l_schedule) + int(bool(descriptor.use_env_seed))
-    return None
+    blocks = message_blocks(model)
+    if not blocks:  # no message passing (one hop), or unknown
+        return 1 if blocks == 0 else None
+    return blocks + int(bool(backbone(model).descriptor.use_env_seed))
 
 
 def gate_margin(model: Any) -> float:
@@ -254,10 +266,9 @@ def gate_margin(model: Any) -> float:
 def require_one_hop(model: Any, what: str) -> None:
     """Refuse ``what`` on a message-passing descriptor.
 
-    Some of this package assumes that an atom's output depends on the edges
-    into that atom alone: the Born tensor's pair formula, and partitions with
-    a halo of one cutoff. On a descriptor that passes messages they would
-    return wrong numbers without an error anywhere.
+    Partitions with a halo of one cutoff assume that an atom's output depends
+    on the edges into that atom alone. On a descriptor that passes messages
+    they would return wrong numbers without an error anywhere.
     """
     hops = receptive_hops(model)
     if hops == 1:
@@ -265,10 +276,10 @@ def require_one_hop(model: Any, what: str) -> None:
     name = type(backbone(model).descriptor).__name__
     reach = "an unknown number of" if hops is None else str(hops)
     raise NotImplementedError(
-        f"{what} is not available on {name} yet: it passes messages, so an "
+        f"{what} is not available on {name}: it passes messages, so an "
         f"atom's energy and charge reach {reach} neighbour shells, and this "
-        "path assumes one (DPA4C). Energies, forces, virials and charges on "
-        "one device are exact for any depth."
+        "path assumes one. Energies, forces, virials and charges on one "
+        "device are exact for any depth."
     )
 
 
@@ -279,9 +290,6 @@ CHARGE_SHIELD_KEY = "charge_shield"
 #: Key in ``long_range``: true freezes the short-range model, so that only the
 #: charge head trains.
 CHARGE_HEAD_ONLY_KEY = "train_charge_head_only"
-
-#: The model-level keys of DeePMD-kit's ZBL bridging.
-_BRIDGING_KEYS = ("bridging_method", "bridging_r_inner", "bridging_r_outer")
 
 
 def _bridging_radii(data: dict) -> tuple[float, float] | None:
@@ -706,8 +714,8 @@ class LongRangeEnergyModel(EnergyModel):
         if fitting_type not in _ENERGY_FITTINGS:
             raise ValueError(
                 f"The '{MODEL_TYPE}' model is an energy model and requires "
-                f"fitting_net.type 'ener' (or 'dpa4_ener'), got "
-                f"'{fitting_type}'. A long-range electrostatic term is only "
+                f"fitting_net.type {' or '.join(map(repr, _ENERGY_FITTINGS))}, "
+                f"got '{fitting_type}'. A long-range electrostatic term is only "
                 "defined as an energy contribution."
             )
         bridging = _bridging_radii(data)
@@ -732,10 +740,7 @@ class LongRangeEnergyModel(EnergyModel):
                     "`zbl` is for DPA4C, `bridging_method` for DPA4"
                 )
             base = {"atomic_model_": _bridged_atomic_model(data)}
-            descriptor = next(
-                child for child in base["atomic_model_"].models
-                if hasattr(child, "descriptor")
-            ).descriptor
+            descriptor = _learned(base["atomic_model_"]).descriptor
 
         charge_fitting, long_range_energy, trained_filter = cls._build_long_range(
             data, descriptor
@@ -744,12 +749,13 @@ class LongRangeEnergyModel(EnergyModel):
             **base, charge_fitting=charge_fitting, long_range_energy=long_range_energy
         )
         model.trained_charge_filter = trained_filter
+        block = data.get(LONG_RANGE_KEY) or {}
         if charge_fitting is not None:
             # The key's own value, or with bridging its radii: a normalized
             # config writes the key as null.
-            shield = (data.get(LONG_RANGE_KEY) or {}).get(CHARGE_SHIELD_KEY)
+            shield = block.get(CHARGE_SHIELD_KEY)
             model.set_charge_shield(bridging if shield is None else shield)
-        if (data.get(LONG_RANGE_KEY) or {}).get(CHARGE_HEAD_ONLY_KEY):
+        if block.get(CHARGE_HEAD_ONLY_KEY):
             # Every weight of the short-range model, whatever its descriptor
             # and fitting net make of their own `trainable` key (DeePMD-kit's
             # `dpa4_ener` net trains with it false).
@@ -790,6 +796,8 @@ class LongRangeEnergyModel(EnergyModel):
                 or self.atomic_model.pair_exclude_types
             ):
                 raise ValueError("zbl with atom or pair exclusions is not supported")
+            if self.charge_shield is not None:
+                raise ValueError("a charge shield already weighs the charges")
             zbl = ZBL(
                 self.get_type_map(), settings, device=next(self.parameters()).device
             )
@@ -1131,7 +1139,8 @@ class LongRangeEnergyModel(EnergyModel):
 
     @property
     def has_charge_envelope(self) -> bool:
-        """Whether the charges are weighted by a short-contact envelope."""
+        """Whether the charges are weighted by a short-contact envelope: a
+        ``zbl`` block's, or the charge shield's (never both)."""
         return self.zbl is not None or self.charge_shield is not None
 
     def set_charge_shield(self, radii: Any) -> None:
@@ -1374,8 +1383,7 @@ class LongRangeEnergyModel(EnergyModel):
         born = None
         if self.compute_born:
             # A second, cheaper VJP over the tape the gradient above left
-            # alive; one pass covers every edge because the descriptor is
-            # one-hop.
+            # alive; one pass covers every edge (`deepmd_lr.born`).
             finish = None
             if contacts is not None:
                 # d local / d w = raw + shift, per node.

@@ -143,6 +143,11 @@ class LongRangeEnergyLoss(EnergyLoss):
         import array_api_compat
 
         lr_ratio = learning_rate / self.starter_learning_rate
+
+        def scheduled(start: float, limit: float) -> float:
+            """A prefactor on the learning-rate schedule, as upstream's."""
+            return limit + (start - limit) * lr_ratio
+
         absolute = self.loss_func == "mae"
         if self.has_qn:
             if SHIFT_KEY not in model_dict:
@@ -154,12 +159,8 @@ class LongRangeEnergyLoss(EnergyLoss):
             shift = model_dict[SHIFT_KEY]
             xp = array_api_compat.array_namespace(shift)
             shift = xp.astype(xp.reshape(shift, (-1,)), loss.dtype)
-            pref = (
-                self.limit_pref_qn
-                + (self.start_pref_qn - self.limit_pref_qn) * lr_ratio
-            )
-            l2 = xp.mean(shift * shift)
-            l1 = xp.mean(xp.abs(shift))
+            pref = scheduled(self.start_pref_qn, self.limit_pref_qn)
+            l2, l1 = xp.mean(shift * shift), xp.mean(xp.abs(shift))
             loss = loss + pref * (l1 if absolute else l2)
             more_loss["rmse_qn"] = xp.sqrt(l2)
             if mae or absolute:
@@ -176,12 +177,8 @@ class LongRangeEnergyLoss(EnergyLoss):
             found = label_dict[f"find_{BORN_KEY}"]
             label = xp.reshape(label_dict[BORN_KEY], born.shape)
             diff = xp.astype(self.bec_scale * born - label, loss.dtype)
-            pref = (
-                self.limit_pref_bec
-                + (self.start_pref_bec - self.limit_pref_bec) * lr_ratio
-            )
-            l2 = xp.mean(diff * diff)
-            l1 = xp.mean(xp.abs(diff))
+            pref = scheduled(self.start_pref_bec, self.limit_pref_bec)
+            l2, l1 = xp.mean(diff * diff), xp.mean(xp.abs(diff))
             loss = loss + found * pref * (l1 if absolute else l2)
             more_loss["rmse_bec"] = self.display_if_exist(xp.sqrt(l2), found)
             if mae or absolute:

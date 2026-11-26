@@ -15,12 +15,7 @@ What is pinned:
   one has not, also in the charge-head-only stage.
 """
 
-import copy
 import json
-import os
-import subprocess
-import sys
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -30,22 +25,21 @@ from deepmd.utils.argcheck import normalize
 
 from deepmd_lr.loss import BORN_KEY, LOSS_TYPE, LongRangeEnergyLoss
 
-from .test_curriculum import DPA4C, LONG_RANGE, write_dataset
+from .test_curriculum import dp_train, long_range, write_dataset
 from .test_dpa4 import build_dpa4
 from .test_joint_model import build, frame
+from .test_neutrality_loss import PENALTY_ONLY, START_LR
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="the model runs on GPU"
 )
 
-START_LR = 1e-3
 ENER = {
     "start_pref_e": 1.0,
     "limit_pref_e": 1.0,
     "start_pref_f": 10.0,
     "limit_pref_f": 1.0,
 }
-REPO = Path(__file__).resolve().parents[1]
 
 
 def labelled(model, find: float = 1.0, seed: int = 3):
@@ -138,12 +132,7 @@ class TestFactory:
 
     def test_schema_accepts_the_keys(self):
         cfg = {
-            "model": {
-                "type": "dp_lr",
-                "type_map": ["O", "H"],
-                **copy.deepcopy(DPA4C),
-                "long_range": copy.deepcopy(LONG_RANGE),
-            },
+            "model": long_range("dpa4c", charge_head_only=False),
             "learning_rate": {"start_lr": 1e-3, "stop_lr": 1e-5},
             "loss": {**self.PARAMS, "bec_scale": 1.75},
             "training": {
@@ -194,10 +183,7 @@ def test_steps_on_the_term_bring_a_student_to_its_teacher(descriptor):
     student.atomic_model.requires_grad_(False)
     loss = LongRangeEnergyLoss(
         starter_learning_rate=START_LR,
-        start_pref_e=1e-12,
-        limit_pref_e=1e-12,
-        start_pref_f=0.0,
-        limit_pref_f=0.0,
+        **PENALTY_ONLY,
         start_pref_bec=1.0,
         limit_pref_bec=1.0,
     )
@@ -237,16 +223,8 @@ def test_cli_training_with_and_without_the_label(tmp_path, charge_head_only):
         labelled_system / f"set.000/{BORN_KEY}.npy",
         0.3 * rng.normal(size=(n_frame, n_atom * 9)),
     )
-    block = copy.deepcopy(LONG_RANGE)
-    if charge_head_only:
-        block["train_charge_head_only"] = True
     cfg = {
-        "model": {
-            "type": "dp_lr",
-            "type_map": ["O", "H"],
-            **copy.deepcopy(DPA4C),
-            "long_range": block,
-        },
+        "model": long_range("dpa4c", charge_head_only),
         "learning_rate": {"start_lr": 1e-3, "stop_lr": 1e-4, "decay_steps": 1},
         "loss": {
             "type": LOSS_TYPE,
@@ -275,21 +253,7 @@ def test_cli_training_with_and_without_the_label(tmp_path, charge_head_only):
         },
     }
     (tmp_path / "input.json").write_text(json.dumps(cfg))
-    env = {
-        **os.environ,
-        "CUDA_VISIBLE_DEVICES": "",
-        "OMP_NUM_THREADS": "1",
-        "PYTHONPATH": str(REPO),
-    }
-    proc = subprocess.run(
-        [sys.executable, "-m", "deepmd", "--pt-expt", "train", "input.json"],
-        cwd=tmp_path,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=900,
-    )
-    assert proc.returncode == 0, proc.stdout + proc.stderr
+    dp_train("input.json", cwd=tmp_path)
     header, *rows = [
         line.split()
         for line in (tmp_path / "lcurve.out").read_text().splitlines()
