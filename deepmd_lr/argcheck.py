@@ -484,9 +484,10 @@ def _long_range_args() -> Argument:
         "the Born tensor. The moments are the descriptor's own equivariant "
         "channels mixed with coefficients this net fits on the invariant "
         "features, so they rotate with the frame by construction. Needs a "
-        "`dpa4` descriptor whose last degree is at least `lmax`, "
-        "`reciprocal.method: \"ewald\"` and a cell periodic in three "
-        "directions. The other keys are the charge head's.",
+        "`dpa4` descriptor whose last degree is at least `lmax` and a cell "
+        "periodic in three directions; with `reciprocal.method: \"pme\"` give "
+        "a mesh about twice as fine as charges need. The other keys are the "
+        "charge head's.",
     )
     return Argument(
         LONG_RANGE_KEY,

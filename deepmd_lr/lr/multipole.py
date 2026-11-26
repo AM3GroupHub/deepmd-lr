@@ -23,11 +23,21 @@ of a charged cell, :math:`E_\text{background} = k_e\,\pi Q_\text{tot}^2 /
 second moment, its energy in a potential :math:`\tfrac12 Q:\nabla\nabla\phi`.
 With no dipole and no quadrupole this is the charge term, number for number.
 
-The k-sum is nvalchemiops' explicit one, exact to its cutoff. Its multipole
-PME is not used: on a 12-atom cell with a 48^3 mesh it missed the explicit sum
-by 4e-3 eV, where the charge PME misses by 1e-6. The cost is that of an Ewald
-sum, atoms times k-vectors, which is small for training cells and grows as
-the square of the size in MD.
+Two ways to the sum, as for charges. ``method: "ewald"`` runs over explicit
+k-vectors, exact to its cutoff, at the cost of atoms times k-vectors.
+``method: "pme"`` is nvalchemiops' multipole PME on a mesh. That routine
+builds its own k-grid with the cell's inverse transposed the wrong way round
+(0.5.0), which a symmetric cell does not notice and a tilted one pays 3e-3 eV
+for on 12 atoms, at any mesh; the grid is therefore built here
+(:func:`mesh_k_squared`) and handed in, after which it agrees with the
+explicit sum to 1e-9 eV for charges on a 64^3 mesh.
+
+A dipole is spread on the mesh with the derivative of the spline and a
+quadrupole with its second derivative, each an order less smooth, so the
+moments need a finer mesh than the charges for the same error: measured at
+alpha 0.4 and spline order 6, a spacing of ``1/(2 alpha)`` leaves 4e-3 eV/A in
+the dipoles' forces and ``1/(4 alpha)`` leaves 5e-5. The mesh a system gets
+follows the second (:func:`multipole_mesh`).
 
 Periodic in three directions only: nvalchemiops has no slab correction that
 knows of atomic dipoles and no isolated multipole sum, so both are refused.
@@ -48,11 +58,16 @@ from nvalchemiops.torch.interactions.electrostatics._multipole_moments import (
 from nvalchemiops.torch.interactions.electrostatics.multipole_electrostatics import (
     multipole_reciprocal_space_energy,
 )
+from nvalchemiops.torch.interactions.electrostatics.pme_multipole import (
+    multipole_pme_reciprocal_space,
+)
 
 from deepmd_lr.lr.term import (
+    DEFAULT_ALPHA,
     LongRangeEnergy,
     _check_inputs,
     build_long_range_energy,
+    system_mesh,
 )
 
 
@@ -65,6 +80,32 @@ def build_term(settings: dict[str, Any], multipoles: bool) -> torch.nn.Module:
     return build_long_range_energy(settings)
 
 
+def mesh_k_squared(cell: torch.Tensor, mesh: tuple[int, int, int]) -> torch.Tensor:
+    """``|k|^2`` on the half-complex FFT grid of ``mesh``, ``(nx, ny, nz // 2
+    + 1)``, attached to ``cell`` (rows are lattice vectors): ``k = 2 pi m
+    inv(cell)^T``."""
+    axes = [
+        torch.fft.fftfreq(n, d=1.0 / n, device=cell.device, dtype=cell.dtype)
+        for n in mesh[:2]
+    ]
+    axes.append(
+        torch.fft.rfftfreq(
+            mesh[2], d=1.0 / mesh[2], device=cell.device, dtype=cell.dtype
+        )
+    )
+    miller = torch.stack(torch.meshgrid(*axes, indexing="ij"), dim=-1)
+    k = 2.0 * math.pi * (miller @ torch.linalg.inv(cell).transpose(-1, -2))
+    return (k * k).sum(-1)
+
+
+def multipole_mesh(settings: dict[str, Any], cell: Any) -> tuple[int, int, int]:
+    """The PME mesh a cell needs with dipoles and quadrupoles on it: at
+    least ``ceil(4 alpha L)`` points along each cell vector, twice what
+    charges need, and never fewer than ``settings`` asks for."""
+    double = {**settings, "alpha": 2.0 * float(settings.get("alpha", DEFAULT_ALPHA))}
+    return system_mesh(double, cell)
+
+
 #: nvalchemiops splits the Gaussian width between the density basis and its
 #: Ewald factor, and the sum depends on their combination alone; this share of
 #: the width goes to the basis.
@@ -74,18 +115,15 @@ _BASIS_SHARE = 0.5
 class MultipoleLongRangeEnergy(LongRangeEnergy):
     """Per-atom long-range energy of charges, dipoles and quadrupoles, in eV.
 
-    The settings of :class:`~deepmd_lr.lr.term.LongRangeEnergy` with
-    ``method="ewald"``; a mesh, a slab correction and an open axis are
-    refused (module docstring).
+    The settings of :class:`~deepmd_lr.lr.term.LongRangeEnergy`; a slab
+    correction and an open axis are refused (module docstring).
     """
 
     def __init__(self, **settings: Any) -> None:
-        if settings.get("method", "pme") != "ewald":
-            raise ValueError(
-                "a long-range term with dipoles or quadrupoles is summed over "
-                'explicit k-vectors: set reciprocal.method to "ewald" (with '
-                "k_cutoff or accuracy, and no mesh). The multipole PME of "
-                "nvalchemiops is not accurate enough to stand in for it."
+        if settings.get("method", "pme") not in ("pme", "ewald"):
+            raise NotImplementedError(
+                "dipoles and quadrupoles need a cell periodic in all three "
+                f"directions: there is no {settings['method']!r} multipole sum yet"
             )
         super().__init__(**settings)
         if self.slab_correction or not all(self.pbc):
@@ -150,29 +188,50 @@ class MultipoleLongRangeEnergy(LongRangeEnergy):
         width = 1.0 / (2.0 * self.alpha)
         sigma = _BASIS_SHARE * width
         split = 1.0 / (2.0 * math.sqrt(width**2 - sigma**2))
+        root = math.sqrt(math.pi)
         energies = []
         for frame in range(nf):
             q = charge[frame].to(torch.float64)
             mu = None if dipole is None else dipole[frame].to(torch.float64)
             theta = None if quadrupole is None else quadrupole[frame].to(torch.float64)
+            moments = pack_multipole_moments(q, mu, theta)
+            volume = torch.abs(torch.linalg.det(cell[frame])).to(torch.float64)
+            # The charged cell's background at this term's alpha, per atom.
+            background = math.pi / (2.0 * self.alpha**2) * q * q.sum() / volume
+            if self.method == "pme":
+                mesh = self._mesh(cell[frame : frame + 1])
+                # Minus the self terms already, and minus a background taken
+                # at the routine's own share of the width: that one is put
+                # back and this term's subtracted.
+                energy = multipole_pme_reciprocal_space(
+                    coord[frame],
+                    moments,
+                    cell[frame],
+                    sigma=sigma,
+                    alpha=split,
+                    mesh_dimensions=mesh,
+                    spline_order=self.spline_order,
+                    k_squared=mesh_k_squared(cell[frame].to(torch.float64), mesh),
+                )
+                theirs = background * (self.alpha / split) ** 2
+                energies.append(
+                    energy + ELECTROSTATIC_CONVERSION * (theirs - background)
+                )
+                continue
             reciprocal = multipole_reciprocal_space_energy(
                 coord[frame],
-                pack_multipole_moments(q, mu, theta),
+                moments,
                 cell[frame],
                 sigma=sigma,
                 alpha=split,
                 k_cutoff=self.k_cutoff,
             )
-            volume = torch.abs(torch.linalg.det(cell[frame])).to(torch.float64)
-            own = self.alpha / math.sqrt(math.pi) * q * q
+            own = self.alpha / root * q * q
             if mu is not None:
-                own = own + (2.0 * self.alpha**3 / (3.0 * math.sqrt(math.pi))) * (
-                    mu * mu
-                ).sum(-1)
+                own = own + (2.0 * self.alpha**3 / (3.0 * root)) * (mu * mu).sum(-1)
             if theta is not None:
-                own = own + (2.0 * self.alpha**5 / (5.0 * math.sqrt(math.pi))) * (
-                    theta * theta
-                ).sum((-2, -1))
-            background = math.pi / (2.0 * self.alpha**2) * q * q.sum() / volume
+                own = own + (2.0 * self.alpha**5 / (5.0 * root)) * (theta * theta).sum(
+                    (-2, -1)
+                )
             energies.append(reciprocal - ELECTROSTATIC_CONVERSION * (own + background))
         return torch.stack(energies).reshape(nf, nloc, 1)

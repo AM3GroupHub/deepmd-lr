@@ -10,7 +10,10 @@ What is pinned:
 - **Two distant dipoles** interact as point dipoles do.
 - **The derivatives** autograd gives: positions, moments and cell against
   finite differences, and a second derivative exists (force training).
-- **What is refused**: a mesh, a slab, a frame without a cell.
+- **The mesh**: PME agrees with the explicit sum in a tilted cell, which
+  nvalchemiops' own k-grid does not give, in energy, forces and cell
+  gradient.
+- **What is refused**: a slab, a frame without a cell.
 """
 
 import math
@@ -203,6 +206,58 @@ class TestDerivatives:
         assert all(torch.isfinite(g).all() and g.abs().max() > 0 for g in grads)
 
 
+class TestMesh:
+    """PME against the explicit sum, in the tilted cell of ``system``."""
+
+    MESH = {"method": "pme", "mesh_dimensions": [48, 48, 48], "k_cutoff": None}
+
+    @pytest.mark.parametrize("moments", ["charge", "dipole", "all", "all, charged"])
+    def test_energy_against_the_explicit_sum(self, moments):
+        coord, charge, dipole, quadrupole, cell = system(
+            net=1.5 if "charged" in moments else 0.0
+        )
+        if moments == "charge":
+            dipole = quadrupole = None
+        if moments == "dipole":
+            charge, quadrupole = 0 * charge, None
+        exact = energy(coord, charge, dipole, quadrupole, cell)
+        mesh = energy(coord, charge, dipole, quadrupole, cell, **self.MESH)
+        torch.testing.assert_close(mesh, exact, atol=2e-6, rtol=0)
+
+    def test_without_moments_it_is_the_charge_mesh_term(self):
+        coord, charge, _, _, cell = system()
+        plain = LongRangeEnergy(alpha=ALPHA, mesh_dimensions=[48, 48, 48])(
+            tensor(coord)[None], tensor(charge)[None], tensor(cell)[None]
+        )
+        ours = energy(coord, charge, None, None, cell, **self.MESH)
+        torch.testing.assert_close(ours, plain.to(DT), atol=5e-6, rtol=0)
+
+    def test_forces_and_cell_gradient_against_the_explicit_sum(self):
+        coord, charge, dipole, quadrupole, cell = system()
+
+        def gradients(**settings):
+            position = tensor(coord).requires_grad_(True)
+            lattice = tensor(cell).requires_grad_(True)
+            total = term(**settings)(
+                position[None], tensor(charge)[None], lattice[None],
+                dipole=tensor(dipole)[None], quadrupole=tensor(quadrupole)[None],
+            ).sum()  # fmt: skip
+            return torch.autograd.grad(total, [position, lattice])
+
+        exact, mesh = gradients(), gradients(**self.MESH)
+        for a, b in zip(mesh, exact, strict=True):
+            torch.testing.assert_close(a, b, atol=5e-5, rtol=0)
+
+    def test_the_mesh_of_a_system_is_twice_as_fine(self):
+        from deepmd_lr.lr.multipole import multipole_mesh
+        from deepmd_lr.lr.term import system_mesh
+
+        settings = {"alpha": ALPHA, "mesh_dimensions": [2, 2, 2]}
+        cell = np.eye(3) * 12.4
+        assert system_mesh(settings, cell) == (10, 10, 10)
+        assert multipole_mesh(settings, cell) == (20, 20, 20)
+
+
 class TestFramesAndMask:
     def test_frames_are_independent(self):
         a, b = system(seed=1), system(seed=2)
@@ -232,9 +287,9 @@ class TestFramesAndMask:
 
 
 class TestRefusals:
-    def test_a_mesh(self):
-        with pytest.raises(ValueError, match="ewald"):
-            MultipoleLongRangeEnergy(alpha=ALPHA, method="pme")
+    def test_an_isolated_sum(self):
+        with pytest.raises(NotImplementedError, match="isolated"):
+            MultipoleLongRangeEnergy(alpha=ALPHA, method="isolated")
 
     def test_a_slab(self):
         with pytest.raises(NotImplementedError, match="three"):

@@ -11,7 +11,7 @@ each other and with the charges in the long-range energy.
 "long_range": {
     "charge_net":    {"neuron": [64, 64]},
     "multipole_net": {"lmax": 2, "neuron": [64, 64]},
-    "reciprocal":    {"method": "ewald", "alpha": 0.4}
+    "reciprocal":    {"alpha": 0.4, "mesh_dimensions": [20, 20, 20]}
 }
 ```
 
@@ -58,11 +58,30 @@ The quadrupole is the traceless second moment; its energy in a potential is
 `1/2 Q : grad grad phi`. Without moments this is the charge term, number for
 number.
 
-- **`method: "ewald"` only.** The sum runs over explicit k-vectors
-  (nvalchemiops), exact to its cutoff. nvalchemiops' multipole PME missed it
-  by 4e-3 eV on a 12-atom cell where the charge PME misses by 1e-6, so a mesh
-  is refused. The cost is atoms times k-vectors: small for a training cell,
-  growing as the square of the size in MD.
+- **`method: "pme"` or `"ewald"`**, as for charges. The explicit sum is exact
+  to its cutoff and costs atoms times k-vectors; PME is nvalchemiops'
+  multipole PME on a mesh.
+- **The mesh must be finer than for charges.** A dipole is spread with the
+  derivative of the spline and a quadrupole with its second derivative, each
+  an order less smooth. Measured on 96 atoms in a tilted 12.4 Å cell, alpha
+  0.4, spline order 6, largest force error against the explicit sum:
+
+  | mesh (spacing) | charges | dipoles | quadrupoles |
+  |---|---|---|---|
+  | 10 (1.24 Å, `1/(2 alpha)`) | 1.3e-3 | 4.3e-3 | 1.2e-3 eV/Å |
+  | 16 (0.78 Å) | 9e-5 | 2e-4 | 1.9e-4 |
+  | 20 (0.62 Å, `1/(4 alpha)`) | 2e-5 | 5e-5 | 1.1e-4 |
+  | 32 (0.39 Å) | 1e-6 | 7e-6 | 2e-5 |
+
+  The MD evaluator and the ASE calculator therefore give a multipole model
+  at least `ceil(4 alpha L)` points per cell vector, twice the rule for
+  charges. In training the mesh is the config's: write `mesh_dimensions`
+  accordingly.
+- **A defect in nvalchemiops 0.5.0 is worked around.** Its multipole PME
+  builds its k-grid from the cell's inverse transposed the wrong way round:
+  right in a cell whose matrix is symmetric (any orthorhombic one), 3e-3 eV
+  off on 12 atoms in a tilted one, at any mesh. The grid is built here and
+  handed to it; the tests compare PME with the explicit sum in a tilted cell.
 - **Periodic in three directions only.** There is no slab correction that
   knows of atomic dipoles and no isolated multipole sum yet; both are refused.
 

@@ -349,6 +349,29 @@ class TestEngine:
             )  # fmt: skip
 
 
+class TestMesh:
+    def test_a_mesh_model_is_the_explicit_one(self):
+        """The same weights on PME and on the explicit sum."""
+        exact = build(2)
+        cfg = config(2)
+        cfg["long_range"]["reciprocal"] = {
+            "method": "pme", "alpha": 0.4, "mesh_dimensions": [40, 40, 40],
+        }  # fmt: skip
+        mesh = roughened(get_model(cfg))
+        coord, atype, cell = frame(n_mol=6, box=10.0)
+        a, b = evaluate(exact, coord, atype, cell), evaluate(mesh, coord, atype, cell)
+        assert float(a["energy"]) == pytest.approx(float(b["energy"]), abs=1e-5)
+        torch.testing.assert_close(a["force"], b["force"], atol=1e-4, rtol=0)
+        torch.testing.assert_close(a["dipole"], b["dipole"], atol=1e-12, rtol=0)
+
+    def test_the_evaluator_takes_a_finer_mesh(self):
+        cfg = config(1)
+        cfg["long_range"]["reciprocal"] = {"method": "pme", "alpha": 0.4}
+        model = get_model(cfg)
+        term = model.long_range_energy_for(np.eye(3) * 12.4, (True, True, True))
+        assert tuple(term.mesh_dimensions) == (20, 20, 20)
+
+
 class TestPlumbing:
     def test_it_round_trips_through_serialization(self):
         model = build(2)
@@ -399,11 +422,11 @@ class TestRefusals:
         with pytest.raises(ValueError, match="degree 1"):
             get_model(cfg)
 
-    def test_a_mesh(self):
-        cfg = config()
-        cfg["long_range"]["reciprocal"] = {"method": "pme", "alpha": 0.4}
-        with pytest.raises(ValueError, match="ewald"):
-            get_model(cfg)
+    def test_a_cluster(self):
+        model = build(1)
+        coord, atype, _ = frame(n_mol=4, box=10.0)
+        with pytest.raises(NotImplementedError, match="isolated"):
+            model(coord, atype, box=None)
 
 
 def test_the_curriculum_through_the_cli(tmp_path):

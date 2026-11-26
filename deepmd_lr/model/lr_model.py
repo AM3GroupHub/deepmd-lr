@@ -95,6 +95,7 @@ from deepmd_lr.fitting.multipole import (
 )
 from deepmd_lr.lr.multipole import (
     build_term,
+    multipole_mesh,
 )
 from deepmd_lr.lr.term import (
     LongRangeTerm,
@@ -641,7 +642,12 @@ class LongRangeEnergyModel(EnergyModel):
             base = self._reciprocal_base
         else:
             base = self.long_range_energy.serialize()
-        return build_term(system_reciprocal(base, cell, pbc), self.has_multipoles)
+        settings = system_reciprocal(base, cell, pbc)
+        if self.has_multipoles and settings.get("method", "pme") == "pme":
+            # Moments are spread with derivatives of the spline: a finer mesh.
+            settings["mesh_dimensions"] = list(multipole_mesh(settings, cell))
+            settings.pop("mesh_spacing", None)
+        return build_term(settings, self.has_multipoles)
 
     def adapt_long_range(self, cell: Any, pbc: Any) -> bool:
         """Install the term :meth:`long_range_energy_for` builds for this
@@ -1385,6 +1391,11 @@ class LongRangeEnergyModel(EnergyModel):
             )
         nf, nloc = atype.shape[0], atype.shape[1]
         geometry = _strained_geometry(coord, box, nf, nloc)
+        if self.has_multipoles and geometry.base_box is None:
+            raise NotImplementedError(
+                "a model with a multipole head needs a cell: there is no "
+                "isolated multipole sum yet"
+            )
         # The frame picks the sum: with no cell, the isolated one at this
         # model's alpha, whatever method the periodic frames use.
         term = (
