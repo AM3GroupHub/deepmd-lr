@@ -88,9 +88,16 @@ from deepmd_lr.fitting.charge import (
     projection_shift,
     resolve_charge_spin,
 )
+from deepmd_lr.fitting.multipole import (
+    cartesian_features,
+    contract,
+    equivariant_channels,
+)
+from deepmd_lr.lr.multipole import (
+    build_term,
+)
 from deepmd_lr.lr.term import (
     LongRangeTerm,
-    build_long_range_energy,
     isolated_term_for,
     system_reciprocal,
 )
@@ -287,6 +294,10 @@ def require_one_hop(model: Any, what: str) -> None:
 #: an atom's charge is switched off at a short contact.
 CHARGE_SHIELD_KEY = "charge_shield"
 
+#: Key in ``long_range``: the head giving every atom a dipole (and a
+#: quadrupole) beside its charge.
+MULTIPOLE_KEY = "multipole_net"
+
 #: Key in ``long_range``: true freezes the short-range model, so that only the
 #: charge head trains.
 CHARGE_HEAD_ONLY_KEY = "train_charge_head_only"
@@ -396,6 +407,11 @@ class _Charges(NamedTuple):
     #: In inference a leaf, a plain factor whose own derivative comes from
     #: the list of contacts; otherwise a function of the edge vectors.
     envelope: torch.Tensor | None = None
+    #: Atomic dipoles ``(nf, nloc, 3)`` and quadrupoles ``(nf, nloc, 3, 3)``
+    #: of a model with a multipole head, already weighted by the mask and the
+    #: envelope; None without one (and the quadrupole below ``lmax`` 2).
+    dipole: torch.Tensor | None = None
+    quadrupole: torch.Tensor | None = None
 
 
 class _Strained(NamedTuple):
@@ -499,6 +515,9 @@ class LongRangeEnergyModel(EnergyModel):
         # `state_dict()`, and are picked up by the optimizer.
         self.charge_fitting = charge_fitting
         self.long_range_energy = long_range_energy
+        #: The head giving every atom a dipole (and a quadrupole) beside its
+        #: charge (``long_range.multipole_net``), or None.
+        self.multipole_fitting = None
         #: Also return Born effective charge tensors from `forward`. Off by
         #: default because it costs an extra backward pass per call, and only
         #: a field simulation needs them. Set it on the model, not in the
@@ -588,6 +607,12 @@ class LongRangeEnergyModel(EnergyModel):
             self.charge_fitting is not None and self.long_range_energy is not None
         )
 
+    @property
+    def has_multipoles(self) -> bool:
+        """Whether the atoms carry dipoles (and quadrupoles) in the
+        long-range term."""
+        return self.multipole_fitting is not None
+
     def long_range_energy_for(
         self, cell: Any, pbc: Any, settings: dict[str, Any] | None = None
     ) -> torch.nn.Module | None:
@@ -616,7 +641,7 @@ class LongRangeEnergyModel(EnergyModel):
             base = self._reciprocal_base
         else:
             base = self.long_range_energy.serialize()
-        return build_long_range_energy(system_reciprocal(base, cell, pbc))
+        return build_term(system_reciprocal(base, cell, pbc), self.has_multipoles)
 
     def adapt_long_range(self, cell: Any, pbc: Any) -> bool:
         """Install the term :meth:`long_range_energy_for` builds for this
@@ -677,7 +702,7 @@ class LongRangeEnergyModel(EnergyModel):
     def _install_long_range(self, settings: dict[str, Any]) -> None:
         """The swap itself, leaving :meth:`adapt_long_range`'s base alone."""
         settings = self._checked_long_range(settings)
-        self.long_range_energy = build_long_range_energy(settings)
+        self.long_range_energy = build_term(settings, self.has_multipoles)
         # Keep the recorded config in step: a model re-serialised after a swap
         # describes the term it has, not the one it was trained with.
         script = getattr(self, "model_def_script", None)
@@ -749,6 +774,7 @@ class LongRangeEnergyModel(EnergyModel):
             **base, charge_fitting=charge_fitting, long_range_energy=long_range_energy
         )
         model.trained_charge_filter = trained_filter
+        model.multipole_fitting = cls._build_multipole(data, descriptor)
         block = data.get(LONG_RANGE_KEY) or {}
         if charge_fitting is not None:
             # The key's own value, or with bridging its radii: a normalized
@@ -843,11 +869,29 @@ class LongRangeEnergyModel(EnergyModel):
         charge_fitting = BaseFitting.get_class_by_type("charge")(**charge_net)
 
         settings = block.get(RECIPROCAL_KEY, block.get(_LEGACY_RECIPROCAL_KEY, {}))
-        long_range_energy = build_long_range_energy(
-            _strip_comments(copy.deepcopy(settings))
+        long_range_energy = build_term(
+            _strip_comments(copy.deepcopy(settings)),
+            block.get(MULTIPOLE_KEY) is not None,
         )
         trained_filter = check_charge_filter(block.get("charge_filter"))
         return charge_fitting, long_range_energy, trained_filter
+
+    @classmethod
+    def _build_multipole(cls, data: dict, descriptor: Any) -> Any:
+        """The multipole head of ``long_range.multipole_net``, or None."""
+        settings = (data.get(LONG_RANGE_KEY) or {}).get(MULTIPOLE_KEY)
+        if settings is None:
+            return None
+        settings = _strip_comments(copy.deepcopy(settings))
+        settings.pop("type", None)
+        settings["channels"] = equivariant_channels(
+            descriptor, int(settings.get("lmax", 1))
+        )
+        settings["ntypes"] = descriptor.get_ntypes()
+        settings["dim_descrpt"] = descriptor.get_dim_out()
+        settings["mixed_types"] = descriptor.mixed_types()
+        settings["type_map"] = copy.deepcopy(data["type_map"])
+        return BaseFitting.get_class_by_type("multipole")(**settings)
 
     def _predict_charges(
         self,
@@ -945,7 +989,7 @@ class LongRangeEnergyModel(EnergyModel):
             out = unhooked(graph, atype_flat, *args, **kwargs)
             # Only the FIRST call is the energy head's. A later one is the
             # fallback re-running the backbone, and must not overwrite this.
-            if not captured:
+            if "features" not in captured:
                 captured.update(
                     features=out[0],
                     rot_mat=out[1],
@@ -959,9 +1003,21 @@ class LongRangeEnergyModel(EnergyModel):
                 )
             return out
 
+        def capture_state(*args: Any, **kwargs: Any) -> Any:
+            out = unhooked_state(*args, **kwargs)
+            # The node state with every degree, which `call_graph` drops.
+            captured.setdefault("equivariant", out[1])
+            return out
+
         self._capture_depth += 1
         try:
-            with _hooked(descriptor, "call_graph", capture):
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(_hooked(descriptor, "call_graph", capture))
+                if self.has_multipoles:
+                    unhooked_state = descriptor._run_graph
+                    stack.enter_context(
+                        _hooked(descriptor, "_run_graph", capture_state)
+                    )
                 yield captured
         finally:
             self._capture_depth -= 1
@@ -1192,6 +1248,7 @@ class LongRangeEnergyModel(EnergyModel):
         *,
         contacts: Contacts | None = None,
         return_raw: bool = False,
+        equivariant: torch.Tensor | None = None,
     ) -> "torch.Tensor | _Charges":
         """Projected charges ``(nf, nloc)`` from an already-computed
         descriptor output on the graph ``edges = (edge_index, edge_vec,
@@ -1231,7 +1288,64 @@ class LongRangeEnergyModel(EnergyModel):
         local = raw
         if envelope is not None:
             local = envelope * (raw + shift.detach()[:, None])
-        return _Charges(projected, raw, local, shift, envelope)
+        dipole, quadrupole = self._moments(features, atype, equivariant, weight)
+        return _Charges(projected, raw, local, shift, envelope, dipole, quadrupole)
+
+    def _moments(
+        self,
+        features: torch.Tensor,
+        atype: torch.Tensor,
+        equivariant: torch.Tensor | None,
+        weight: torch.Tensor | None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Atomic dipoles ``(nf, nloc, 3)`` and quadrupoles ``(nf, nloc, 3,
+        3)`` from the descriptor's ``equivariant`` node state, weighted as the
+        charges are (mask and short-contact envelope, ``(nf, nloc)``); both
+        None without a multipole head."""
+        head = self.multipole_fitting
+        if head is None:
+            return None, None
+        if equivariant is None:
+            raise NotImplementedError(
+                "the multipole head needs the descriptor's equivariant node "
+                "state, which only the shared backbone capture carries; this "
+                "evaluation took a path without it"
+            )
+        coefficient = head.call_graph(features, atype.reshape(-1))[head.var_name]
+        vectors, tensors = cartesian_features(
+            backbone(self).descriptor, equivariant, head.lmax
+        )
+        dipole, quadrupole = contract(coefficient, vectors, tensors)
+        nf = atype.shape[0]
+        dipole = dipole.reshape(nf, -1, 3)
+        if weight is not None:
+            dipole = dipole * weight.to(dipole.dtype)[..., None]
+        if quadrupole is not None:
+            quadrupole = quadrupole.reshape(nf, -1, 3, 3)
+            if weight is not None:
+                quadrupole = quadrupole * weight.to(quadrupole.dtype)[..., None, None]
+        return dipole, quadrupole
+
+    def _term_energy(
+        self,
+        term: LongRangeTerm,
+        geometry: "_Strained",
+        charge: torch.Tensor,
+        mask: torch.Tensor,
+        charges: _Charges,
+    ) -> torch.Tensor:
+        """The long-range energy per atom, with the dipoles and quadrupoles
+        of a model that has them."""
+        if not self.has_multipoles:
+            return term(geometry.coord, charge, geometry.box, mask=mask)
+        return term(
+            geometry.coord,
+            charge,
+            geometry.box,
+            mask=mask,
+            dipole=charges.dipole,
+            quadrupole=charges.quadrupole,
+        )
 
     def _long_range(
         self,
@@ -1287,6 +1401,10 @@ class LongRangeEnergyModel(EnergyModel):
         }
         if result["born"] is not None:
             out["born_charge"] = result["born"]
+        # Screened like the charges: sqrt(eps_inf) times the model's own.
+        for key in ("dipole", "quadrupole"):
+            if result.get(key) is not None:
+                out[key] = result[key] * screening_factor(self.eps_inf)
         return out
 
     def _charge_filter_for(
@@ -1356,9 +1474,10 @@ class LongRangeEnergyModel(EnergyModel):
             (shared["edge_index"], shared["edge_vec"], shared["edge_mask"]),
             contacts=contacts,
             return_raw=True,
+            equivariant=shared.get("equivariant"),
         )
         charge = filtered(charges)
-        atom_energy = term(geometry.coord, charge, geometry.box, mask=mask)
+        atom_energy = self._term_energy(term, geometry, charge, mask, charges)
         edge_vec = shared["edge_vec"]
         leaves = [geometry.leaf, geometry.eps, edge_vec]
         if contacts is not None:
@@ -1408,6 +1527,8 @@ class LongRangeEnergyModel(EnergyModel):
             "force": -grad_coord + response_force.reshape(nf, nloc, 3),
             "virial": (-grad_eps).reshape(nf, 9) + response_virial.reshape(nf, 9),
             "born": born,
+            "dipole": charges.dipole,
+            "quadrupole": charges.quadrupole,
         }
 
     def _direct_long_range(
@@ -1423,6 +1544,12 @@ class LongRangeEnergyModel(EnergyModel):
         pass on a graph strained with ``geometry``, for when the energy path
         did not go through the graph lower and nothing was captured."""
         self._refuse_compressed_fallback()
+        if self.has_multipoles:
+            raise NotImplementedError(
+                "a model with a multipole head needs the shared backbone "
+                "capture, but this forward took the fallback path, so the "
+                "descriptor's equivariant node state was not captured"
+            )
         if self.compute_born:
             # No captured `edge_vec`, so no cheap route to Z. Notably taken
             # under DP_CUDA_INFER >= 2, whose fused kernel bypasses
@@ -1530,8 +1657,9 @@ class LongRangeEnergyModel(EnergyModel):
                 out[key] = short_range[key] + long_range[key]
         out["charge"] = long_range["charge"]
         out["charge_projection_shift"] = long_range["charge_projection_shift"]
-        if "born_charge" in long_range:
-            out["born_charge"] = long_range["born_charge"]
+        for key in ("born_charge", "dipole", "quadrupole"):
+            if key in long_range:
+                out[key] = long_range[key]
         out["energy_long_range"] = long_range["energy"]
         out["energy_short_range"] = short_range["energy"]
         return out
@@ -2053,6 +2181,10 @@ class LongRangeEnergyModel(EnergyModel):
                 "charge_net": self.charge_fitting.serialize(),
                 RECIPROCAL_KEY: self.long_range_energy.serialize(),
             }
+            if self.has_multipoles:
+                data[LONG_RANGE_KEY][MULTIPOLE_KEY] = (
+                    self.multipole_fitting.serialize()
+                )
             if self.trained_charge_filter is not None:
                 data[LONG_RANGE_KEY]["charge_filter"] = list(self.trained_charge_filter)
             if self.charge_shield is not None:
@@ -2077,8 +2209,10 @@ class LongRangeEnergyModel(EnergyModel):
         model.set_zbl(zbl)
         if block is not None:
             model.charge_fitting = BaseFitting.deserialize(block["charge_net"])
+            if block.get(MULTIPOLE_KEY) is not None:
+                model.multipole_fitting = BaseFitting.deserialize(block[MULTIPOLE_KEY])
             settings = block.get(RECIPROCAL_KEY, block.get(_LEGACY_RECIPROCAL_KEY))
-            model.long_range_energy = build_long_range_energy(settings)
+            model.long_range_energy = build_term(settings, model.has_multipoles)
             model.trained_charge_filter = check_charge_filter(
                 block.get("charge_filter")
             )

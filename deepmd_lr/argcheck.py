@@ -463,10 +463,42 @@ def _long_range_args() -> Argument:
         "A training switch only; it changes nothing in a model that is "
         "evaluated.",
     )
+    multipole_net = Argument(
+        "multipole_net",
+        [dict, None],
+        [
+            Argument(
+                "lmax",
+                int,
+                optional=True,
+                default=1,
+                doc="The highest atomic moment: 1 gives every atom a dipole, "
+                "2 a traceless quadrupole as well.",
+            ),
+            *charge_fitting_args(),
+        ],
+        optional=True,
+        default=None,
+        doc="A head giving every atom a dipole (and a quadrupole) beside its "
+        "charge, which enter the long-range energy with it and, the dipoles, "
+        "the Born tensor. The moments are the descriptor's own equivariant "
+        "channels mixed with coefficients this net fits on the invariant "
+        "features, so they rotate with the frame by construction. Needs a "
+        "`dpa4` descriptor whose last degree is at least `lmax`, "
+        "`reciprocal.method: \"ewald\"` and a cell periodic in three "
+        "directions. The other keys are the charge head's.",
+    )
     return Argument(
         LONG_RANGE_KEY,
         dict,
-        [charge_net, reciprocal, charge_filter, charge_shield, charge_head_only],
+        [
+            charge_net,
+            reciprocal,
+            charge_filter,
+            charge_shield,
+            charge_head_only,
+            multipole_net,
+        ],
         optional=True,
         default=None,
         doc="The long-range electrostatic term. Omit for a pure short-range "

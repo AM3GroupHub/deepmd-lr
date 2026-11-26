@@ -52,7 +52,18 @@ from nvalchemiops.torch.interactions.electrostatics.multipole_electrostatics imp
 from deepmd_lr.lr.term import (
     LongRangeEnergy,
     _check_inputs,
+    build_long_range_energy,
 )
+
+
+def build_term(settings: dict[str, Any], multipoles: bool) -> torch.nn.Module:
+    """The long-range term of ``settings``: with ``multipoles`` the one that
+    takes dipoles and quadrupoles, else what
+    :func:`~deepmd_lr.lr.term.build_long_range_energy` builds."""
+    if multipoles:
+        return MultipoleLongRangeEnergy(**settings)
+    return build_long_range_energy(settings)
+
 
 #: nvalchemiops splits the Gaussian width between the density basis and its
 #: Ewald factor, and the sum depends on their combination alone; this share of
