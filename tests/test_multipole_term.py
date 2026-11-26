@@ -13,7 +13,14 @@ What is pinned:
 - **The mesh**: PME agrees with the explicit sum in a tilted cell, which
   nvalchemiops' own k-grid does not give, in energy, forces and cell
   gradient.
-- **What is refused**: a slab, a frame without a cell.
+- **The isolated sum** (no periodic axis): against the same atoms written
+  out as point charges, against a very large periodic cell, against the
+  textbook point dipoles, with autograd's derivatives against finite
+  differences and atoms on top of each other giving finite numbers.
+- **The slab correction**: nvalchemiops' atom by atom when there are only
+  charges, and with moments against the same atoms as point charges under
+  the charge term's own correction.
+- **What is refused**: a periodic term on a frame without a cell.
 """
 
 import math
@@ -21,10 +28,17 @@ import math
 import numpy as np
 import pytest
 import torch
+from deepmd.dpmodel.modifier.dipole_charge import ELECTROSTATIC_CONVERSION
 from deepmd.pt_expt.utils.env import DEVICE
 
-from deepmd_lr.lr.multipole import MultipoleLongRangeEnergy
-from deepmd_lr.lr.term import LongRangeEnergy
+from deepmd_lr.lr.multipole import (
+    IsolatedMultipoleEnergy,
+    MultipoleLongRangeEnergy,
+    build_term,
+    isolated_multipole_term_for,
+)
+from deepmd_lr.lr.multipole_pairs import radial_coefficients
+from deepmd_lr.lr.term import IsolatedLongRangeEnergy, LongRangeEnergy
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="the k-sum kernels run on GPU"
@@ -286,18 +300,313 @@ class TestFramesAndMask:
         torch.testing.assert_close(masked[:, :-1], without, atol=1e-9, rtol=0)
 
 
+def as_point_charges(coord, charge, dipole, quadrupole, d):
+    """The same atoms as point charges: a dipole as a pair ``d`` apart, a
+    quadrupole as three charges in a row along each of its principal axes.
+    Right to ``d**2``. Returns positions, charges and each one's atom."""
+    points, charges, owner = [], [], []
+    for atom in range(len(coord)):
+        points.append(coord[atom])
+        charges.append(charge[atom])
+        size = np.linalg.norm(dipole[atom])
+        along = dipole[atom] / size
+        points += [coord[atom] + along * d / 2, coord[atom] - along * d / 2]
+        charges += [size / d, -size / d]
+        values, axes = np.linalg.eigh(quadrupole[atom])
+        for value, axis in zip(values, axes.T, strict=True):
+            end = value / (2 * d * d)
+            points += [coord[atom] + axis * d, coord[atom], coord[atom] - axis * d]
+            charges += [end, -2 * end, end]
+        owner += [atom] * 12
+    return np.array(points), np.array(charges), np.array(owner)
+
+
+def within_atoms(points, charges, owner, alpha=ALPHA) -> float:
+    """What the point charges of one atom do to each other, in eV: a multipole
+    has no such energy, its self term being subtracted."""
+    distance = np.linalg.norm(points[:, None] - points[None], axis=-1)
+    kernel = np.full_like(distance, 2 * alpha / math.sqrt(math.pi))
+    apart = distance > 1e-12
+    kernel[apart] = np.vectorize(math.erf)(alpha * distance[apart]) / distance[apart]
+    np.fill_diagonal(kernel, 0.0)
+    same = owner[:, None] == owner[None]
+    # The term's own constant: these are thousands of eV, taken off as many.
+    pairs = (charges[:, None] * charges[None] * kernel * same).sum()
+    return ELECTROSTATIC_CONVERSION * 0.5 * float(pairs)
+
+
+def extrapolated(difference) -> float:
+    """The d -> 0 limit of a quantity with a d**2 error, from d and d / 2."""
+    coarse, fine = difference
+    return (4 * fine - coarse) / 3
+
+
+def isolated(coord, charge, dipole=None, quadrupole=None, **settings) -> torch.Tensor:
+    return IsolatedMultipoleEnergy(alpha=ALPHA, **settings)(
+        tensor(coord)[None],
+        tensor(charge)[None],
+        None,
+        dipole=None if dipole is None else tensor(dipole)[None],
+        quadrupole=None if quadrupole is None else tensor(quadrupole)[None],
+    )
+
+
+class TestCluster:
+    def test_the_radial_coefficients(self):
+        # Against autograd on erf(alpha r)/r, where that is well conditioned.
+        r = tensor([1.2, 1.6, 2.4, 2.6, 5.0, 9.0]).requires_grad_(True)
+        coefficients = radial_coefficients(r * r, ALPHA)
+        value = torch.erf(ALPHA * r) / r
+        for order in range(5):
+            torch.testing.assert_close(
+                coefficients[order], value, rtol=1e-9, atol=0
+            )
+            (slope,) = torch.autograd.grad(value.sum(), r, create_graph=True)
+            value = -slope / r
+
+    def test_without_moments_it_is_the_charge_sum(self):
+        coord, charge, _, _, _ = system(seed=2, net=0.4)
+        ours = isolated(coord, charge)
+        theirs = IsolatedLongRangeEnergy(alpha=ALPHA, isolated_kernel="dense")(
+            tensor(coord)[None], tensor(charge)[None]
+        )
+        torch.testing.assert_close(ours, theirs, atol=1e-12, rtol=0)
+
+    @pytest.mark.parametrize("moments", ["dipole", "both"])
+    def test_against_the_same_atoms_as_point_charges(self, moments):
+        coord, charge, dipole, quadrupole, _ = system(n=6, box=6.0, seed=5, net=0.3)
+        if moments == "dipole":
+            ours = float(isolated(coord, charge, dipole).sum())
+            quadrupole = np.zeros_like(quadrupole)
+        else:
+            ours = float(isolated(coord, charge, dipole, quadrupole).sum())
+        difference = []
+        for d in (0.1, 0.05):
+            points, charges, owner = as_point_charges(
+                coord, charge, dipole, quadrupole, d
+            )
+            total = float(isolated(points, charges).sum())
+            difference.append(ours - (total - within_atoms(points, charges, owner)))
+        assert abs(difference[1]) < 0.3 * abs(difference[0])  # the d**2 error
+        assert extrapolated(difference) == pytest.approx(0.0, abs=2e-6)
+
+    def test_it_is_the_limit_of_a_large_cell(self):
+        coord, charge, dipole, quadrupole, _ = system(n=6, box=6.0, seed=6)
+        box = 60.0
+        cluster = float(isolated(coord, charge, dipole, quadrupole).sum())
+        periodic = float(
+            energy(
+                coord, charge, dipole, quadrupole, np.eye(3) * box,
+                method="pme", mesh_dimensions=[144, 144, 144], k_cutoff=None,
+            ).sum()
+        )  # fmt: skip
+        # A cubic lattice of the cell's dipole M lowers the energy by
+        # 2 pi M^2 / 3V; what is left falls as L^-5 (and the mesh's own
+        # error, 2e-4 eV at the default spacing with moments this large).
+        moment = (charge[:, None] * coord).sum(0) + dipole.sum(0)
+        images = KE * 2 * math.pi * float(moment @ moment) / (3 * box**3)
+        assert abs(periodic - cluster) > 5e-3
+        assert periodic + images == pytest.approx(cluster, abs=5e-5)
+
+    def test_two_distant_dipoles_are_point_dipoles(self):
+        first, second = np.array([0.3, -0.2, 0.5]), np.array([-0.4, 0.1, 0.2])
+        separation = np.array([14.0, 3.0, -2.0])
+        r = np.linalg.norm(separation)
+        point = KE * (
+            first @ second / r**3
+            - 3 * (first @ separation) * (second @ separation) / r**5
+        )
+        ours = isolated(
+            np.array([np.zeros(3), separation]), np.zeros(2), np.array([first, second])
+        )
+        assert float(ours.sum()) == pytest.approx(point, rel=1e-10)
+
+    @pytest.mark.parametrize("which", [0, 1, 2, 3])
+    def test_first_derivatives_against_finite_differences(self, which):
+        coord, charge, dipole, quadrupole, _ = system(n=6, box=5.0, seed=7, net=0.2)
+        leaves = [tensor(x) for x in (coord, charge, dipole, quadrupole)]
+        term = IsolatedMultipoleEnergy(alpha=ALPHA)
+
+        def total(coord, charge, dipole, quadrupole):
+            sym = 0.5 * (quadrupole + quadrupole.transpose(-1, -2))
+            return term(
+                coord[None], charge[None], None, dipole=dipole[None],
+                quadrupole=sym[None],
+            ).sum()  # fmt: skip
+
+        leaves[which].requires_grad_(True)
+        (analytic,) = torch.autograd.grad(total(*leaves), leaves[which])
+        direction = tensor(
+            np.random.default_rng(which).normal(size=tuple(leaves[which].shape))
+        )
+        h = 1e-4
+        shifted = []
+        for sign in (1.0, -1.0):
+            moved = [x.detach().clone() for x in leaves]
+            moved[which] = moved[which] + sign * h * direction
+            shifted.append(float(total(*moved)))
+        assert float((analytic * direction).sum()) == pytest.approx(
+            (shifted[0] - shifted[1]) / (2 * h), rel=1e-6, abs=1e-8
+        )
+
+    def test_it_turns_with_the_frame(self):
+        coord, charge, dipole, quadrupole, _ = system(n=6, box=5.0, seed=8)
+        turn, _ = np.linalg.qr(np.random.default_rng(1).normal(size=(3, 3)))
+        before = isolated(coord, charge, dipole, quadrupole)
+        after = isolated(
+            coord @ turn.T, charge, dipole @ turn.T, turn @ quadrupole @ turn.T
+        )
+        torch.testing.assert_close(before, after, atol=1e-11, rtol=0)
+
+    def test_atoms_on_top_of_each_other_stay_finite(self):
+        coord, charge, dipole, quadrupole, _ = system(n=4, box=5.0, seed=9)
+        coord[1] = coord[0]
+        coord[3] = coord[2] + 1e-9
+        position = tensor(coord).requires_grad_(True)
+        moment = tensor(dipole).requires_grad_(True)
+        total = IsolatedMultipoleEnergy(alpha=ALPHA)(
+            position[None], tensor(charge)[None], None, dipole=moment[None],
+            quadrupole=tensor(quadrupole)[None],
+        ).sum()  # fmt: skip
+        (force,) = torch.autograd.grad(total, position, create_graph=True)
+        (second,) = torch.autograd.grad(force.square().sum(), moment)
+        for value in (total, force, second):
+            assert bool(torch.isfinite(value).all())
+
+    def test_frames_and_a_mask(self):
+        coord, charge, dipole, quadrupole, _ = system(n=5, box=5.0, seed=10)
+        other = system(n=5, box=5.0, seed=11)
+        term = IsolatedMultipoleEnergy(alpha=ALPHA)
+        stack = lambda a, b: torch.stack([tensor(a), tensor(b)])  # noqa: E731
+        mask = torch.ones(2, 5, dtype=torch.bool, device=DEVICE)
+        mask[0, -1] = False
+        both = term(
+            stack(coord, other[0]), stack(charge, other[1]), None, mask=mask,
+            dipole=stack(dipole, other[2]), quadrupole=stack(quadrupole, other[3]),
+        )  # fmt: skip
+        alone = isolated(coord[:-1], charge[:-1], dipole[:-1], quadrupole[:-1])
+        torch.testing.assert_close(both[:1, :-1], alone, atol=1e-11, rtol=0)
+        assert float(both[0, -1].abs()) == 0.0
+        torch.testing.assert_close(both[1:], isolated(*other[:4]), atol=1e-11, rtol=0)
+
+    def test_a_term_for_a_frame_without_a_cell(self):
+        periodic = term(alpha=0.37)
+        cluster = isolated_multipole_term_for(periodic)
+        assert isinstance(cluster, IsolatedMultipoleEnergy)
+        assert cluster.alpha == 0.37
+        assert isolated_multipole_term_for(cluster) is cluster
+        built = build_term(cluster.serialize(), multipoles=True)
+        assert isinstance(built, IsolatedMultipoleEnergy)
+
+    def test_too_many_atoms_are_refused(self):
+        coord, charge, dipole, _, _ = system()
+        with pytest.raises(ValueError, match="max_isolated_atoms"):
+            isolated(coord, charge, dipole, max_isolated_atoms=5)
+
+
+SLAB = {"slab_correction": True, "pbc": [True, True, False]}
+
+
+def slab(seed: int = 12, net: float = 0.0):
+    """Atoms in the lower third of a tilted cell with 20 A along its third
+    vector."""
+    rng = np.random.default_rng(seed)
+    cell = np.array([[8.0, 0.0, 0.0], [1.5, 7.5, 0.0], [0.7, -0.9, 20.0]])
+    n = 6
+    coord = (rng.uniform(size=(n, 3)) * [1.0, 1.0, 0.3]) @ cell
+    charge = rng.normal(scale=0.5, size=n)
+    charge += net / n - charge.mean()
+    dipole = 0.3 * rng.normal(size=(n, 3))
+    quadrupole = traceless(0.3 * rng.normal(size=(n, 3, 3)))
+    return coord, charge, dipole, quadrupole, cell
+
+
+class TestSlab:
+    @pytest.mark.parametrize("net", [0.0, 0.4])
+    @pytest.mark.parametrize("axis", [0, 1, 2])
+    def test_without_moments_it_is_the_charge_correction(self, net, axis):
+        coord, charge, _, _, cell = slab(net=net)
+        # The open axis moved to each place in turn.
+        order = np.roll(np.arange(3), axis + 1)
+        cell = cell[order]
+        pbc = [k != int(np.argmax(order == 2)) for k in range(3)]
+        settings = {"slab_correction": True, "pbc": pbc, "k_cutoff": 4.0}
+        ours = energy(coord, charge, None, None, cell, **settings)
+        theirs = LongRangeEnergy(alpha=ALPHA, method="ewald", **settings)(
+            tensor(coord)[None], tensor(charge)[None], tensor(cell)[None]
+        )
+        plain = energy(coord, charge, None, None, cell, k_cutoff=4.0)
+        assert float((ours - plain).abs().max()) > 1e-3
+        torch.testing.assert_close(ours, theirs, atol=1e-9, rtol=0)
+
+    @pytest.mark.parametrize("net", [0.0, 0.3])
+    def test_against_the_same_atoms_as_point_charges(self, net):
+        coord, charge, dipole, quadrupole, cell = slab(net=net)
+        settings = {**SLAB, "k_cutoff": 5.0}
+        ours = float(energy(coord, charge, dipole, quadrupole, cell, **settings).sum())
+        system_ = (coord, charge, dipole, quadrupole, cell)
+        bulk = float(energy(*system_, k_cutoff=5.0).sum())
+        assert abs(ours - bulk) > 1e-2
+        charges_only = LongRangeEnergy(alpha=ALPHA, method="ewald", **settings)
+        difference = []
+        for d in (0.2, 0.1):
+            points, charges, owner = as_point_charges(
+                coord, charge, dipole, quadrupole, d
+            )
+            total = float(
+                charges_only(
+                    tensor(points)[None], tensor(charges)[None], tensor(cell)[None]
+                ).sum()
+            )
+            difference.append(ours - (total - within_atoms(points, charges, owner)))
+        assert abs(difference[1]) < 0.3 * abs(difference[0])
+        assert extrapolated(difference) == pytest.approx(0.0, abs=2e-5)
+
+    def test_derivatives_against_finite_differences(self):
+        coord, charge, dipole, quadrupole, cell = slab(net=0.2)
+        leaves = [tensor(x) for x in (coord, charge, dipole, cell)]
+        slab_term = term(**SLAB, k_cutoff=4.0)
+
+        def total(coord, charge, dipole, cell):
+            return slab_term(
+                coord[None], charge[None], cell[None], dipole=dipole[None],
+                quadrupole=tensor(quadrupole)[None],
+            ).sum()  # fmt: skip
+
+        for which in range(4):
+            moved = [x.clone().requires_grad_(k == which) for k, x in enumerate(leaves)]
+            (analytic,) = torch.autograd.grad(total(*moved), moved[which])
+            direction = tensor(
+                np.random.default_rng(which).normal(size=tuple(leaves[which].shape))
+            )
+            h = 1e-4
+            shifted = []
+            for sign in (1.0, -1.0):
+                moved = [x.clone() for x in leaves]
+                moved[which] = moved[which] + sign * h * direction
+                shifted.append(float(total(*moved)))
+            assert float((analytic * direction).sum()) == pytest.approx(
+                (shifted[0] - shifted[1]) / (2 * h), rel=1e-5, abs=1e-7
+            ), which
+
+    def test_on_the_mesh(self):
+        coord, charge, dipole, quadrupole, cell = slab()
+        explicit = energy(coord, charge, dipole, quadrupole, cell, **SLAB)
+        mesh = energy(
+            coord, charge, dipole, quadrupole, cell, method="pme", k_cutoff=None,
+            mesh_dimensions=[32, 32, 64], **SLAB,
+        )  # fmt: skip
+        torch.testing.assert_close(mesh, explicit, atol=2e-5, rtol=0)
+
+    def test_a_slab_needs_its_correction(self):
+        with pytest.raises(ValueError, match="slab_correction"):
+            term(pbc=[True, True, False])
+
+
 class TestRefusals:
-    def test_an_isolated_sum(self):
-        with pytest.raises(NotImplementedError, match="isolated"):
-            MultipoleLongRangeEnergy(alpha=ALPHA, method="isolated")
-
-    def test_a_slab(self):
-        with pytest.raises(NotImplementedError, match="three"):
-            term(slab_correction=True, pbc=[True, True, False])
-
     def test_a_frame_without_a_cell(self):
         coord, charge, dipole, _, _ = system()
-        with pytest.raises(NotImplementedError, match="isolated"):
+        with pytest.raises(ValueError, match="isolated_multipole_term_for"):
             term()(tensor(coord)[None], tensor(charge)[None], None,
                    dipole=tensor(dipole)[None])  # fmt: skip
 

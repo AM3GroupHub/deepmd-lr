@@ -95,6 +95,7 @@ from deepmd_lr.fitting.multipole import (
 )
 from deepmd_lr.lr.multipole import (
     build_term,
+    isolated_multipole_term_for,
     multipole_mesh,
 )
 from deepmd_lr.lr.term import (
@@ -1344,6 +1345,12 @@ class LongRangeEnergyModel(EnergyModel):
         )
         return contract(coefficient, vectors, tensors)
 
+    def _isolated_term(self) -> LongRangeTerm:
+        """The term a frame with no cell is summed by, at this model's alpha."""
+        if self.has_multipoles:
+            return isolated_multipole_term_for(self.long_range_energy)
+        return isolated_term_for(self.long_range_energy)
+
     def _term_energy(
         self,
         term: LongRangeTerm,
@@ -1391,17 +1398,12 @@ class LongRangeEnergyModel(EnergyModel):
             )
         nf, nloc = atype.shape[0], atype.shape[1]
         geometry = _strained_geometry(coord, box, nf, nloc)
-        if self.has_multipoles and geometry.base_box is None:
-            raise NotImplementedError(
-                "a model with a multipole head needs a cell: there is no "
-                "isolated multipole sum yet"
-            )
         # The frame picks the sum: with no cell, the isolated one at this
         # model's alpha, whatever method the periodic frames use.
         term = (
             self.long_range_energy
             if geometry.base_box is not None
-            else isolated_term_for(self.long_range_energy)
+            else self._isolated_term()
         )
         mask = charge_mask(self, atype)
         filtered = self._charge_filter_for(charge_spin, mask)

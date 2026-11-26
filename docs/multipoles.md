@@ -82,8 +82,23 @@ number.
   right in a cell whose matrix is symmetric (any orthorhombic one), 3e-3 eV
   off on 12 atoms in a tilted one, at any mesh. The grid is built here and
   handed to it; the tests compare PME with the explicit sum in a tilted cell.
-- **Periodic in three directions only.** There is no slab correction that
-  knows of atomic dipoles and no isolated multipole sum yet; both are refused.
+- **Slabs.** A cell with one open axis takes the Yeh-Berkowitz correction on
+  top of the 3D sum, as for charges. What the correction needs of the cell's
+  content is its first and second moment along the slab normal, and an atom's
+  dipole and quadrupole add to those: `M = sum q z + mu.n`,
+  `M2 = sum q z^2 + 2 z mu.n + n.Q.n`. nvalchemiops' correction knows of
+  charges only, so this one is written here; with no moments it is theirs,
+  atom by atom.
+- **Molecules and clusters.** A frame with no cell, or a system with no
+  periodic axis, is summed pair by pair: every pair of atoms interacts through
+  `erf(alpha r)/r` and its derivatives up to the fourth (quadrupole with
+  quadrupole), which is the periodic sum's limit in an infinite cell. One
+  dense kernel in float64, O(N²) memory, differentiable to any order; a call
+  of more than `max_isolated_atoms` atoms (default 5000) is refused. There is
+  no chunked kernel as the charges have, so the MD evaluator's
+  `isolated_dtype` and `isolated_kernel` do not apply.
+- **The quadrupole is traceless.** The head's is by construction; the trace of
+  one handed to the term from outside is dropped by every sum alike.
 
 The model reports `dipole` `(nf, nloc, 3)` in e Å and `quadrupole`
 `(nf, nloc, 3, 3)` in e Å², beside `charge`; the ASE calculator as

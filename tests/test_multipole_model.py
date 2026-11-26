@@ -372,6 +372,79 @@ class TestMesh:
         assert tuple(term.mesh_dimensions) == (20, 20, 20)
 
 
+class TestOpenBoundaries:
+    """A cluster is summed pair by pair, a slab with the correction that
+    knows of the atoms' dipoles; the frame or the system's pbc picks."""
+
+    def test_a_cluster_has_the_gradient_of_its_energy(self):
+        model = build(2)
+        coord, atype, _ = frame(n_mol=6, box=8.0)
+        out = model(coord, atype, box=None)
+        assert float(out["dipole"].detach().abs().max()) > 1e-4
+        force = out["force"][0]
+        for atom, axis in [(0, 0), (7, 1), (13, 2)]:
+
+            def displaced(step, atom=atom, axis=axis):
+                moved = coord.clone()
+                moved[0, atom, axis] += step
+                return float(model(moved, atype, box=None)["energy"].sum())
+
+            assert -derivative(displaced) == pytest.approx(
+                float(force[atom, axis]), abs=1e-7
+            )
+
+    def test_a_cluster_is_the_limit_of_a_large_cell(self):
+        model = build(2)
+        coord, atype, _ = frame(n_mol=6, box=8.0)
+        cluster = float(model(coord, atype, box=None)["energy"].sum())
+        box = 50.0 * torch.eye(3, dtype=DT, device=DEVICE)[None]
+        periodic = float(evaluate(model, coord, atype, box)["energy"].sum())
+        assert periodic == pytest.approx(cluster, abs=2e-3)
+
+    @pytest.mark.parametrize("pbc", [[False] * 3, [True, True, False]])
+    def test_the_engine_is_the_serial_model(self, pbc):
+        from deepmd_lr.nvalchemi import DistributedEvaluator
+
+        model = build(2, n_blocks=1)
+        system = frame(n_mol=6, box=10.0)
+        coord, atype, cell = TestEngine.host(system)
+        cell = cell.copy()
+        cell[2, 2] = 30.0
+        evaluator = DistributedEvaluator(
+            model, atype, cell, pbc=pbc, devices=[DEVICE], memory_headroom=None
+        )
+        energy, force = evaluator(coord)
+        # The serial model with the term this system needs (a fresh model).
+        model.long_range_energy = model.long_range_energy_for(cell, pbc)
+        box = torch.tensor(cell, dtype=DT, device=DEVICE)[None] if any(pbc) else None
+        serial = model(system[0], system[1], box=box)
+        assert energy == pytest.approx(float(serial["energy"]), abs=1e-8)
+        assert (force - serial["force"][0].detach()).abs().max() < 1e-8
+        dipole = torch.as_tensor(evaluator.results["dipole"], device=DEVICE)
+        assert torch.allclose(dipole, serial["dipole"][0], atol=1e-10)
+
+    def test_a_slab_has_its_own_energy_and_its_gradient(self):
+        model = build(1)
+        coord, atype, cell = frame(n_mol=6, box=10.0)
+        cell = cell.clone()
+        cell[0, 2, 2] = 30.0
+        bulk = float(evaluate(model, coord, atype, cell)["energy"].sum())
+        model.long_range_energy = model.long_range_energy_for(
+            cell[0].cpu().numpy(), [True, True, False]
+        )
+        slab = evaluate(model, coord, atype, cell)
+        assert abs(float(slab["energy"].sum()) - bulk) > 1e-7
+
+        def displaced(step):
+            moved = coord.clone()
+            moved[0, 3, 2] += step
+            return float(evaluate(model, moved, atype, cell)["energy"].sum())
+
+        assert -derivative(displaced) == pytest.approx(
+            float(slab["force"][0, 3, 2]), abs=1e-7
+        )
+
+
 class TestPlumbing:
     def test_it_round_trips_through_serialization(self):
         model = build(2)
@@ -422,11 +495,6 @@ class TestRefusals:
         with pytest.raises(ValueError, match="degree 1"):
             get_model(cfg)
 
-    def test_a_cluster(self):
-        model = build(1)
-        coord, atype, _ = frame(n_mol=4, box=10.0)
-        with pytest.raises(NotImplementedError, match="isolated"):
-            model(coord, atype, box=None)
 
 
 def test_the_curriculum_through_the_cli(tmp_path):

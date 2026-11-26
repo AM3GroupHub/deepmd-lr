@@ -39,8 +39,13 @@ alpha 0.4 and spline order 6, a spacing of ``1/(2 alpha)`` leaves 4e-3 eV/A in
 the dipoles' forces and ``1/(4 alpha)`` leaves 5e-5. The mesh a system gets
 follows the second (:func:`multipole_mesh`).
 
-Periodic in three directions only: nvalchemiops has no slab correction that
-knows of atomic dipoles and no isolated multipole sum, so both are refused.
+A slab (one open axis) takes the Yeh-Berkowitz correction on top of the 3D
+sum, as the charge term does. nvalchemiops' knows of charges only, so it is
+written here (:func:`slab_multipole_correction`): what the correction needs of
+the cell's content is its first and second moment along the slab normal, and
+an atom's dipole and quadrupole add to those. A system with no periodic axis
+is summed pair by pair (:class:`IsolatedMultipoleEnergy`,
+:mod:`deepmd_lr.lr.multipole_pairs`).
 """
 
 import math
@@ -62,11 +67,16 @@ from nvalchemiops.torch.interactions.electrostatics.pme_multipole import (
     multipole_pme_reciprocal_space,
 )
 
+from deepmd_lr.lr.multipole_pairs import (
+    isolated_multipole_energy,
+)
 from deepmd_lr.lr.term import (
     DEFAULT_ALPHA,
+    IsolatedLongRangeEnergy,
     LongRangeEnergy,
     _check_inputs,
     build_long_range_energy,
+    isolated_term_for,
     system_mesh,
 )
 
@@ -75,9 +85,116 @@ def build_term(settings: dict[str, Any], multipoles: bool) -> torch.nn.Module:
     """The long-range term of ``settings``: with ``multipoles`` the one that
     takes dipoles and quadrupoles, else what
     :func:`~deepmd_lr.lr.term.build_long_range_energy` builds."""
-    if multipoles:
-        return MultipoleLongRangeEnergy(**settings)
-    return build_long_range_energy(settings)
+    if not multipoles:
+        return build_long_range_energy(settings)
+    if settings.get("method", "pme") == IsolatedMultipoleEnergy.METHOD:
+        return IsolatedMultipoleEnergy(**settings)
+    return MultipoleLongRangeEnergy(**settings)
+
+
+def isolated_multipole_term_for(term: torch.nn.Module) -> "IsolatedMultipoleEnergy":
+    """The isolated multipole term at ``term``'s alpha: how a frame with no
+    cell is summed, whatever method the periodic frames use."""
+    if isinstance(term, IsolatedMultipoleEnergy):
+        return term
+    return IsolatedMultipoleEnergy(**isolated_term_for(term).serialize())
+
+
+def _checked_moments(
+    charge: torch.Tensor,
+    dipole: torch.Tensor | None,
+    quadrupole: torch.Tensor | None,
+    mask: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """The three moments, their shapes checked, padding atoms zeroed and the
+    quadrupole's trace taken out.
+
+    The trace of a second moment is not a quadrupole: on a Gaussian it only
+    changes the width. The multipole head has none; one handed in from
+    outside is dropped, by every sum alike.
+    """
+    nf, nloc = charge.shape
+    if quadrupole is not None and dipole is None:
+        raise ValueError("a quadrupole needs a dipole beside it")
+    if dipole is not None and dipole.shape != (nf, nloc, 3):
+        raise ValueError(
+            f"dipole must have shape {(nf, nloc, 3)}, got {tuple(dipole.shape)}"
+        )
+    if quadrupole is not None and quadrupole.shape != (nf, nloc, 3, 3):
+        raise ValueError(
+            f"quadrupole must have shape {(nf, nloc, 3, 3)}, "
+            f"got {tuple(quadrupole.shape)}"
+        )
+    if quadrupole is not None:
+        trace = quadrupole.diagonal(dim1=-2, dim2=-1).sum(-1) / 3.0
+        eye = torch.eye(3, dtype=quadrupole.dtype, device=quadrupole.device)
+        quadrupole = quadrupole - trace[..., None, None] * eye
+    if mask is not None:
+        weight = mask.to(charge.dtype)
+        charge = charge * weight
+        if dipole is not None:
+            dipole = dipole * weight[..., None]
+        if quadrupole is not None:
+            quadrupole = quadrupole * weight[..., None, None]
+    return charge, dipole, quadrupole
+
+
+def slab_multipole_correction(
+    coord: torch.Tensor,
+    charge: torch.Tensor,
+    cell: torch.Tensor,
+    pbc: tuple[bool, bool, bool],
+    dipole: torch.Tensor | None = None,
+    quadrupole: torch.Tensor | None = None,
+) -> torch.Tensor:
+    r"""The Yeh-Berkowitz slab correction with atomic dipoles and
+    quadrupoles, per atom in e^2/angstrom, ``(nf, nloc)`` float64.
+
+    With :math:`z` the coordinate along the unit normal :math:`n` of the
+    periodic plane, :math:`L` the cell's height along it and
+    :math:`Q_\text{tot}` the cell's charge,
+
+    .. math::
+        E = \frac{2\pi}{V}\Bigl(M^2 - Q_\text{tot} M_2
+            - \frac{Q_\text{tot}^2 L^2}{12}\Bigr),
+        \quad M = \sum_i q_i z_i + \mu_i\cdot n,
+        \quad M_2 = \sum_i q_i z_i^2 + 2 z_i\,\mu_i\cdot n + n\cdot Q_i\cdot n
+
+    the first and second moment of the charge density along the normal. The
+    charged-cell terms are those of nvalchemiops' charge-only correction
+    (Ballenegger et al. 2009), which this reproduces atom by atom when no
+    atom has a dipole. ``cell`` is ``(nf, 3, 3)``, rows the cell vectors, and
+    ``pbc`` has exactly one open axis.
+    """
+    open_axis = [k for k in range(3) if not pbc[k]]
+    if len(open_axis) != 1:
+        raise ValueError(f"a slab has exactly one open axis, got pbc={pbc}")
+    k = open_axis[0]
+    cell = cell.to(torch.float64)
+    coord = coord.to(torch.float64)
+    q = charge.to(torch.float64)
+    normal = torch.linalg.cross(cell[:, (k + 1) % 3], cell[:, (k + 2) % 3])
+    normal = normal / torch.linalg.norm(normal, dim=-1, keepdim=True)
+    height = (cell[:, k] * normal).sum(-1, keepdim=True)
+    volume = torch.abs(torch.linalg.det(cell))[:, None]
+    z = (coord * normal[:, None, :]).sum(-1)
+    first = q * z
+    second = q * z * z
+    if dipole is not None:
+        along = (dipole.to(torch.float64) * normal[:, None, :]).sum(-1)
+        first = first + along
+        second = second + 2.0 * z * along
+    if quadrupole is not None:
+        second = second + torch.einsum(
+            "fa,fiab,fb->fi", normal, quadrupole.to(torch.float64), normal
+        )
+    total = q.sum(-1, keepdim=True)
+    energy = (
+        first * first.sum(-1, keepdim=True)
+        - 0.5 * (q * second.sum(-1, keepdim=True) + total * second)
+        - q * total * height * height / 12.0
+    )
+    return (2.0 * math.pi / volume) * energy
 
 
 def mesh_k_squared(cell: torch.Tensor, mesh: tuple[int, int, int]) -> torch.Tensor:
@@ -115,23 +232,9 @@ _BASIS_SHARE = 0.5
 class MultipoleLongRangeEnergy(LongRangeEnergy):
     """Per-atom long-range energy of charges, dipoles and quadrupoles, in eV.
 
-    The settings of :class:`~deepmd_lr.lr.term.LongRangeEnergy`; a slab
-    correction and an open axis are refused (module docstring).
+    The settings of :class:`~deepmd_lr.lr.term.LongRangeEnergy`, the slab
+    correction among them (:func:`slab_multipole_correction`).
     """
-
-    def __init__(self, **settings: Any) -> None:
-        if settings.get("method", "pme") not in ("pme", "ewald"):
-            raise NotImplementedError(
-                "dipoles and quadrupoles need a cell periodic in all three "
-                f"directions: there is no {settings['method']!r} multipole sum yet"
-            )
-        super().__init__(**settings)
-        if self.slab_correction or not all(self.pbc):
-            raise NotImplementedError(
-                "dipoles and quadrupoles need a cell periodic in all three "
-                "directions: there is no slab correction with atomic dipoles "
-                "and no isolated multipole sum yet"
-            )
 
     def forward(
         self,
@@ -160,31 +263,14 @@ class MultipoleLongRangeEnergy(LongRangeEnergy):
             Per-atom energy in eV, shape ``(nf, nloc, 1)``, float64.
         """
         if box is None:
-            raise NotImplementedError(
-                "dipoles and quadrupoles need a cell: there is no isolated "
-                "multipole sum yet"
+            raise ValueError(
+                "The periodic long-range term needs a cell, but box is None; a "
+                "frame with no cell is summed by isolated_multipole_term_for(term)."
             )
         _check_inputs(coord, charge)
         nf, nloc = charge.shape
-        if quadrupole is not None and dipole is None:
-            raise ValueError("a quadrupole needs a dipole beside it")
-        if dipole is not None and dipole.shape != (nf, nloc, 3):
-            raise ValueError(
-                f"dipole must have shape {(nf, nloc, 3)}, got {tuple(dipole.shape)}"
-            )
-        if quadrupole is not None and quadrupole.shape != (nf, nloc, 3, 3):
-            raise ValueError(
-                f"quadrupole must have shape {(nf, nloc, 3, 3)}, "
-                f"got {tuple(quadrupole.shape)}"
-            )
+        charge, dipole, quadrupole = _checked_moments(charge, dipole, quadrupole, mask)
         cell = box.reshape(nf, 3, 3)
-        if mask is not None:
-            weight = mask.to(charge.dtype)
-            charge = charge * weight
-            if dipole is not None:
-                dipole = dipole * weight[..., None]
-            if quadrupole is not None:
-                quadrupole = quadrupole * weight[..., None, None]
         width = 1.0 / (2.0 * self.alpha)
         sigma = _BASIS_SHARE * width
         split = 1.0 / (2.0 * math.sqrt(width**2 - sigma**2))
@@ -234,4 +320,46 @@ class MultipoleLongRangeEnergy(LongRangeEnergy):
                     (-2, -1)
                 )
             energies.append(reciprocal - ELECTROSTATIC_CONVERSION * (own + background))
-        return torch.stack(energies).reshape(nf, nloc, 1)
+        energy = torch.stack(energies).reshape(nf, nloc)
+        if self.slab_correction:
+            energy = energy + ELECTROSTATIC_CONVERSION * slab_multipole_correction(
+                coord, charge, cell, self.pbc, dipole, quadrupole
+            )
+        return energy.reshape(nf, nloc, 1)
+
+
+class IsolatedMultipoleEnergy(IsolatedLongRangeEnergy):
+    """The isolated sum of charges, dipoles and quadrupoles, per atom in eV:
+    :class:`~deepmd_lr.lr.term.IsolatedLongRangeEnergy` with more moments
+    (:mod:`deepmd_lr.lr.multipole_pairs`).
+
+    One dense kernel in float64, whatever ``isolated_kernel`` and
+    ``kernel_dtype`` say: there is no chunked multipole sum, and a call of
+    more than ``max_isolated_atoms`` atoms is refused.
+    """
+
+    def forward(
+        self,
+        coord: torch.Tensor,
+        charge: torch.Tensor,
+        box: torch.Tensor | None = None,
+        mask: torch.Tensor | None = None,
+        dipole: torch.Tensor | None = None,
+        quadrupole: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Per-atom energy in eV, ``(nf, nloc, 1)`` float64; arguments as
+        :meth:`MultipoleLongRangeEnergy.forward`, ``box`` ignored."""
+        del box
+        _check_inputs(coord, charge)
+        charge, dipole, quadrupole = _checked_moments(charge, dipole, quadrupole, mask)
+        if charge.numel() > self.max_isolated_atoms:
+            raise ValueError(
+                f"{charge.numel()} atoms exceed max_isolated_atoms = "
+                f"{self.max_isolated_atoms}: the isolated multipole sum has a "
+                "dense O(N^2) kernel only. Raise max_isolated_atoms if the "
+                "memory is there."
+            )
+        energy = isolated_multipole_energy(
+            coord, charge, self.alpha, dipole, quadrupole
+        )
+        return (energy * ELECTROSTATIC_CONVERSION).unsqueeze(-1)
