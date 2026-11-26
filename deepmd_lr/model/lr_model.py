@@ -1503,6 +1503,10 @@ class LongRangeEnergyModel(EnergyModel):
         if self.compute_born:
             # A second, cheaper VJP over the tape the gradient above left
             # alive; one pass covers every edge (`deepmd_lr.born`).
+            if contacts is not None and self.has_multipoles:
+                raise NotImplementedError(
+                    "Born tensors of atomic dipoles with a `zbl` block"
+                )
             finish = None
             if contacts is not None:
                 # d local / d w = raw + shift, per node.
@@ -1519,6 +1523,9 @@ class LongRangeEnergyModel(EnergyModel):
                 create_graph=create_graph,
                 eps_inf=self.eps_inf,
                 finish_gradient=finish,
+                dipole=(
+                    None if charges.dipole is None else charges.dipole.reshape(-1, 3)
+                ),
             )
         return {
             "atom_energy": atom_energy,

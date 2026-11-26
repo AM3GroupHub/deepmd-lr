@@ -177,6 +177,71 @@ class TestDerivatives:
         assert grads and all(torch.isfinite(g).all() for g in grads)
 
 
+class TestBornTensor:
+    """``Z = dP/dr`` with ``P = sum q r + sum mu``: the dipoles add their own
+    derivative to the charges' part, and the quadrupoles nothing."""
+
+    @staticmethod
+    def born(model, coord, atype, cell) -> torch.Tensor:
+        model.compute_born = True
+        try:
+            return evaluate(model, coord, atype, cell)["born_charge"][0]
+        finally:
+            model.compute_born = False
+
+    def test_the_dipoles_add_their_derivative(self):
+        model = build(2)
+        coord, atype, cell = frame(n_mol=4, box=10.0)
+        full = self.born(model, coord, atype, cell)
+        # The charges come from the invariant features alone: without the
+        # head they, and their part of Z, are what they were.
+        head, term = model.multipole_fitting, model.long_range_energy
+        model.multipole_fitting = None
+        model.long_range_energy = type(term).__mro__[1](**term.serialize())
+        try:
+            charges_only = self.born(model, coord, atype, cell)
+        finally:
+            model.multipole_fitting, model.long_range_energy = head, term
+        added = full - charges_only
+        assert float(added.abs().max()) > 1e-5
+        for atom, axis in [(0, 0), (4, 1), (9, 2)]:
+
+            def moment(step, atom=atom, axis=axis):
+                moved = coord.clone()
+                moved[0, atom, axis] += step
+                return evaluate(model, moved, atype, cell)["dipole"][0].sum(0)
+
+            h = 1e-4
+            column = (
+                8 * (moment(h) - moment(-h)) - (moment(2 * h) - moment(-2 * h))
+            ) / (12 * h)
+            torch.testing.assert_close(added[atom, :, axis], column, atol=1e-7, rtol=0)
+
+    def test_the_sum_rule_is_still_the_total_charge(self):
+        model = build(2)
+        coord, atype, cell = frame(n_mol=4, box=10.0)
+        total = self.born(model, coord, atype, cell).sum(0)
+        assert float(total.abs().max()) < 1e-8  # a neutral frame
+
+    def test_it_rotates_as_a_tensor(self):
+        model = build(2)
+        coord, atype, cell = frame(n_mol=4, box=10.0)
+        turn = rotation()
+        here = self.born(model, coord, atype, cell)
+        there = self.born(model, coord @ turn.T, atype, cell @ turn.T)
+        torch.testing.assert_close(there, turn @ here @ turn.T, atol=1e-8, rtol=0)
+
+    def test_a_loss_on_it_reaches_the_head(self):
+        model = build(1).train()
+        model.compute_born = True
+        coord, atype, cell = frame(n_mol=4, box=10.0)
+        out = model(coord, atype, box=cell)
+        out["born_charge"].square().sum().backward()
+        grads = [p.grad for p in model.multipole_fitting.parameters()]
+        assert all(g is not None and torch.isfinite(g).all() for g in grads)
+        assert any(float(g.abs().max()) > 0 for g in grads)
+
+
 class TestPlumbing:
     def test_it_round_trips_through_serialization(self):
         model = build(2)
