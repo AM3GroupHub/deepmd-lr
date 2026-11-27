@@ -88,10 +88,14 @@ from deepmd_lr.fitting.charge import (
     projection_shift,
     resolve_charge_spin,
 )
+from deepmd_lr.fitting.moment_table import (
+    MomentTable,
+)
 from deepmd_lr.fitting.multipole import (
     cartesian_features,
     contract,
     equivariant_channels,
+    state_source,
 )
 from deepmd_lr.lr.multipole import (
     build_term,
@@ -520,6 +524,9 @@ class LongRangeEnergyModel(EnergyModel):
         #: The head giving every atom a dipole (and a quadrupole) beside its
         #: charge (``long_range.multipole_net``), or None.
         self.multipole_fitting = None
+        #: The radial table a compressed DPA4C's moments come from, built on
+        #: first use (not a module: it is a function of the weights).
+        self._moment_table = None
         #: Also return Born effective charge tensors from `forward`. Off by
         #: default because it costs an extra backward pass per call, and only
         #: a field simulation needs them. Set it on the model, not in the
@@ -967,6 +974,18 @@ class LongRangeEnergyModel(EnergyModel):
                 "`descriptor.call_graph`)."
             )
 
+    def _table_moments(self, graph: Any, atype_flat: torch.Tensor) -> torch.Tensor:
+        """A compressed DPA4C's moments for the multipole head, from the
+        radial table (:mod:`deepmd_lr.fitting.moment_table`), at the frame
+        condition the compression folded in."""
+        if self._moment_table is None:
+            self._moment_table = MomentTable(
+                backbone(self).descriptor, self.multipole_fitting.lmax
+            )
+        return self._moment_table(
+            graph, atype_flat, self._compressed_charge_spin
+        )
+
     @contextlib.contextmanager
     def _capturing_backbone(self) -> Any:
         """Yield a dict that fills with the descriptor's output as it runs.
@@ -1008,12 +1027,16 @@ class LongRangeEnergyModel(EnergyModel):
                     # inference: the charges weigh in the same envelope.
                     contacts=self._contacts,
                 )
+                if self.has_multipoles and "equivariant" not in captured:
+                    # The compressed kernel ran: it keeps its moments on the
+                    # device, so the head's come from the radial table.
+                    captured["equivariant"] = self._table_moments(graph, atype_flat)
             return out
 
         def capture_state(*args: Any, **kwargs: Any) -> Any:
             out = unhooked_state(*args, **kwargs)
-            # The node state with every degree, which `call_graph` drops.
-            captured.setdefault("equivariant", out[1])
+            # The features of every degree, which `call_graph` drops.
+            captured.setdefault("equivariant", out[position])
             return out
 
         self._capture_depth += 1
@@ -1021,10 +1044,9 @@ class LongRangeEnergyModel(EnergyModel):
             with contextlib.ExitStack() as stack:
                 stack.enter_context(_hooked(descriptor, "call_graph", capture))
                 if self.has_multipoles:
-                    unhooked_state = descriptor._run_graph
-                    stack.enter_context(
-                        _hooked(descriptor, "_run_graph", capture_state)
-                    )
+                    method, position = state_source(descriptor)
+                    unhooked_state = getattr(descriptor, method)
+                    stack.enter_context(_hooked(descriptor, method, capture_state))
                 yield captured
         finally:
             self._capture_depth -= 1

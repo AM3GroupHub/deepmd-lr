@@ -10,6 +10,8 @@ What is pinned:
 - **Forces and virial** are the gradient of that energy.
 - **The plumbing**: training reaches the head, serialization restores it, and
   what cannot work is refused when the model is built.
+- **DPA4C** gives the head its degree-wise moments instead of a node state,
+  in another packing and with fewer channels: the same properties hold.
 """
 
 import copy
@@ -34,6 +36,7 @@ from .test_curriculum import (
     write_dataset,
 )
 from .test_dpa4 import DESCRIPTOR, derivative, evaluate, roughened
+from .test_joint_model import DESCRIPTOR as DPA4C_DESCRIPTOR
 from .test_joint_model import DT, FITTING, frame
 
 pytestmark = pytest.mark.skipif(
@@ -65,6 +68,12 @@ def config(lmax: int = 2, **descriptor) -> dict:
 
 def build(lmax: int = 2, **descriptor):
     return roughened(get_model(config(lmax, **descriptor)))
+
+
+def build_dpa4c(moments: int = 2, **descriptor):
+    cfg = config(moments)
+    cfg["descriptor"] = {**copy.deepcopy(DPA4C_DESCRIPTOR), **descriptor}
+    return roughened(get_model(cfg))
 
 
 def rotation(seed: int = 4) -> torch.Tensor:
@@ -213,17 +222,17 @@ class TestBornTensor:
         finally:
             model.compute_born = False
 
-    def test_the_dipoles_add_their_derivative(self):
-        model = build(2)
-        coord, atype, cell = frame(n_mol=4, box=10.0)
-        full = self.born(model, coord, atype, cell)
+    @classmethod
+    def dipole_part(cls, model, coord, atype, cell) -> None:
+        """What the head adds to Z is the derivative of the summed dipoles."""
+        full = cls.born(model, coord, atype, cell)
         # The charges come from the invariant features alone: without the
         # head they, and their part of Z, are what they were.
         head, term = model.multipole_fitting, model.long_range_energy
         model.multipole_fitting = None
         model.long_range_energy = type(term).__mro__[1](**term.serialize())
         try:
-            charges_only = self.born(model, coord, atype, cell)
+            charges_only = cls.born(model, coord, atype, cell)
         finally:
             model.multipole_fitting, model.long_range_energy = head, term
         added = full - charges_only
@@ -240,6 +249,9 @@ class TestBornTensor:
                 8 * (moment(h) - moment(-h)) - (moment(2 * h) - moment(-2 * h))
             ) / (12 * h)
             torch.testing.assert_close(added[atom, :, axis], column, atol=1e-7, rtol=0)
+
+    def test_the_dipoles_add_their_derivative(self):
+        self.dipole_part(build(2), *frame(n_mol=4, box=10.0))
 
     def test_the_sum_rule_is_still_the_total_charge(self):
         model = build(2)
@@ -445,6 +457,122 @@ class TestOpenBoundaries:
         )
 
 
+class TestDPA4C:
+    """The head on DPA4C's moments: 4 vectors and 4 tensors here, flat and
+    in DPA4C's own packing."""
+
+    def test_the_head_is_as_wide_as_the_moments(self):
+        model = build_dpa4c(2)
+        descriptor = model.atomic_model.descriptor
+        assert model.multipole_fitting.channels == descriptor.degree_channels[1:3]
+        assert build_dpa4c(1).multipole_fitting.channels == [
+            descriptor.degree_channels[1]
+        ]
+
+    def test_they_rotate_with_the_frame(self):
+        model = build_dpa4c(2)
+        coord, atype, cell = frame(n_mol=6, box=10.0)
+        turn = rotation()
+        here = evaluate(model, coord, atype, cell)
+        there = evaluate(model, coord @ turn.T, atype, cell @ turn.T)
+        assert float(here["dipole"].detach().abs().max()) > 1e-5
+        assert float(here["quadrupole"].detach().abs().max()) > 1e-5
+        assert float(there["energy"]) == pytest.approx(float(here["energy"]), abs=1e-8)
+        torch.testing.assert_close(
+            there["dipole"], here["dipole"] @ turn.T, atol=1e-9, rtol=0
+        )
+        quadrupole = here["quadrupole"]
+        torch.testing.assert_close(
+            there["quadrupole"], turn @ quadrupole @ turn.T, atol=1e-9, rtol=0
+        )
+        torch.testing.assert_close(
+            quadrupole, quadrupole.transpose(-1, -2), atol=1e-12, rtol=0
+        )
+        trace = quadrupole.diagonal(dim1=-2, dim2=-1).sum(-1)
+        assert float(trace.abs().max()) < 1e-10
+
+    @pytest.mark.parametrize("lmax", [1, 2])
+    def test_forces_and_virial_are_the_energy_gradient(self, lmax):
+        model = build_dpa4c(lmax)
+        coord, atype, cell = frame(n_mol=8, box=10.0)
+        out = evaluate(model, coord, atype, cell)
+        for atom, axis in [(0, 0), (13, 2)]:
+
+            def displaced(step, atom=atom, axis=axis):
+                moved = coord.clone()
+                moved[0, atom, axis] += step
+                return float(evaluate(model, moved, atype, cell)["energy"].sum())
+
+            assert -derivative(displaced) == pytest.approx(
+                float(out["force"][0, atom, axis]), abs=1e-7
+            )
+
+        def strained(step):
+            scale = 1 + step
+            energy = evaluate(model, coord * scale, atype, cell * scale)["energy"]
+            return float(energy.sum())
+
+        virial = out["virial"].reshape(3, 3)
+        torch.testing.assert_close(virial, virial.T, atol=1e-9, rtol=0)
+        assert -derivative(strained) == pytest.approx(
+            float(virial.diagonal().sum()), abs=1e-6
+        )
+
+    def test_a_training_step_reaches_the_head(self):
+        model = build_dpa4c(2).train()
+        coord, atype, cell = frame(n_mol=6, box=10.0)
+        out = model(coord, atype, box=cell)
+        (out["energy"].sum() + out["force"].square().sum()).backward()
+        grads = [p.grad for p in model.multipole_fitting.parameters()]
+        assert all(g is not None and torch.isfinite(g).all() for g in grads)
+        assert any(float(g.abs().max()) > 0 for g in grads)
+
+    def test_the_born_tensor_has_the_dipoles(self):
+        model = build_dpa4c(2)
+        system = frame(n_mol=4, box=10.0)
+        TestBornTensor.dipole_part(model, *system)
+        assert float(TestBornTensor.born(model, *system).sum(0).abs().max()) < 1e-8
+
+    def test_partitions_are_the_serial_model(self):
+        from deepmd_lr.nvalchemi import evaluate_partitioned, to_numpy
+
+        model = build_dpa4c(2)
+        system = frame(n_mol=16, box=14.0)
+        coord, atype, cell = TestEngine.host(system)
+        serial = evaluate(model, *system)
+        born = TestBornTensor.born(model, *system).cpu().numpy()
+        for n in (1, 2, 4):
+            for merged in (False, True):
+                out = to_numpy(
+                    evaluate_partitioned(
+                        model, coord, atype, cell, n_partitions=n,
+                        devices=[DEVICE] * n, compute_virial=True,
+                        merge_backward=merged,
+                    )
+                )  # fmt: skip
+                assert out["energy"] == pytest.approx(float(serial["energy"]), abs=1e-8)
+                for key in ("force", "virial", "charge", "dipole", "quadrupole"):
+                    reference = (
+                        serial[key].detach().cpu().numpy().reshape(out[key].shape)
+                    )
+                    assert np.abs(out[key] - reference).max() < 1e-8, (n, merged, key)
+            out = to_numpy(
+                evaluate_partitioned(
+                    model, coord, atype, cell, n_partitions=n,
+                    devices=[DEVICE] * n, compute_born=True,
+                )
+            )  # fmt: skip
+            assert np.abs(out["born_charge"] - born).max() < 1e-8, n
+
+    def test_it_round_trips_through_serialization(self):
+        model = build_dpa4c(2)
+        system = frame(n_mol=6, box=10.0)
+        again = BaseModel.deserialize(model.serialize()).to(DEVICE).eval()
+        a, b = evaluate(model, *system), evaluate(again, *system)
+        for key in ("energy", "force", "charge", "dipole", "quadrupole"):
+            assert torch.allclose(a[key], b[key], atol=1e-10), key
+
+
 class TestPlumbing:
     def test_it_round_trips_through_serialization(self):
         model = build(2)
@@ -481,7 +609,10 @@ class TestPlumbing:
 class TestRefusals:
     def test_a_descriptor_without_equivariant_features(self):
         cfg = config()
-        cfg["descriptor"] = {"type": "dpa4c", "rcut": 4.0, "channels": 8, "lmax": 2}
+        cfg["descriptor"] = {
+            "type": "se_e2_a", "rcut": 4.0, "rcut_smth": 0.5, "sel": [20, 40],
+            "precision": "float64",
+        }  # fmt: skip
         with pytest.raises(NotImplementedError, match="dpa4"):
             get_model(cfg)
 

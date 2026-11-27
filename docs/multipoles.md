@@ -26,7 +26,7 @@ channels that rotate as vectors (`l = 1`) and as traceless tensors (`l = 2`).
 The head mixes them,
 
 ```
-mu_i = 1/C  sum_c a_c(D_i) X1_i,c          Q_i = 1/C  sum_c b_c(D_i) X2_i,c
+mu_i = 1/C1  sum_c a_c(D_i) X1_i,c        Q_i = 1/C2  sum_c b_c(D_i) X2_i,c
 ```
 
 with coefficients `a`, `b` from an ordinary fitting net on the invariant
@@ -34,10 +34,14 @@ features `D_i` (its keys are the charge head's). An invariant number times an
 equivariant tensor is equivariant, so the moments turn with the frame by
 construction.
 
-- **DPA4 only.** The state with every degree is what DPA4 computes and its
-  `call_graph` drops; the model keeps it. The last entry of the `l` schedule
-  must be at least the head's `lmax`. DPA4C builds such moments too, but its
-  compressed kernel never exposes them, and it is refused for now.
+- **DPA4** keeps a node state with every degree, which its `call_graph`
+  drops; the model keeps it. The last entry of the `l` schedule must be at
+  least the head's `lmax`, and every moment has the descriptor's full width
+  (`C` channels).
+- **DPA4C** reduces its edges into degree-wise moments on the way to its
+  invariant features, and the head reads those: fewer channels (8 vectors
+  and 4 tensors at `channels: 32`), in DPA4C's own packing. See
+  [DPA4C](#dpa4c) below for the compressed model.
 - With the default `so3_readout: "none"`, the last block's `l > 0` output
   does not reach the energy head: only this head trains it.
 - The short-contact envelope (the charge shield) and `exclude_types` weigh
@@ -132,4 +136,38 @@ field force work unchanged.
   turning the atoms at fixed moments and turning the moments are not
   separately symmetries, and the two contributions are combined before it is
   reported.
-- Not yet: `charge_same_as` links, DPA4C, slabs, clusters.
+- Not yet: `charge_same_as` links.
+
+## DPA4C
+
+Training and an uncompressed evaluation need nothing new: the moments are
+taken where the descriptor computes them.
+
+A **compressed** DPA4C computes them inside DeePMD-kit's CUDA kernel and
+returns the invariant features only. The model then computes the few the
+head needs beside the kernel, from a table
+([moment_table.py](../deepmd_lr/fitting/moment_table.py)):
+
+- For one frame condition the radial part of a moment is a function of the
+  distance alone for each ordered pair of types, and degrees 1 and 2 read
+  only the leading channels. Those functions are tabulated once (values and
+  slopes, every 0.01 Å) by running the descriptor's own edge stage on a row
+  of edges per pair. A step is then a cubic Hermite lookup per edge, the
+  harmonics and one sum per atom: no network on the edge list.
+- The table is built at the first evaluation for the types present, grows
+  when a new type appears, and follows the frame condition the compression
+  folded in. It is not stored: it is a function of the weights.
+- Forces are the exact gradient of the tabulated energy. Against the
+  uncompressed model the moments agree to 2e-7 and the forces to the
+  compressed kernel's own 1e-5 eV/Å.
+- On CUDA, in an evaluation, the lookup and the sum run as one Triton kernel
+  with its own backward ([kernels/moments.py](../deepmd_lr/kernels/moments.py)).
+  `DP_LR_TRITON=0` selects the plain torch route, which gives the same
+  numbers. The kernel is single precision and has no second derivative;
+  anything else takes the torch route by itself.
+
+Measured on the GB10, 1,536 water atoms, one MD step with dipoles and
+quadrupoles on the DPA4C water model (random head): 41 ms uncompressed, 17 to
+20 ms compressed with the torch route, 15 ms compressed with the kernel. The
+same model with charges only takes 7 to 9 ms compressed; most of what is left
+is the multipole mesh sum.
