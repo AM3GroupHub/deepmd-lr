@@ -51,6 +51,9 @@ from deepmd.dpmodel.utils.neighbor_graph import (
     NeighborGraph,
 )
 
+from deepmd_lr.fitting.multipole import (
+    equivariant_channels,
+)
 from deepmd_lr.kernels.moments import (
     available,
     table_moments,
@@ -112,33 +115,26 @@ class MomentTable:
     ) -> None:
         self.descriptor = descriptor
         self.lmax = int(lmax)
-        widths = [int(w) for w in descriptor.degree_channels[1 : self.lmax + 1]]
         #: Channels of each degree, and of the table (the widest, the first).
-        self.widths = widths
+        self.widths = equivariant_channels(descriptor, self.lmax)
         self.rcut = float(descriptor.get_rcut())
         self.knots = int(-(-self.rcut // stride))
         self.stride = self.rcut / self.knots
         self.ntypes = int(descriptor.get_ntypes())
+        self.floor = float(descriptor._DEGREE_NORM_FLOOR)
+        self.eps = float(descriptor._EPS)
         #: ``(P * (knots + 1), 2, C_1 + 1)``: value and radial derivative of
         #: ``chi phi_c`` and of ``chi^4`` for each tabulated ordered pair.
         self.table: torch.Tensor | None = None
         #: ``((ntypes + 1)^2,)``: the row block of an ordered pair, -1 if
         #: not tabulated.
         self.pair_slot: torch.Tensor | None = None
-        self._known: torch.Tensor | None = None
+        #: The types tabulated, and whether those are all of them.
+        self._known: set[int] = set()
+        self._complete = False
         self._condition: Any = None
 
     # -- building ---------------------------------------------------------
-
-    def _covers(self, atype: torch.Tensor, condition: Any) -> bool:
-        if self.table is None or condition != self._condition:
-            return False
-        if self.table.device != atype.device:
-            return False
-        present = torch.zeros(self.ntypes + 1, dtype=torch.bool, device=atype.device)
-        present[atype.clamp(0, self.ntypes)] = True
-        present[self.ntypes] = False
-        return not bool((present & ~self._known).any())
 
     def build(self, types: list[int], condition: Any, device: Any) -> None:
         """Tabulate every ordered pair of ``types`` at the frame condition
@@ -202,22 +198,24 @@ class MomentTable:
         )
         slot[center * (self.ntypes + 1) + neighbor] = torch.arange(pairs, device=device)
         self.pair_slot = slot
-        known = torch.zeros(self.ntypes + 1, dtype=torch.bool, device=device)
-        known[kind] = True
-        self._known = known
+        self._known = set(types)
+        self._complete = len(self._known) == self.ntypes
         self._condition = condition
 
     def ensure(self, atype: torch.Tensor, condition: Any) -> None:
         """Tabulate what ``atype`` needs and the table does not hold yet."""
-        if self._covers(atype, condition):
-            return
-        present = set(atype[(atype >= 0) & (atype < self.ntypes)].unique().tolist())
-        if (
-            self._known is not None
+        reusable = (
+            self.table is not None
             and condition == self._condition
             and self.table.device == atype.device
-        ):
-            present |= set(torch.nonzero(self._known).reshape(-1).tolist())
+        )
+        if reusable and self._complete:
+            return  # every type there is: nothing to read off the device
+        present = set(atype[(atype >= 0) & (atype < self.ntypes)].unique().tolist())
+        if reusable:
+            if present <= self._known:
+                return
+            present |= self._known
         self.build(sorted(present), condition, atype.device)
 
     # -- evaluating -------------------------------------------------------
@@ -241,16 +239,14 @@ class MomentTable:
         valid = graph.edge_mask & (slot >= 0)
         row = slot.clamp(min=0) * (self.knots + 1)
         table = self.table.to(edge_vec.dtype)
-        floor = float(self.descriptor._DEGREE_NORM_FLOOR)
-        eps = float(self.descriptor._EPS)
         if self.fused(edge_vec):
             reduced = table_moments(
                 edge_vec, dst, row, valid, table, n_total,
-                self.widths, self.stride, self.knots, eps,
+                self.widths, self.stride, self.knots, self.eps,
             )  # fmt: skip
         else:
-            reduced = self.reduce(edge_vec, dst, row, valid, table, n_total, eps)
-        moments = reduced[:, 1:] / torch.sqrt(reduced[:, :1] + floor)
+            reduced = self.reduce(edge_vec, dst, row, valid, table, n_total)
+        moments = reduced[:, 1:] / torch.sqrt(reduced[:, :1] + self.floor)
         scalar = moments.new_zeros(n_total, int(self.descriptor.degree_offsets[1]))
         return torch.cat([scalar, moments], dim=1)
 
@@ -262,11 +258,10 @@ class MomentTable:
         valid: torch.Tensor,
         table: torch.Tensor,
         n_total: int,
-        eps: float,
     ) -> torch.Tensor:
         """The plain torch route to the unnormalised sums, ``(N, 1 + 3 C_1
         [+ 5 C_2])``: the envelope weight, the vectors, the tensors."""
-        distance = torch.sqrt((edge_vec * edge_vec).sum(-1) + eps * eps)
+        distance = torch.sqrt((edge_vec * edge_vec).sum(-1) + self.eps * self.eps)
         position = (distance / self.stride).clamp(max=self.knots)
         cell = position.detach().floor().clamp(max=self.knots - 1)
         u = (position - cell)[:, None]

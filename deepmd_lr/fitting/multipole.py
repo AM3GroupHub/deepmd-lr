@@ -31,8 +31,13 @@ invariant readout; only its uncompressed evaluation builds them in Python,
 the compressed kernel keeps them on the device.
 """
 
+import functools
+from collections.abc import (
+    Callable,
+)
 from typing import (
     Any,
+    NamedTuple,
 )
 
 import torch
@@ -62,20 +67,79 @@ MULTIPOLE_VAR_NAME = "multipole"
 MAX_MOMENT = 2
 
 
-#: Per descriptor class: the method whose return value carries the
-#: equivariant features, and where in that value they are.
-_STATE = {
-    "DescrptDPA4": ("_run_graph", 1),
-    "DescrptDPA4C": ("aggregate_moments", 0),
+def _dpa4_channels(descriptor: Any, lmax: int) -> list[int]:
+    last = int(descriptor.node_l_schedule[-1])
+    if last < lmax:
+        raise ValueError(
+            f"multipole_net.lmax is {lmax}, but this DPA4 ends with features "
+            f"of degree {last} (the last entry of its l schedule); raise the "
+            "schedule or lower lmax"
+        )
+    return [int(descriptor.channels)] * lmax
+
+
+def _dpa4c_channels(descriptor: Any, lmax: int) -> list[int]:
+    # DPA4C has no form below degree 2, the highest moment a head takes.
+    return [int(width) for width in descriptor.degree_channels[1 : lmax + 1]]
+
+
+@functools.cache
+def _dpa4_l2_basis(dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    """DeePMD-kit's Cartesian basis of DPA4's five ``l = 2`` coefficients,
+    ``(5, 3, 3)``."""
+    basis = build_cartesian_basis(2, dtype="float64")[4:9]
+    return torch.as_tensor(basis, dtype=dtype, device=device)
+
+
+def _dpa4_cartesian(
+    descriptor: Any, state: torch.Tensor, lmax: int
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    del descriptor
+    packed = state[:, :, 0, :]
+    vectors = torch.stack([packed[:, 3], -packed[:, 1], -packed[:, 2]], dim=1)
+    if lmax < 2:
+        return vectors, None
+    basis = _dpa4_l2_basis(state.dtype, state.device)
+    return vectors, torch.einsum("ndc,dab->nabc", packed[:, 4:9], basis)
+
+
+def _dpa4c_cartesian(
+    descriptor: Any, state: torch.Tensor, lmax: int
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    offsets = descriptor.degree_offsets
+    n = state.shape[0]
+    vectors = state[:, offsets[1] : offsets[2]].reshape(n, 3, -1)
+    if lmax < 2:
+        return vectors, None
+    packed = state[:, offsets[2] : offsets[3]].reshape(n, 5, -1)
+    tensors = packed_l2_to_stf(packed.transpose(1, 2)).permute(0, 2, 3, 1)
+    return vectors, tensors
+
+
+class _Source(NamedTuple):
+    """How one descriptor class hands out its equivariant features."""
+
+    #: The method whose return value carries them, and where in that value.
+    method: str
+    position: int
+    #: ``(descriptor, lmax)`` to the channel count of each degree.
+    channels: Callable[[Any, int], list[int]]
+    #: ``(descriptor, state, lmax)`` to Cartesian vectors and tensors.
+    cartesian: Callable[..., tuple[torch.Tensor, torch.Tensor | None]]
+
+
+_SOURCES = {
+    "DescrptDPA4": _Source("_run_graph", 1, _dpa4_channels, _dpa4_cartesian),
+    "DescrptDPA4C": _Source("aggregate_moments", 0, _dpa4c_channels, _dpa4c_cartesian),
 }
 
 
-def state_source(descriptor: Any) -> tuple[str, int]:
-    """The method of ``descriptor`` that computes its equivariant features
-    and the index of them in what it returns; refused for a descriptor that
-    has none."""
+def state_source(descriptor: Any) -> _Source:
+    """How ``descriptor`` hands out its equivariant features (the method that
+    computes them and the index of them in what it returns, first); refused
+    for a descriptor that has none."""
     try:
-        return _STATE[type(descriptor).__name__]
+        return _SOURCES[type(descriptor).__name__]
     except KeyError:
         raise NotImplementedError(
             "atomic dipoles and quadrupoles need the descriptor's equivariant "
@@ -87,18 +151,7 @@ def state_source(descriptor: Any) -> tuple[str, int]:
 def equivariant_channels(descriptor: Any, lmax: int) -> list[int]:
     """How many channels of degree ``1 .. lmax`` ``descriptor`` offers a
     head; refused for a descriptor that offers none."""
-    state_source(descriptor)
-    if type(descriptor).__name__ == "DescrptDPA4C":
-        # DPA4C has no form below degree 2, the highest moment a head takes.
-        return [int(width) for width in descriptor.degree_channels[1 : lmax + 1]]
-    last = int(descriptor.node_l_schedule[-1])
-    if last < lmax:
-        raise ValueError(
-            f"multipole_net.lmax is {lmax}, but this DPA4 ends with features "
-            f"of degree {last} (the last entry of its l schedule); raise the "
-            "schedule or lower lmax"
-        )
-    return [int(descriptor.channels)] * lmax
+    return state_source(descriptor).channels(descriptor, lmax)
 
 
 def cartesian_features(
@@ -118,27 +171,7 @@ def cartesian_features(
     ``(x, y, z)``; its ``l = 2`` components are the ones DeePMD-kit's own
     ``packed_l2_to_stf`` turns into a traceless matrix.
     """
-    widths = equivariant_channels(descriptor, lmax)  # one we can read
-    if type(descriptor).__name__ == "DescrptDPA4C":
-        offsets = descriptor.degree_offsets
-        n = state.shape[0]
-        vectors = state[:, offsets[1] : offsets[2]].reshape(n, 3, widths[0])
-        if lmax < 2:
-            return vectors, None
-        packed = state[:, offsets[2] : offsets[3]].reshape(n, 5, widths[1])
-        tensors = packed_l2_to_stf(packed.transpose(1, 2)).permute(0, 2, 3, 1)
-        return vectors, tensors
-    packed = state[:, :, 0, :]
-    vectors = torch.stack([packed[:, 3], -packed[:, 1], -packed[:, 2]], dim=1)
-    if lmax < 2:
-        return vectors, None
-    basis = torch.as_tensor(
-        build_cartesian_basis(2, dtype="float64")[4:9],
-        dtype=state.dtype,
-        device=state.device,
-    )
-    tensors = torch.einsum("ndc,dab->nabc", packed[:, 4:9], basis)
-    return vectors, tensors
+    return state_source(descriptor).cartesian(descriptor, state, lmax)
 
 
 def contract(

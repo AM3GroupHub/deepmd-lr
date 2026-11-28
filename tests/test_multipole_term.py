@@ -358,9 +358,7 @@ class TestCluster:
         coefficients = radial_coefficients(r * r, ALPHA)
         value = torch.erf(ALPHA * r) / r
         for order in range(5):
-            torch.testing.assert_close(
-                coefficients[order], value, rtol=1e-9, atol=0
-            )
+            torch.testing.assert_close(coefficients[order], value, rtol=1e-9, atol=0)
             (slope,) = torch.autograd.grad(value.sum(), r, create_graph=True)
             value = -slope / r
 

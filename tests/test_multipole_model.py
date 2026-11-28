@@ -627,7 +627,6 @@ class TestRefusals:
             get_model(cfg)
 
 
-
 def test_the_curriculum_through_the_cli(tmp_path):
     """SR, then the charge and multipole heads alone on it, then everything:
     `dp train`, the graft and a restart on a model with a multipole head."""

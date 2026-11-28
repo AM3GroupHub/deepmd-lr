@@ -79,6 +79,32 @@ if triton is not None:
         )
 
     @triton.jit
+    def _edges(vec_ptr, dst_ptr, row_ptr, valid_ptr, edge, inside, eps2):
+        # One block of edges: the vector, its end, its table rows, whether it
+        # counts, and its length.
+        x = tl.load(vec_ptr + 3 * edge, mask=inside, other=0.0)
+        y = tl.load(vec_ptr + 3 * edge + 1, mask=inside, other=0.0)
+        z = tl.load(vec_ptr + 3 * edge + 2, mask=inside, other=0.0)
+        dst = tl.load(dst_ptr + edge, mask=inside, other=0)
+        row = tl.load(row_ptr + edge, mask=inside, other=0)
+        keep = inside & (tl.load(valid_ptr + edge, mask=inside, other=0) != 0)
+        r = tl.sqrt(x * x + y * y + z * z + eps2)
+        return x, y, z, dst, row, keep, r
+
+    @triton.jit
+    def _l2_basis(ux, uy, uz):
+        # The five degree-2 harmonics of a unit vector, in DPA4C's order.
+        root = 1.7320508075688772
+        norm = ux * ux + uy * uy + uz * uz
+        return (
+            root * ux * uy,
+            root * uy * uz,
+            0.5 * (3.0 * uz * uz - norm),
+            root * ux * uz,
+            0.5 * root * (ux * ux - uy * uy),
+        )
+
+    @triton.jit
     def _forward(
         vec_ptr, dst_ptr, row_ptr, valid_ptr, table_ptr, out_ptr,
         n_edge, stride, knots, span, eps2,
@@ -87,13 +113,9 @@ if triton is not None:
     ):  # fmt: skip
         edge = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
         inside = edge < n_edge
-        x = tl.load(vec_ptr + 3 * edge, mask=inside, other=0.0)
-        y = tl.load(vec_ptr + 3 * edge + 1, mask=inside, other=0.0)
-        z = tl.load(vec_ptr + 3 * edge + 2, mask=inside, other=0.0)
-        dst = tl.load(dst_ptr + edge, mask=inside, other=0)
-        row = tl.load(row_ptr + edge, mask=inside, other=0)
-        keep = inside & (tl.load(valid_ptr + edge, mask=inside, other=0) != 0)
-        r = tl.sqrt(x * x + y * y + z * z + eps2)
+        x, y, z, dst, row, keep, r = _edges(
+            vec_ptr, dst_ptr, row_ptr, valid_ptr, edge, inside, eps2
+        )
         position = tl.minimum(r / stride, span)
         cell = tl.minimum(position.to(tl.int64), knots - 1)
         u = position - cell.to(tl.float32)
@@ -127,21 +149,12 @@ if triton is not None:
         if LMAX >= 2:
             narrow = wide & (c[None, :] < C2)
             second = first + 3 * C1
-            root = 1.7320508075688772
-            norm = ux * ux + uy * uy + uz * uz
-            tl.atomic_add(second, g * (root * ux * uy)[:, None], mask=narrow)
-            tl.atomic_add(second + C2, g * (root * uy * uz)[:, None], mask=narrow)
-            tl.atomic_add(
-                second + 2 * C2,
-                g * (0.5 * (3.0 * uz * uz - norm))[:, None],
-                mask=narrow,
-            )
-            tl.atomic_add(second + 3 * C2, g * (root * ux * uz)[:, None], mask=narrow)
-            tl.atomic_add(
-                second + 4 * C2,
-                g * (0.5 * root * (ux * ux - uy * uy))[:, None],
-                mask=narrow,
-            )
+            b0, b1, b2, b3, b4 = _l2_basis(ux, uy, uz)
+            tl.atomic_add(second, g * b0[:, None], mask=narrow)
+            tl.atomic_add(second + C2, g * b1[:, None], mask=narrow)
+            tl.atomic_add(second + 2 * C2, g * b2[:, None], mask=narrow)
+            tl.atomic_add(second + 3 * C2, g * b3[:, None], mask=narrow)
+            tl.atomic_add(second + 4 * C2, g * b4[:, None], mask=narrow)
 
     @triton.jit
     def _backward(
@@ -152,13 +165,9 @@ if triton is not None:
     ):  # fmt: skip
         edge = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
         inside = edge < n_edge
-        x = tl.load(vec_ptr + 3 * edge, mask=inside, other=0.0)
-        y = tl.load(vec_ptr + 3 * edge + 1, mask=inside, other=0.0)
-        z = tl.load(vec_ptr + 3 * edge + 2, mask=inside, other=0.0)
-        dst = tl.load(dst_ptr + edge, mask=inside, other=0)
-        row = tl.load(row_ptr + edge, mask=inside, other=0)
-        keep = inside & (tl.load(valid_ptr + edge, mask=inside, other=0) != 0)
-        r = tl.sqrt(x * x + y * y + z * z + eps2)
+        x, y, z, dst, row, keep, r = _edges(
+            vec_ptr, dst_ptr, row_ptr, valid_ptr, edge, inside, eps2
+        )
         scaled = r / stride
         # Beyond the last knot the lookup is clamped: no radial slope there.
         moving = keep & (scaled < span)
@@ -201,17 +210,12 @@ if triton is not None:
             narrow = wide & (c[None, :] < C2)
             second = first + 3 * C1
             root = 1.7320508075688772
-            norm = ux * ux + uy * uy + uz * uz
             q0 = tl.load(second, mask=narrow, other=0.0)
             q1 = tl.load(second + C2, mask=narrow, other=0.0)
             q2 = tl.load(second + 2 * C2, mask=narrow, other=0.0)
             q3 = tl.load(second + 3 * C2, mask=narrow, other=0.0)
             q4 = tl.load(second + 4 * C2, mask=narrow, other=0.0)
-            b0 = root * ux * uy
-            b1 = root * uy * uz
-            b2 = 0.5 * (3.0 * uz * uz - norm)
-            b3 = root * ux * uz
-            b4 = 0.5 * root * (ux * ux - uy * uy)
+            b0, b1, b2, b3, b4 = _l2_basis(ux, uy, uz)
             s += tl.sum(
                 (
                     q0 * b0[:, None]

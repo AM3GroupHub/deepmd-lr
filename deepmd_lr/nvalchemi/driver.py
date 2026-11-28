@@ -885,6 +885,7 @@ def _gather(run: _Run, launched: list[_Launched]) -> None:
             node_force = (
                 out["energy_derv_r"].reshape(part.n_node, 3).detach().to(home, dtype)
             )
+        moments = ((run.dipole, item.dipole), (run.quadrupole, item.quadrupole))
         if part.is_whole_system:
             # Nodes are the atoms in order: the sums have one term each.
             run.atom_energy.copy_(per_atom)
@@ -894,10 +895,9 @@ def _gather(run: _Run, launched: list[_Launched]) -> None:
                 run.raw_charge.copy_(raw.detach().to(home, dtype))
             if envelope is not None:
                 run.envelope.copy_(envelope.detach().to(home, dtype))
-            if item.dipole is not None:
-                run.dipole.copy_(item.dipole.detach().to(home, dtype))
-            if item.quadrupole is not None:
-                run.quadrupole.copy_(item.quadrupole.detach().to(home, dtype))
+            for buffer, moment in moments:
+                if moment is not None:
+                    buffer.copy_(moment.detach().to(home, dtype))
             continue
         run.atom_energy.index_add_(0, v["owned"], per_atom[: part.n_owned])
         if node_force is not None:
@@ -906,12 +906,9 @@ def _gather(run: _Run, launched: list[_Launched]) -> None:
             run.raw_charge.index_copy_(0, v["owned"], raw.detach().to(home, dtype))
         if envelope is not None:
             run.envelope.index_copy_(0, v["owned"], envelope.detach().to(home, dtype))
-        if item.dipole is not None:
-            run.dipole.index_copy_(0, v["owned"], item.dipole.detach().to(home, dtype))
-        if item.quadrupole is not None:
-            run.quadrupole.index_copy_(
-                0, v["owned"], item.quadrupole.detach().to(home, dtype)
-            )
+        for buffer, moment in moments:
+            if moment is not None:
+                buffer.index_copy_(0, v["owned"], moment.detach().to(home, dtype))
 
 
 def _assembled(
@@ -1184,9 +1181,9 @@ def _charge_response_force(
                 # then through the partition's own `edge_vec`, which is a
                 # function of both; the leaves are numerically identical, so
                 # this is the exact chain rule.
-                g1 = born_grads[k] if born_grads is not None else None
-                if item.dipole is not None:
-                    g1 = None  # the reuse is of the charges' cotangent alone
+                # The reuse is of the charges' cotangent alone.
+                reuse = born_grads is not None and item.dipole is None
+                g1 = born_grads[k] if reuse else None
                 if g1 is not None:
                     per_node = weights
                     if item.contacts is not None:
