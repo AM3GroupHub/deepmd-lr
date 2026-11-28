@@ -1,0 +1,173 @@
+# Atomic dipoles and quadrupoles
+
+A point charge per atom is the first term of what an atom contributes to the
+long-range field. `long_range.multipole_net` adds the next ones: every atom
+gets a dipole, and with `lmax: 2` a traceless quadrupole, which interact with
+each other and with the charges in the long-range energy.
+
+```json
+"descriptor": {"type": "dpa4", "rcut": 6.0, "n_blocks": 1, "lmax": 3},
+"fitting_net": {"type": "dpa4_ener"},
+"long_range": {
+    "charge_net":    {"neuron": [64, 64]},
+    "multipole_net": {"lmax": 2, "neuron": [64, 64]},
+    "reciprocal":    {"alpha": 0.4, "mesh_dimensions": [20, 20, 20]}
+}
+```
+
+Without the block the model is exactly what it was.
+
+## The head
+
+A dipole is a vector and a quadrupole a tensor of the atom's surroundings, so
+neither can be fitted on the invariant features the energy and the charge
+use. DPA4 already carries what is needed: its node state holds, per atom,
+channels that rotate as vectors (`l = 1`) and as traceless tensors (`l = 2`).
+The head mixes them,
+
+```
+mu_i = 1/C1  sum_c a_c(D_i) X1_i,c        Q_i = 1/C2  sum_c b_c(D_i) X2_i,c
+```
+
+with coefficients `a`, `b` from an ordinary fitting net on the invariant
+features `D_i` (its keys are the charge head's). An invariant number times an
+equivariant tensor is equivariant, so the moments turn with the frame by
+construction.
+
+- **DPA4** keeps a node state with every degree, which its `call_graph`
+  drops; the model keeps it. The last entry of the `l` schedule must be at
+  least the head's `lmax`, and every moment has the descriptor's full width
+  (`C` channels).
+- **DPA4C** reduces its edges into degree-wise moments on the way to its
+  invariant features, and the head reads those: fewer channels (8 vectors
+  and 4 tensors at `channels: 32`), in DPA4C's own packing. See
+  [DPA4C](#dpa4c) below for the compressed model.
+- With the default `so3_readout: "none"`, the last block's `l > 0` output
+  does not reach the energy head: only this head trains it.
+- The short-contact envelope (the charge shield) and `exclude_types` weigh
+  the moments as they weigh the charges.
+
+## The energy
+
+The long-range term stays the smooth one (the network learns the short-range
+rest): each atom is a Gaussian of the width that makes two charges interact
+as `erf(alpha r)/r`, and now carries a dipole and a quadrupole too,
+
+```
+E = 2 pi k_e / V  sum_{k != 0} exp(-k^2 / 4 alpha^2) / k^2  |S(k)|^2  -  E_self
+S(k) = sum_i ( q_i + i k.mu_i - 1/2 k.Q_i.k ) exp(i k.r_i)
+```
+
+The quadrupole is the traceless second moment; its energy in a potential is
+`1/2 Q : grad grad phi`. Without moments this is the charge term, number for
+number.
+
+- **`method: "pme"` or `"ewald"`**, as for charges. The explicit sum is exact
+  to its cutoff and costs atoms times k-vectors; PME is nvalchemiops'
+  multipole PME on a mesh.
+- **The mesh must be finer than for charges.** A dipole is spread with the
+  derivative of the spline and a quadrupole with its second derivative, each
+  an order less smooth. Measured on 96 atoms in a tilted 12.4 Å cell, alpha
+  0.4, spline order 6, largest force error against the explicit sum:
+
+  | mesh (spacing) | charges | dipoles | quadrupoles |
+  |---|---|---|---|
+  | 10 (1.24 Å, `1/(2 alpha)`) | 1.3e-3 | 4.3e-3 | 1.2e-3 eV/Å |
+  | 16 (0.78 Å) | 9e-5 | 2e-4 | 1.9e-4 |
+  | 20 (0.62 Å, `1/(4 alpha)`) | 2e-5 | 5e-5 | 1.1e-4 |
+  | 32 (0.39 Å) | 1e-6 | 7e-6 | 2e-5 |
+
+  The MD evaluator and the ASE calculator therefore give a multipole model
+  at least `ceil(4 alpha L)` points per cell vector, twice the rule for
+  charges. In training the mesh is the config's: write `mesh_dimensions`
+  accordingly.
+- **A defect in nvalchemiops 0.5.0 is worked around.** Its multipole PME
+  builds its k-grid from the cell's inverse transposed the wrong way round:
+  right in a cell whose matrix is symmetric (any orthorhombic one), 3e-3 eV
+  off on 12 atoms in a tilted one, at any mesh. The grid is built here and
+  handed to it; the tests compare PME with the explicit sum in a tilted cell.
+- **Slabs.** A cell with one open axis takes the Yeh-Berkowitz correction on
+  top of the 3D sum, as for charges. What the correction needs of the cell's
+  content is its first and second moment along the slab normal, and an atom's
+  dipole and quadrupole add to those: `M = sum q z + mu.n`,
+  `M2 = sum q z^2 + 2 z mu.n + n.Q.n`. nvalchemiops' correction knows of
+  charges only, so this one is written here; with no moments it is theirs,
+  atom by atom.
+- **Molecules and clusters.** A frame with no cell, or a system with no
+  periodic axis, is summed pair by pair: every pair of atoms interacts through
+  `erf(alpha r)/r` and its derivatives up to the fourth (quadrupole with
+  quadrupole), which is the periodic sum's limit in an infinite cell. One
+  dense kernel in float64, O(N²) memory, differentiable to any order; a call
+  of more than `max_isolated_atoms` atoms (default 5000) is refused. There is
+  no chunked kernel as the charges have, so the MD evaluator's
+  `isolated_dtype` and `isolated_kernel` do not apply.
+- **The quadrupole is traceless.** The head's is by construction; the trace of
+  one handed to the term from outside is dropped by every sum alike.
+
+The model reports `dipole` `(nf, nloc, 3)` in e Å and `quadrupole`
+`(nf, nloc, 3, 3)` in e Å², beside `charge`; the ASE calculator as
+`results["dipoles"]` and `results["quadrupoles"]`. `eps_inf` scales them as
+it scales the charges.
+
+## The Born tensor
+
+With `P = sum_j q_j r_j + sum_j mu_j`, the dipoles add their own derivative
+to the [Born tensor](born-charges.md):
+
+```
+Z_i  +=  sum_j d mu_j / d r_i
+```
+
+Three more backward passes; no position stands in it, so it is exact at any
+depth of message passing and in a periodic cell, and it sums to zero over
+the atoms (the acoustic sum rule stays the total charge). **Quadrupoles add
+nothing to `Z`**: a uniform field couples to the dipole moment alone. They
+act through the energy and the forces. The Born loss (`pref_bec`) and the
+field force work unchanged.
+
+## Training and MD
+
+- The SR → LR → FT curriculum works as before: the graft starts the multipole
+  head small, like the charge head, and `train_charge_head_only` leaves both
+  heads trainable.
+- Partitions, the merged backward and the MD evaluator carry the moments:
+  nine numbers per atom cross a partition where one did.
+- The virial of a model with tensor moments is symmetric, as it must be:
+  turning the atoms at fixed moments and turning the moments are not
+  separately symmetries, and the two contributions are combined before it is
+  reported.
+- Not yet: `charge_same_as` links.
+
+## DPA4C
+
+Training and an uncompressed evaluation need nothing new: the moments are
+taken where the descriptor computes them.
+
+A **compressed** DPA4C computes them inside DeePMD-kit's CUDA kernel and
+returns the invariant features only. The model then computes the few the
+head needs beside the kernel, from a table
+([moment_table.py](../deepmd_lr/fitting/moment_table.py)):
+
+- For one frame condition the radial part of a moment is a function of the
+  distance alone for each ordered pair of types, and degrees 1 and 2 read
+  only the leading channels. Those functions are tabulated once (values and
+  slopes, every 0.01 Å) by running the descriptor's own edge stage on a row
+  of edges per pair. A step is then a cubic Hermite lookup per edge, the
+  harmonics and one sum per atom: no network on the edge list.
+- The table is built at the first evaluation for the types present, grows
+  when a new type appears, and follows the frame condition the compression
+  folded in. It is not stored: it is a function of the weights.
+- Forces are the exact gradient of the tabulated energy. Against the
+  uncompressed model the moments agree to 2e-7 and the forces to the
+  compressed kernel's own 1e-5 eV/Å.
+- On CUDA, in an evaluation, the lookup and the sum run as one Triton kernel
+  with its own backward ([kernels/moments.py](../deepmd_lr/kernels/moments.py)).
+  `DP_LR_TRITON=0` selects the plain torch route, which gives the same
+  numbers. The kernel is single precision and has no second derivative;
+  anything else takes the torch route by itself.
+
+Measured on the GB10, 1,536 water atoms, one MD step with dipoles and
+quadrupoles on the DPA4C water model (random head): 41 ms uncompressed, 17 to
+20 ms compressed with the torch route, 15 ms compressed with the kernel. The
+same model with charges only takes 7 to 9 ms compressed; most of what is left
+is the multipole mesh sum.

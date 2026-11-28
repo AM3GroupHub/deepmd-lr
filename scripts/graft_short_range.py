@@ -54,9 +54,15 @@ def _scale_charge_head_output(state: dict, scale: float) -> int:
     if not 0.0 < scale <= 1.0:
         raise ValueError(f"charge output scale must be in (0, 1], got {scale}")
 
-    tag = "charge_fitting."
+    # The multipole head with it: its moments are quadratic in the energy
+    # too, and as fresh.
+    tags = ("charge_fitting.", "multipole_fitting.")
     layer_keys = [
-        k for k in state if tag in k and ".layers." in k and k.endswith((".w", ".b"))
+        k
+        for k in state
+        if any(tag in k for tag in tags)
+        and ".layers." in k
+        and k.endswith((".w", ".b"))
     ]
     depth: dict[str, int] = {}
     for key in layer_keys:
@@ -70,7 +76,7 @@ def _scale_charge_head_output(state: dict, scale: float) -> int:
             state[key] = state[key] * scale
             scaled += 1
     for key in state:
-        if key.endswith(tag + "bias_atom_e"):
+        if key.endswith(tuple(tag + "bias_atom_e" for tag in tags)):
             state[key] = state[key] * scale
             scaled += 1
     return scaled

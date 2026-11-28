@@ -416,6 +416,10 @@ class LongRangeCalculator(Calculator):
                 self.results[key] = float(out[key].reshape(-1)[0].detach())
         if "charge" in out:
             self.results["charges"] = out["charge"].reshape(-1).detach().cpu().numpy()
+        # Atomic moments of a model with a multipole head, in e A and e A^2.
+        for key, name in (("dipole", "dipoles"), ("quadrupole", "quadrupoles")):
+            if key in out:
+                self.results[name] = out[key][0].detach().cpu().numpy()
 
 
 def _charge_spin_condition(charge_spin: Any, device: Any) -> torch.Tensor | None:

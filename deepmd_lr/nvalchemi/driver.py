@@ -47,6 +47,7 @@ from deepmd.kernels.utils import (
 )
 
 from deepmd_lr.born import (
+    dipole_born_response,
     edge_born_response,
     screening_factor,
 )
@@ -109,6 +110,11 @@ class _Launched(NamedTuple):
     #: derivative comes from this list. None when the envelope is attached
     #: to the graph like ``raw``.
     contacts: Any = None
+    #: The owned atoms' dipoles ``(n_owned, 3)`` and quadrupoles ``(n_owned,
+    #: 3, 3)`` from a multipole head, attached like ``raw`` and zero on
+    #: excluded types; the envelope weighs them after the gather.
+    dipole: torch.Tensor | None = None
+    quadrupole: torch.Tensor | None = None
 
 
 @dataclass
@@ -140,6 +146,10 @@ class _Run:
     #: One backward per partition for the short-range and the charge-response
     #: force together (:func:`_merges_backward`).
     merged: bool = False
+    #: Every atom's dipole ``(N, 3)`` and quadrupole ``(N, 3, 3)``, gathered
+    #: beside the raw charges; None without a multipole head.
+    dipole: torch.Tensor | None = None
+    quadrupole: torch.Tensor | None = None
 
     @property
     def n_atoms(self) -> int:
@@ -533,6 +543,8 @@ def evaluate_partitioned(
             term=long_range_energy,
             charge_filter=charge_filter,
             envelope=run.envelope,
+            dipole=run.dipole,
+            quadrupole=run.quadrupole,
         )
     )
     born_grads = None
@@ -543,7 +555,12 @@ def evaluate_partitioned(
             run, launched, result["charge"], eps_inf, result["charge_shift"]
         )
     response = _charge_response_force(
-        run, launched, result["dE_dq"], born_grads, result.get("dE_dw")
+        run,
+        launched,
+        result["dE_dq"],
+        born_grads,
+        result.get("dE_dw"),
+        (result.get("dE_dmu"), result.get("dE_dQ")),
     )
     return _assembled(result, response, compute_virial, eps_inf, run.merged)
 
@@ -681,7 +698,18 @@ def _prepared(
         envelope=envelope,
         hops=receptive_hops(model) or 1,
         merged=merge_backward and _merges_backward(model),
+        dipole=_moment_buffer(model, 1, n_atoms, (3,), dtype, home),
+        quadrupole=_moment_buffer(model, 2, n_atoms, (3, 3), dtype, home),
     )
+
+
+def _moment_buffer(model, degree: int, n_atoms: int, shape, dtype, device):
+    """The zeroed sum of every atom's moment of ``degree``, or None for a
+    model whose multipole head stops below it."""
+    head = getattr(model, "multipole_fitting", None)
+    if head is None or head.lmax < degree:
+        return None
+    return torch.zeros((n_atoms, *shape), dtype=dtype, device=device)
 
 
 def _merges_backward(model) -> bool:
@@ -791,9 +819,43 @@ def _launch_one(run: _Run, part: Partition, device, charge_spin) -> _Launched:
                 raw, envelope = partition_charges(
                     local, graph, node_type, part.n_owned, condition
                 )
+        dipole = quadrupole = None
+        if run.dipole is not None:
+            dipole, quadrupole = _partition_moments(
+                local, captured, node_type, part.n_owned
+            )
         return _Launched(
-            part, out, raw, node_coord, eps, graph, cap_edge_vec, envelope, contacts
+            part,
+            out,
+            raw,
+            node_coord,
+            eps,
+            graph,
+            cap_edge_vec,
+            envelope,
+            contacts,
+            dipole,
+            quadrupole,
         )
+
+
+def _partition_moments(model, captured, node_type, n_owned: int):
+    """The owned atoms' dipoles and quadrupoles from the captured backbone,
+    attached to the partition's graph and zero on the types the charge head
+    excludes."""
+    if not _usable_capture(captured) or "equivariant" not in captured:
+        raise NotImplementedError(
+            "a model with a multipole head needs the shared backbone capture, "
+            "but this partition's forward did not give one"
+        )
+    dipole, quadrupole = model.raw_moments(
+        captured["features"], captured["equivariant"], node_type
+    )
+    keep = charge_mask(model, node_type[None])[0, :n_owned].to(dipole.dtype)
+    dipole = dipole[:n_owned] * keep[:, None]
+    if quadrupole is not None:
+        quadrupole = quadrupole[:n_owned] * keep[:, None, None]
+    return dipole, quadrupole
 
 
 def _gather(run: _Run, launched: list[_Launched]) -> None:
@@ -823,6 +885,7 @@ def _gather(run: _Run, launched: list[_Launched]) -> None:
             node_force = (
                 out["energy_derv_r"].reshape(part.n_node, 3).detach().to(home, dtype)
             )
+        moments = ((run.dipole, item.dipole), (run.quadrupole, item.quadrupole))
         if part.is_whole_system:
             # Nodes are the atoms in order: the sums have one term each.
             run.atom_energy.copy_(per_atom)
@@ -832,6 +895,9 @@ def _gather(run: _Run, launched: list[_Launched]) -> None:
                 run.raw_charge.copy_(raw.detach().to(home, dtype))
             if envelope is not None:
                 run.envelope.copy_(envelope.detach().to(home, dtype))
+            for buffer, moment in moments:
+                if moment is not None:
+                    buffer.copy_(moment.detach().to(home, dtype))
             continue
         run.atom_energy.index_add_(0, v["owned"], per_atom[: part.n_owned])
         if node_force is not None:
@@ -840,6 +906,9 @@ def _gather(run: _Run, launched: list[_Launched]) -> None:
             run.raw_charge.index_copy_(0, v["owned"], raw.detach().to(home, dtype))
         if envelope is not None:
             run.envelope.index_copy_(0, v["owned"], envelope.detach().to(home, dtype))
+        for buffer, moment in moments:
+            if moment is not None:
+                buffer.index_copy_(0, v["owned"], moment.detach().to(home, dtype))
 
 
 def _assembled(
@@ -872,7 +941,9 @@ def _assembled(
     # after the Born tensor took the unscaled ones for its delta term.
     factor = screening_factor(eps_inf)
     if factor != 1.0:
-        result["charge"] = result["charge"] * factor
+        for key in ("charge", "dipole", "quadrupole"):
+            if key in result:
+                result[key] = result[key] * factor
     return result
 
 
@@ -991,6 +1062,21 @@ def _born_charges_partitioned(
                 node = edge_born_response(
                     g, vec, graph.edge_index, graph.edge_mask, part.n_node
                 )
+            if item.dipole is not None:
+                if item.contacts is not None:
+                    raise NotImplementedError(
+                        "Born tensors of atomic dipoles with a `zbl` block"
+                    )
+                moment = item.dipole
+                if item.envelope is not None:
+                    moment = moment * item.envelope.to(moment.dtype)[:, None]
+                if part.n_node > part.n_owned:
+                    moment = torch.nn.functional.pad(
+                        moment, (0, 0, 0, part.n_node - part.n_owned)
+                    )
+                node = node + dipole_born_response(
+                    moment, leaf, graph.edge_index, graph.edge_mask, part.n_node
+                ).to(node.dtype)
             contributions.append((part, node))
             unweighted.append(reusable)
 
@@ -1013,6 +1099,7 @@ def _charge_response_force(
     dE_dq,
     born_grads: list | None = None,
     dE_dw=None,
+    dE_dmoments: tuple = (None, None),
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     r"""The force (and virial) from charges shifting as atoms move.
 
@@ -1045,6 +1132,11 @@ def _charge_response_force(
     repeated. With a list of contacts the cotangent already holds the
     envelope, and the weight is divided by it: ``dE/dq_j`` is proportional
     to the envelope, so the ratio is finite and an atom in contact has none.
+
+    ``dE_dmoments`` are the energy's derivatives with respect to every atom's
+    dipole and quadrupole, for a model with a multipole head: the moments
+    move with the atoms as the charges do, and ``sum_j (dE/dmu_j . mu_j +
+    dE/dQ_j : Q_j)`` is back-propagated with them.
     """
     home, dtype = run.home, run.dtype
     force = torch.zeros((run.n_atoms, 3), dtype=dtype, device=home)
@@ -1065,6 +1157,12 @@ def _charge_response_force(
                 through = dE_dw[owned].to(device=raw.device, dtype=raw.dtype)
                 if item.contacts is None:
                     response = response + (item.envelope * through).sum()
+            for moment, slope in zip(
+                (item.dipole, item.quadrupole), dE_dmoments, strict=True
+            ):
+                if moment is not None:
+                    slope = slope[owned].to(device=moment.device, dtype=moment.dtype)
+                    response = response + (moment * slope).sum()
             targets = [node_coord] if eps is None else [node_coord, eps]
             if run.merged:
                 # The owned atoms' energies with it, as DeePMD-kit's lower
@@ -1083,7 +1181,9 @@ def _charge_response_force(
                 # then through the partition's own `edge_vec`, which is a
                 # function of both; the leaves are numerically identical, so
                 # this is the exact chain rule.
-                g1 = born_grads[k] if born_grads is not None else None
+                # The reuse is of the charges' cotangent alone.
+                reuse = born_grads is not None and item.dipole is None
+                g1 = born_grads[k] if reuse else None
                 if g1 is not None:
                     per_node = weights
                     if item.contacts is not None:
@@ -1132,6 +1232,8 @@ def _long_range_global(
     term=None,
     charge_filter=None,
     envelope=None,
+    dipole=None,
+    quadrupole=None,
 ) -> dict:
     """The global half: project the charges, then evaluate the reciprocal sum.
 
@@ -1145,6 +1247,11 @@ def _long_range_global(
     ``-sum_j (dE/dq_j) dq_j/dr_i``, is short-ranged and is added per partition
     by :func:`_charge_response_force`; taking ``dE/dq`` out as a plain value
     here is what keeps the autograd graph on one device.
+
+    ``dipole`` and ``quadrupole`` are every atom's moments from a multipole
+    head (None without one). They enter the sum weighted as the charges are,
+    and ``dE_dmu`` and ``dE_dQ``, with respect to the unweighted ones, come
+    back beside ``dE_dq``.
     """
     n_atoms = coord.shape[0]
     coord_t = coord.detach().reshape(1, n_atoms, 3).clone().requires_grad_(True)
@@ -1187,9 +1294,26 @@ def _long_range_global(
         )
     if term is None:
         term = model.long_range_energy
-    atom_energy = term(coord_in, charge, cell_in)
+    dipole_t = quadrupole_t = None
+    moments = {}
+    if dipole is not None:
+        factor = weight.to(dtype).reshape(1, n_atoms)
+        dipole_t = dipole.detach().reshape(1, n_atoms, 3).clone().requires_grad_(True)
+        moments["dipole"] = dipole_t * factor[..., None]
+        if quadrupole is not None:
+            quadrupole_t = quadrupole.detach().reshape(1, n_atoms, 3, 3).clone()
+            quadrupole_t.requires_grad_(True)
+            moments["quadrupole"] = quadrupole_t * factor[..., None, None]
+    atom_energy = term(coord_in, charge, cell_in, **moments)
     total = atom_energy.sum()
-    leaves = {"coord": coord_t, "charge": charge_t, "eps": eps, "w": envelope_t}
+    leaves = {
+        "coord": coord_t,
+        "charge": charge_t,
+        "eps": eps,
+        "w": envelope_t,
+        "mu": dipole_t,
+        "Q": quadrupole_t,
+    }
     leaves = {key: leaf for key, leaf in leaves.items() if leaf is not None}
     grads = dict(
         zip(leaves, torch.autograd.grad(total, list(leaves.values())), strict=True)
@@ -1211,4 +1335,8 @@ def _long_range_global(
         out["virial_long_range"] = -grads["eps"].reshape(3, 3).detach()
     if envelope_t is not None:
         out["dE_dw"] = grads["w"].reshape(-1).detach()
+    for key, name in (("mu", "dipole"), ("Q", "quadrupole")):
+        if key in grads:
+            out[f"dE_d{key}"] = grads[key][0].detach()
+            out[name] = moments[name][0].detach()
     return out

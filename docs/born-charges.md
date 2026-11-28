@@ -18,6 +18,9 @@ The tensor, following 10.1021/acs.jctc.6c00146, is
 Z_iab = q_i d_ab + 1/2 sum_{j!=i} ( r_ji,a dq_i/dr_ji,b  -  r_ij,a dq_j/dr_ij,b )
 ```
 
+A model whose atoms also carry dipoles ([multipoles](multipoles.md)) adds
+their derivative, `sum_j d mu_j,a / d r_i,b`, to this tensor.
+
 The first axis is polarization and the second displacement, so the field
 force is `F_ib = sum_a E_a Z_iab`, or `F = Z.T·E`. Its net is exactly `Q·E`,
 zero for a neutral cell, because `sum_i Z_i = Q·I` holds identically.

@@ -311,7 +311,16 @@ class TestGuards:
         every = model._charges_from_features(
             cap["features"], cap["rot_mat"], atype, None, mask, edges, return_raw=True
         )
-        assert every._fields == ("projected", "raw", "local", "shift", "envelope")
+        assert every._fields == (
+            "projected",
+            "raw",
+            "local",
+            "shift",
+            "envelope",
+            "dipole",
+            "quadrupole",
+        )
+        assert every.dipole is None and every.quadrupole is None
         torch.testing.assert_close(every.projected, one)
 
 

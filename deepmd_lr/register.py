@@ -26,8 +26,9 @@ from deepmd_lr import (  # schema args; `same_as`, EMA, compression, loss hooks
     loss,
     same_as,
 )
-from deepmd_lr.fitting import (  # registers the `charge` fitting head
+from deepmd_lr.fitting import (  # registers the `charge`, `multipole` heads
     charge,
+    multipole,
 )
 from deepmd_lr.model import (  # registers the `dp_lr` model type
     lr_model,
@@ -57,6 +58,7 @@ loss.install()
 __all__ = [
     "argcheck",
     "charge",
+    "multipole",
     "compress",
     "ema_default",
     "loss",

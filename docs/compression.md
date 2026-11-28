@@ -59,6 +59,7 @@ a correct file, on the graph lower instead of the compact one.
 | charge state | folded into the tables: the calculator and evaluator fold in the run's `charge_spin`, and a forward with a different one is refused. The descriptor records the folded state, so the refusal holds however the tables were built (upstream's `enable_compression`, which folds `default_chg_spin`; a later `apply_charge_state`; a model with no `long_range` block) |
 | persistence | none: tables are rebuilt at load, and a `state_dict` saved from a compressed model is rejected by `load_model` |
 | multi-GPU | the evaluator compresses once, before making replicas |
+| multipole head | its moments come from a radial table beside the kernel, which keeps them to itself; see [multipoles](multipoles.md#dpa4c) |
 | precision | none: the fp32 descriptor already sees fp32 edge vectors; the only new error is the tabulation |
 
 ## Building the CUDA operators

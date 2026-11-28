@@ -155,6 +155,51 @@ def edge_born_response(g, vec, edge_index, edge_mask, n_node: int) -> torch.Tens
     return 0.5 * (segment_sum(outer, dst, n_node) - segment_sum(outer, src, n_node))
 
 
+def dipole_born_response(
+    dipole: torch.Tensor,
+    edge_vec: torch.Tensor,
+    edge_index: torch.Tensor,
+    edge_mask: torch.Tensor,
+    n_node: int,
+    create_graph: bool = False,
+) -> torch.Tensor:
+    r"""What atomic dipoles add to the Born tensors, ``(N, 3, 3)``:
+    :math:`\sum_j \partial\mu_{jlpha} / \partial r_{ieta}`.
+
+    The polarisation of charges and dipoles is :math:`P = \sum_j q_j r_j +
+    \sum_j \mu_j`, and this is the second sum's derivative. No position
+    stands in it, so it needs no pair form: a dipole depends on the atoms
+    through the edge vectors :math:`v_e = r_	ext{src} - r_	ext{dst}` only,
+    and
+
+    .. math::
+        \sum_j rac{\partial\mu_{jlpha}}{\partial r_{ieta}}
+          = \sum_{e:\,	ext{src}(e)=i} G^lpha_{eeta}
+          - \sum_{e:\,	ext{dst}(e)=i} G^lpha_{eeta},
+        \qquad G^lpha_e = rac{\partial \sum_j \mu_{jlpha}}{\partial v_e}.
+
+    Three backward passes, exact at any depth of message passing and in a
+    periodic cell. Summed over the atoms it vanishes, so the acoustic sum
+    rule stays the total charge. A quadrupole adds nothing: a uniform field
+    couples to the dipole moment alone.
+
+    ``dipole`` is ``(N, 3)`` on the flat node axis, attached to ``edge_vec``.
+    """
+    src = edge_index[0].to(torch.int64)
+    dst = edge_index[1].to(torch.int64)
+    rows = []
+    for axis in range(3):
+        (g,) = torch.autograd.grad(
+            dipole[:, axis].sum(),
+            edge_vec,
+            create_graph=create_graph,
+            retain_graph=True,
+        )
+        g = g * edge_mask[:, None].to(g.dtype)
+        rows.append(segment_sum(g, src, n_node) - segment_sum(g, dst, n_node))
+    return torch.stack(rows, dim=1)
+
+
 def born_charges(
     charge: torch.Tensor,
     raw: torch.Tensor,
@@ -165,6 +210,7 @@ def born_charges(
     create_graph: bool = False,
     eps_inf: float = 1.0,
     finish_gradient: Any = None,
+    dipole: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Per-atom Born effective charge tensors, shape ``(nf, nloc, 3, 3)``.
 
@@ -199,6 +245,10 @@ def born_charges(
         whose ``raw`` holds a factor it keeps out of the autograd graph: the
         short-contact envelope in inference, whose share is added from its
         list of contacts (:func:`deepmd_lr.zbl.add_envelope_gradient`).
+    dipole
+        Atomic dipoles on the flat node axis, ``(N, 3)``, attached to
+        ``edge_vec``, for a model that has them: their derivative is added
+        (:func:`dipole_born_response`).
 
     Returns
     -------
@@ -236,7 +286,12 @@ def born_charges(
 
     eye = torch.eye(3, dtype=charge.dtype, device=charge.device)
     diag = charge.reshape(-1)[:, None, None] * eye[None]
-    out = (diag + response.to(charge.dtype)).reshape(nf, nloc, 3, 3)
+    total = diag + response.to(charge.dtype)
+    if dipole is not None:
+        total = total + dipole_born_response(
+            dipole, edge_vec, edge_index, edge_mask, n_total, create_graph
+        ).to(charge.dtype)
+    out = total.reshape(nf, nloc, 3, 3)
     # Both halves are built from the same charges, so the screening factor
     # multiplies the whole tensor: Z~ = sqrt(eps_inf) Z, as q~ = sqrt(eps_inf) q.
     factor = screening_factor(eps_inf)
